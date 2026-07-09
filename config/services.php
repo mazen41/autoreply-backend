@@ -47,4 +47,8 @@ return [
         'redirect' => env('FACEBOOK_LOGIN_REDIRECT_URI'),
     ],
 
+    'meta' => [
+        'webhook_verify_token' => env('META_WEBHOOK_VERIFY_TOKEN'),
+    ],
+
 ];

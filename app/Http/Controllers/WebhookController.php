@@ -11,7 +11,7 @@ class WebhookController extends Controller
 {
     public function verify(Request $request)
     {
-        $verifyToken = env('META_WEBHOOK_VERIFY_TOKEN');
+        $verifyToken = config('services.meta.webhook_verify_token');
 
         if (
             $request->get('hub_mode') === 'subscribe' &&

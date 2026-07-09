@@ -6,7 +6,7 @@ return [
 
     'allowed_methods' => ['*'],
 
-    'allowed_origins' => ['http://localhost:3000'],
+    'allowed_origins' => ['http://localhost:3000', 'https://nazbiz.io', 'https://www.nazbiz.io'],
 
     'allowed_origins_patterns' => [],
 

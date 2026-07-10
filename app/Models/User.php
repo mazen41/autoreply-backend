@@ -18,6 +18,7 @@ class User extends Authenticatable
         'password',
         'plan',
         'onboarding_completed',
+        'is_admin',
     ];
 
     protected $hidden = [
@@ -31,6 +32,19 @@ class User extends Authenticatable
             'email_verified_at'     => 'datetime',
             'password'              => 'hashed',
             'onboarding_completed'  => 'boolean',
+            'is_admin'              => 'boolean',
         ];
+    }
+
+    public function subscription()
+    {
+        return $this->hasOne(Subscription::class)->active();
+    }
+
+    public function activeSubscription()
+    {
+        return $this->hasOne(Subscription::class)->where('status', 'active')
+            ->where('starts_at', '<=', now())
+            ->where('ends_at', '>', now());
     }
 }

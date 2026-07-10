@@ -51,6 +51,39 @@ class ProcessAutoReply implements ShouldQueue
             return;
         }
 
+        // Check subscription limits
+        $user = $channel->user;
+        if (!$user) {
+            Log::warning('ProcessAutoReply: channel has no user', ['channel_id' => $channel->id]);
+            return;
+        }
+
+        $subscription = $user->activeSubscription;
+        $package = $subscription ? $subscription->package : \App\Models\Package::where('name', 'Free')->first();
+
+        if (!$package) {
+            Log::error('ProcessAutoReply: no package found', ['user_id' => $user->id]);
+            return;
+        }
+
+        // Count AI replies this month
+        $aiRepliesThisMonth = Message::where('is_ai', true)
+            ->where('created_at', '>=', now()->startOfMonth())
+            ->whereHas('conversation.channel', function ($query) use ($user) {
+                $query->where('user_id', $user->id);
+            })
+            ->count();
+
+        // Check limit
+        if ($package->ai_replies_limit !== -1 && $aiRepliesThisMonth >= $package->ai_replies_limit) {
+            Log::info('ProcessAutoReply: AI replies limit reached', [
+                'user_id' => $user->id,
+                'limit' => $package->ai_replies_limit,
+                'used' => $aiRepliesThisMonth
+            ]);
+            return;
+        }
+
         // Build system prompt from business profile
         $systemPrompt = $this->buildSystemPrompt($channel);
 

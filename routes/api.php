@@ -3,6 +3,9 @@
 use App\Http\Controllers\Api\AuthController;
 use App\Http\Controllers\Api\OnboardingController;
 use App\Http\Controllers\Api\SocialAuthController;
+use App\Http\Controllers\Api\PackageController;
+use App\Http\Controllers\Api\SubscriptionController;
+use App\Http\Controllers\Api\PaymentController;
 use App\Http\Controllers\WebhookController;
 use App\Http\Controllers\ChannelController;
 use App\Http\Controllers\GmailController;
@@ -75,3 +78,20 @@ Route::middleware(['auth:sanctum', 'admin'])->group(function () {
 // Public blog approval webhooks
 Route::get('/blog/approve/{id}', [PostController::class, 'approveWebhook']);
 Route::get('/blog/reject/{id}', [PostController::class, 'rejectWebhook']);
+
+// Public package routes
+Route::get('/packages', [PackageController::class, 'index']);
+Route::get('/packages/{id}', [PackageController::class, 'show']);
+
+// Payment callback (public - Moyasar redirects here)
+Route::get('/payments/callback', [PaymentController::class, 'callback']);
+
+// Moyasar webhook (public, exclude CSRF)
+Route::post('/payments/webhook', [PaymentController::class, 'webhook'])->withoutMiddleware([\App\Http\Middleware\VerifyCsrfToken::class]);
+
+// Protected subscription and payment routes
+Route::middleware('auth:sanctum')->group(function () {
+    Route::get('/subscriptions/current', [SubscriptionController::class, 'current']);
+    Route::delete('/subscriptions', [SubscriptionController::class, 'cancel']);
+    Route::post('/payments/create', [PaymentController::class, 'createPayment']);
+});

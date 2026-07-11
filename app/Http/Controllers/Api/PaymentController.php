@@ -144,6 +144,12 @@ class PaymentController extends Controller
             return redirect(config('services.frontend_url') . '/dashboard?payment=success');
         }
 
+        Log::warning('Payment callback reached with non-paid status', [
+            'payment_id' => $paymentId,
+            'status' => $payment['status'] ?? 'unknown',
+            'payment' => $payment,
+        ]);
+
         return redirect(config('services.frontend_url') . '/pricing?payment=failed');
     }
 

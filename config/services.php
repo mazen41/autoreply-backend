@@ -64,4 +64,6 @@ return [
         'webhook_secret' => env('MOYASAR_WEBHOOK_SECRET'),
     ],
 
+    'frontend_url' => env('FRONTEND_URL'),
+
 ];

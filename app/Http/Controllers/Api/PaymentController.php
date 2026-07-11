@@ -35,13 +35,18 @@ class PaymentController extends Controller
             'amount' => $amountInHalalas,
             'currency' => 'SAR',
             'description' => "Naz Autoreply - {$package->name} plan",
-            'callback_url' => env('APP_URL') . '/api/payments/callback',
+            'callback_url' => config('app.url') . '/api/payments/callback',
             'source' => $request->source,
+            'metadata' => [
+                'package_id' => (string) $package->id,
+                'billing_cycle' => $request->billing_cycle,
+                'user_id' => (string) $user->id,
+            ],
         ];
 
         // Call Moyasar API
         $response = Http::withBasicAuth(
-            env('MOYASAR_SECRET_KEY'), 
+            config('services.moyasar.secret_key'),
             ''
         )->post('https://api.moyasar.com/v1/payments', $paymentData);
 
@@ -64,18 +69,18 @@ class PaymentController extends Controller
         $paymentId = $request->query('id');
         
         if (!$paymentId) {
-            return redirect(env('FRONTEND_URL') . '/pricing?payment=failed');
+            return redirect(config('services.frontend_url') . '/pricing?payment=failed');
         }
 
         // Verify payment status with Moyasar
         $response = Http::withBasicAuth(
-            env('MOYASAR_SECRET_KEY'), 
+            config('services.moyasar.secret_key'),
             ''
         )->get("https://api.moyasar.com/v1/payments/{$paymentId}");
 
         if (!$response->successful()) {
             Log::error('Moyasar payment verification failed', ['payment_id' => $paymentId]);
-            return redirect(env('FRONTEND_URL') . '/pricing?payment=failed');
+            return redirect(config('services.frontend_url') . '/pricing?payment=failed');
         }
 
         $payment = $response->json();
@@ -84,18 +89,22 @@ class PaymentController extends Controller
             // Create subscription
             $packageId = $payment['metadata']['package_id'] ?? null;
             $billingCycle = $payment['metadata']['billing_cycle'] ?? 'monthly';
-            
-            if (!$packageId) {
-                Log::error('Package ID missing in payment metadata', ['payment' => $payment]);
-                return redirect(env('FRONTEND_URL') . '/pricing?payment=failed');
+            $userId = $payment['metadata']['user_id'] ?? null;
+
+            if (!$packageId || !$userId) {
+                Log::error('Package ID or user ID missing in payment metadata', ['payment' => $payment]);
+                return redirect(config('services.frontend_url') . '/pricing?payment=failed');
             }
 
             $package = Package::findOrFail($packageId);
-            $user = auth()->check() ? auth()->user() : null;
+            // Moyasar's redirect is a plain browser GET with no Bearer token, so
+            // auth()->user() is never populated here — we rely on the user_id we
+            // stashed in metadata when the payment was created instead.
+            $user = \App\Models\User::find($userId);
 
             if (!$user) {
-                // Handle case where user needs to be authenticated
-                return redirect(env('FRONTEND_URL') . '/login?payment_success=' . $paymentId);
+                Log::error('User from payment metadata not found', ['user_id' => $userId, 'payment' => $payment]);
+                return redirect(config('services.frontend_url') . '/login?payment_success=' . $paymentId);
             }
 
             // Calculate subscription end date
@@ -132,10 +141,10 @@ class PaymentController extends Controller
                 'package_id' => $package->id
             ]);
 
-            return redirect(env('FRONTEND_URL') . '/dashboard?payment=success');
+            return redirect(config('services.frontend_url') . '/dashboard?payment=success');
         }
 
-        return redirect(env('FRONTEND_URL') . '/pricing?payment=failed');
+        return redirect(config('services.frontend_url') . '/pricing?payment=failed');
     }
 
     public function webhook(Request $request)
@@ -144,7 +153,7 @@ class PaymentController extends Controller
         $signature = $request->header('X-Moyasar-Signature');
 
         // Verify webhook signature
-        $expectedSignature = hash_hmac('sha256', json_encode($payload), env('MOYASAR_WEBHOOK_SECRET'));
+        $expectedSignature = hash_hmac('sha256', json_encode($payload), config('services.moyasar.webhook_secret'));
         
         if (!hash_equals($expectedSignature, $signature)) {
             Log::error('Invalid webhook signature', ['payload' => $payload]);

@@ -51,4 +51,17 @@ return [
         'webhook_verify_token' => env('META_WEBHOOK_VERIFY_TOKEN'),
     ],
 
+    'evolution' => [
+        'base_url' => env('EVOLUTION_BASE_URL', 'http://localhost:8080'),
+        'api_key' => env('EVOLUTION_API_KEY', ''),
+        'timeout' => env('EVOLUTION_TIMEOUT', 30),
+        'max_retries' => env('EVOLUTION_MAX_RETRIES', 3),
+    ],
+
+    'moyasar' => [
+        'publishable_key' => env('MOYASAR_PUBLISHABLE_KEY'),
+        'secret_key' => env('MOYASAR_SECRET_KEY'),
+        'webhook_secret' => env('MOYASAR_WEBHOOK_SECRET'),
+    ],
+
 ];

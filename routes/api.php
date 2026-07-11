@@ -6,6 +6,8 @@ use App\Http\Controllers\Api\SocialAuthController;
 use App\Http\Controllers\Api\PackageController;
 use App\Http\Controllers\Api\SubscriptionController;
 use App\Http\Controllers\Api\PaymentController;
+use App\Http\Controllers\Api\AdminController;
+use App\Http\Controllers\Api\WhatsAppController;
 use App\Http\Controllers\WebhookController;
 use App\Http\Controllers\ChannelController;
 use App\Http\Controllers\GmailController;
@@ -94,4 +96,48 @@ Route::middleware('auth:sanctum')->group(function () {
     Route::get('/subscriptions/current', [SubscriptionController::class, 'current']);
     Route::delete('/subscriptions', [SubscriptionController::class, 'cancel']);
     Route::post('/payments/create', [PaymentController::class, 'createPayment']);
+
+    // WhatsApp routes
+    Route::prefix('whatsapp')->group(function () {
+        Route::get('/status', [WhatsAppController::class, 'status']);
+        Route::post('/connect', [WhatsAppController::class, 'connect']);
+        Route::get('/qrcode', [WhatsAppController::class, 'getQrCode']);
+        Route::post('/disconnect', [WhatsAppController::class, 'disconnect']);
+        Route::post('/reconnect', [WhatsAppController::class, 'reconnect']);
+        Route::post('/send', [WhatsAppController::class, 'sendMessage']);
+        Route::get('/messages', [WhatsAppController::class, 'getMessages']);
+        Route::get('/instance', [WhatsAppController::class, 'getInstance']);
+    });
+});
+
+// Evolution API webhook (public, exclude CSRF)
+Route::post('/whatsapp/webhook', [WhatsAppController::class, 'webhook'])->withoutMiddleware([\App\Http\Middleware\VerifyCsrfToken::class]);
+
+// Admin routes (protected + admin middleware)
+Route::middleware(['auth:sanctum', 'admin'])->prefix('admin')->group(function () {
+    // Dashboard
+    Route::get('/dashboard', [AdminController::class, 'dashboard']);
+    
+    // Users
+    Route::get('/users', [AdminController::class, 'users']);
+    Route::get('/users/{id}', [AdminController::class, 'showUser']);
+    Route::patch('/users/{id}', [AdminController::class, 'updateUser']);
+    Route::delete('/users/{id}', [AdminController::class, 'deleteUser']);
+    Route::post('/users/{id}/toggle-admin', [AdminController::class, 'toggleAdmin']);
+    
+    // Packages
+    Route::get('/packages', [AdminController::class, 'packages']);
+    Route::get('/packages/{id}', [AdminController::class, 'showPackage']);
+    Route::post('/packages', [AdminController::class, 'createPackage']);
+    Route::patch('/packages/{id}', [AdminController::class, 'updatePackage']);
+    Route::delete('/packages/{id}', [AdminController::class, 'deletePackage']);
+    
+    // Subscriptions/Payments
+    Route::get('/subscriptions', [AdminController::class, 'subscriptions']);
+    Route::get('/subscriptions/{id}', [AdminController::class, 'showSubscription']);
+    Route::patch('/subscriptions/{id}', [AdminController::class, 'updateSubscription']);
+    
+    // Settings
+    Route::get('/settings', [AdminController::class, 'settings']);
+    Route::patch('/settings', [AdminController::class, 'updateSettings']);
 });

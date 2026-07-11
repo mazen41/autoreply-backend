@@ -67,8 +67,14 @@ class PaymentController extends Controller
     public function callback(Request $request)
     {
         $paymentId = $request->query('id');
-        
+
+        Log::info('Payment callback hit', [
+            'all_query_params' => $request->query(),
+            'full_url' => $request->fullUrl(),
+        ]);
+
         if (!$paymentId) {
+            Log::warning('Payment callback missing id param', ['query' => $request->query()]);
             return redirect(config('services.frontend_url') . '/pricing?payment=failed');
         }
 

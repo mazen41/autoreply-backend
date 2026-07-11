@@ -16,15 +16,21 @@ class SocialAuthController extends Controller
     {
         try {
             $redirectTo = $request->query('redirect');
+            $packageId = $request->query('package');
+            $billingCycle = $request->query('billing');
 
             $driver = Socialite::driver('google')
                 ->stateless()
                 ->scopes(['email', 'profile'])
                 ->redirectUrl(config('services.google.redirect'));
 
-            if ($redirectTo) {
-                $driver = $driver->with(['state' => base64_encode($redirectTo)]);
-            }
+            // Build state with redirect, package, and billing info
+            $stateData = [
+                'redirect' => $redirectTo,
+                'package' => $packageId,
+                'billing' => $billingCycle,
+            ];
+            $driver = $driver->with(['state' => base64_encode(json_encode($stateData))]);
 
             $url = $driver->redirect()->getTargetUrl();
 
@@ -46,8 +52,17 @@ class SocialAuthController extends Controller
             $user = User::where('email', $googleUser->getEmail())->first();
 
             $state = $request->query('state');
-            $redirectTo = $state ? base64_decode($state) : null;
-            $redirectParam = $redirectTo ? '&redirect=' . urlencode($redirectTo) : '';
+            $stateData = $state ? json_decode(base64_decode($state), true) : [];
+            $redirectTo = $stateData['redirect'] ?? null;
+            $packageId = $stateData['package'] ?? null;
+            $billingCycle = $stateData['billing'] ?? null;
+
+            // Build redirect params
+            $params = [];
+            if ($redirectTo) $params[] = 'redirect=' . urlencode($redirectTo);
+            if ($packageId) $params[] = 'package=' . urlencode($packageId);
+            if ($billingCycle) $params[] = 'billing=' . urlencode($billingCycle);
+            $redirectParam = !empty($params) ? '&' . implode('&', $params) : '';
 
             if ($user) {
                 // Update existing user
@@ -88,15 +103,21 @@ class SocialAuthController extends Controller
     {
         try {
             $redirectTo = $request->query('redirect');
+            $packageId = $request->query('package');
+            $billingCycle = $request->query('billing');
 
             $driver = Socialite::driver('facebook')
                 ->stateless()
                 ->scopes(['email', 'public_profile'])
                 ->redirectUrl(config('services.facebook.redirect'));
 
-            if ($redirectTo) {
-                $driver = $driver->with(['state' => base64_encode($redirectTo)]);
-            }
+            // Build state with redirect, package, and billing info
+            $stateData = [
+                'redirect' => $redirectTo,
+                'package' => $packageId,
+                'billing' => $billingCycle,
+            ];
+            $driver = $driver->with(['state' => base64_encode(json_encode($stateData))]);
 
             $url = $driver->redirect()->getTargetUrl();
 
@@ -118,8 +139,17 @@ class SocialAuthController extends Controller
             $user = User::where('email', $facebookUser->getEmail())->first();
 
             $state = $request->query('state');
-            $redirectTo = $state ? base64_decode($state) : null;
-            $redirectParam = $redirectTo ? '&redirect=' . urlencode($redirectTo) : '';
+            $stateData = $state ? json_decode(base64_decode($state), true) : [];
+            $redirectTo = $stateData['redirect'] ?? null;
+            $packageId = $stateData['package'] ?? null;
+            $billingCycle = $stateData['billing'] ?? null;
+
+            // Build redirect params
+            $params = [];
+            if ($redirectTo) $params[] = 'redirect=' . urlencode($redirectTo);
+            if ($packageId) $params[] = 'package=' . urlencode($packageId);
+            if ($billingCycle) $params[] = 'billing=' . urlencode($billingCycle);
+            $redirectParam = !empty($params) ? '&' . implode('&', $params) : '';
 
             if ($user) {
                 // Update existing user

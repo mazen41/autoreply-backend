@@ -12,15 +12,21 @@ use Illuminate\Support\Facades\Auth;
 
 class SocialAuthController extends Controller
 {
-    public function redirectToGoogle()
+    public function redirectToGoogle(Request $request)
     {
         try {
-            $url = Socialite::driver('google')
+            $redirectTo = $request->query('redirect');
+
+            $driver = Socialite::driver('google')
                 ->stateless()
                 ->scopes(['email', 'profile'])
-                ->redirectUrl(env('GOOGLE_LOGIN_REDIRECT_URI'))
-                ->redirect()
-                ->getTargetUrl();
+                ->redirectUrl(config('services.google.redirect'));
+
+            if ($redirectTo) {
+                $driver = $driver->with(['state' => base64_encode($redirectTo)]);
+            }
+
+            $url = $driver->redirect()->getTargetUrl();
 
             return response()->json(['url' => $url]);
         } catch (\Exception $e) {
@@ -34,10 +40,14 @@ class SocialAuthController extends Controller
         try {
             $googleUser = Socialite::driver('google')
                 ->stateless()
-                ->redirectUrl(env('GOOGLE_LOGIN_REDIRECT_URI'))
+                ->redirectUrl(config('services.google.redirect'))
                 ->user();
 
             $user = User::where('email', $googleUser->getEmail())->first();
+
+            $state = $request->query('state');
+            $redirectTo = $state ? base64_decode($state) : null;
+            $redirectParam = $redirectTo ? '&redirect=' . urlencode($redirectTo) : '';
 
             if ($user) {
                 // Update existing user
@@ -50,8 +60,8 @@ class SocialAuthController extends Controller
                 $user->save();
 
                 $token = $user->createToken('auth_token')->plainTextToken;
-                $frontendUrl = env('FRONTEND_URL', 'http://localhost:3000');
-                return redirect()->away("{$frontendUrl}/auth/callback?token={$token}&provider=google&is_new_user=false");
+                $frontendUrl = config('services.frontend_url', 'http://localhost:3000');
+                return redirect()->away("{$frontendUrl}/auth/callback?token={$token}&provider=google&is_new_user=false{$redirectParam}");
             } else {
                 // Create new user
                 $user = User::create([
@@ -64,25 +74,31 @@ class SocialAuthController extends Controller
                 ]);
 
                 $token = $user->createToken('auth_token')->plainTextToken;
-                $frontendUrl = env('FRONTEND_URL', 'http://localhost:3000');
-                return redirect()->away("{$frontendUrl}/auth/callback?token={$token}&provider=google&is_new_user=true");
+                $frontendUrl = config('services.frontend_url', 'http://localhost:3000');
+                return redirect()->away("{$frontendUrl}/auth/callback?token={$token}&provider=google&is_new_user=true{$redirectParam}");
             }
         } catch (\Exception $e) {
             Log::error('Google callback error: ' . $e->getMessage());
-            $frontendUrl = env('FRONTEND_URL', 'http://localhost:3000');
+            $frontendUrl = config('services.frontend_url', 'http://localhost:3000');
             return redirect()->away("{$frontendUrl}/login?error=auth_failed");
         }
     }
 
-    public function redirectToFacebook()
+    public function redirectToFacebook(Request $request)
     {
         try {
-            $url = Socialite::driver('facebook')
+            $redirectTo = $request->query('redirect');
+
+            $driver = Socialite::driver('facebook')
                 ->stateless()
                 ->scopes(['email', 'public_profile'])
-                ->redirectUrl(env('FACEBOOK_LOGIN_REDIRECT_URI'))
-                ->redirect()
-                ->getTargetUrl();
+                ->redirectUrl(config('services.facebook.redirect'));
+
+            if ($redirectTo) {
+                $driver = $driver->with(['state' => base64_encode($redirectTo)]);
+            }
+
+            $url = $driver->redirect()->getTargetUrl();
 
             return response()->json(['url' => $url]);
         } catch (\Exception $e) {
@@ -96,10 +112,14 @@ class SocialAuthController extends Controller
         try {
             $facebookUser = Socialite::driver('facebook')
                 ->stateless()
-                ->redirectUrl(env('FACEBOOK_LOGIN_REDIRECT_URI'))
+                ->redirectUrl(config('services.facebook.redirect'))
                 ->user();
 
             $user = User::where('email', $facebookUser->getEmail())->first();
+
+            $state = $request->query('state');
+            $redirectTo = $state ? base64_decode($state) : null;
+            $redirectParam = $redirectTo ? '&redirect=' . urlencode($redirectTo) : '';
 
             if ($user) {
                 // Update existing user
@@ -112,8 +132,8 @@ class SocialAuthController extends Controller
                 $user->save();
 
                 $token = $user->createToken('auth_token')->plainTextToken;
-                $frontendUrl = env('FRONTEND_URL', 'http://localhost:3000');
-                return redirect()->away("{$frontendUrl}/auth/callback?token={$token}&provider=facebook&is_new_user=false");
+                $frontendUrl = config('services.frontend_url', 'http://localhost:3000');
+                return redirect()->away("{$frontendUrl}/auth/callback?token={$token}&provider=facebook&is_new_user=false{$redirectParam}");
             } else {
                 // Create new user
                 $user = User::create([
@@ -126,12 +146,12 @@ class SocialAuthController extends Controller
                 ]);
 
                 $token = $user->createToken('auth_token')->plainTextToken;
-                $frontendUrl = env('FRONTEND_URL', 'http://localhost:3000');
-                return redirect()->away("{$frontendUrl}/auth/callback?token={$token}&provider=facebook&is_new_user=true");
+                $frontendUrl = config('services.frontend_url', 'http://localhost:3000');
+                return redirect()->away("{$frontendUrl}/auth/callback?token={$token}&provider=facebook&is_new_user=true{$redirectParam}");
             }
         } catch (\Exception $e) {
             Log::error('Facebook callback error: ' . $e->getMessage());
-            $frontendUrl = env('FRONTEND_URL', 'http://localhost:3000');
+            $frontendUrl = config('services.frontend_url', 'http://localhost:3000');
             return redirect()->away("{$frontendUrl}/login?error=auth_failed");
         }
     }

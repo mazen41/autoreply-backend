@@ -24,18 +24,18 @@ class PackageSeeder extends Seeder
             'channels_limit' => 1,
             'tools_limit' => -1,
             'blog_posts_limit' => 0,
-            'features' => json_encode([
+            'features' => [
                 '50 AI replies per month',
                 '1 connected channel',
                 'Access to all free tools',
                 'Email support'
-            ]),
-            'features_ar' => json_encode([
+            ],
+            'features_ar' => [
                 '50 رد آلي شهرياً',
                 'قناة واحدة متصلة',
                 'الوصول لجميع الأدوات المجانية',
                 'دعم عبر البريد الإلكتروني'
-            ]),
+            ],
             'is_popular' => false,
             'is_active' => true,
             'sort_order' => 1,
@@ -52,22 +52,22 @@ class PackageSeeder extends Seeder
             'channels_limit' => 3,
             'tools_limit' => -1,
             'blog_posts_limit' => 10,
-            'features' => json_encode([
+            'features' => [
                 '1,000 AI replies per month',
                 '3 connected channels',
                 'Facebook, Instagram & Gmail',
                 'Automated blog (10 posts/month)',
                 'Priority support',
                 'Analytics dashboard'
-            ]),
-            'features_ar' => json_encode([
+            ],
+            'features_ar' => [
                 '1,000 رد آلي شهرياً',
                 '3 قنوات متصلة',
                 'فيسبوك وانستغرام وجيميل',
                 'مدونة مؤتمتة (10 مقالات/شهر)',
                 'دعم أولوية',
                 'لوحة تحليلات'
-            ]),
+            ],
             'is_popular' => true,
             'is_active' => true,
             'sort_order' => 2,
@@ -84,7 +84,7 @@ class PackageSeeder extends Seeder
             'channels_limit' => -1,
             'tools_limit' => -1,
             'blog_posts_limit' => -1,
-            'features' => json_encode([
+            'features' => [
                 'Unlimited AI replies',
                 'Unlimited channels',
                 'WhatsApp integration',
@@ -92,8 +92,8 @@ class PackageSeeder extends Seeder
                 'Dedicated account manager',
                 'Custom AI personality',
                 'White-label option'
-            ]),
-            'features_ar' => json_encode([
+            ],
+            'features_ar' => [
                 'ردود آلية غير محدودة',
                 'قنوات غير محدودة',
                 'تكامل واتساب',
@@ -101,7 +101,7 @@ class PackageSeeder extends Seeder
                 'مدير حساب مخصص',
                 'شخصية ذكاء اصطناعي مخصصة',
                 'خيار العلامة البيضاء'
-            ]),
+            ],
             'is_popular' => false,
             'is_active' => true,
             'sort_order' => 3,

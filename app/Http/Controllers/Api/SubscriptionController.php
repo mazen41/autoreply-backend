@@ -47,4 +47,42 @@ class SubscriptionController extends Controller
 
         return response()->json(['message' => 'Subscription cancelled successfully']);
     }
+
+    public function createFree(Request $request)
+    {
+        $user = auth()->user();
+        
+        // Check if user already has an active subscription
+        if ($user->activeSubscription) {
+            return response()->json(['message' => 'User already has an active subscription'], 400);
+        }
+
+        $validated = $request->validate([
+            'package_id' => 'required|exists:packages,id',
+            'billing_cycle' => 'required|in:monthly,yearly',
+        ]);
+
+        $package = Package::findOrFail($validated['package_id']);
+
+        // Only allow free packages
+        if ($package->price_monthly > 0 || $package->price_yearly > 0) {
+            return response()->json(['message' => 'This endpoint is only for free plans'], 400);
+        }
+
+        $subscription = Subscription::create([
+            'user_id' => $user->id,
+            'package_id' => $package->id,
+            'billing_cycle' => $validated['billing_cycle'],
+            'status' => 'active',
+            'starts_at' => now(),
+            'ends_at' => now()->addMonth(), // Free plans renew monthly
+            'amount_paid' => 0,
+        ]);
+
+        return response()->json([
+            'subscription' => $subscription->load('package'),
+            'package' => $package,
+            'message' => 'Free subscription created successfully'
+        ]);
+    }
 }

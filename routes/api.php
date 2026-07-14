@@ -8,6 +8,7 @@ use App\Http\Controllers\Api\SubscriptionController;
 use App\Http\Controllers\Api\PaymentController;
 use App\Http\Controllers\Api\AdminController;
 use App\Http\Controllers\Api\WhatsAppController;
+use App\Http\Controllers\Api\ReportsController;
 use App\Http\Controllers\WebhookController;
 use App\Http\Controllers\ChannelController;
 use App\Http\Controllers\GmailController;
@@ -40,6 +41,8 @@ Route::get('/channels/callback/gmail',    [GmailController::class, 'callback']);
 Route::middleware('auth:sanctum')->group(function () {
     Route::post('/auth/logout', [AuthController::class, 'logout']);
     Route::get('/auth/user',    [AuthController::class, 'user']);
+    Route::patch('/auth/profile', [AuthController::class, 'updateProfile']);
+    Route::post('/auth/password', [AuthController::class, 'changePassword']);
 
     // Onboarding
     Route::prefix('onboarding')->group(function () {
@@ -57,10 +60,20 @@ Route::middleware('auth:sanctum')->group(function () {
     Route::patch('/channels/{id}',            [ChannelController::class, 'update']);
     Route::delete('/channels/{id}',           [ChannelController::class, 'disconnect']);
 
-    // Inbox â€” conversations + messages + manual reply
+    // Inbox — conversations + messages + manual reply
     Route::get('/inbox',                                [InboxController::class, 'index']);
     Route::get('/inbox/{conversationId}/messages',      [InboxController::class, 'messages']);
     Route::post('/inbox/{conversationId}/reply',        [InboxController::class, 'reply']);
+
+    // Reports
+    Route::prefix('reports')->group(function () {
+        Route::get('/daily-messages', [ReportsController::class, 'dailyMessages']);
+        Route::get('/channel-breakdown', [ReportsController::class, 'channelBreakdown']);
+        Route::get('/ai-performance', [ReportsController::class, 'aiPerformance']);
+        Route::get('/top-questions', [ReportsController::class, 'topQuestions']);
+        Route::get('/time-saved', [ReportsController::class, 'timeSaved']);
+        Route::get('/summary', [ReportsController::class, 'summary']);
+    });
 });
 
 // Gmail Webhook - public, Google Pub/Sub calls this
@@ -94,6 +107,7 @@ Route::post('/payments/webhook', [PaymentController::class, 'webhook'])->without
 // Protected subscription and payment routes
 Route::middleware('auth:sanctum')->group(function () {
     Route::get('/subscriptions/current', [SubscriptionController::class, 'current']);
+    Route::post('/subscriptions/create-free', [SubscriptionController::class, 'createFree']);
     Route::delete('/subscriptions', [SubscriptionController::class, 'cancel']);
     Route::post('/payments/create', [PaymentController::class, 'createPayment']);
 

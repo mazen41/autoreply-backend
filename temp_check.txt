@@ -1,0 +1,111 @@
+﻿<?php
+
+namespace Database\Seeders;
+
+use Illuminate\Database\Console\Seeds\WithoutModelEvents;
+use Illuminate\Database\Seeder;
+use App\Models\Package;
+
+class PackageSeeder extends Seeder
+{
+    /**
+     * Run the database seeds.
+     */
+    public function run(): void
+    {
+        Package::create([
+            'name' => 'Free',
+            'name_ar' => 'Ù…Ø¬Ø§Ù†ÙŠ',
+            'description' => 'Perfect for getting started with AI-powered automated replies.',
+            'description_ar' => 'Ù…Ø«Ø§Ù„ÙŠ Ù„Ù„Ø¨Ø¯Ø¡ Ù…Ø¹ Ø§Ù„Ø±Ø¯ÙˆØ¯ Ø§Ù„Ø¢Ù„ÙŠØ© Ø§Ù„Ù…Ø¯Ø¹ÙˆÙ…Ø© Ø¨Ø§Ù„Ø°ÙƒØ§Ø¡ Ø§Ù„Ø§ØµØ·Ù†Ø§Ø¹ÙŠ.',
+            'price_monthly' => 0.00,
+            'price_yearly' => 0.00,
+            'ai_replies_limit' => 50,
+            'channels_limit' => 1,
+            'tools_limit' => -1,
+            'blog_posts_limit' => 0,
+            'features' => json_encode([
+                '50 AI replies per month',
+                '1 connected channel',
+                'Access to all free tools',
+                'Email support'
+            ]),
+            'features_ar' => json_encode([
+                '50 Ø±Ø¯ Ø¢Ù„ÙŠ Ø´Ù‡Ø±ÙŠØ§Ù‹',
+                'Ù‚Ù†Ø§Ø© ÙˆØ§Ø­Ø¯Ø© Ù…ØªØµÙ„Ø©',
+                'Ø§Ù„ÙˆØµÙˆÙ„ Ù„Ø¬Ù…ÙŠØ¹ Ø§Ù„Ø£Ø¯ÙˆØ§Øª Ø§Ù„Ù…Ø¬Ø§Ù†ÙŠØ©',
+                'Ø¯Ø¹Ù… Ø¹Ø¨Ø± Ø§Ù„Ø¨Ø±ÙŠØ¯ Ø§Ù„Ø¥Ù„ÙƒØªØ±ÙˆÙ†ÙŠ'
+            ]),
+            'is_popular' => false,
+            'is_active' => true,
+            'sort_order' => 1,
+        ]);
+
+        Package::create([
+            'name' => 'Starter',
+            'name_ar' => 'Ø§Ù„Ù…Ø¨ØªØ¯Ø¦',
+            'description' => 'Great for growing businesses with multiple channels.',
+            'description_ar' => 'Ø±Ø§Ø¦Ø¹ Ù„Ù„Ø´Ø±ÙƒØ§Øª Ø§Ù„Ù†Ø§Ù…ÙŠØ© Ù…Ø¹ Ù‚Ù†ÙˆØ§Øª Ù…ØªØ¹Ø¯Ø¯Ø©.',
+            'price_monthly' => 99.00,
+            'price_yearly' => 990.00,
+            'ai_replies_limit' => 1000,
+            'channels_limit' => 3,
+            'tools_limit' => -1,
+            'blog_posts_limit' => 10,
+            'features' => json_encode([
+                '1,000 AI replies per month',
+                '3 connected channels',
+                'Facebook, Instagram & Gmail',
+                'Automated blog (10 posts/month)',
+                'Priority support',
+                'Analytics dashboard'
+            ]),
+            'features_ar' => json_encode([
+                '1,000 Ø±Ø¯ Ø¢Ù„ÙŠ Ø´Ù‡Ø±ÙŠØ§Ù‹',
+                '3 Ù‚Ù†ÙˆØ§Øª Ù…ØªØµÙ„Ø©',
+                'ÙÙŠØ³Ø¨ÙˆÙƒ ÙˆØ§Ù†Ø³ØªØºØ±Ø§Ù… ÙˆØ¬ÙŠÙ…ÙŠÙ„',
+                'Ù…Ø¯ÙˆÙ†Ø© Ù…Ø¤ØªÙ…ØªØ© (10 Ù…Ù‚Ø§Ù„Ø§Øª/Ø´Ù‡Ø±)',
+                'Ø¯Ø¹Ù… Ø£ÙˆÙ„ÙˆÙŠØ©',
+                'Ù„ÙˆØ­Ø© ØªØ­Ù„ÙŠÙ„Ø§Øª'
+            ]),
+            'is_popular' => true,
+            'is_active' => true,
+            'sort_order' => 2,
+        ]);
+
+        Package::create([
+            'name' => 'Pro',
+            'name_ar' => 'Ø§Ù„Ø§Ø­ØªØ±Ø§ÙÙŠ',
+            'description' => 'For businesses that need unlimited AI-powered automation.',
+            'description_ar' => 'Ù„Ù„Ø´Ø±ÙƒØ§Øª Ø§Ù„ØªÙŠ ØªØ­ØªØ§Ø¬ Ø¥Ù„Ù‰ Ø£ØªÙ…ØªØ© ØºÙŠØ± Ù…Ø­Ø¯ÙˆØ¯Ø© Ø¨Ø§Ù„Ø°ÙƒØ§Ø¡ Ø§Ù„Ø§ØµØ·Ù†Ø§Ø¹ÙŠ.',
+            'price_monthly' => 299.00,
+            'price_yearly' => 2990.00,
+            'ai_replies_limit' => -1,
+            'channels_limit' => -1,
+            'tools_limit' => -1,
+            'blog_posts_limit' => -1,
+            'features' => json_encode([
+                'Unlimited AI replies',
+                'Unlimited channels',
+                'WhatsApp integration',
+                'Unlimited blog automation',
+                'Dedicated account manager',
+                'Custom AI personality',
+                'White-label option'
+            ]),
+            'features_ar' => json_encode([
+                'Ø±Ø¯ÙˆØ¯ Ø¢Ù„ÙŠØ© ØºÙŠØ± Ù…Ø­Ø¯ÙˆØ¯Ø©',
+                'Ù‚Ù†ÙˆØ§Øª ØºÙŠØ± Ù…Ø­Ø¯ÙˆØ¯Ø©',
+                'ØªÙƒØ§Ù…Ù„ ÙˆØ§ØªØ³Ø§Ø¨',
+                'Ø£ØªÙ…ØªØ© Ù…Ø¯ÙˆÙ†Ø© ØºÙŠØ± Ù…Ø­Ø¯ÙˆØ¯Ø©',
+                'Ù…Ø¯ÙŠØ± Ø­Ø³Ø§Ø¨ Ù…Ø®ØµØµ',
+                'Ø´Ø®ØµÙŠØ© Ø°ÙƒØ§Ø¡ Ø§ØµØ·Ù†Ø§Ø¹ÙŠ Ù…Ø®ØµØµØ©',
+                'Ø®ÙŠØ§Ø± Ø§Ù„Ø¹Ù„Ø§Ù…Ø© Ø§Ù„Ø¨ÙŠØ¶Ø§Ø¡'
+            ]),
+            'is_popular' => false,
+            'is_active' => true,
+            'sort_order' => 3,
+        ]);
+    }
+}
+

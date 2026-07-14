@@ -237,7 +237,20 @@ class EvolutionApiService
     public function processWebhookEvent(array $event): void
     {
         try {
-            $eventType = $event['event'] ?? null;
+            $rawEventType = $event['event'] ?? null;
+
+            // Evolution API is inconsistent about event name casing/format across
+            // versions — docs show "CONNECTION_UPDATE" but live payloads often send
+            // "connection.update" (lowercase, dot-separated). Normalize to the
+            // uppercase-underscore form our switch below expects, so we match
+            // regardless of which style Evolution sends.
+            $eventType = $rawEventType ? strtoupper(str_replace('.', '_', $rawEventType)) : null;
+
+            Log::info('Evolution webhook event normalized', [
+                'raw_event' => $rawEventType,
+                'normalized_event' => $eventType,
+                'instance' => $event['instance'] ?? null,
+            ]);
 
             switch ($eventType) {
                 case 'MESSAGES_UPSERT':
@@ -253,7 +266,7 @@ class EvolutionApiService
                     $this->handleStatusInstance($event);
                     break;
                 default:
-                    Log::info("Unhandled webhook event type: {$eventType}");
+                    Log::info("Unhandled webhook event type: {$eventType} (raw: {$rawEventType})");
             }
         } catch (Exception $e) {
             Log::error("Failed to process webhook event: {$e->getMessage()}", ['event' => $event]);

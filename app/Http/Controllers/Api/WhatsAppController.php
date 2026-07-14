@@ -26,7 +26,7 @@ class WhatsAppController extends Controller
     public function status()
     {
         $user = Auth::user();
-        $instance = WhatsAppInstance::forUser($user->id)->first();
+        $instance = WhatsAppInstance::forUser($user->id)->latest()->first();
 
         if (!$instance) {
             return response()->json([
@@ -74,12 +74,24 @@ class WhatsAppController extends Controller
         $user = Auth::user();
 
         // Check if user already has an instance
-        $existingInstance = WhatsAppInstance::forUser($user->id)->first();
+        $existingInstance = WhatsAppInstance::forUser($user->id)->latest()->first();
         if ($existingInstance && $existingInstance->isConnected()) {
             return response()->json([
                 'message' => 'WhatsApp already connected',
                 'instance' => $existingInstance,
             ], 400);
+        }
+
+        // Clean up any stale (not connected) instance rows for this user so we
+        // never end up with duplicate rows — status()/etc always assume one
+        // active instance per user.
+        if ($existingInstance) {
+            try {
+                $this->evolutionService->deleteInstance($existingInstance->instance_name);
+            } catch (Exception $cleanupError) {
+                Log::warning("Failed to delete stale Evolution instance during reconnect: {$cleanupError->getMessage()}");
+            }
+            WhatsAppInstance::forUser($user->id)->delete();
         }
 
         // Generate unique instance name for this user
@@ -136,7 +148,7 @@ class WhatsAppController extends Controller
     public function getQrCode(Request $request)
     {
         $user = Auth::user();
-        $instance = WhatsAppInstance::forUser($user->id)->first();
+        $instance = WhatsAppInstance::forUser($user->id)->latest()->first();
 
         if (!$instance) {
             return response()->json(['message' => 'No instance found'], 404);
@@ -169,7 +181,7 @@ class WhatsAppController extends Controller
     public function disconnect(Request $request)
     {
         $user = Auth::user();
-        $instance = WhatsAppInstance::forUser($user->id)->first();
+        $instance = WhatsAppInstance::forUser($user->id)->latest()->first();
 
         if (!$instance) {
             return response()->json(['message' => 'No instance found'], 404);
@@ -209,27 +221,9 @@ class WhatsAppController extends Controller
      */
     public function reconnect(Request $request)
     {
-        $user = Auth::user();
-        $instance = WhatsAppInstance::forUser($user->id)->first();
-
-        if (!$instance) {
-            return response()->json(['message' => 'No instance found'], 404);
-        }
-
-        try {
-            // Delete old instance from Evolution
-            $this->evolutionService->deleteInstance($instance->instance_name);
-
-            // Create new instance
-            return $this->connect($request);
-
-        } catch (Exception $e) {
-            Log::error("Failed to reconnect WhatsApp: {$e->getMessage()}");
-            return response()->json([
-                'message' => 'Failed to reconnect WhatsApp',
-                'error' => $e->getMessage(),
-            ], 500);
-        }
+        // connect() already handles cleaning up any existing stale instance
+        // before creating a fresh one, so reconnect is just an alias for it.
+        return $this->connect($request);
     }
 
     /**
@@ -246,7 +240,7 @@ class WhatsAppController extends Controller
         ]);
 
         $user = Auth::user();
-        $instance = WhatsAppInstance::forUser($user->id)->first();
+        $instance = WhatsAppInstance::forUser($user->id)->latest()->first();
 
         if (!$instance || !$instance->isConnected()) {
             return response()->json(['message' => 'WhatsApp not connected'], 400);
@@ -315,7 +309,7 @@ class WhatsAppController extends Controller
     public function getMessages(Request $request)
     {
         $user = Auth::user();
-        $instance = WhatsAppInstance::forUser($user->id)->first();
+        $instance = WhatsAppInstance::forUser($user->id)->latest()->first();
 
         if (!$instance) {
             return response()->json(['message' => 'No instance found'], 404);
@@ -335,7 +329,7 @@ class WhatsAppController extends Controller
     public function getInstance(Request $request)
     {
         $user = Auth::user();
-        $instance = WhatsAppInstance::forUser($user->id)->first();
+        $instance = WhatsAppInstance::forUser($user->id)->latest()->first();
 
         if (!$instance) {
             return response()->json(['message' => 'No instance found'], 404);

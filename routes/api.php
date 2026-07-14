@@ -125,7 +125,9 @@ Route::middleware('auth:sanctum')->group(function () {
 });
 
 // Evolution API webhook (public, exclude CSRF)
-Route::post('/whatsapp/webhook', [WhatsAppController::class, 'webhook'])->withoutMiddleware([\App\Http\Middleware\VerifyCsrfToken::class]);
+Route::post('/whatsapp/webhook', [WhatsAppController::class, 'webhook'])
+    ->withoutMiddleware([\App\Http\Middleware\VerifyCsrfToken::class])
+    ->name('whatsapp.webhook');
 
 // Admin routes (protected + admin middleware)
 Route::middleware(['auth:sanctum', 'admin'])->prefix('admin')->group(function () {

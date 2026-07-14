@@ -170,4 +170,56 @@ class ReportsController extends Controller
             'time_saved' => $this->timeSaved($request)->getData(true),
         ]);
     }
+
+    /**
+     * Get top-level dashboard stats (used by the main dashboard home page)
+     */
+    public function dashboardStats(Request $request)
+    {
+        $user = Auth::user();
+
+        $totalMessages = Message::where('user_id', $user->id)->count();
+        $aiReplies = Message::where('user_id', $user->id)
+            ->where('is_ai_generated', true)
+            ->count();
+        $responseRate = $totalMessages > 0 ? round(($aiReplies / $totalMessages) * 100, 1) : 0;
+
+        // Time saved: assume 3 minutes saved per AI-handled reply
+        $hoursSaved = round(($aiReplies * 3) / 60, 1);
+
+        // Week-over-week message trend
+        $thisWeek = Message::where('user_id', $user->id)
+            ->where('created_at', '>=', now()->subDays(7))
+            ->count();
+        $lastWeek = Message::where('user_id', $user->id)
+            ->whereBetween('created_at', [now()->subDays(14), now()->subDays(7)])
+            ->count();
+        $messagesTrend = null;
+        if ($lastWeek > 0) {
+            $change = round((($thisWeek - $lastWeek) / $lastWeek) * 100, 1);
+            $messagesTrend = ['value' => abs($change), 'isPositive' => $change >= 0];
+        }
+
+        // Top question this week (simple heuristic: incoming messages ending in '?')
+        $topQuestionRow = Message::where('user_id', $user->id)
+            ->where('direction', 'incoming')
+            ->where('created_at', '>=', now()->subDays(7))
+            ->where('body', 'like', '%?')
+            ->select(DB::raw('body'), DB::raw('COUNT(*) as count'))
+            ->groupBy('body')
+            ->orderByDesc('count')
+            ->first();
+
+        return response()->json([
+            'total_messages' => $totalMessages,
+            'ai_replies' => $aiReplies,
+            'response_rate' => $responseRate,
+            'hours_saved' => $hoursSaved,
+            'google_rating' => null,
+            'messages_trend' => $messagesTrend,
+            'rating_trend' => null,
+            'top_question' => $topQuestionRow->body ?? null,
+            'question_count' => $topQuestionRow->count ?? 0,
+        ]);
+    }
 }

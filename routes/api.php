@@ -74,6 +74,9 @@ Route::middleware('auth:sanctum')->group(function () {
         Route::get('/time-saved', [ReportsController::class, 'timeSaved']);
         Route::get('/summary', [ReportsController::class, 'summary']);
     });
+
+    // Top-level dashboard stats
+    Route::get('/stats', [ReportsController::class, 'dashboardStats']);
 });
 
 // Gmail Webhook - public, Google Pub/Sub calls this

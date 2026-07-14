@@ -8,6 +8,8 @@ use Illuminate\Database\Eloquent\Relations\BelongsTo;
 
 class WhatsAppInstance extends Model
 {
+    protected $table = 'whatsapp_instances';
+
     protected $fillable = [
         'user_id',
         'instance_name',

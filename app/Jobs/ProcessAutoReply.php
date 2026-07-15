@@ -6,6 +6,7 @@ use App\Models\Channel;
 use App\Models\Conversation;
 use App\Models\Message;
 use App\Http\Controllers\GmailController;
+use App\Services\EvolutionApiService;
 use Google\Service\Gmail;
 use Google\Service\Gmail\Message as GmailMessage;
 use Illuminate\Bus\Queueable;
@@ -300,6 +301,8 @@ class ProcessAutoReply implements ShouldQueue
                 $success = $this->sendInstagramReply($channel, $senderId, $content);
             } elseif ($channel->type === 'gmail') {
                 $success = $this->sendGmailReply($channel, $conversation, $content);
+            } elseif ($channel->type === 'whatsapp') {
+                $success = $this->sendWhatsAppReply($channel, $senderId, $content);
             }
 
             if ($success) {
@@ -393,6 +396,44 @@ class ProcessAutoReply implements ShouldQueue
 
         } catch (\Exception $e) {
             Log::error('ProcessAutoReply: Gmail send exception', ['error' => $e->getMessage()]);
+            return false;
+        }
+    }
+
+    private function sendWhatsAppReply(Channel $channel, string $recipientId, string $message): bool
+    {
+        try {
+            $whatsappService = new EvolutionApiService();
+            $instanceName = $channel->page_id; // We store instance_name in page_id for WhatsApp
+
+            $response = $whatsappService->sendTextMessage($instanceName, $recipientId, $message);
+
+            if (isset($response['key']['id'])) {
+                // Also save to WhatsApp messages table for legacy compatibility
+                \App\Models\WhatsAppMessage::create([
+                    'whatsapp_instance_id' => \App\Models\WhatsAppInstance::where('instance_name', $instanceName)->first()?->id,
+                    'user_id' => $channel->user_id,
+                    'message_id' => $response['key']['id'] ?? null,
+                    'remote_message_id' => $response['key']['id'] ?? null,
+                    'direction' => 'outgoing',
+                    'from_phone' => null,
+                    'from_name' => null,
+                    'to_phone' => $recipientId,
+                    'body' => $message,
+                    'message_type' => 'text',
+                    'media' => null,
+                    'metadata' => ['evolution_response' => $response],
+                    'status' => 'sent',
+                    'sent_at' => now(),
+                ]);
+
+                return true;
+            }
+
+            return false;
+
+        } catch (\Exception $e) {
+            Log::error('ProcessAutoReply: WhatsApp send exception', ['error' => $e->getMessage()]);
             return false;
         }
     }

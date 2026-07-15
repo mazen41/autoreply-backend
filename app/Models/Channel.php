@@ -26,12 +26,27 @@ class Channel extends Model
 
     public function setAccessTokenAttribute($value)
     {
-        $this->attributes['access_token'] = encrypt($value);
+        // For WhatsApp, we store empty string (instance_name is in page_id)
+        if (empty($value)) {
+            $this->attributes['access_token'] = '';
+        } else {
+            $this->attributes['access_token'] = encrypt($value);
+        }
     }
 
     public function getAccessTokenAttribute($value)
     {
-        return decrypt($value);
+        // For WhatsApp, we store empty string in access_token (instance_name is in page_id)
+        if (empty($value)) {
+            return null;
+        }
+
+        try {
+            return decrypt($value);
+        } catch (\Exception $e) {
+            // If decryption fails, return the value as-is (might be already decrypted)
+            return $value;
+        }
     }
 
     public function user()

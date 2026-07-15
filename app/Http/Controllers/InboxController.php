@@ -5,6 +5,7 @@ namespace App\Http\Controllers;
 use App\Models\Conversation;
 use App\Models\Message;
 use App\Models\Channel;
+use App\Services\EvolutionApiService;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\Http;
 use Illuminate\Support\Facades\Log;
@@ -69,6 +70,10 @@ class InboxController extends Controller
         // Handle different channel types
         if ($channel->type === 'gmail') {
             return $this->sendGmailReply($request, $conversation, $channel);
+        }
+
+        if ($channel->type === 'whatsapp') {
+            return $this->sendWhatsAppReply($request, $conversation, $channel);
         }
 
         // Handle Facebook/Instagram
@@ -164,6 +169,70 @@ class InboxController extends Controller
         }
 
         return response()->json(['success' => true, 'message' => $message]);
+    }
+
+    /**
+     * Send reply via WhatsApp Evolution API
+     */
+    private function sendWhatsAppReply(Request $request, Conversation $conversation, Channel $channel)
+    {
+        try {
+            $whatsappService = new EvolutionApiService();
+            $instanceName = $channel->page_id; // We store instance_name in page_id for WhatsApp
+
+            // Send message via Evolution API
+            $response = $whatsappService->sendTextMessage(
+                $instanceName,
+                $conversation->sender_id,
+                $request->message
+            );
+
+            if (!isset($response['key']['id'])) {
+                Log::error('WhatsApp reply failed', ['response' => $response]);
+                return response()->json(['error' => 'Failed to send WhatsApp message'], 500);
+            }
+
+            // Save to DB
+            $message = Message::create([
+                'conversation_id' => $conversation->id,
+                'content'         => $request->message,
+                'direction'       => 'outbound',
+                'is_ai'           => false,
+                'status'          => 'manual',
+                'source'          => 'whatsapp',
+                'send_status'     => 'sent',
+            ]);
+
+            $conversation->update(['last_message_at' => now()]);
+
+            // Also save to WhatsApp messages table for legacy compatibility
+            \App\Models\WhatsAppMessage::create([
+                'whatsapp_instance_id' => \App\Models\WhatsAppInstance::where('instance_name', $instanceName)->first()?->id,
+                'user_id' => $channel->user_id,
+                'message_id' => $response['key']['id'] ?? null,
+                'remote_message_id' => $response['key']['id'] ?? null,
+                'direction' => 'outgoing',
+                'from_phone' => null, // Business number
+                'from_name' => null,
+                'to_phone' => $conversation->sender_id,
+                'body' => $request->message,
+                'message_type' => 'text',
+                'media' => null,
+                'metadata' => ['evolution_response' => $response],
+                'status' => 'sent',
+                'sent_at' => now(),
+            ]);
+
+            if ($channel->user_id) {
+                broadcast(new \App\Events\MessageReceived($message, $conversation, $channel->user_id));
+            }
+
+            return response()->json(['success' => true, 'message' => $message]);
+
+        } catch (\Exception $e) {
+            Log::error('WhatsApp reply failed', ['error' => $e->getMessage(), 'channel_id' => $channel->id]);
+            return response()->json(['error' => 'Failed to send WhatsApp reply: ' . $e->getMessage()], 500);
+        }
     }
 
     /**

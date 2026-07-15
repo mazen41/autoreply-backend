@@ -5,6 +5,9 @@ namespace App\Services;
 use Illuminate\Support\Facades\Http;
 use Illuminate\Support\Facades\Log;
 use App\Models\WhatsAppInstance;
+use App\Models\Channel;
+use App\Models\Conversation;
+use App\Models\Message;
 use Exception;
 
 class EvolutionApiService
@@ -298,6 +301,7 @@ class EvolutionApiService
         $body = $messageContent['conversation'] ?? $messageContent['extendedTextMessage']['text'] ?? null;
         $messageType = $this->detectMessageType($messageContent);
 
+        // Save to WhatsApp messages table (legacy)
         WhatsAppMessage::create([
             'whatsapp_instance_id' => $instance->id,
             'user_id' => $instance->user_id,
@@ -318,7 +322,94 @@ class EvolutionApiService
             'sent_at' => now(),
         ]);
 
+        // Also save to unified inbox system
+        $this->saveToUnifiedInbox($instance, $fromPhone, $fromName, $body, $messageType);
+
         Log::info("Message saved from {$fromPhone} for instance {$instanceName}");
+    }
+
+    /**
+     * Save WhatsApp message to unified inbox (Conversation/Message)
+     */
+    protected function saveToUnifiedInbox(WhatsAppInstance $instance, ?string $fromPhone, ?string $fromName, ?string $body, string $messageType): void
+    {
+        try {
+            // Find the WhatsApp channel
+            $channel = Channel::where('user_id', $instance->user_id)
+                ->where('type', 'whatsapp')
+                ->where('page_id', $instance->instance_name)
+                ->first();
+
+            if (!$channel) {
+                Log::warning("WhatsApp channel not found for unified inbox", [
+                    'instance_name' => $instance->instance_name,
+                    'user_id' => $instance->user_id,
+                ]);
+                return;
+            }
+
+            // Find or create conversation
+            $conversation = Conversation::where('channel_id', $channel->id)
+                ->where('sender_id', $fromPhone)
+                ->first();
+
+            if (!$conversation) {
+                $conversation = Conversation::create([
+                    'channel_id' => $channel->id,
+                    'business_id' => $channel->business_id,
+                    'sender_id' => $fromPhone,
+                    'sender_name' => $fromName,
+                    'sender_email' => null,
+                    'subject' => null,
+                    'status' => 'active',
+                    'last_message_at' => now(),
+                ]);
+
+                Log::info("Created new conversation for WhatsApp", [
+                    'conversation_id' => $conversation->id,
+                    'sender_id' => $fromPhone,
+                ]);
+            } else {
+                // Update conversation metadata
+                $conversation->update([
+                    'sender_name' => $fromName,
+                    'last_message_at' => now(),
+                ]);
+            }
+
+            // Create message in unified inbox
+            $message = Message::create([
+                'conversation_id' => $conversation->id,
+                'content' => $body,
+                'type' => $messageType,
+                'direction' => 'inbound',
+                'status' => 'received',
+                'is_ai' => false,
+                'source' => 'whatsapp',
+                'send_status' => 'delivered',
+            ]);
+
+            // Broadcast for real-time UI updates
+            if ($channel->user_id) {
+                broadcast(new \App\Events\MessageReceived($message, $conversation, $channel->user_id));
+            }
+
+            // Trigger AI auto-reply if enabled
+            if ($channel->ai_enabled) {
+                \App\Jobs\ProcessAutoReply::dispatch($message->id);
+            }
+
+            Log::info("WhatsApp message saved to unified inbox", [
+                'message_id' => $message->id,
+                'conversation_id' => $conversation->id,
+            ]);
+
+        } catch (\Exception $e) {
+            Log::error("Failed to save WhatsApp message to unified inbox: {$e->getMessage()}", [
+                'instance_id' => $instance->id,
+                'from_phone' => $fromPhone,
+            ]);
+        }
     }
 
     /**
@@ -392,6 +483,9 @@ class EvolutionApiService
         if ($state === 'open') {
             $instance->connected_at = now();
             $instance->disconnected_at = null;
+
+            // Create or update Channel for WhatsApp integration
+            $this->ensureWhatsAppChannel($instance);
         } elseif ($state === 'close') {
             $instance->disconnected_at = now();
         }
@@ -399,6 +493,54 @@ class EvolutionApiService
         $instance->save();
 
         Log::info("Connection status updated for {$instanceName}: {$state}");
+    }
+
+    /**
+     * Ensure a Channel row exists for WhatsApp integration
+     */
+    protected function ensureWhatsAppChannel(WhatsAppInstance $instance): void
+    {
+        try {
+            $channel = Channel::where('user_id', $instance->user_id)
+                ->where('type', 'whatsapp')
+                ->where('page_id', $instance->instance_name)
+                ->first();
+
+            if (!$channel) {
+                $channel = Channel::create([
+                    'user_id' => $instance->user_id,
+                    'business_id' => null,
+                    'type' => 'whatsapp',
+                    'page_id' => $instance->instance_name,
+                    'page_name' => $instance->profile_name ?? $instance->instance_name,
+                    'access_token' => '', // Empty for WhatsApp, instance_name stored in page_id
+                    'status' => 'connected',
+                    'connected_at' => now(),
+                    'ai_enabled' => false,
+                ]);
+
+                Log::info("Created WhatsApp channel for instance", [
+                    'instance_name' => $instance->instance_name,
+                    'channel_id' => $channel->id,
+                ]);
+            } else {
+                // Update existing channel status
+                $channel->update([
+                    'status' => 'connected',
+                    'connected_at' => now(),
+                    'page_name' => $instance->profile_name ?? $instance->instance_name,
+                ]);
+
+                Log::info("Updated WhatsApp channel status", [
+                    'instance_name' => $instance->instance_name,
+                    'channel_id' => $channel->id,
+                ]);
+            }
+        } catch (\Exception $e) {
+            Log::error("Failed to ensure WhatsApp channel: {$e->getMessage()}", [
+                'instance_id' => $instance->id,
+            ]);
+        }
     }
 
     /**

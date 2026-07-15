@@ -5,6 +5,7 @@ namespace App\Services;
 use Illuminate\Support\Facades\Http;
 use Illuminate\Support\Facades\Log;
 use App\Models\WhatsAppInstance;
+use App\Models\WhatsAppMessage;
 use App\Models\Channel;
 use App\Models\Conversation;
 use App\Models\Message;

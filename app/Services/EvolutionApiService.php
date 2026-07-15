@@ -299,6 +299,12 @@ class EvolutionApiService
 
         $fromPhone = $message['remoteJid'] ?? null;
         $fromName = $message['pushName'] ?? null;
+        
+        // If pushName is empty or just a dot, use the phone number instead
+        if (empty($fromName) || $fromName === '.') {
+            $fromName = $this->formatPhoneNumber($fromPhone);
+        }
+        
         $body = $messageContent['conversation'] ?? $messageContent['extendedTextMessage']['text'] ?? null;
         $messageType = $this->detectMessageType($messageContent);
 
@@ -347,6 +353,11 @@ class EvolutionApiService
                     'user_id' => $instance->user_id,
                 ]);
                 return;
+            }
+
+            // Format sender name if empty or just a dot
+            if (empty($fromName) || $fromName === '.') {
+                $fromName = $this->formatPhoneNumber($fromPhone);
             }
 
             // Find or create conversation
@@ -623,5 +634,30 @@ class EvolutionApiService
         }
 
         return null;
+    }
+
+    /**
+     * Format WhatsApp phone number for display
+     */
+    protected function formatPhoneNumber(?string $phone): string
+    {
+        if (!$phone) {
+            return 'Unknown';
+        }
+
+        // Remove @s.whatsapp.net suffix if present
+        $phone = str_replace('@s.whatsapp.net', '', $phone);
+        
+        // Remove any other suffixes
+        $phone = preg_replace('/@.+$/', '', $phone);
+        
+        // If it starts with country code, format it nicely
+        if (preg_match('/^(\d{1,3})(\d+)$/', $phone, $matches)) {
+            $countryCode = $matches[1];
+            $number = $matches[2];
+            return "+{$countryCode} {$number}";
+        }
+
+        return $phone;
     }
 }

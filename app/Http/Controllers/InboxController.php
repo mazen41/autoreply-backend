@@ -137,11 +137,14 @@ class InboxController extends Controller
     private function sendFacebookReply(Request $request, Conversation $conversation, Channel $channel)
     {
         $certPath = base_path('cacert.pem');
+        
+        // Decrypt the access token
+        $accessToken = decrypt($channel->access_token);
 
         $fbResponse = Http::timeout(10)
             ->withOptions(['verify' => file_exists($certPath) ? $certPath : false])
             ->post(
-                "https://graph.facebook.com/v19.0/me/messages?access_token={$channel->access_token}",
+                "https://graph.facebook.com/v19.0/me/messages?access_token={$accessToken}",
                 [
                     'recipient' => ['id' => $conversation->sender_id],
                     'message'   => ['text' => $request->message],

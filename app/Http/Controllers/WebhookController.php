@@ -193,11 +193,14 @@ class WebhookController extends Controller
     private function fetchSenderName(Channel $channel, string $senderId): ?string
     {
         try {
+            // Decrypt the access token
+            $accessToken = decrypt($channel->access_token);
+            
             $response = Http::timeout(8)
                 ->withOptions(['verify' => false])
                 ->get("https://graph.facebook.com/v19.0/{$senderId}", [
                     'fields'       => 'first_name,last_name,name',
-                    'access_token' => $channel->access_token,
+                    'access_token' => $accessToken,
                 ]);
 
             if (!$response->successful()) {
@@ -221,8 +224,11 @@ class WebhookController extends Controller
 
     private function sendReply(Channel $channel, string $recipientId, string $message): void
     {
+        // Decrypt the access token
+        $accessToken = decrypt($channel->access_token);
+        
         // /me/messages works for both Facebook and Instagram when using the Page Access Token
-        $url = "https://graph.facebook.com/v19.0/me/messages?access_token={$channel->access_token}";
+        $url = "https://graph.facebook.com/v19.0/me/messages?access_token={$accessToken}";
 
         try {
             $response = Http::timeout(10)

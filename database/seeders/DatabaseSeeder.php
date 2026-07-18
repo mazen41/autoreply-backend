@@ -17,6 +17,13 @@ class DatabaseSeeder extends Seeder
     {
         // User::factory(10)->create();
 
+        // Seed admin user
+        $this->call(AdminSeeder::class);
+
+        // Seed packages
+        $this->call(PackageSeeder::class);
+
+        // Optional: Create a test user
         User::factory()->create([
             'name' => 'Test User',
             'email' => 'test@example.com',

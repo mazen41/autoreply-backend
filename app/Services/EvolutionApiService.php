@@ -323,7 +323,7 @@ class EvolutionApiService
         $messageType = $this->detectMessageType($messageContent);
 
         // Save to WhatsApp messages table (legacy)
-        WhatsAppMessage::create([
+        $whatsappMessage = WhatsAppMessage::create([
             'whatsapp_instance_id' => $instance->id,
             'user_id' => $instance->user_id,
             'message_id' => $message['id'] ?? null,
@@ -338,6 +338,7 @@ class EvolutionApiService
             'metadata' => [
                 'event' => $event,
                 'message_key' => $message,
+                'pushName' => $message['pushName'] ?? null, // Store original pushName
             ],
             'status' => 'pending',
             'sent_at' => now(),

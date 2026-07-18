@@ -55,6 +55,12 @@ class CheckWebhookStructure extends Command
                 // Check for pushName in different locations
                 $this->info("\n=== SEARCHING FOR pushName ===");
                 
+                if (isset($event['data']['pushName'])) {
+                    $this->info("✓ Found in event.data.pushName: {$event['data']['pushName']}");
+                } else {
+                    $this->info("✗ Not found in event.data.pushName");
+                }
+                
                 if (isset($event['data']['key']['pushName'])) {
                     $this->info("✓ Found in event.data.key.pushName: {$event['data']['key']['pushName']}");
                 } else {

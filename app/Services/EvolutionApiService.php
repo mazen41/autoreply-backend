@@ -301,7 +301,12 @@ class EvolutionApiService
         }
 
         $fromPhone = $message['remoteJid'] ?? null;
+        
+        // Try to get pushName from different locations in the webhook structure
         $fromName = $message['pushName'] ?? null;
+        if (empty($fromName) || $fromName === '.') {
+            $fromName = $event['data']['pushName'] ?? null;
+        }
         
         // Log the name we received for debugging
         Log::info("WhatsApp webhook received contact info", [
@@ -338,7 +343,7 @@ class EvolutionApiService
             'metadata' => [
                 'event' => $event,
                 'message_key' => $message,
-                'pushName' => $message['pushName'] ?? null, // Store original pushName
+                'pushName' => $fromName, // Store the resolved name
             ],
             'status' => 'pending',
             'sent_at' => now(),

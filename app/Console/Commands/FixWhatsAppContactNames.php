@@ -74,8 +74,8 @@ class FixWhatsAppContactNames extends Command
 
                 if ($whatsappMessageWithMeta) {
                     $metadata = $whatsappMessageWithMeta->metadata;
-                    if (isset($metadata['pushName']) && $metadata['pushName'] && $metadata['pushName'] !== '.') {
-                        $realName = $metadata['pushName'];
+                    if (isset($metadata['event']['data']['pushName']) && $metadata['event']['data']['pushName'] && $metadata['event']['data']['pushName'] !== '.') {
+                        $realName = $metadata['event']['data']['pushName'];
                         $this->info("Found name in metadata: {$realName}");
                     }
                 }

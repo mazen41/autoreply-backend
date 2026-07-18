@@ -110,13 +110,11 @@ class EvolutionApiService
         
         $payload = [
             'number' => $cleanNumber,
+            'text' => $text,
             'options' => [
                 'delay' => 1200,
                 'presence' => 'composing',
                 'linkPreview' => false,
-            ],
-            'textMessage' => [
-                'text' => $text,
             ],
         ];
 

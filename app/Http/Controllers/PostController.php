@@ -118,9 +118,14 @@ class PostController extends Controller
 
     public function approveWebhook(Request $request, $id)
     {
+        $secret = env('BLOG_APPROVAL_SECRET');
+        if (!$secret) {
+            return response('❌ BLOG_APPROVAL_SECRET not configured', 500);
+        }
+
         $token = $request->query('token');
         
-        if ($token !== env('BLOG_APPROVAL_SECRET')) {
+        if ($token !== $secret) {
             return response('❌ Invalid token', 403);
         }
 
@@ -159,9 +164,14 @@ class PostController extends Controller
 
     public function rejectWebhook(Request $request, $id)
     {
+        $secret = env('BLOG_APPROVAL_SECRET');
+        if (!$secret) {
+            return response('❌ BLOG_APPROVAL_SECRET not configured', 500);
+        }
+
         $token = $request->query('token');
         
-        if ($token !== env('BLOG_APPROVAL_SECRET')) {
+        if ($token !== $secret) {
             return response('❌ Invalid token', 403);
         }
 
@@ -194,5 +204,15 @@ class PostController extends Controller
     </div>
 </body>
 </html>');
+    }
+
+    /**
+     * Admin-only: Get all posts (including drafts)
+     */
+    public function adminIndex(Request $request)
+    {
+        $posts = Post::orderBy('created_at', 'desc')->paginate(20);
+        
+        return response()->json($posts);
     }
 }

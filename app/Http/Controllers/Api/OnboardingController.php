@@ -61,6 +61,77 @@ class OnboardingController extends Controller
         return response()->json(['message' => 'Step 3 saved']);
     }
 
+    /** Upload and extract text from PDF/Excel files */
+    public function uploadKnowledgeFile(Request $request)
+    {
+        $request->validate([
+            'file' => 'required|file|mimes:pdf,xlsx,xls|max:10240', // Max 10MB
+        ]);
+
+        $file = $request->file('file');
+        $extractedText = '';
+
+        try {
+            if ($file->getClientOriginalExtension() === 'pdf') {
+                $extractedText = $this->extractPdfText($file);
+            } elseif (in_array($file->getClientOriginalExtension(), ['xlsx', 'xls'])) {
+                $extractedText = $this->extractExcelText($file);
+            } else {
+                return response()->json(['error' => 'Unsupported file type'], 400);
+            }
+
+            if (empty($extractedText)) {
+                return response()->json(['error' => 'Could not extract text from file'], 400);
+            }
+
+            // Store extracted text in knowledge_base
+            $profile = $this->profile($request);
+            $existingKnowledge = $profile->knowledge_base ?? '';
+            $profile->update([
+                'knowledge_base' => $existingKnowledge . "\n\n" . $extractedText,
+            ]);
+
+            return response()->json([
+                'message' => 'File processed successfully',
+                'extracted_length' => strlen($extractedText),
+            ]);
+        } catch (\Exception $e) {
+            \Illuminate\Support\Facades\Log::error('File extraction failed', [
+                'error' => $e->getMessage(),
+                'file' => $file->getClientOriginalName(),
+            ]);
+            return response()->json(['error' => 'Failed to process file: ' . $e->getMessage()], 500);
+        }
+    }
+
+    private function extractPdfText($file)
+    {
+        $parser = new \Smalot\PdfParser\Parser();
+        $pdf = $parser->parseFile($file->getPathname());
+        return $pdf->getText();
+    }
+
+    private function extractExcelText($file)
+    {
+        $spreadsheet = \PhpOffice\PhpSpreadsheet\IOFactory::load($file->getPathname());
+        $text = '';
+
+        foreach ($spreadsheet->getAllSheets() as $sheet) {
+            foreach ($sheet->getRowIterator() as $row) {
+                $cellIterator = $row->getCellIterator();
+                $cellIterator->setIterateOnlyExistingCells(false);
+                $rowData = [];
+                foreach ($cellIterator as $cell) {
+                    $rowData[] = $cell->getFormattedValue();
+                }
+                $text .= implode(' | ', array_filter($rowData)) . "\n";
+            }
+            $text .= "\n--- Sheet End ---\n\n";
+        }
+
+        return $text;
+    }
+
     /** STEP 4 — connected channel */
     public function step4(Request $request)
     {

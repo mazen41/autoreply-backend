@@ -41,9 +41,15 @@ class ProcessAutoReply implements ShouldQueue
         }
 
         $channel = $message->conversation->channel;
+        $conversation = $message->conversation;
 
         if (!$channel || !$channel->ai_enabled) {
             Log::info('ProcessAutoReply: AI not enabled for channel', ['channel_id' => $channel?->id]);
+            return;
+        }
+
+        if (!$conversation || !$conversation->ai_enabled) {
+            Log::info('ProcessAutoReply: AI not enabled for conversation', ['conversation_id' => $conversation?->id]);
             return;
         }
 
@@ -164,6 +170,10 @@ class ProcessAutoReply implements ShouldQueue
 
         if ($faqsText) {
             $prompt .= "\nCommon questions and answers:\n{$faqsText}\n";
+        }
+
+        if (!empty($business->knowledge_base)) {
+            $prompt .= "\nAdditional business knowledge and documentation:\n{$business->knowledge_base}\n";
         }
 
         $prompt .= "\nRules:\n";

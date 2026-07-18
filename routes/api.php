@@ -51,6 +51,7 @@ Route::middleware('auth:sanctum')->group(function () {
         Route::post('/step3',    [OnboardingController::class, 'step3']);
         Route::post('/step4',    [OnboardingController::class, 'step4']);
         Route::post('/complete', [OnboardingController::class, 'complete']);
+        Route::post('/upload-knowledge', [OnboardingController::class, 'uploadKnowledgeFile']);
     });
 
     // Channels â€” listing and disconnect
@@ -64,6 +65,7 @@ Route::middleware('auth:sanctum')->group(function () {
     Route::get('/inbox',                                [InboxController::class, 'index']);
     Route::get('/inbox/{conversationId}/messages',      [InboxController::class, 'messages']);
     Route::post('/inbox/{conversationId}/reply',        [InboxController::class, 'reply']);
+    Route::patch('/inbox/{conversationId}/toggle-ai',   [InboxController::class, 'toggleAi']);
 
     // Reports
     Route::prefix('reports')->group(function () {
@@ -73,6 +75,8 @@ Route::middleware('auth:sanctum')->group(function () {
         Route::get('/top-questions', [ReportsController::class, 'topQuestions']);
         Route::get('/time-saved', [ReportsController::class, 'timeSaved']);
         Route::get('/summary', [ReportsController::class, 'summary']);
+        Route::get('/export/csv', [ReportsController::class, 'exportCsv']);
+        Route::get('/export/pdf', [ReportsController::class, 'exportPdf']);
     });
 
     // Top-level dashboard stats
@@ -88,6 +92,7 @@ Route::get('/posts/{slug}', [PostController::class, 'show']);
 
 // Protected blog admin routes
 Route::middleware(['auth:sanctum', 'admin'])->group(function () {
+    Route::get('/admin/posts', [PostController::class, 'adminIndex']);
     Route::post('/posts', [PostController::class, 'store']);
     Route::patch('/posts/{id}/publish', [PostController::class, 'publish']);
     Route::patch('/posts/{id}/reject', [PostController::class, 'reject']);

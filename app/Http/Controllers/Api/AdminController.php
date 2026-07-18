@@ -232,6 +232,22 @@ class AdminController extends Controller
         $settings = [
             'app_name' => config('app.name'),
             'app_url' => config('app.url'),
+            // Meta (Facebook/Instagram)
+            'meta_app_id' => config('services.meta.app_id'),
+            'meta_app_secret' => config('services.meta.app_secret') ? '***' : null,
+            // Google (Gmail/Reviews)
+            'google_client_id' => config('services.google.client_id'),
+            'google_client_secret' => config('services.google.client_secret') ? '***' : null,
+            // Gemini AI
+            'gemini_api_key' => config('services.gemini.api_key') ? '***' : null,
+            'gemini_model' => config('services.gemini.model'),
+            // Pusher (Real-time)
+            'pusher_app_id' => config('broadcasting.connections.pusher.app_id'),
+            'pusher_app_key' => config('broadcasting.connections.pusher.key'),
+            'pusher_secret' => config('broadcasting.connections.pusher.secret') ? '***' : null,
+            'pusher_cluster' => config('broadcasting.connections.pusher.options.cluster'),
+            'pusher_host' => config('broadcasting.connections.pusher.options.host'),
+            // Moyasar Payment
             'moyasar_publishable_key' => config('services.moyasar.publishable_key'),
             'moyasar_secret_key' => config('services.moyasar.secret_key') ? '***' : null,
         ];
@@ -243,21 +259,82 @@ class AdminController extends Controller
     {
         $request->validate([
             'app_name' => 'sometimes|string|max:255',
+            // Meta
+            'meta_app_id' => 'sometimes|string',
+            'meta_app_secret' => 'sometimes|string',
+            // Google
+            'google_client_id' => 'sometimes|string',
+            'google_client_secret' => 'sometimes|string',
+            // Gemini
+            'gemini_api_key' => 'sometimes|string',
+            'gemini_model' => 'sometimes|string',
+            // Pusher
+            'pusher_app_id' => 'sometimes|string',
+            'pusher_app_key' => 'sometimes|string',
+            'pusher_secret' => 'sometimes|string',
+            'pusher_cluster' => 'sometimes|string',
+            'pusher_host' => 'sometimes|string',
+            // Moyasar
             'moyasar_publishable_key' => 'sometimes|string',
             'moyasar_secret_key' => 'sometimes|string',
         ]);
 
+        // App Name
         if ($request->has('app_name')) {
             $this->setEnvValue('APP_NAME', $request->app_name);
         }
 
+        // Meta
+        if ($request->has('meta_app_id')) {
+            $this->setEnvValue('META_APP_ID', $request->meta_app_id);
+        }
+        if ($request->has('meta_app_secret')) {
+            $this->setEnvValue('META_APP_SECRET', $request->meta_app_secret);
+        }
+
+        // Google
+        if ($request->has('google_client_id')) {
+            $this->setEnvValue('GOOGLE_CLIENT_ID', $request->google_client_id);
+        }
+        if ($request->has('google_client_secret')) {
+            $this->setEnvValue('GOOGLE_CLIENT_SECRET', $request->google_client_secret);
+        }
+
+        // Gemini
+        if ($request->has('gemini_api_key')) {
+            $this->setEnvValue('GEMINI_API_KEY', $request->gemini_api_key);
+        }
+        if ($request->has('gemini_model')) {
+            $this->setEnvValue('GEMINI_MODEL', $request->gemini_model);
+        }
+
+        // Pusher
+        if ($request->has('pusher_app_id')) {
+            $this->setEnvValue('PUSHER_APP_ID', $request->pusher_app_id);
+        }
+        if ($request->has('pusher_app_key')) {
+            $this->setEnvValue('PUSHER_APP_KEY', $request->pusher_app_key);
+        }
+        if ($request->has('pusher_secret')) {
+            $this->setEnvValue('PUSHER_SECRET', $request->pusher_secret);
+        }
+        if ($request->has('pusher_cluster')) {
+            $this->setEnvValue('PUSHER_CLUSTER', $request->pusher_cluster);
+        }
+        if ($request->has('pusher_host')) {
+            $this->setEnvValue('PUSHER_HOST', $request->pusher_host);
+        }
+
+        // Moyasar
         if ($request->has('moyasar_publishable_key')) {
             $this->setEnvValue('MOYASAR_PUBLISHABLE_KEY', $request->moyasar_publishable_key);
         }
-
         if ($request->has('moyasar_secret_key')) {
             $this->setEnvValue('MOYASAR_SECRET_KEY', $request->moyasar_secret_key);
         }
+
+        // Clear config cache so changes take effect immediately
+        \Illuminate\Support\Facades\Artisan::call('config:clear');
 
         return response()->json(['message' => 'Settings updated successfully']);
     }

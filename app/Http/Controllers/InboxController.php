@@ -295,4 +295,24 @@ class InboxController extends Controller
         $message .= "--{$boundary}--\r\n";
         return $message;
     }
+
+    /**
+     * Toggle AI for a specific conversation
+     */
+    public function toggleAi(Request $request, $conversationId)
+    {
+        $conversation = Conversation::whereHas('channel', function ($q) {
+                $q->where('user_id', auth()->id());
+            })
+            ->findOrFail($conversationId);
+
+        $conversation->update([
+            'ai_enabled' => !$conversation->ai_enabled
+        ]);
+
+        return response()->json([
+            'message' => 'AI toggled successfully',
+            'ai_enabled' => $conversation->ai_enabled
+        ]);
+    }
 }

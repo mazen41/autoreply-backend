@@ -13,14 +13,26 @@ use Illuminate\Support\Facades\DB;
 class ReportsController extends Controller
 {
     /**
+     * Base query: every message belonging to a conversation whose channel
+     * belongs to the current user. The messages table has no user_id column
+     * of its own, so this join is required for every report below.
+     */
+    private function userMessages()
+    {
+        $user = Auth::user();
+        return Message::whereHas('conversation.channel', function ($q) use ($user) {
+            $q->where('user_id', $user->id);
+        });
+    }
+
+    /**
      * Get daily message counts for the current user
      */
     public function dailyMessages(Request $request)
     {
-        $user = Auth::user();
         $days = $request->get('days', 30); // Default to last 30 days
-        
-        $data = Message::where('user_id', $user->id)
+
+        $data = $this->userMessages()
             ->where('created_at', '>=', now()->subDays($days))
             ->select(DB::raw('DATE(created_at) as date'), DB::raw('COUNT(*) as count'))
             ->groupBy('date')
@@ -48,15 +60,15 @@ class ReportsController extends Controller
     public function channelBreakdown(Request $request)
     {
         $user = Auth::user();
-        
+
         $channels = Channel::where('user_id', $user->id)
-            ->withCount('messages')
+            ->withCount('messages as messages_count')
             ->get()
             ->map(function ($channel) {
                 return [
                     'id' => $channel->id,
                     'type' => $channel->type,
-                    'name' => $channel->name ?? $channel->type,
+                    'name' => $channel->page_name ?? $channel->type,
                     'messages_count' => $channel->messages_count,
                 ];
             });
@@ -68,26 +80,65 @@ class ReportsController extends Controller
     }
 
     /**
+     * Compute average response time in seconds: for every inbound message,
+     * find the next outbound message in the same conversation and measure
+     * the gap between them. There's no stored response_time column, so this
+     * is calculated on the fly from real timestamps.
+     */
+    private function averageResponseTimeSeconds(): float
+    {
+        $user = Auth::user();
+
+        $conversationIds = Conversation::whereHas('channel', function ($q) use ($user) {
+            $q->where('user_id', $user->id);
+        })->pluck('id');
+
+        if ($conversationIds->isEmpty()) {
+            return 0;
+        }
+
+        $gaps = [];
+
+        Message::whereIn('conversation_id', $conversationIds)
+            ->orderBy('conversation_id')
+            ->orderBy('created_at')
+            ->get(['conversation_id', 'direction', 'created_at'])
+            ->groupBy('conversation_id')
+            ->each(function ($messages) use (&$gaps) {
+                $pendingInboundAt = null;
+                foreach ($messages as $m) {
+                    if ($m->direction === 'inbound') {
+                        $pendingInboundAt = $m->created_at;
+                    } elseif ($m->direction === 'outbound' && $pendingInboundAt) {
+                        $gaps[] = $m->created_at->diffInSeconds($pendingInboundAt);
+                        $pendingInboundAt = null;
+                    }
+                }
+            });
+
+        if (empty($gaps)) {
+            return 0;
+        }
+
+        return array_sum($gaps) / count($gaps);
+    }
+
+    /**
      * Get AI performance metrics
      */
     public function aiPerformance(Request $request)
     {
-        $user = Auth::user();
-        
-        $totalMessages = Message::where('user_id', $user->id)->count();
-        $autoReplies = Message::where('user_id', $user->id)
-            ->where('is_ai_generated', true)
-            ->count();
-        
-        $manualInterventions = Message::where('user_id', $user->id)
-            ->where('is_ai_generated', false)
-            ->where('direction', 'outgoing')
+        $totalMessages = $this->userMessages()->count();
+        $autoReplies = $this->userMessages()
+            ->where('is_ai', true)
             ->count();
 
-        // Calculate average response time (in seconds)
-        $avgResponseTime = Message::where('user_id', $user->id)
-            ->whereNotNull('response_time_seconds')
-            ->avg('response_time_seconds') ?? 0;
+        $manualInterventions = $this->userMessages()
+            ->where('is_ai', false)
+            ->where('direction', 'outbound')
+            ->count();
+
+        $avgResponseTime = $this->averageResponseTimeSeconds();
 
         $responseRate = $totalMessages > 0 ? ($autoReplies / $totalMessages) * 100 : 0;
 
@@ -97,8 +148,8 @@ class ReportsController extends Controller
             'auto_reply_rate' => round($responseRate, 1),
             'manual_interventions' => $manualInterventions,
             'avg_response_time_seconds' => round($avgResponseTime, 1),
-            'avg_response_time_formatted' => $avgResponseTime < 60 
-                ? round($avgResponseTime, 1) . 's' 
+            'avg_response_time_formatted' => $avgResponseTime < 60
+                ? round($avgResponseTime, 1) . 's'
                 : round($avgResponseTime / 60, 1) . 'm',
         ]);
     }
@@ -108,14 +159,13 @@ class ReportsController extends Controller
      */
     public function topQuestions(Request $request)
     {
-        $user = Auth::user();
         $limit = $request->get('limit', 10);
-        
+
         // Extract questions from incoming messages (simple heuristic: messages ending with ?)
-        $questions = Message::where('user_id', $user->id)
-            ->where('direction', 'incoming')
-            ->where('body', 'like', '%?')
-            ->select(DB::raw('LOWER(body) as question'), DB::raw('COUNT(*) as count'))
+        $questions = $this->userMessages()
+            ->where('direction', 'inbound')
+            ->where('content', 'like', '%?')
+            ->select(DB::raw('LOWER(content) as question'), DB::raw('COUNT(*) as count'))
             ->groupBy('question')
             ->orderByDesc('count')
             ->limit($limit)
@@ -131,10 +181,8 @@ class ReportsController extends Controller
      */
     public function timeSaved(Request $request)
     {
-        $user = Auth::user();
-        
-        $autoReplies = Message::where('user_id', $user->id)
-            ->where('is_ai_generated', true)
+        $autoReplies = $this->userMessages()
+            ->where('is_ai', true)
             ->count();
 
         // Assume manual reply takes 3 minutes on average
@@ -142,7 +190,7 @@ class ReportsController extends Controller
         $totalTimeSavedMinutes = $autoReplies * $manualReplyTimeMinutes;
         $totalTimeSavedHours = round($totalTimeSavedMinutes / 60, 1);
 
-        // Estimate value (assuming $100/hour)
+        // Estimate value (assuming 100 SAR/hour)
         $hourlyRate = 100;
         $estimatedValue = round($totalTimeSavedHours * $hourlyRate);
 
@@ -160,8 +208,6 @@ class ReportsController extends Controller
      */
     public function summary(Request $request)
     {
-        $user = Auth::user();
-        
         return response()->json([
             'daily_messages' => $this->dailyMessages($request)->getData(true),
             'channel_breakdown' => $this->channelBreakdown($request)->getData(true),
@@ -176,11 +222,9 @@ class ReportsController extends Controller
      */
     public function dashboardStats(Request $request)
     {
-        $user = Auth::user();
-
-        $totalMessages = Message::where('user_id', $user->id)->count();
-        $aiReplies = Message::where('user_id', $user->id)
-            ->where('is_ai_generated', true)
+        $totalMessages = $this->userMessages()->count();
+        $aiReplies = $this->userMessages()
+            ->where('is_ai', true)
             ->count();
         $responseRate = $totalMessages > 0 ? round(($aiReplies / $totalMessages) * 100, 1) : 0;
 
@@ -188,10 +232,10 @@ class ReportsController extends Controller
         $hoursSaved = round(($aiReplies * 3) / 60, 1);
 
         // Week-over-week message trend
-        $thisWeek = Message::where('user_id', $user->id)
+        $thisWeek = $this->userMessages()
             ->where('created_at', '>=', now()->subDays(7))
             ->count();
-        $lastWeek = Message::where('user_id', $user->id)
+        $lastWeek = $this->userMessages()
             ->whereBetween('created_at', [now()->subDays(14), now()->subDays(7)])
             ->count();
         $messagesTrend = null;
@@ -201,12 +245,12 @@ class ReportsController extends Controller
         }
 
         // Top question this week (simple heuristic: incoming messages ending in '?')
-        $topQuestionRow = Message::where('user_id', $user->id)
-            ->where('direction', 'incoming')
+        $topQuestionRow = $this->userMessages()
+            ->where('direction', 'inbound')
             ->where('created_at', '>=', now()->subDays(7))
-            ->where('body', 'like', '%?')
-            ->select(DB::raw('body'), DB::raw('COUNT(*) as count'))
-            ->groupBy('body')
+            ->where('content', 'like', '%?')
+            ->select(DB::raw('content'), DB::raw('COUNT(*) as count'))
+            ->groupBy('content')
             ->orderByDesc('count')
             ->first();
 
@@ -218,8 +262,155 @@ class ReportsController extends Controller
             'google_rating' => null,
             'messages_trend' => $messagesTrend,
             'rating_trend' => null,
-            'top_question' => $topQuestionRow->body ?? null,
+            'top_question' => $topQuestionRow->content ?? null,
             'question_count' => $topQuestionRow->count ?? 0,
         ]);
+    }
+
+    /**
+     * Export reports as CSV
+     */
+    public function exportCsv(Request $request)
+    {
+        $user = Auth::user();
+        $type = $request->get('type', 'messages'); // messages, channels, ai_performance
+
+        $filename = "report_{$type}_" . now()->format('Y-m-d') . '.csv';
+        $headers = [
+            'Content-Type' => 'text/csv',
+            'Content-Disposition' => "attachment; filename=\"{$filename}\"",
+        ];
+
+        $callback = function () use ($user, $type) {
+            $file = fopen('php://output', 'w');
+
+            if ($type === 'messages') {
+                fputcsv($file, ['Date', 'Direction', 'Is AI', 'Content', 'Channel Type']);
+                
+                $this->userMessages()
+                    ->with('conversation.channel')
+                    ->orderBy('created_at', 'desc')
+                    ->chunk(1000, function ($messages) use ($file) {
+                        foreach ($messages as $msg) {
+                            fputcsv($file, [
+                                $msg->created_at,
+                                $msg->direction,
+                                $msg->is_ai ? 'Yes' : 'No',
+                                substr($msg->content, 0, 500),
+                                $msg->conversation->channel->type ?? 'Unknown',
+                            ]);
+                        }
+                    });
+            } elseif ($type === 'channels') {
+                fputcsv($file, ['Channel Type', 'Channel Name', 'Message Count', 'Status']);
+                
+                Channel::where('user_id', $user->id)
+                    ->withCount('messages')
+                    ->get()
+                    ->each(function ($channel) use ($file) {
+                        fputcsv($file, [
+                            $channel->type,
+                            $channel->page_name ?? 'N/A',
+                            $channel->messages_count,
+                            $channel->status,
+                        ]);
+                    });
+            } elseif ($type === 'ai_performance') {
+                fputcsv($file, ['Metric', 'Value']);
+                
+                $totalMessages = $this->userMessages()->count();
+                $autoReplies = $this->userMessages()->where('is_ai', true)->count();
+                $manualInterventions = $this->userMessages()
+                    ->where('is_ai', false)
+                    ->where('direction', 'outbound')
+                    ->count();
+                $avgResponseTime = $this->averageResponseTimeSeconds();
+                $responseRate = $totalMessages > 0 ? ($autoReplies / $totalMessages) * 100 : 0;
+
+                fputcsv($file, ['Total Messages', $totalMessages]);
+                fputcsv($file, ['AI Auto Replies', $autoReplies]);
+                fputcsv($file, ['Manual Interventions', $manualInterventions]);
+                fputcsv($file, ['Auto Reply Rate (%)', round($responseRate, 1)]);
+                fputcsv($file, ['Avg Response Time (seconds)', round($avgResponseTime, 1)]);
+            }
+
+            fclose($file);
+        };
+
+        return response()->stream($callback, 200, $headers);
+    }
+
+    /**
+     * Export reports as PDF (simple text-based PDF for now)
+     */
+    public function exportPdf(Request $request)
+    {
+        $user = Auth::user();
+        $type = $request->get('type', 'messages');
+
+        $filename = "report_{$type}_" . now()->format('Y-m-d') . '.pdf';
+        $headers = [
+            'Content-Type' => 'application/pdf',
+            'Content-Disposition' => "attachment; filename=\"{$filename}\"",
+        ];
+
+        // For simplicity, we'll generate a basic text-based PDF
+        // In production, you'd use a proper PDF library like TCPDF or DomPDF
+        $callback = function () use ($user, $type) {
+            echo "Report: {$type}\n";
+            echo "Generated: " . now()->toDateTimeString() . "\n";
+            echo "User: {$user->name} ({$user->email})\n";
+            echo "\n========================================\n\n";
+
+            if ($type === 'messages') {
+                echo "Message Report\n\n";
+                $this->userMessages()
+                    ->with('conversation.channel')
+                    ->orderBy('created_at', 'desc')
+                    ->limit(1000)
+                    ->get()
+                    ->each(function ($msg) {
+                        echo "Date: {$msg->created_at}\n";
+                        echo "Direction: {$msg->direction}\n";
+                        echo "AI: " . ($msg->is_ai ? 'Yes' : 'No') . "\n";
+                        echo "Channel: " . ($msg->conversation->channel->type ?? 'Unknown') . "\n";
+                        echo "Content: " . substr($msg->content, 0, 200) . "\n";
+                        echo "---\n";
+                    });
+            } elseif ($type === 'channels') {
+                echo "Channel Report\n\n";
+                Channel::where('user_id', $user->id)
+                    ->withCount('messages')
+                    ->get()
+                    ->each(function ($channel) {
+                        echo "Type: {$channel->type}\n";
+                        echo "Name: " . ($channel->page_name ?? 'N/A') . "\n";
+                        echo "Messages: {$channel->messages_count}\n";
+                        echo "Status: {$channel->status}\n";
+                        echo "---\n";
+                    });
+            } elseif ($type === 'ai_performance') {
+                echo "AI Performance Report\n\n";
+                
+                $totalMessages = $this->userMessages()->count();
+                $autoReplies = $this->userMessages()->where('is_ai', true)->count();
+                $manualInterventions = $this->userMessages()
+                    ->where('is_ai', false)
+                    ->where('direction', 'outbound')
+                    ->count();
+                $avgResponseTime = $this->averageResponseTimeSeconds();
+                $responseRate = $totalMessages > 0 ? ($autoReplies / $totalMessages) * 100 : 0;
+
+                echo "Total Messages: {$totalMessages}\n";
+                echo "AI Auto Replies: {$autoReplies}\n";
+                echo "Manual Interventions: {$manualInterventions}\n";
+                echo "Auto Reply Rate: " . round($responseRate, 1) . "%\n";
+                echo "Avg Response Time: " . round($avgResponseTime, 1) . " seconds\n";
+            }
+        };
+
+        // Note: This generates a text file with .pdf extension for simplicity
+        // For real PDFs, install a PDF library and use it here
+        return response()->stream($callback, 200, $headers);
     }
 }

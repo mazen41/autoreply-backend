@@ -105,8 +105,11 @@ class EvolutionApiService
     {
         $url = "{$this->baseUrl}/message/sendText/{$instanceName}";
         
+        // Strip @s.whatsapp.net suffix if present
+        $cleanNumber = str_replace('@s.whatsapp.net', '', $number);
+        
         $payload = [
-            'number' => $number,
+            'number' => $cleanNumber,
             'options' => [
                 'delay' => 1200,
                 'presence' => 'composing',
@@ -300,9 +303,20 @@ class EvolutionApiService
         $fromPhone = $message['remoteJid'] ?? null;
         $fromName = $message['pushName'] ?? null;
         
+        // Log the name we received for debugging
+        Log::info("WhatsApp webhook received contact info", [
+            'from_phone' => $fromPhone,
+            'push_name' => $fromName,
+            'instance' => $instanceName,
+        ]);
+        
         // If pushName is empty or just a dot, use the phone number instead
         if (empty($fromName) || $fromName === '.') {
             $fromName = $this->formatPhoneNumber($fromPhone);
+            Log::info("Using phone number as name since pushName is empty", [
+                'from_phone' => $fromPhone,
+                'formatted_name' => $fromName,
+            ]);
         }
         
         $body = $messageContent['conversation'] ?? $messageContent['extendedTextMessage']['text'] ?? null;
@@ -358,6 +372,15 @@ class EvolutionApiService
             // Format sender name if empty or just a dot
             if (empty($fromName) || $fromName === '.') {
                 $fromName = $this->formatPhoneNumber($fromPhone);
+                Log::info("Using phone number as name in unified inbox", [
+                    'from_phone' => $fromPhone,
+                    'formatted_name' => $fromName,
+                ]);
+            } else {
+                Log::info("Using pushName from WhatsApp", [
+                    'from_phone' => $fromPhone,
+                    'push_name' => $fromName,
+                ]);
             }
 
             // Find or create conversation
@@ -380,13 +403,29 @@ class EvolutionApiService
                 Log::info("Created new conversation for WhatsApp", [
                     'conversation_id' => $conversation->id,
                     'sender_id' => $fromPhone,
+                    'sender_name' => $fromName,
                 ]);
             } else {
                 // Update conversation metadata
-                $conversation->update([
-                    'sender_name' => $fromName,
-                    'last_message_at' => now(),
-                ]);
+                // Only update sender_name if we have a real name (not empty, not just a dot)
+                // and the current sender_name is empty or a phone number format
+                $shouldUpdateName = !empty($fromName) && 
+                                    $fromName !== '.' && 
+                                    (empty($conversation->sender_name) || 
+                                     strpos($conversation->sender_name, '+') === 0 ||
+                                     preg_match('/^\d+$/', $conversation->sender_name));
+                
+                $updateData = ['last_message_at' => now()];
+                if ($shouldUpdateName) {
+                    $updateData['sender_name'] = $fromName;
+                    Log::info("Updating conversation sender_name", [
+                        'conversation_id' => $conversation->id,
+                        'old_name' => $conversation->sender_name,
+                        'new_name' => $fromName,
+                    ]);
+                }
+                
+                $conversation->update($updateData);
             }
 
             // Create message in unified inbox

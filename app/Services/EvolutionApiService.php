@@ -285,7 +285,18 @@ class EvolutionApiService
                     return $response->json();
                 }
 
-                throw new Exception("HTTP request failed with status: {$response->status()}");
+                // Log the actual response body so we can see WHY Evolution
+                // rejected the request (validation errors, bad media URL, etc.)
+                // — previously only the status code was kept, which hid the
+                // real reason for every 400/422 failure.
+                Log::error('Evolution API returned non-success response', [
+                    'url' => $url,
+                    'status' => $response->status(),
+                    'body' => $response->body(),
+                    'sent_payload' => $data,
+                ]);
+
+                throw new Exception("HTTP request failed with status: {$response->status()} — body: {$response->body()}");
             } catch (Exception $e) {
                 $attempt++;
                 $lastException = $e;

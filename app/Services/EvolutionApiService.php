@@ -10,6 +10,8 @@ use App\Models\Channel;
 use App\Models\Conversation;
 use App\Models\Message;
 use Exception;
+use Illuminate\Support\Facades\Storage;
+use Illuminate\Support\Str;
 
 class EvolutionApiService
 {
@@ -37,15 +39,17 @@ class EvolutionApiService
             'instanceName' => $instanceName,
             'qrcode' => true,
             'integration' => 'WHATSAPP-BAILEYS',
-            'webhook' => [
-                'url' => route('whatsapp.webhook'),
-                'webhook_by_events' => true,
-                'events' => [
-                    'MESSAGES_UPSERT',
-                    'MESSAGES_UPDATE',
-                    'SEND_MESSAGE',
-                    'CONNECTION_UPDATE',
-                    'STATUS_INSTANCE',
+                'webhook' => [
+                    'url' => route('whatsapp.webhook'),
+                    'webhook_by_events' => true,
+                    'base64' => true,
+                    'events' => [
+                        'MESSAGES_UPSERT',
+                        'MESSAGES_UPDATE',
+                        'MESSAGES_REACTION',
+                        'SEND_MESSAGE',
+                        'CONNECTION_UPDATE',
+                        'STATUS_INSTANCE',
                 ],
             ],
         ], $options);
@@ -124,24 +128,54 @@ class EvolutionApiService
     /**
      * Send a media message
      */
-    public function sendMediaMessage(string $instanceName, string $number, string $mediaUrl, string $caption = ''): array
+    public function sendMediaMessage(string $instanceName, string $number, string $mediaUrl, string $caption = '', string $mediaType = 'image', ?string $mimeType = null, ?string $fileName = null): array
     {
         $url = "{$this->baseUrl}/message/sendMedia/{$instanceName}";
-        
+
+        $cleanNumber = str_replace('@s.whatsapp.net', '', $number);
+
         $payload = [
-            'number' => $number,
+            'number' => $cleanNumber,
+            'mediatype' => $mediaType,
+            'media' => $mediaUrl,
+            'caption' => $caption,
             'options' => [
                 'delay' => 1200,
                 'presence' => 'composing',
             ],
             'mediaMessage' => [
-                'mediatype' => 'image',
+                'mediatype' => $mediaType,
                 'media' => $mediaUrl,
                 'caption' => $caption,
             ],
         ];
 
+        if ($mimeType) {
+            $payload['mimetype'] = $mimeType;
+            $payload['mediaMessage']['mimetype'] = $mimeType;
+        }
+
+        if ($fileName) {
+            $payload['fileName'] = $fileName;
+            $payload['file_name'] = $fileName;
+            $payload['mediaMessage']['fileName'] = $fileName;
+        }
+
         return $this->makeRequest('POST', $url, $payload);
+    }
+
+    /**
+     * Send a WhatsApp push-to-talk audio message.
+     */
+    public function sendWhatsAppAudio(string $instanceName, string $number, string $audioUrl): array
+    {
+        $url = "{$this->baseUrl}/message/sendWhatsAppAudio/{$instanceName}";
+        $cleanNumber = str_replace('@s.whatsapp.net', '', $number);
+
+        return $this->makeRequest('POST', $url, [
+            'number' => $cleanNumber,
+            'audio' => $audioUrl,
+        ]);
     }
 
     /**
@@ -187,6 +221,7 @@ class EvolutionApiService
         $defaultEvents = [
             'MESSAGES_UPSERT',
             'MESSAGES_UPDATE',
+            'MESSAGES_REACTION',
             'SEND_MESSAGE',
             'CONNECTION_UPDATE',
             'STATUS_INSTANCE',
@@ -195,6 +230,7 @@ class EvolutionApiService
         $payload = [
             'url' => $webhookUrl,
             'webhook_by_events' => true,
+            'base64' => true,
             'events' => $events ?: $defaultEvents,
         ];
 
@@ -283,6 +319,9 @@ class EvolutionApiService
                 case 'MESSAGES_UPDATE':
                     $this->handleMessageUpdate($event);
                     break;
+                case 'MESSAGES_REACTION':
+                    $this->handleMessageReaction($event);
+                    break;
                 case 'CONNECTION_UPDATE':
                     $this->handleConnectionUpdate($event);
                     break;
@@ -343,6 +382,12 @@ class EvolutionApiService
         
         $body = $messageContent['conversation'] ?? $messageContent['extendedTextMessage']['text'] ?? null;
         $messageType = $this->detectMessageType($messageContent);
+        $media = $this->extractAndStoreMedia($messageContent, $event);
+
+        if ($this->isReactionMessage($messageContent)) {
+            $this->handleMessageReaction($event);
+            return;
+        }
 
         // Save to WhatsApp messages table (legacy)
         $whatsappMessage = WhatsAppMessage::create([
@@ -356,7 +401,7 @@ class EvolutionApiService
             'to_phone' => $instance->phone_number,
             'body' => $body,
             'message_type' => $messageType,
-            'media' => $this->extractMedia($messageContent),
+            'media' => $media,
             'metadata' => [
                 'event' => $event,
                 'message_key' => $message,
@@ -367,7 +412,7 @@ class EvolutionApiService
         ]);
 
         // Also save to unified inbox system
-        $this->saveToUnifiedInbox($instance, $fromPhone, $fromName, $body, $messageType);
+        $this->saveToUnifiedInbox($instance, $fromPhone, $fromName, $body, $messageType, $media, $message);
 
         Log::info("Message saved from {$fromPhone} for instance {$instanceName}");
     }
@@ -375,7 +420,7 @@ class EvolutionApiService
     /**
      * Save WhatsApp message to unified inbox (Conversation/Message)
      */
-    protected function saveToUnifiedInbox(WhatsAppInstance $instance, ?string $fromPhone, ?string $fromName, ?string $body, string $messageType): void
+    protected function saveToUnifiedInbox(WhatsAppInstance $instance, ?string $fromPhone, ?string $fromName, ?string $body, string $messageType, ?array $media = null, array $messageKey = []): void
     {
         try {
             // Find the WhatsApp channel
@@ -454,13 +499,26 @@ class EvolutionApiService
             // Create message in unified inbox
             $message = Message::create([
                 'conversation_id' => $conversation->id,
-                'content' => $body,
+                'content' => $body ?? $media['caption'] ?? '',
                 'type' => $messageType,
                 'direction' => 'inbound',
                 'status' => 'received',
                 'is_ai' => false,
                 'source' => 'whatsapp',
                 'send_status' => 'delivered',
+                'media_url' => $media['url'] ?? null,
+                'media_type' => $media['type'] ?? null,
+                'mime_type' => $media['mimetype'] ?? null,
+                'file_name' => $media['filename'] ?? null,
+                'file_size' => $media['file_size'] ?? null,
+                'duration' => $media['duration'] ?? null,
+                'whatsapp_message_id' => $messageKey['id'] ?? null,
+                'whatsapp_remote_jid' => $messageKey['remoteJid'] ?? $fromPhone,
+                'whatsapp_from_me' => $messageKey['fromMe'] ?? false,
+                'metadata' => [
+                    'whatsapp_key' => $messageKey,
+                    'media' => $media,
+                ],
             ]);
 
             // Broadcast for real-time UI updates
@@ -527,6 +585,76 @@ class EvolutionApiService
             }
 
             $message->save();
+        }
+    }
+
+    /**
+     * Handle a WhatsApp reaction received through Evolution webhooks.
+     */
+    protected function handleMessageReaction(array $event): void
+    {
+        $data = $event['data'] ?? [];
+        if (array_is_list($data)) {
+            foreach ($data as $item) {
+                $this->applyReactionPayload($item, $event);
+            }
+            return;
+        }
+
+        $this->applyReactionPayload($data, $event);
+    }
+
+    protected function applyReactionPayload(array $data, array $event): void
+    {
+        $reaction = $data['reaction'] ?? $data['message']['reactionMessage'] ?? null;
+        if (!$reaction) {
+            return;
+        }
+
+        $emoji = $reaction['text'] ?? $reaction['emoji'] ?? $reaction;
+        if (!is_string($emoji)) {
+            return;
+        }
+
+        $targetKey = $reaction['key'] ?? $data['key'] ?? [];
+        $targetId = $targetKey['id'] ?? $reaction['messageId'] ?? null;
+        $remoteJid = $targetKey['remoteJid'] ?? ($data['key']['remoteJid'] ?? null);
+
+        if (!$targetId) {
+            return;
+        }
+
+        $message = Message::where('whatsapp_message_id', $targetId)
+            ->when($remoteJid, fn ($query) => $query->where('whatsapp_remote_jid', $remoteJid))
+            ->with('conversation.channel')
+            ->first();
+
+        if (!$message) {
+            Log::warning('Reaction target message not found', [
+                'target_id' => $targetId,
+                'remote_jid' => $remoteJid,
+            ]);
+            return;
+        }
+
+        $reactions = $message->reactions ?? [];
+        $actor = ($data['key']['fromMe'] ?? false) ? 'business' : 'contact';
+        $reactions = array_values(array_filter($reactions, fn ($item) => ($item['actor'] ?? null) !== $actor));
+
+        if ($emoji !== '') {
+            $reactions[] = [
+                'emoji' => $emoji,
+                'actor' => $actor,
+                'remote_jid' => $remoteJid,
+                'created_at' => now()->toISOString(),
+            ];
+        }
+
+        $message->update(['reactions' => $reactions]);
+
+        $channel = $message->conversation->channel;
+        if ($channel?->user_id) {
+            broadcast(new \App\Events\MessageReceived($message->fresh(), $message->conversation, $channel->user_id));
         }
     }
 
@@ -648,6 +776,9 @@ class EvolutionApiService
      */
     protected function detectMessageType(array $messageContent): string
     {
+        if ($this->isReactionMessage($messageContent)) {
+            return 'reaction';
+        }
         if (isset($messageContent['conversation'])) {
             return 'text';
         }
@@ -696,6 +827,100 @@ class EvolutionApiService
         }
 
         return null;
+    }
+
+    protected function extractAndStoreMedia(array $messageContent, array $event): ?array
+    {
+        $media = $this->extractMedia($messageContent);
+        if (!$media) {
+            return null;
+        }
+
+        $mediaNode = $this->getMediaNode($messageContent);
+        $media['file_size'] = $mediaNode['fileLength'] ?? $mediaNode['fileSize'] ?? null;
+        $media['duration'] = $mediaNode['seconds'] ?? $mediaNode['duration'] ?? null;
+
+        $storedUrl = $this->storeIncomingMedia($mediaNode, $media, $event);
+        if ($storedUrl) {
+            $media['remote_url'] = $media['url'] ?? null;
+            $media['url'] = $storedUrl;
+        }
+
+        return $media;
+    }
+
+    protected function getMediaNode(array $messageContent): array
+    {
+        foreach (['imageMessage', 'videoMessage', 'audioMessage', 'documentMessage'] as $type) {
+            if (isset($messageContent[$type])) {
+                return $messageContent[$type];
+            }
+        }
+
+        return [];
+    }
+
+    protected function storeIncomingMedia(array $mediaNode, array $media, array $event): ?string
+    {
+        $binary = null;
+        $mimeType = $media['mimetype'] ?? 'application/octet-stream';
+        $extension = $this->extensionFromMime($mimeType, $media['filename'] ?? null);
+
+        $base64 = $mediaNode['base64'] ?? $event['data']['message']['base64'] ?? $event['data']['base64'] ?? null;
+        if (is_string($base64) && $base64 !== '') {
+            $binary = base64_decode(preg_replace('/^data:[^;]+;base64,/', '', $base64), true);
+        }
+
+        if (!$binary && !empty($media['url'])) {
+            try {
+                $response = Http::timeout($this->timeout)
+                    ->withHeaders(['apikey' => $this->apiKey])
+                    ->get($media['url']);
+                if ($response->successful()) {
+                    $binary = $response->body();
+                }
+            } catch (Exception $e) {
+                Log::warning('Failed to download WhatsApp media', [
+                    'url' => $media['url'],
+                    'error' => $e->getMessage(),
+                ]);
+            }
+        }
+
+        if (!$binary) {
+            return $media['url'] ?? null;
+        }
+
+        $path = 'whatsapp/' . now()->format('Y/m') . '/' . Str::uuid() . '.' . $extension;
+        $disk = config('services.evolution.media_disk', 'public');
+        Storage::disk($disk)->put($path, $binary);
+
+        return Storage::disk($disk)->url($path);
+    }
+
+    protected function extensionFromMime(string $mimeType, ?string $filename = null): string
+    {
+        if ($filename && pathinfo($filename, PATHINFO_EXTENSION)) {
+            return strtolower(pathinfo($filename, PATHINFO_EXTENSION));
+        }
+
+        return match ($mimeType) {
+            'image/jpeg' => 'jpg',
+            'image/png' => 'png',
+            'image/webp' => 'webp',
+            'image/gif' => 'gif',
+            'video/mp4' => 'mp4',
+            'audio/ogg' => 'ogg',
+            'audio/mpeg' => 'mp3',
+            'audio/mp4' => 'm4a',
+            'application/pdf' => 'pdf',
+            default => 'bin',
+        };
+    }
+
+    protected function isReactionMessage(array $messageContent): bool
+    {
+        return isset($messageContent['reactionMessage']);
     }
 
     /**

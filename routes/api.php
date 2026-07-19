@@ -82,6 +82,7 @@ Route::middleware('auth:sanctum')->group(function () {
     Route::get('/inbox',                                [InboxController::class, 'index']);
     Route::get('/inbox/{conversationId}/messages',      [InboxController::class, 'messages']);
     Route::post('/inbox/{conversationId}/reply',        [InboxController::class, 'reply']);
+    Route::post('/inbox/{conversationId}/media',        [InboxController::class, 'mediaReply']);
     Route::patch('/inbox/{conversationId}/toggle-ai',   [InboxController::class, 'toggleAi']);
     Route::post('/messages/{messageId}/react',          [InboxController::class, 'reactToMessage']);
 

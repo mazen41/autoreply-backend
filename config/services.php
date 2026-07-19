@@ -56,6 +56,7 @@ return [
         'api_key' => env('EVOLUTION_API_KEY', ''),
         'timeout' => env('EVOLUTION_TIMEOUT', 30),
         'max_retries' => env('EVOLUTION_MAX_RETRIES', 3),
+        'media_disk' => env('EVOLUTION_MEDIA_DISK', 'public'),
     ],
 
     'moyasar' => [

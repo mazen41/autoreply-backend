@@ -9,6 +9,8 @@ use App\Services\EvolutionApiService;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\Http;
 use Illuminate\Support\Facades\Log;
+use Illuminate\Support\Facades\Storage;
+use Illuminate\Support\Str;
 use Google\Client as GoogleClient;
 use Google\Service\Gmail;
 
@@ -78,6 +80,117 @@ class InboxController extends Controller
 
         // Handle Facebook/Instagram
         return $this->sendFacebookReply($request, $conversation, $channel);
+    }
+
+    /**
+     * Send a media reply from the business owner.
+     */
+    public function mediaReply(Request $request, $conversationId)
+    {
+        $request->validate([
+            'file' => 'required|file|max:51200',
+            'caption' => 'nullable|string|max:2000',
+            'media_type' => 'nullable|in:image,audio,video,document',
+            'voice_note' => 'nullable|boolean',
+        ]);
+
+        $conversation = Conversation::whereHas('channel', function ($q) {
+                $q->where('user_id', auth()->id());
+            })
+            ->findOrFail($conversationId);
+
+        $channel = $conversation->channel;
+        if ($channel->type !== 'whatsapp') {
+            return response()->json(['error' => 'Media uploads are only supported for WhatsApp conversations right now'], 400);
+        }
+
+        try {
+            $file = $request->file('file');
+            $mimeType = $file->getMimeType() ?: 'application/octet-stream';
+            $mediaType = $request->media_type ?: $this->mediaTypeFromMime($mimeType);
+            $fileName = $file->getClientOriginalName() ?: Str::uuid() . '.' . ($file->guessExtension() ?: 'bin');
+            $disk = config('services.evolution.media_disk', 'public');
+            $path = $file->storeAs('whatsapp/outgoing/' . now()->format('Y/m'), Str::uuid() . '-' . $fileName, $disk);
+            $mediaUrl = Storage::disk($disk)->url($path);
+
+            $whatsappService = new EvolutionApiService();
+            $instanceName = $channel->page_id;
+            $caption = $request->caption ?? '';
+
+            if ($mediaType === 'audio' && $request->boolean('voice_note')) {
+                $response = $whatsappService->sendWhatsAppAudio($instanceName, $conversation->sender_id, $mediaUrl);
+            } else {
+                $response = $whatsappService->sendMediaMessage(
+                    $instanceName,
+                    $conversation->sender_id,
+                    $mediaUrl,
+                    $caption,
+                    $mediaType,
+                    $mimeType,
+                    $fileName
+                );
+            }
+
+            if (!isset($response['key']['id'])) {
+                Log::error('WhatsApp media reply failed', ['response' => $response]);
+                return response()->json(['error' => 'Failed to send WhatsApp media'], 500);
+            }
+
+            $message = Message::create([
+                'conversation_id' => $conversation->id,
+                'content' => $caption,
+                'type' => $mediaType,
+                'direction' => 'outbound',
+                'is_ai' => false,
+                'status' => 'manual',
+                'source' => 'whatsapp',
+                'send_status' => 'sent',
+                'media_url' => $mediaUrl,
+                'media_type' => $mediaType,
+                'mime_type' => $mimeType,
+                'file_name' => $fileName,
+                'file_size' => $file->getSize(),
+                'whatsapp_message_id' => $response['key']['id'] ?? null,
+                'whatsapp_remote_jid' => $response['key']['remoteJid'] ?? $conversation->sender_id,
+                'whatsapp_from_me' => $response['key']['fromMe'] ?? true,
+                'metadata' => ['evolution_response' => $response],
+            ]);
+
+            $conversation->update(['last_message_at' => now()]);
+
+            \App\Models\WhatsAppMessage::create([
+                'whatsapp_instance_id' => \App\Models\WhatsAppInstance::where('instance_name', $instanceName)->first()?->id,
+                'user_id' => $channel->user_id,
+                'message_id' => $response['key']['id'] ?? null,
+                'remote_message_id' => $response['key']['id'] ?? null,
+                'direction' => 'outgoing',
+                'from_phone' => null,
+                'from_name' => null,
+                'to_phone' => $conversation->sender_id,
+                'body' => $caption,
+                'message_type' => $mediaType,
+                'media' => [
+                    'url' => $mediaUrl,
+                    'type' => $mediaType,
+                    'mimetype' => $mimeType,
+                    'filename' => $fileName,
+                    'file_size' => $file->getSize(),
+                    'caption' => $caption,
+                ],
+                'metadata' => ['evolution_response' => $response, 'unified_message_id' => $message->id],
+                'status' => 'sent',
+                'sent_at' => now(),
+            ]);
+
+            if ($channel->user_id) {
+                broadcast(new \App\Events\MessageReceived($message, $conversation, $channel->user_id));
+            }
+
+            return response()->json(['success' => true, 'message' => $message]);
+        } catch (\Exception $e) {
+            Log::error('WhatsApp media reply failed', ['error' => $e->getMessage(), 'channel_id' => $channel->id]);
+            return response()->json(['error' => 'Failed to send WhatsApp media: ' . $e->getMessage()], 500);
+        }
     }
 
     /**
@@ -204,6 +317,10 @@ class InboxController extends Controller
                 'status'          => 'manual',
                 'source'          => 'whatsapp',
                 'send_status'     => 'sent',
+                'whatsapp_message_id' => $response['key']['id'] ?? null,
+                'whatsapp_remote_jid' => $response['key']['remoteJid'] ?? $conversation->sender_id,
+                'whatsapp_from_me' => $response['key']['fromMe'] ?? true,
+                'metadata' => ['evolution_response' => $response],
             ]);
 
             $conversation->update(['last_message_at' => now()]);
@@ -221,7 +338,7 @@ class InboxController extends Controller
                 'body' => $request->message,
                 'message_type' => 'text',
                 'media' => null,
-                'metadata' => ['evolution_response' => $response],
+                'metadata' => ['evolution_response' => $response, 'unified_message_id' => $message->id],
                 'status' => 'sent',
                 'sent_at' => now(),
             ]);
@@ -247,7 +364,11 @@ class InboxController extends Controller
             'emoji' => 'required|string|max:10',
         ]);
 
-        $message = Message::with(['conversation.channel'])->findOrFail($messageId);
+        $message = Message::whereHas('conversation.channel', function ($q) {
+                $q->where('user_id', auth()->id());
+            })
+            ->with(['conversation.channel'])
+            ->findOrFail($messageId);
         $channel = $message->conversation->channel;
 
         // Only allow reactions for WhatsApp channels
@@ -257,26 +378,16 @@ class InboxController extends Controller
 
         try {
             $evolutionService = new EvolutionApiService();
-            $instanceName = $channel->page_name; // Assuming instance name is stored in page_name for WhatsApp
+            $instanceName = $channel->page_id;
 
-            // Get WhatsApp message metadata for the message key
-            $whatsappMessage = \App\Models\WhatsAppMessage::where('message_id', $message->id)->first();
-            
-            if (!$whatsappMessage) {
-                return response()->json(['error' => 'WhatsApp message not found'], 404);
-            }
-
-            $metadata = $whatsappMessage->metadata ?? [];
-            $messageKey = $metadata['key'] ?? null;
-
-            if (!$messageKey) {
-                return response()->json(['error' => 'Message key not found in metadata'], 400);
+            if (!$message->whatsapp_message_id) {
+                return response()->json(['error' => 'WhatsApp message key not found for this message'], 400);
             }
 
             $response = $evolutionService->sendReaction(
                 $instanceName,
-                $messageKey['remoteJid'] ?? $message->conversation->sender_id,
-                $messageKey['id'] ?? $whatsappMessage->remote_message_id,
+                $message->whatsapp_remote_jid ?? $message->conversation->sender_id,
+                $message->whatsapp_message_id,
                 $request->emoji
             );
 
@@ -287,9 +398,11 @@ class InboxController extends Controller
 
             // Update message reactions in database
             $currentReactions = $message->reactions ?? [];
+            $currentReactions = array_values(array_filter($currentReactions, fn ($item) => ($item['actor'] ?? null) !== 'business'));
             $currentReactions[] = [
                 'emoji' => $request->emoji,
                 'user_id' => auth()->id(),
+                'actor' => 'business',
                 'created_at' => now()->toISOString(),
             ];
 
@@ -297,7 +410,7 @@ class InboxController extends Controller
 
             // Broadcast the reaction update
             if ($channel->user_id) {
-                broadcast(new \App\Events\MessageReceived($message, $message->conversation, $channel->user_id));
+                broadcast(new \App\Events\MessageReceived($message->fresh(), $message->conversation, $channel->user_id));
             }
 
             return response()->json(['success' => true, 'reactions' => $currentReactions]);
@@ -306,6 +419,21 @@ class InboxController extends Controller
             Log::error('WhatsApp reaction error', ['error' => $e->getMessage(), 'message_id' => $messageId]);
             return response()->json(['error' => 'Failed to send reaction: ' . $e->getMessage()], 500);
         }
+    }
+
+    private function mediaTypeFromMime(string $mimeType): string
+    {
+        if (str_starts_with($mimeType, 'image/')) {
+            return 'image';
+        }
+        if (str_starts_with($mimeType, 'audio/')) {
+            return 'audio';
+        }
+        if (str_starts_with($mimeType, 'video/')) {
+            return 'video';
+        }
+
+        return 'document';
     }
 
     /**

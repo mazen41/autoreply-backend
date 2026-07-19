@@ -179,6 +179,21 @@ class EvolutionApiService
     }
 
     /**
+     * Ask Evolution to decrypt a received WhatsApp media message and return it as base64.
+     */
+    public function getBase64FromMediaMessage(string $instanceName, array $messageKey, bool $convertToMp4 = false): array
+    {
+        $url = "{$this->baseUrl}/chat/getBase64FromMediaMessage/{$instanceName}";
+
+        return $this->makeRequest('POST', $url, [
+            'message' => [
+                'key' => $messageKey,
+            ],
+            'convertToMp4' => $convertToMp4,
+        ]);
+    }
+
+    /**
      * Send a reaction to a message
      */
     public function sendReaction(string $instanceName, string $remoteJid, string $messageId, string $emoji): array
@@ -382,7 +397,7 @@ class EvolutionApiService
         
         $body = $messageContent['conversation'] ?? $messageContent['extendedTextMessage']['text'] ?? null;
         $messageType = $this->detectMessageType($messageContent);
-        $media = $this->extractAndStoreMedia($messageContent, $event);
+        $media = $this->extractAndStoreMedia($messageContent, $event, $instanceName, $message);
 
         if ($this->isReactionMessage($messageContent)) {
             $this->handleMessageReaction($event);
@@ -509,9 +524,9 @@ class EvolutionApiService
                 'media_url' => $media['url'] ?? null,
                 'media_type' => $media['type'] ?? null,
                 'mime_type' => $media['mimetype'] ?? null,
-                'file_name' => $media['filename'] ?? null,
-                'file_size' => $media['file_size'] ?? null,
-                'duration' => $media['duration'] ?? null,
+                'file_name' => is_string($media['filename'] ?? null) ? $media['filename'] : null,
+                'file_size' => is_int($media['file_size'] ?? null) ? $media['file_size'] : null,
+                'duration' => is_int($media['duration'] ?? null) ? $media['duration'] : null,
                 'whatsapp_message_id' => $messageKey['id'] ?? null,
                 'whatsapp_remote_jid' => $messageKey['remoteJid'] ?? $fromPhone,
                 'whatsapp_from_me' => $messageKey['fromMe'] ?? false,
@@ -829,7 +844,7 @@ class EvolutionApiService
         return null;
     }
 
-    protected function extractAndStoreMedia(array $messageContent, array $event): ?array
+    protected function extractAndStoreMedia(array $messageContent, array $event, string $instanceName, array $messageKey): ?array
     {
         $media = $this->extractMedia($messageContent);
         if (!$media) {
@@ -837,10 +852,10 @@ class EvolutionApiService
         }
 
         $mediaNode = $this->getMediaNode($messageContent);
-        $media['file_size'] = $mediaNode['fileLength'] ?? $mediaNode['fileSize'] ?? null;
-        $media['duration'] = $mediaNode['seconds'] ?? $mediaNode['duration'] ?? null;
+        $media['file_size'] = $this->normalizeNumericValue($mediaNode['fileLength'] ?? $mediaNode['fileSize'] ?? null);
+        $media['duration'] = $this->normalizeNumericValue($mediaNode['seconds'] ?? $mediaNode['duration'] ?? null);
 
-        $storedUrl = $this->storeIncomingMedia($mediaNode, $media, $event);
+        $storedUrl = $this->storeIncomingMedia($mediaNode, $media, $event, $instanceName, $messageKey);
         if ($storedUrl) {
             $media['remote_url'] = $media['url'] ?? null;
             $media['url'] = $storedUrl;
@@ -860,18 +875,51 @@ class EvolutionApiService
         return [];
     }
 
-    protected function storeIncomingMedia(array $mediaNode, array $media, array $event): ?string
+    protected function storeIncomingMedia(array $mediaNode, array $media, array $event, string $instanceName, array $messageKey): ?string
     {
         $binary = null;
         $mimeType = $media['mimetype'] ?? 'application/octet-stream';
         $extension = $this->extensionFromMime($mimeType, $media['filename'] ?? null);
 
         $base64 = $mediaNode['base64'] ?? $event['data']['message']['base64'] ?? $event['data']['base64'] ?? null;
+        if (!$base64 && !empty($messageKey['id'])) {
+            try {
+                $base64Response = $this->getBase64FromMediaMessage(
+                    $instanceName,
+                    $messageKey,
+                    str_starts_with($mimeType, 'audio/')
+                );
+
+                $base64 = $base64Response['base64']
+                    ?? $base64Response['data']['base64']
+                    ?? $base64Response['media']
+                    ?? $base64Response['data']['media']
+                    ?? null;
+
+                $responseMime = $base64Response['mimetype']
+                    ?? $base64Response['mimeType']
+                    ?? $base64Response['data']['mimetype']
+                    ?? $base64Response['data']['mimeType']
+                    ?? null;
+
+                if ($responseMime) {
+                    $mimeType = $responseMime;
+                    $extension = $this->extensionFromMime($mimeType, $media['filename'] ?? null);
+                }
+            } catch (Exception $e) {
+                Log::warning('Failed to fetch WhatsApp media base64 from Evolution', [
+                    'instance' => $instanceName,
+                    'message_id' => $messageKey['id'] ?? null,
+                    'error' => $e->getMessage(),
+                ]);
+            }
+        }
+
         if (is_string($base64) && $base64 !== '') {
             $binary = base64_decode(preg_replace('/^data:[^;]+;base64,/', '', $base64), true);
         }
 
-        if (!$binary && !empty($media['url'])) {
+        if (!$binary && !empty($media['url']) && !str_contains($media['url'], '.enc')) {
             try {
                 $response = Http::timeout($this->timeout)
                     ->withHeaders(['apikey' => $this->apiKey])
@@ -904,6 +952,8 @@ class EvolutionApiService
             return strtolower(pathinfo($filename, PATHINFO_EXTENSION));
         }
 
+        $mimeType = strtolower(trim(explode(';', $mimeType)[0]));
+
         return match ($mimeType) {
             'image/jpeg' => 'jpg',
             'image/png' => 'png',
@@ -916,6 +966,30 @@ class EvolutionApiService
             'application/pdf' => 'pdf',
             default => 'bin',
         };
+    }
+
+    protected function normalizeNumericValue(mixed $value): ?int
+    {
+        if ($value === null || $value === '') {
+            return null;
+        }
+
+        if (is_int($value)) {
+            return $value;
+        }
+
+        if (is_float($value) || is_numeric($value)) {
+            return (int) $value;
+        }
+
+        if (is_array($value) && array_key_exists('low', $value)) {
+            $low = (int) ($value['low'] ?? 0);
+            $high = (int) ($value['high'] ?? 0);
+
+            return ($high * 4294967296) + $low;
+        }
+
+        return null;
     }
 
     protected function isReactionMessage(array $messageContent): bool

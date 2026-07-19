@@ -15,6 +15,23 @@ use App\Http\Controllers\GmailController;
 use App\Http\Controllers\InboxController;
 use App\Http\Controllers\PostController;
 use Illuminate\Support\Facades\Route;
+use Illuminate\Support\Facades\RateLimiter;
+
+// Rate limiting middleware
+$rateLimitMiddleware = function ($request, $next) {
+    $key = 'api:' . $request->ip() . ':' . $request->path();
+    $limit = 60; // 60 requests per minute
+    $decay = 60; // per minute
+    
+    if (RateLimiter::tooManyAttempts($key, $limit, $decay)) {
+        return response()->json([
+            'error' => 'Too many requests. Please slow down.',
+            'retry_after' => $decay
+        ], 429);
+    }
+    
+    return $next($request);
+};
 
 // â”€â”€ Public auth routes â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 Route::prefix('auth')->group(function () {
@@ -66,6 +83,7 @@ Route::middleware('auth:sanctum')->group(function () {
     Route::get('/inbox/{conversationId}/messages',      [InboxController::class, 'messages']);
     Route::post('/inbox/{conversationId}/reply',        [InboxController::class, 'reply']);
     Route::patch('/inbox/{conversationId}/toggle-ai',   [InboxController::class, 'toggleAi']);
+    Route::post('/messages/{messageId}/react',          [InboxController::class, 'reactToMessage']);
 
     // Reports
     Route::prefix('reports')->group(function () {

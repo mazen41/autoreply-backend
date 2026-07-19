@@ -106,11 +106,16 @@ class ProcessAutoReply implements ShouldQueue
             ])
             ->toArray();
 
-        // Call Claude API
+        // Call Claude API (primary) - fallback to Gemini if Claude key not configured
         $aiResponse = $this->callClaudeAPI($systemPrompt, $contextMessages);
 
         if (!$aiResponse) {
-            Log::error('ProcessAutoReply: Claude API returned no response', ['message_id' => $this->messageId]);
+            Log::warning('ProcessAutoReply: Claude API returned no response, trying Gemini fallback', ['message_id' => $this->messageId]);
+            $aiResponse = $this->callGeminiAPI($systemPrompt, $contextMessages);
+        }
+
+        if (!$aiResponse) {
+            Log::error('ProcessAutoReply: Both Claude and Gemini APIs returned no response', ['message_id' => $this->messageId]);
             return;
         }
 
@@ -202,7 +207,7 @@ class ProcessAutoReply implements ShouldQueue
                     'content-type' => 'application/json',
                 ])
                 ->post('https://api.anthropic.com/v1/messages', [
-                    'model' => 'claude-sonnet-4-20250514',
+                    'model' => 'claude-haiku-4-5-20251001',
                     'max_tokens' => 500,
                     'system' => $systemPrompt,
                     'messages' => $contextMessages,

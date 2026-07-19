@@ -239,6 +239,76 @@ class InboxController extends Controller
     }
 
     /**
+     * Send reaction to a WhatsApp message
+     */
+    public function reactToMessage(Request $request, $messageId)
+    {
+        $request->validate([
+            'emoji' => 'required|string|max:10',
+        ]);
+
+        $message = Message::with(['conversation.channel'])->findOrFail($messageId);
+        $channel = $message->conversation->channel;
+
+        // Only allow reactions for WhatsApp channels
+        if ($channel->type !== 'whatsapp') {
+            return response()->json(['error' => 'Reactions are only supported for WhatsApp messages'], 400);
+        }
+
+        try {
+            $evolutionService = new EvolutionApiService();
+            $instanceName = $channel->page_name; // Assuming instance name is stored in page_name for WhatsApp
+
+            // Get WhatsApp message metadata for the message key
+            $whatsappMessage = \App\Models\WhatsAppMessage::where('message_id', $message->id)->first();
+            
+            if (!$whatsappMessage) {
+                return response()->json(['error' => 'WhatsApp message not found'], 404);
+            }
+
+            $metadata = $whatsappMessage->metadata ?? [];
+            $messageKey = $metadata['key'] ?? null;
+
+            if (!$messageKey) {
+                return response()->json(['error' => 'Message key not found in metadata'], 400);
+            }
+
+            $response = $evolutionService->sendReaction(
+                $instanceName,
+                $messageKey['remoteJid'] ?? $message->conversation->sender_id,
+                $messageKey['id'] ?? $whatsappMessage->remote_message_id,
+                $request->emoji
+            );
+
+            if (!$response || (isset($response['error']) && $response['error'])) {
+                Log::error('WhatsApp reaction failed', ['response' => $response]);
+                return response()->json(['error' => 'Failed to send reaction'], 500);
+            }
+
+            // Update message reactions in database
+            $currentReactions = $message->reactions ?? [];
+            $currentReactions[] = [
+                'emoji' => $request->emoji,
+                'user_id' => auth()->id(),
+                'created_at' => now()->toISOString(),
+            ];
+
+            $message->update(['reactions' => $currentReactions]);
+
+            // Broadcast the reaction update
+            if ($channel->user_id) {
+                broadcast(new \App\Events\MessageReceived($message, $message->conversation, $channel->user_id));
+            }
+
+            return response()->json(['success' => true, 'reactions' => $currentReactions]);
+
+        } catch (\Exception $e) {
+            Log::error('WhatsApp reaction error', ['error' => $e->getMessage(), 'message_id' => $messageId]);
+            return response()->json(['error' => 'Failed to send reaction: ' . $e->getMessage()], 500);
+        }
+    }
+
+    /**
      * Get authenticated Gmail client
      */
     private function getGmailClient(Channel $channel): ?GoogleClient

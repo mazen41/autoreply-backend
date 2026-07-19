@@ -12,3 +12,5 @@ use Illuminate\Support\Facades\Schedule;
 
 Schedule::job(new PollGmailInbox())->everyTwoMinutes()->name('poll-gmail')->withoutOverlapping();
 Schedule::command('gmail:renew-watch')->daily()->name('renew-gmail-watch')->withoutOverlapping();
+Schedule::command('monitor:failed-jobs')->everyFiveMinutes()->name('monitor-failed-jobs')->withoutOverlapping();
+Schedule::command('backup:database')->dailyAt('02:00')->name('database-backup')->withoutOverlapping();

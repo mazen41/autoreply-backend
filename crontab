@@ -1,0 +1,2 @@
+# Laravel Scheduler - Run every minute
+* * * * * cd /var/www/autoreply/backend && php artisan schedule:run >> /dev/null 2>&1

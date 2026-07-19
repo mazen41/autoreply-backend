@@ -16,10 +16,12 @@ class Message extends Model
         'source',
         'send_status',
         'gmail_message_id',
+        'reactions',
     ];
 
     protected $casts = [
         'is_ai' => 'boolean',
+        'reactions' => 'array',
     ];
 
     public function conversation()

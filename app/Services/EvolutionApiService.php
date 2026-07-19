@@ -145,6 +145,25 @@ class EvolutionApiService
     }
 
     /**
+     * Send a reaction to a message
+     */
+    public function sendReaction(string $instanceName, string $remoteJid, string $messageId, string $emoji): array
+    {
+        $url = "{$this->baseUrl}/message/sendReaction/{$instanceName}";
+        
+        $payload = [
+            'key' => [
+                'remoteJid' => $remoteJid,
+                'fromMe' => false,
+                'id' => $messageId,
+            ],
+            'reaction' => $emoji,
+        ];
+
+        return $this->makeRequest('POST', $url, $payload);
+    }
+
+    /**
      * Check if instance exists
      */
     public function instanceExists(string $instanceName): bool

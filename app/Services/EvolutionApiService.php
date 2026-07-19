@@ -134,31 +134,27 @@ class EvolutionApiService
 
         $cleanNumber = str_replace('@s.whatsapp.net', '', $number);
 
+        // Evolution API v2's documented /message/sendMedia schema is FLAT —
+        // { number, mediatype, mimetype, caption, media, fileName, delay, ... }.
+        // Evolution v2 runs on NestJS with strict DTO validation, which rejects
+        // unrecognized properties with 400 Bad Request. The old code sent an
+        // extra nested `mediaMessage` object (a v1-era format) alongside the
+        // flat fields, which is exactly what was causing every media send to
+        // fail with HTTP 400. Keep this payload flat and match the docs exactly.
         $payload = [
             'number' => $cleanNumber,
             'mediatype' => $mediaType,
             'media' => $mediaUrl,
             'caption' => $caption,
-            'options' => [
-                'delay' => 1200,
-                'presence' => 'composing',
-            ],
-            'mediaMessage' => [
-                'mediatype' => $mediaType,
-                'media' => $mediaUrl,
-                'caption' => $caption,
-            ],
+            'delay' => 1200,
         ];
 
         if ($mimeType) {
             $payload['mimetype'] = $mimeType;
-            $payload['mediaMessage']['mimetype'] = $mimeType;
         }
 
         if ($fileName) {
             $payload['fileName'] = $fileName;
-            $payload['file_name'] = $fileName;
-            $payload['mediaMessage']['fileName'] = $fileName;
         }
 
         return $this->makeRequest('POST', $url, $payload);

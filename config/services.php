@@ -64,6 +64,26 @@ return [
         'webhook_secret' => env('MOYASAR_WEBHOOK_SECRET'),
     ],
 
+    'ai' => [
+        'provider' => env('AI_PROVIDER', 'gemini'),
+        'fallback_provider' => env('AI_FALLBACK_PROVIDER', 'claude'),
+        'temperature' => (float) env('AI_TEMPERATURE', 0.7),
+        'max_tokens' => (int) env('AI_MAX_TOKENS', 500),
+        'timeout' => (int) env('AI_TIMEOUT', 30),
+        'retries' => (int) env('AI_RETRIES', 3),
+        'streaming' => filter_var(env('AI_STREAMING', false), FILTER_VALIDATE_BOOLEAN),
+    ],
+
+    'gemini' => [
+        'api_key' => env('GEMINI_API_KEY'),
+        'model' => env('GEMINI_MODEL', 'gemini-2.5-flash'),
+    ],
+
+    'claude' => [
+        'api_key' => env('ANTHROPIC_API_KEY'),
+        'model' => env('CLAUDE_MODEL', 'claude-haiku-4-5-20251001'),
+    ],
     'frontend_url' => env('FRONTEND_URL'),
 
 ];
+

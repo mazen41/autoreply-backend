@@ -47,4 +47,9 @@ class User extends Authenticatable
             ->where('starts_at', '<=', now())
             ->where('ends_at', '>', now());
     }
+    public function channels()
+    {
+        return $this->hasMany(Channel::class);
+    }
 }
+

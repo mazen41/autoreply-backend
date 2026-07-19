@@ -106,16 +106,10 @@ class ProcessAutoReply implements ShouldQueue
             ])
             ->toArray();
 
-        // Call Claude API (primary) - fallback to Gemini if Claude key not configured
-        $aiResponse = $this->callClaudeAPI($systemPrompt, $contextMessages);
+        $aiResponse = $this->callConfiguredAI($systemPrompt, $contextMessages);
 
         if (!$aiResponse) {
-            Log::warning('ProcessAutoReply: Claude API returned no response, trying Gemini fallback', ['message_id' => $this->messageId]);
-            $aiResponse = $this->callGeminiAPI($systemPrompt, $contextMessages);
-        }
-
-        if (!$aiResponse) {
-            Log::error('ProcessAutoReply: Both Claude and Gemini APIs returned no response', ['message_id' => $this->messageId]);
+            Log::error('ProcessAutoReply: configured AI providers returned no response', ['message_id' => $this->messageId]);
             return;
         }
 
@@ -191,24 +185,47 @@ class ProcessAutoReply implements ShouldQueue
         return $prompt;
     }
 
+    private function callConfiguredAI(string $systemPrompt, array $contextMessages): ?string
+    {
+        $primary = config('services.ai.provider', 'gemini');
+        $fallback = config('services.ai.fallback_provider', $primary === 'gemini' ? 'claude' : 'gemini');
+        $providers = array_values(array_unique(array_filter([$primary, $fallback])));
+
+        foreach ($providers as $provider) {
+            $reply = match ($provider) {
+                'claude' => $this->callClaudeAPI($systemPrompt, $contextMessages),
+                'gemini' => $this->callGeminiAPI($systemPrompt, $contextMessages),
+                default => null,
+            };
+
+            if ($reply) {
+                Log::info('ProcessAutoReply: AI provider succeeded', ['provider' => $provider]);
+                return $reply;
+            }
+
+            Log::warning('ProcessAutoReply: AI provider failed, checking fallback', ['provider' => $provider]);
+        }
+
+        return null;
+    }
     private function callClaudeAPI(string $systemPrompt, array $contextMessages): ?string
     {
-        $apiKey = env('ANTHROPIC_API_KEY');
+        $apiKey = config('services.claude.api_key');
         if (!$apiKey) {
             Log::error('ProcessAutoReply: ANTHROPIC_API_KEY not set');
             return null;
         }
 
         try {
-            $response = Http::timeout(30)
+            $response = Http::timeout((int) config('services.ai.timeout', 30))
                 ->withHeaders([
                     'x-api-key' => $apiKey,
                     'anthropic-version' => '2023-06-01',
                     'content-type' => 'application/json',
                 ])
                 ->post('https://api.anthropic.com/v1/messages', [
-                    'model' => 'claude-haiku-4-5-20251001',
-                    'max_tokens' => 500,
+                    'model' => config('services.claude.model', 'claude-haiku-4-5-20251001'),
+                    'max_tokens' => (int) config('services.ai.max_tokens', 500),
                     'system' => $systemPrompt,
                     'messages' => $contextMessages,
                 ]);
@@ -232,19 +249,19 @@ class ProcessAutoReply implements ShouldQueue
 
     private function callGeminiAPI(string $systemPrompt, array $contextMessages): ?string
     {
-        $apiKey = env('GEMINI_API_KEY');
+        $apiKey = config('services.gemini.api_key');
         if (!$apiKey) {
             Log::error('ProcessAutoReply: GEMINI_API_KEY not set');
             return null;
         }
 
-        // Fallback models in order of preference
-        $models = [
+        $models = array_values(array_unique(array_filter([
+            config('services.gemini.model', 'gemini-2.5-flash'),
             'gemini-2.5-flash',
             'gemini-2.0-flash-exp',
             'gemini-1.5-flash',
             'gemini-1.5-pro',
-        ];
+        ])));
 
         // Convert context to Gemini format
         $contents = [];
@@ -263,15 +280,15 @@ class ProcessAutoReply implements ShouldQueue
 
         foreach ($models as $model) {
             try {
-                $response = Http::timeout(30)
+                $response = Http::timeout((int) config('services.ai.timeout', 30))
                     ->withOptions(['verify' => false])
                     ->post(
                         "https://generativelanguage.googleapis.com/v1beta/models/{$model}:generateContent?key={$apiKey}",
                         [
                             'contents' => $contents,
                             'generationConfig' => [
-                                'maxOutputTokens' => 500,
-                                'temperature' => 0.7,
+                                'maxOutputTokens' => (int) config('services.ai.max_tokens', 500),
+                                'temperature' => (float) config('services.ai.temperature', 0.7),
                             ],
                         ]
                     );
@@ -453,3 +470,6 @@ class ProcessAutoReply implements ShouldQueue
         }
     }
 }
+
+
+

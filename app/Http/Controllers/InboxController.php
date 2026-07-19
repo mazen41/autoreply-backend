@@ -109,8 +109,17 @@ class InboxController extends Controller
             $mimeType = $file->getMimeType() ?: 'application/octet-stream';
             $mediaType = $request->media_type ?: $this->mediaTypeFromMime($mimeType);
             $fileName = $file->getClientOriginalName() ?: Str::uuid() . '.' . ($file->guessExtension() ?: 'bin');
+
+            // Evolution API validates that `media` is a well-formed URL (or base64).
+            // Raw spaces (and other unsafe characters) in a filename produce an
+            // invalid URL once appended to the storage path — e.g. a screenshot
+            // named "Screenshot 2026-07-18 154008.png" breaks the URL Evolution
+            // receives, and it correctly rejects it with "Owned media must be a
+            // url or base64". Build a URL-safe filename for the actual storage
+            // path, but keep the original (with spaces) for display/metadata.
+            $safeFileName = preg_replace('/[^A-Za-z0-9._-]+/', '_', $fileName);
             $disk = config('services.evolution.media_disk', 'public');
-            $path = $file->storeAs('whatsapp/outgoing/' . now()->format('Y/m'), Str::uuid() . '-' . $fileName, $disk);
+            $path = $file->storeAs('whatsapp/outgoing/' . now()->format('Y/m'), Str::uuid() . '-' . $safeFileName, $disk);
             $mediaUrl = Storage::disk($disk)->url($path);
 
             $whatsappService = new EvolutionApiService();

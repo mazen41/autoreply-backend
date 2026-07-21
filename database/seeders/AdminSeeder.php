@@ -15,18 +15,25 @@ class AdminSeeder extends Seeder
     public function run(): void
     {
         // Create or update the admin user
+        $adminPassword = env('ADMIN_PASSWORD');
+        
+        if (!$adminPassword) {
+            $adminPassword = str()->random(32);
+            $this->command->warn('IMPORTANT: Set ADMIN_PASSWORD in .env file for production!');
+            $this->command->warn("Generated random password: {$adminPassword}");
+        }
+        
         $admin = User::updateOrCreate(
             ['email' => 'admin@naz.com'],
             [
                 'name' => 'Admin',
                 'email' => 'admin@naz.com',
-                'password' => Hash::make('admin123'), // Change this in production!
+                'password' => $adminPassword, // Hashing is handled by User model cast
                 'is_admin' => true,
                 'onboarding_completed' => true,
             ]
         );
 
-        $this->command->info('Admin user created/updated: admin@naz.com (password: admin123)');
-        $this->command->warn('IMPORTANT: Change the default admin password in production!');
+        $this->command->info('Admin user created/updated: admin@naz.com');
     }
 }

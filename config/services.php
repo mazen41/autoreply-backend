@@ -86,5 +86,10 @@ return [
     ],
     'frontend_url' => env('FRONTEND_URL'),
 
+    'metrics' => [
+        'avg_manual_reply_time' => (int) env('AVG_MANUAL_REPLY_TIME', 3), // minutes
+        'hourly_rate' => (int) env('HOURLY_RATE', 100), // SAR per hour
+    ],
+
 ];
 

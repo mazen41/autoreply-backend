@@ -22,11 +22,5 @@ class DatabaseSeeder extends Seeder
 
         // Seed packages
         $this->call(PackageSeeder::class);
-
-        // Optional: Create a test user
-        User::factory()->create([
-            'name' => 'Test User',
-            'email' => 'test@example.com',
-        ]);
     }
 }

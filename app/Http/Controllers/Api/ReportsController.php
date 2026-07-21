@@ -185,13 +185,13 @@ class ReportsController extends Controller
             ->where('is_ai', true)
             ->count();
 
-        // Assume manual reply takes 3 minutes on average
-        $manualReplyTimeMinutes = 3;
+        // Use configurable values or defaults
+        $manualReplyTimeMinutes = config('services.metrics.avg_manual_reply_time', 3);
         $totalTimeSavedMinutes = $autoReplies * $manualReplyTimeMinutes;
         $totalTimeSavedHours = round($totalTimeSavedMinutes / 60, 1);
 
-        // Estimate value (assuming 100 SAR/hour)
-        $hourlyRate = 100;
+        // Estimate value using configurable hourly rate
+        $hourlyRate = config('services.metrics.hourly_rate', 100);
         $estimatedValue = round($totalTimeSavedHours * $hourlyRate);
 
         return response()->json([
@@ -228,8 +228,9 @@ class ReportsController extends Controller
             ->count();
         $responseRate = $totalMessages > 0 ? round(($aiReplies / $totalMessages) * 100, 1) : 0;
 
-        // Time saved: assume 3 minutes saved per AI-handled reply
-        $hoursSaved = round(($aiReplies * 3) / 60, 1);
+        // Time saved: use configurable reply time
+        $replyTimeMinutes = config('services.metrics.avg_manual_reply_time', 3);
+        $hoursSaved = round(($aiReplies * $replyTimeMinutes) / 60, 1);
 
         // Week-over-week message trend
         $thisWeek = $this->userMessages()
@@ -259,9 +260,7 @@ class ReportsController extends Controller
             'ai_replies' => $aiReplies,
             'response_rate' => $responseRate,
             'hours_saved' => $hoursSaved,
-            'google_rating' => null,
             'messages_trend' => $messagesTrend,
-            'rating_trend' => null,
             'top_question' => $topQuestionRow->content ?? null,
             'question_count' => $topQuestionRow->count ?? 0,
         ]);

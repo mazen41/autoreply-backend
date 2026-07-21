@@ -19,6 +19,9 @@ class User extends Authenticatable
         'plan',
         'onboarding_completed',
         'is_admin',
+        'google_id',
+        'facebook_id',
+        'avatar',
     ];
 
     protected $hidden = [

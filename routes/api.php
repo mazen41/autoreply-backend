@@ -78,6 +78,7 @@ Route::middleware('auth:sanctum')->group(function () {
         Route::post('/upload', [KnowledgeController::class, 'upload']);
         Route::delete('/files/{id}', [KnowledgeController::class, 'delete']);
         Route::post('/instructions', [KnowledgeController::class, 'updateInstructions']);
+        Route::post('/profile', [KnowledgeController::class, 'updateProfile']);
         Route::post('/test', [KnowledgeController::class, 'testResponse']);
     });
 

@@ -20,7 +20,6 @@ class GmailController extends Controller
         $client->setRedirectUri(env('GOOGLE_REDIRECT_URI'));
         $client->addScope(Gmail::GMAIL_READONLY);
         $client->addScope(Gmail::GMAIL_SEND);
-        $client->addScope('https://www.googleapis.com/auth/gmail.metadata');
         $client->setAccessType('offline');
         $client->setPrompt('consent');
         return $client;

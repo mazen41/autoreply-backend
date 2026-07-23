@@ -60,6 +60,8 @@ class GmailController extends Controller
             $profile = $gmail->users->getProfile('me');
             $email   = $profile->getEmailAddress();
 
+            $businessProfile = \App\Models\BusinessProfile::where('user_id', $userId)->first();
+
             $channel = Channel::updateOrCreate(
                 ['user_id' => $userId, 'type' => 'gmail'],
                 [
@@ -68,6 +70,7 @@ class GmailController extends Controller
                     'refresh_token' => isset($token['refresh_token']) ? encrypt($token['refresh_token']) : null,
                     'status'        => 'connected',
                     'connected_at'  => now(),
+                    'business_id'   => $businessProfile ? $businessProfile->id : null,
                 ]
             );
 

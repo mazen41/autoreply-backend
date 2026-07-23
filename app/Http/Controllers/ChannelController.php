@@ -177,6 +177,8 @@ class ChannelController extends Controller
                 : $pageAccessToken;
 
             // Step 3: Save Facebook channel with encrypted token
+            $businessProfile = \App\Models\BusinessProfile::where('user_id', $userId)->first();
+
             $channel = Channel::updateOrCreate(
                 [
                     'user_id' => $userId,
@@ -188,6 +190,7 @@ class ChannelController extends Controller
                     'access_token' => encrypt($longLivedToken),
                     'status'       => 'connected',
                     'connected_at' => now(),
+                    'business_id'  => $businessProfile ? $businessProfile->id : null,
                 ]
             );
 
@@ -217,6 +220,7 @@ class ChannelController extends Controller
                         'access_token' => encrypt($longLivedToken),
                         'status'       => 'connected',
                         'connected_at' => now(),
+                        'business_id'  => $businessProfile ? $businessProfile->id : null,
                     ]
                 );
                 \Log::info('Instagram channel saved', ['account_id' => $igAccountId]);

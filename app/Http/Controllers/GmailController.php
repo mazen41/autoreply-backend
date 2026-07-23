@@ -77,6 +77,9 @@ class GmailController extends Controller
             // Set up Gmail Push Notifications via watch()
             $this->setupGmailWatch($channel);
 
+            // Sync historical messages in the background
+            \App\Jobs\SyncGmailHistory::dispatch($channel->id);
+
             Log::info('Gmail channel connected', ['user_id' => $userId, 'email' => $email]);
             return redirect(env('FRONTEND_URL') . '/dashboard/channels?success=gmail');
 
@@ -271,7 +274,7 @@ class GmailController extends Controller
         }
     }
 
-    private function extractBody($payload): string
+    public function extractBody($payload): string
     {
         // Try parts first (multipart)
         $parts = $payload->getParts() ?? [];

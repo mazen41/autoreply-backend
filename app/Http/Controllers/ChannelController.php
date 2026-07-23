@@ -187,7 +187,7 @@ class ChannelController extends Controller
                 ],
                 [
                     'page_name'    => $pageName,
-                    'access_token' => encrypt($longLivedToken),
+                    'access_token' => $longLivedToken,  // mutator encrypts this automatically
                     'status'       => 'connected',
                     'connected_at' => now(),
                     'business_id'  => $businessProfile ? $businessProfile->id : null,
@@ -217,7 +217,7 @@ class ChannelController extends Controller
                     ],
                     [
                         'page_name'    => $pageName . ' (Instagram)',
-                        'access_token' => encrypt($longLivedToken),
+                        'access_token' => $longLivedToken,
                         'status'       => 'connected',
                         'connected_at' => now(),
                         'business_id'  => $businessProfile ? $businessProfile->id : null,

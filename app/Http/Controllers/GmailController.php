@@ -66,7 +66,7 @@ class GmailController extends Controller
                 ['user_id' => $userId, 'type' => 'gmail'],
                 [
                     'page_name'     => $email,
-                    'access_token'  => encrypt(json_encode($token)),
+                    'access_token'  => json_encode($token),   // mutator encrypts this automatically
                     'refresh_token' => isset($token['refresh_token']) ? encrypt($token['refresh_token']) : null,
                     'status'        => 'connected',
                     'connected_at'  => now(),

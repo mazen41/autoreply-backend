@@ -402,6 +402,11 @@ class EvolutionApiService
             ]);
         }
         
+        // Skip messages sent FROM this WhatsApp instance (our own outgoing messages)
+        // Evolution sends MESSAGES_UPSERT for all messages including ones we send,
+        // marked with fromMe=true in the key.
+        $fromMe = $message['fromMe'] ?? false;
+
         $body = $messageContent['conversation'] ?? $messageContent['extendedTextMessage']['text'] ?? null;
         $messageType = $this->detectMessageType($messageContent);
         $media = $this->extractAndStoreMedia($messageContent, $event, $instanceName, $message);
@@ -417,7 +422,7 @@ class EvolutionApiService
             'user_id' => $instance->user_id,
             'message_id' => $message['id'] ?? null,
             'remote_message_id' => $message['id'] ?? null,
-            'direction' => 'incoming',
+            'direction' => $fromMe ? 'outgoing' : 'incoming',
             'from_phone' => $fromPhone,
             'from_name' => $fromName,
             'to_phone' => $instance->phone_number,
@@ -427,22 +432,22 @@ class EvolutionApiService
             'metadata' => [
                 'event' => $event,
                 'message_key' => $message,
-                'pushName' => $fromName, // Store the resolved name
+                'pushName' => $fromName,
             ],
             'status' => 'pending',
             'sent_at' => now(),
         ]);
 
         // Also save to unified inbox system
-        $this->saveToUnifiedInbox($instance, $fromPhone, $fromName, $body, $messageType, $media, $message);
+        $this->saveToUnifiedInbox($instance, $fromPhone, $fromName, $body, $messageType, $media, $message, $fromMe);
 
-        Log::info("Message saved from {$fromPhone} for instance {$instanceName}");
+        Log::info("Message saved from {$fromPhone} for instance {$instanceName} (fromMe: " . ($fromMe ? 'true' : 'false') . ")");
     }
 
     /**
      * Save WhatsApp message to unified inbox (Conversation/Message)
      */
-    protected function saveToUnifiedInbox(WhatsAppInstance $instance, ?string $fromPhone, ?string $fromName, ?string $body, string $messageType, ?array $media = null, array $messageKey = []): void
+    protected function saveToUnifiedInbox(WhatsAppInstance $instance, ?string $fromPhone, ?string $fromName, ?string $body, string $messageType, ?array $media = null, array $messageKey = [], bool $fromMe = false): void
     {
         try {
             // Find the WhatsApp channel
@@ -523,8 +528,8 @@ class EvolutionApiService
                 'conversation_id' => $conversation->id,
                 'content' => $body ?? $media['caption'] ?? '',
                 'type' => $messageType,
-                'direction' => 'inbound',
-                'status' => 'received',
+                'direction' => $fromMe ? 'outbound' : 'inbound',
+                'status' => $fromMe ? 'sent' : 'received',
                 'is_ai' => false,
                 'source' => 'whatsapp',
                 'send_status' => 'delivered',
@@ -536,7 +541,7 @@ class EvolutionApiService
                 'duration' => is_int($media['duration'] ?? null) ? $media['duration'] : null,
                 'whatsapp_message_id' => $messageKey['id'] ?? null,
                 'whatsapp_remote_jid' => $messageKey['remoteJid'] ?? $fromPhone,
-                'whatsapp_from_me' => $messageKey['fromMe'] ?? false,
+                'whatsapp_from_me' => $fromMe,
                 'metadata' => [
                     'whatsapp_key' => $messageKey,
                     'media' => $media,
@@ -548,8 +553,8 @@ class EvolutionApiService
                 broadcast(new \App\Events\MessageReceived($message, $conversation, $channel->user_id));
             }
 
-            // Trigger AI auto-reply if enabled
-            if ($channel->ai_enabled) {
+            // Trigger AI auto-reply only for incoming messages
+            if (!$fromMe && $channel->ai_enabled) {
                 \App\Jobs\ProcessAutoReply::dispatch($message->id);
             }
 

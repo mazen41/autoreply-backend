@@ -400,7 +400,9 @@ class ProcessAutoReply implements ShouldQueue
 
     private function sendFacebookReply(Channel $channel, string $recipientId, string $message): bool
     {
-        $accessToken = decrypt($channel->getRawOriginal('access_token'));
+        // The Channel model's accessor already decrypts access_token — do NOT
+        // call decrypt() again or the token will be double-decrypted and corrupted.
+        $accessToken = $channel->access_token;
         $url = "https://graph.facebook.com/v19.0/me/messages?access_token={$accessToken}";
 
         $response = Http::timeout(10)
@@ -409,6 +411,14 @@ class ProcessAutoReply implements ShouldQueue
                 'recipient' => ['id' => $recipientId],
                 'message' => ['text' => $message],
             ]);
+
+        if (!$response->successful()) {
+            Log::error('ProcessAutoReply: Facebook send failed', [
+                'status' => $response->status(),
+                'body' => $response->json(),
+                'recipient' => $recipientId,
+            ]);
+        }
 
         return $response->successful();
     }

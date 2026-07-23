@@ -9,6 +9,7 @@ use App\Http\Controllers\Api\PaymentController;
 use App\Http\Controllers\Api\AdminController;
 use App\Http\Controllers\Api\WhatsAppController;
 use App\Http\Controllers\Api\ReportsController;
+use App\Http\Controllers\Api\KnowledgeController;
 use App\Http\Controllers\WebhookController;
 use App\Http\Controllers\ChannelController;
 use App\Http\Controllers\GmailController;
@@ -69,6 +70,15 @@ Route::middleware('auth:sanctum')->group(function () {
         Route::post('/step4',    [OnboardingController::class, 'step4']);
         Route::post('/complete', [OnboardingController::class, 'complete']);
         Route::post('/upload-knowledge', [OnboardingController::class, 'uploadKnowledgeFile']);
+    });
+
+    // AI Knowledge & Instructions
+    Route::prefix('knowledge')->group(function () {
+        Route::get('/', [KnowledgeController::class, 'index']);
+        Route::post('/upload', [KnowledgeController::class, 'upload']);
+        Route::delete('/files/{id}', [KnowledgeController::class, 'delete']);
+        Route::post('/instructions', [KnowledgeController::class, 'updateInstructions']);
+        Route::post('/test', [KnowledgeController::class, 'testResponse']);
     });
 
     // Channels â€” listing and disconnect

@@ -157,6 +157,18 @@ class ProcessAutoReply implements ShouldQueue
             }
         }
 
+        // Build knowledge base from individual files
+        $knowledgeText = '';
+        foreach ($business->knowledgeFiles()->get() as $file) {
+            $knowledgeText .= "\n\n--- File: {$file->filename} ---\n";
+            $knowledgeText .= $file->extracted_text;
+        }
+
+        // Truncate if too long to avoid token limits (keep under 15,000 chars)
+        if (strlen($knowledgeText) > 15000) {
+            $knowledgeText = substr($knowledgeText, 0, 15000) . "\n\n[Content truncated due to length]";
+        }
+
         $prompt = "You are a customer support agent for the following business. Never mention you are AI.
 
 ";
@@ -171,8 +183,14 @@ class ProcessAutoReply implements ShouldQueue
             $prompt .= "\nCommon questions and answers:\n{$faqsText}\n";
         }
 
-        if (!empty($business->knowledge_base)) {
-            $prompt .= "\nAdditional business knowledge and documentation:\n{$business->knowledge_base}\n";
+        // Add knowledge base from uploaded files
+        if (!empty($knowledgeText)) {
+            $prompt .= "\nAdditional business knowledge and documentation:\n{$knowledgeText}\n";
+        }
+
+        // Add custom AI instructions
+        if (!empty($business->ai_instructions)) {
+            $prompt .= "\nCustom AI Instructions:\n{$business->ai_instructions}\n";
         }
 
         $prompt .= "\nRules:\n";

@@ -21,6 +21,7 @@ class BusinessProfile extends Model
         'faqs',
         'reply_style',
         'connected_channel',
+        'ai_instructions',
     ];
 
     protected $casts = [
@@ -31,5 +32,10 @@ class BusinessProfile extends Model
     public function user(): BelongsTo
     {
         return $this->belongsTo(User::class);
+    }
+
+    public function knowledgeFiles()
+    {
+        return $this->hasMany(\App\Models\BusinessKnowledgeFile::class);
     }
 }

@@ -13,14 +13,13 @@ class BlogSeeder extends Seeder
     {
         $posts = [
             [
-                [
-                    'title' => 'كيف تضاعف مبيعاتك باستخدام الردود التلقائية بالذكاء الاصطناعي',
-                    'title_en' => 'How to Double Your Sales with AI-Powered Auto-Replies',
-                    'slug' => 'double-sales-ai-auto-replies',
-                    'excerpt' => 'اكتشف كيف يمكن للردود التلقائية بالذكاء الاصطناعي أن تحول المزيد من الرسائل إلى مبيعات حقيقية وتزيد من معدل التحويل بنسبة 35%.',
-                    'excerpt_en' => 'Discover how AI-powered auto-replies can turn more messages into real sales and increase your conversion rate by 35%.',
-                    'body' => '<h2>لماذا الردود التلقائية؟</h2>
-<p>في عالم التجارة الإلكترونية المتسارع، السرعة هي المفتاح. العملاء يتوقعون ردوداً فورية، وكل دقيقة تأخير يمكن أن تكلفك عميلاً محتمماً.</p>
+                'title' => 'كيف تضاعف مبيعاتك باستخدام الردود التلقائية بالذكاء الاصطناعي',
+                'title_en' => 'How to Double Your Sales with AI-Powered Auto-Replies',
+                'slug' => 'double-sales-ai-auto-replies',
+                'excerpt' => 'اكتشف كيف يمكن للردود التلقائية بالذكاء الاصطناعي أن تحول المزيد من الرسائل إلى مبيعات حقيقية وتزيد من معدل التحويل بنسبة 35%.',
+                'excerpt_en' => 'Discover how AI-powered auto-replies can turn more messages into real sales and increase your conversion rate by 35%.',
+                'body' => '<h2>لماذا الردود التلقائية؟</h2>
+<p>في عالم التجارة الإلكترونية المتسارع، السرعة هي المفتاح. العملاء يتوقعون ردوداً فورية، وكل دقيقة تأخير يمكن أن تكلفك عميلاً محتملاً.</p>
 
 <h2>القوة الحقيقية للذكاء الاصطناعي</h2>
 <p>الذكاء الاصطناعي لا يرد فقط على الرسائل، بل يفهم السياق، ويحدد نية العميل، ويقدم حلولاً مناسباً لكل حالة.</p>
@@ -43,7 +42,7 @@ class BlogSeeder extends Seeder
 </ul>
 
 <p>الذكاء الاصطناعي ليس مجرد أداة للرد، بل هو شريك استراتيجي في نمو عملك.</p>',
-                    'body_en' => '<h2>Why Auto-Replies?</h2>
+                'body_en' => '<h2>Why Auto-Replies?</h2>
 <p>In the fast-paced world of e-commerce, speed is key. Customers expect instant responses, and every minute of delay can cost you a potential sale.</p>
 
 <h2>The True Power of AI</h2>
@@ -67,23 +66,23 @@ class BlogSeeder extends Seeder
 </ul>
 
 <p>AI auto-replies are not just a response tool—they\'re a strategic partner in growing your business.</p>',
-                    'category' => 'أتمتة المبيعات',
-                    'author' => 'فريق ناز',
-                    'status' => 'published',
-                    'published_at' => Carbon::now()->subDays(7),
-                    'featured_image_url' => 'https://images.unsplash.com/photo-1551434685726-6f7602e7a1d4?w=800',
-                    'meta_description' => 'دليل شامل حول كيفية استخدام الردود التلقائية بالذكاء الاصطناعي لزيادة المبيع وتحسين خدمة العملاء.',
-                    'tags' => ['أتمتة المبيعات', 'ذكاء اصطناعي', 'زيادة المبيعات'],
-                    'created_at' => Carbon::now()->subDays(7),
-                    'updated_at' => Carbon::now()->subDays(7),
-                ],
-                [
-                    'title' => 'دليل المبتدئين في التجارة الإلكترونية: من الفكرة إلى أول ألف عميل',
-                    'title_en' => 'E-commerce Beginner Guide: From Idea to First 1000 Customers',
-                    'slug' => 'ecommerce-beginner-guide',
-                    'excerpt' => 'الخطوات العملية والاستراتيجيات التي تحتاجها لبدء متجر إلكتروني ناجح وجذب أول 1000 عميل.',
-                    'excerpt_en' => 'The actionable steps and strategies you need to start a successful e-commerce business and attract your first 1000 customers.',
-                    'body' => '<h2>الخطوة 1: اختيار المنتج المناسب</h2>
+                'category' => 'أتمتة المبيعات',
+                'author' => 'فريق ناز',
+                'status' => 'published',
+                'published_at' => Carbon::now()->subDays(7),
+                'featured_image_url' => 'https://images.unsplash.com/photo-1551434685726-6f7602e7a1d4?w=800',
+                'meta_description' => 'دليل شامل حول كيفية استخدام الردود التلقائية بالذكاء الاصطناعي لزيادة المبيع وتحسين خدمة العملاء.',
+                'tags' => ['أتمتة المبيعات', 'ذكاء اصطناعي', 'زيادة المبيعات'],
+                'created_at' => Carbon::now()->subDays(7),
+                'updated_at' => Carbon::now()->subDays(7),
+            ],
+            [
+                'title' => 'دليل المبتدئين في التجارة الإلكترونية: من الفكرة إلى أول ألف عميل',
+                'title_en' => 'E-commerce Beginner Guide: From Idea to First 1000 Customers',
+                'slug' => 'ecommerce-beginner-guide',
+                'excerpt' => 'الخطوات العملية والاستراتيجيات التي تحتاجها لبدء متجر إلكتروني ناجح وجذب أول 1000 عميل.',
+                'excerpt_en' => 'The actionable steps and strategies you need to start a successful e-commerce business and attract your first 1000 customers.',
+                'body' => '<h2>الخطوة 1: اختيار المنتج المناسب</h2>
 <p>النجاح في التجارة الإلكترونية يبدأ باختيار المنتج الصحيح. ابحث عن منتج يحل مشكلة حقيقية وله طلب في السوق.</p>
 
 <h2>الخطوة 2: بناء متجر جذاب بصرياً</h2>
@@ -99,7 +98,7 @@ class BlogSeeder extends Seeder
 <p>راقب مقاييس الأداء مثل معدل التحويل، تكلفة الاستحوا، وقيمة الطلب العمر.</p>
 
 <p>ابدأ صغيراً، وسحق النتائج، ثم قم بالتوسع تدريجياً.</p>',
-                    'body_en' => '<h2>Step 1: Choose the Right Product</h2>
+                'body_en' => '<h2>Step 1: Choose the Right Product</h2>
 <p>E-commerce success starts with choosing the right product. Look for a product that solves a real problem and has market demand.</p>
 
 <h2>Step 2: Build an Attractive Store</h2>
@@ -115,23 +114,23 @@ class BlogSeeder extends Seeder
 <p>Track performance metrics like conversion rate, acquisition cost, and customer lifetime value.</p>
 
 <p>Start small, achieve results, then scale gradually.</p>',
-                    'category' => 'ريادة الأعمال',
-                    'author' => 'فريق ناز',
-                    'status' => 'published',
-                    'published_at' => Carbon::now()->subDays(14),
-                    'featured_image_url' => 'https://images.unsplash.com/photo-1460925895917-afdab827c52f?w=800',
-                    'meta_description' => 'دليل شامل للمبتدئين في التجارة الإلكترونية: كيف تبدأ متجر ناجح وجذب أول 1000 عميل.',
-                    'tags' => ['ريادة الأعمال', 'التجارة الإلكترونية', 'دليل المبتدئين'],
-                    'created_at' => Carbon::now()->subDays(14),
-                    'updated_at' => Carbon::now()->subDays(14),
-                ],
-                [
-                    'title' => 'أهم 5 أدوات مجانية لزيادة مبيعاتك في 2024',
-                    'title_en' => 'Top 5 Free Tools to Boost Your Sales in 2024',
-                    'slug' => 'top-5-free-tools-boost-sales',
-                    'excerpt' => 'استكشف أفضل الأدوات المجانية التي تساعدك على زيادة المبيعات، تحسين خدمة العملاء، وتنمية عملك دون تكاليف إضافية.',
-                    'excerpt_en' => 'Discover the best free tools that help you increase sales, improve customer service, and grow your business without additional costs.',
-                    'body' => '<h2>1. مولد نصوص البيع</h2>
+                'category' => 'ريادة الأعمال',
+                'author' => 'فريق ناز',
+                'status' => 'published',
+                'published_at' => Carbon::now()->subDays(14),
+                'featured_image_url' => 'https://images.unsplash.com/photo-1460925895917-afdab827c52f?w=800',
+                'meta_description' => 'دليل شامل للمبتدئين في التجارة الإلكترونية: كيف تبدأ متجر ناجح وجذب أول 1000 عميل.',
+                'tags' => ['ريادة الأعمال', 'التجارة الإلكترونية', 'دليل المبتدئين'],
+                'created_at' => Carbon::now()->subDays(14),
+                'updated_at' => Carbon::now()->subDays(14),
+            ],
+            [
+                'title' => 'أهم 5 أدوات مجانية لزيادة مبيعاتك في 2024',
+                'title_en' => 'Top 5 Free Tools to Boost Your Sales in 2024',
+                'slug' => 'top-5-free-tools-boost-sales',
+                'excerpt' => 'استكشف أفضل الأدوات المجانية التي تساعدك على زيادة المبيعات، تحسين خدمة العملاء، وتنمية عملك دون تكاليف إضافية.',
+                'excerpt_en' => 'Discover the best free tools that help you increase sales, improve customer service, and grow your business without additional costs.',
+                'body' => '<h2>1. مولد نصوص البيع</h2>
 <p>يحول استفسارات العملاء إلى نصوص بيع مقنعة باستخدام الذكاء الاصطناعي.</p>
 
 <h2>2. محلل الشكاوى</h2>
@@ -147,7 +146,7 @@ class BlogSeeder extends Seeder
 <p>عدل نبرة رسائلك لتناسب مختلف المواقف والعملاء.</p>
 
 <p>هذه الأدوات متاحة مجاناً ويمكنها أن تحدث تحسن كبيراً في عملياتك.</p>',
-                    'body_en' => '<h2>1. Sales Script Generator</h2>
+                'body_en' => '<h2>1. Sales Script Generator</h2>
 <p>Transforms customer inquiries into sales-oriented scripts using AI.</p>
 
 <h2>2. Complaint Analyzer</h2>
@@ -163,23 +162,23 @@ class BlogSeeder extends Seeder
 <p>Adjusts the tone of your messages to suit different situations and customers.</p>
 
 <p>These tools are available for free and can significantly improve your operations.</p>',
-                    'category' => 'التجارة الإلكترونية',
-                    'author' => 'فريق ناز',
-                    'status' => 'published',
-                    'published_at' => Carbon::now()->subDays(3),
-                    'featured_image_url' => 'https://images.unsplash.com/photo-1551288049-feb661d7264a?w=800',
-                    'meta_description' => 'استكشف أفضل الأدوات المجانية لزيادة المبيعات وتحسين خدمة العملاء في 2024.',
-                    'tags' => ['التجارة الإلكترونية', 'أدوات مجانية', 'زيادة المبيعات'],
-                    'created_at' => Carbon::now()->subDays(3),
-                    'updated_at' => Carbon::now()->subDays(3),
-                ],
-                [
-                    'title' => 'كيف تحمي سمعتك على Google باستخدام الردود الذكية',
-                    'title_en' => 'How to Protect Your Google Reputation with Smart Replies',
-                    'slug' => 'protect-google-reputation-smart-replies',
-                    'excerpt' => 'تعلم كيف يمكن للردود الذكية أن تكتشف العملاء غير الراضين وتتصل معهم قبل أن يتركوا تقييماً سلبياً.',
-                    'excerpt_en' => 'Learn how smart replies can detect dissatisfied customers and reach out to them before they leave negative reviews.',
-                    'body' => '<h2>مشكلة التقييمات السلبية</h2>
+                'category' => 'التجارة الإلكترونية',
+                'author' => 'فريق ناز',
+                'status' => 'published',
+                'published_at' => Carbon::now()->subDays(3),
+                'featured_image_url' => 'https://images.unsplash.com/photo-1551288049-feb661d7264a?w=800',
+                'meta_description' => 'استكشف أفضل الأدوات المجانية لزيادة المبيعات وتحسين خدمة العملاء في 2024.',
+                'tags' => ['التجارة الإلكترونية', 'أدوات مجانية', 'زيادة المبيعات'],
+                'created_at' => Carbon::now()->subDays(3),
+                'updated_at' => Carbon::now()->subDays(3),
+            ],
+            [
+                'title' => 'كيف تحمي سمعتك على Google باستخدام الردود الذكية',
+                'title_en' => 'How to Protect Your Google Reputation with Smart Replies',
+                'slug' => 'protect-google-reputation-smart-replies',
+                'excerpt' => 'تعلم كيف يمكن للردود الذكية أن تكتشف العملاء غير الراضين وتتصل معهم قبل أن يتركوا تقييماً سلبياً.',
+                'excerpt_en' => 'Learn how smart replies can detect dissatisfied customers and reach out to them before they leave negative reviews.',
+                'body' => '<h2>مشكلة التقييمات السلبية</h2>
 <p>تقييم واحد سلبي يمكن أن يضر بسمعتك لسنوات. من المهم معالجة المشكلات بسرعة.</p>
 
 <h2>كيف يعمل نظام الاكتشاف</h2>
@@ -192,7 +191,7 @@ class BlogSeeder extends Seeder
 <p>يراقب استجاباتك ويعلم من التفاعل لتحسين الاستراتيجية مع الوقت.</p>
 
 <p>الحماية من سمعتك الاستثمار الذكي يستحق الوقت والجهد.</p>',
-                    'body_en' => '<h2>The Problem with Negative Reviews</h2>
+                'body_en' => '<h2>The Problem with Negative Reviews</h2>
 <p>A single negative review can damage your reputation for years. It\'s crucial to address issues quickly.</p>
 
 <h2>How Detection Works</h2>
@@ -205,24 +204,24 @@ class BlogSeeder extends Seeder
 <p>Track your responses and learn from interactions to improve your strategy over time.</p>
 
 <p>Protecting your reputation with smart responses is a smart investment of time and effort.</p>',
-                    'category' => 'التجارة الإلكترونية',
-                    'author' => 'فريق ناز',
-                    'status' => 'published',
-                    'published_at' => Carbon::now()->subDays(10),
-                    'featured_image_url' => 'https://images.unsplash.com/photo-1516321483858-d7f99504770c?w=800',
-                    'meta_description' => 'استراتيجيات فعالة لحماية سمعتك على Google باستخدام الردود الذكية.',
-                    'tags' => ['سمعة', 'تقييمات Google', 'حماية السمعة'],
-                    'created_at' => Carbon::now()->subDays(10),
-                    'updated_at' => Carbon::now()->subDays(10),
-                ],
-                [
-                    'title' => 'استراتيجيات التسويق المبتدئين لمتاجر السوشال ميديا',
-                    'title_en' => 'Social Media Marketing Strategies for Beginners',
-                    'slug' => 'social-media-marketing-strategies',
-                    'excerpt' => 'خطوات بسيطة وفعالة لبناء حضور قوي على منصات التواصل الاجتماعي وجذب المزيد من المتابعين.',
-                    'excerpt_en' => 'Simple and effective steps to build a strong presence on social media platforms and attract more followers.',
-                    'body' => '<h2>الاستمرار قبل البدء</h2>
-<p>حدد منصاتك المستهدة بناءً على نوع منتجك وجمهورك المستهدف.</p>
+                'category' => 'التجارة الإلكترونية',
+                'author' => 'فريق ناز',
+                'status' => 'published',
+                'published_at' => Carbon::now()->subDays(10),
+                'featured_image_url' => 'https://images.unsplash.com/photo-1516321483858-d7f99504770c?w=800',
+                'meta_description' => 'استراتيجيات فعالة لحماية سمعتك على Google باستخدام الردود الذكية.',
+                'tags' => ['سمعة', 'تقييمات Google', 'حماية السمعة'],
+                'created_at' => Carbon::now()->subDays(10),
+                'updated_at' => Carbon::now()->subDays(10),
+            ],
+            [
+                'title' => 'استراتيجيات التسويق المبتدئين لمتاجر السوشال ميديا',
+                'title_en' => 'Social Media Marketing Strategies for Beginners',
+                'slug' => 'social-media-marketing-strategies',
+                'excerpt' => 'خطوات بسيطة وفعالة لبناء حضور قوي على منصات التواصل الاجتماعي وجذب المزيد من المتابعين.',
+                'excerpt_en' => 'Simple and effective steps to build a strong presence on social media platforms and attract more followers.',
+                'body' => '<h2>الاستمرار قبل البدء</h2>
+<p>حدد منصاتك المستهدفة بناءً على نوع منتجك وجمهورك المستهدف.</p>
 
 <h2>إنشاء محتوى جذاب</h2>
 <p>ركز على المحتوى الذي يقدم قيمة للعملاء وليس مجرد الترويج.</p>
@@ -234,7 +233,7 @@ class BlogSeeder extends Seeder
 <p>استهدف فئات محددة من المتابعين للوصول للجمهور المناسب.</p>
 
 <p>التسويق في السوشال ميديا يتطلب الصبر والاستمرار، لكن النتائج تستحق العناء.</p>',
-                    'body_en' => '<h2>Pre-Launch Planning</h2>
+                'body_en' => '<h2>Pre-Launch Planning</h2>
 <p>Identify your target platforms based on your product type and target audience.</p>
 
 <h2>Creating Engaging Content</h2>
@@ -247,16 +246,15 @@ class BlogSeeder extends Seeder
 <p>Target specific follower segments to reach the right audience.</p>
 
 <p>Social media marketing requires patience and consistency, but the results are worth the effort.</p>',
-                    'category' => 'ريادة الأعمال',
-                    'author' => 'فريق ناز',
-                    'status' => 'published',
-                    'published_at' => Carbon::now()->subDays(5),
-                    'featured_image_url' => 'https://images.unsplash.com/photo-1611162617474-5b21e8e6fb387?w=800',
-                    'meta_description' => 'استراتيجيات التسويق في السوشال ميديا للمبتدئين.',
-                    'tags' => ['تسويق سوشال ميديا', 'ريادة الأعمال', 'نمو المتابعين'],
-                    'created_at' => Carbon::now()->subDays(5),
-                    'updated_at' => Carbon::now()->subDays(5),
-                ],
+                'category' => 'ريادة الأعمال',
+                'author' => 'فريق ناز',
+                'status' => 'published',
+                'published_at' => Carbon::now()->subDays(5),
+                'featured_image_url' => 'https://images.unsplash.com/photo-1611162617474-5b21e8e6fb387?w=800',
+                'meta_description' => 'استراتيجيات التسويق في السوشال ميديا للمبتدئين.',
+                'tags' => ['تسويق سوشال ميديا', 'ريادة الأعمال', 'نمو المتابعين'],
+                'created_at' => Carbon::now()->subDays(5),
+                'updated_at' => Carbon::now()->subDays(5),
             ],
         ];
 

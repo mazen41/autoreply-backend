@@ -14,7 +14,7 @@ class BlogAIService
      * @param array $context Optional context messages
      * @return string|null AI response or null on failure
      */
-    public static function callAI(string $prompt, array $context = []): ?string
+    public static function callAI(string $prompt, array $context = [], ?string $systemPrompt = null): ?string
     {
         $primary = config('services.ai.provider', 'gemini');
         $fallback = config('services.ai.fallback_provider', $primary === 'gemini' ? 'claude' : 'gemini');
@@ -22,8 +22,8 @@ class BlogAIService
 
         foreach ($providers as $provider) {
             $response = match ($provider) {
-                'claude' => self::callClaudeAPI($prompt, $context),
-                'gemini' => self::callGeminiAPI($prompt, $context),
+                'claude' => self::callClaudeAPI($prompt, $context, $systemPrompt),
+                'gemini' => self::callGeminiAPI($prompt, $context, $systemPrompt),
                 default => null,
             };
 
@@ -41,7 +41,7 @@ class BlogAIService
     /**
      * Call Claude API for blog tasks
      */
-    private static function callClaudeAPI(string $prompt, array $context): ?string
+    private static function callClaudeAPI(string $prompt, array $context, ?string $systemPrompt = null): ?string
     {
         $apiKey = config('services.claude.api_key');
         if (!$apiKey) {
@@ -66,17 +66,23 @@ class BlogAIService
                 'content' => $prompt
             ];
 
+            $payload = [
+                'model' => config('services.claude.model', 'claude-haiku-4-5-20251001'),
+                'max_tokens' => (int) config('services.ai.max_tokens', 1000),
+                'messages' => $messages,
+            ];
+
+            if ($systemPrompt) {
+                $payload['system'] = $systemPrompt;
+            }
+
             $response = Http::timeout((int) config('services.ai.timeout', 30))
                 ->withHeaders([
                     'x-api-key' => $apiKey,
                     'anthropic-version' => '2023-06-01',
                     'Content-Type' => 'application/json',
                 ])
-                ->post('https://api.anthropic.com/v1/messages', [
-                    'model' => config('services.claude.model', 'claude-haiku-4-5-20251001'),
-                    'max_tokens' => (int) config('services.ai.max_tokens', 1000),
-                    'messages' => $messages,
-                ]);
+                ->post('https://api.anthropic.com/v1/messages', $payload);
 
             if (!$response->successful()) {
                 Log::error('BlogAIService: Claude API request failed', [
@@ -98,7 +104,7 @@ class BlogAIService
     /**
      * Call Gemini API for blog tasks
      */
-    private static function callGeminiAPI(string $prompt, array $context): ?string
+    private static function callGeminiAPI(string $prompt, array $context, ?string $systemPrompt = null): ?string
     {
         $apiKey = config('services.gemini.api_key');
         if (!$apiKey) {
@@ -149,6 +155,12 @@ class BlogAIService
                         'temperature' => (float) config('services.ai.temperature', 0.7),
                     ],
                 ];
+
+                if ($systemPrompt) {
+                    $postData['systemInstruction'] = [
+                        'parts' => [['text' => $systemPrompt]],
+                    ];
+                }
 
                 $response = Http::timeout((int) config('services.ai.timeout', 30))
                     ->withHeaders([

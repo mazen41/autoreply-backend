@@ -13,6 +13,7 @@ use App\Http\Controllers\Api\KnowledgeController;
 use App\Http\Controllers\Api\TrainingController;
 use App\Http\Controllers\Api\ProactiveController;
 use App\Http\Controllers\Api\AutomationController;
+use App\Http\Controllers\Api\ToolsController;
 use App\Http\Controllers\WebhookController;
 use App\Http\Controllers\ChannelController;
 use App\Http\Controllers\GmailController;
@@ -171,6 +172,9 @@ Route::get('/packages/{id}', [PackageController::class, 'show']);
 
 // Payment callback (public - Moyasar redirects here)
 Route::get('/payments/callback', [PaymentController::class, 'callback']);
+
+// Tools API (public with rate limiting)
+Route::post('/tools/ai-call', [ToolsController::class, 'aiCall']);
 
 // Moyasar webhook (public, exclude CSRF)
 Route::post('/payments/webhook', [PaymentController::class, 'webhook'])->withoutMiddleware([\App\Http\Middleware\VerifyCsrfToken::class]);

@@ -8,6 +8,7 @@ use App\Models\Message;
 use App\Http\Controllers\GmailController;
 use App\Services\EvolutionApiService;
 use App\Services\KnowledgeChunker;
+use App\Services\AICapabilitiesService;
 use Google\Service\Gmail;
 use Google\Service\Gmail\Message as GmailMessage;
 use Illuminate\Bus\Queueable;
@@ -17,6 +18,7 @@ use Illuminate\Queue\InteractsWithQueue;
 use Illuminate\Queue\SerializesModels;
 use Illuminate\Support\Facades\Http;
 use Illuminate\Support\Facades\Log;
+use Illuminate\Support\Facades\Cache;
 
 class ProcessAutoReply implements ShouldQueue
 {
@@ -110,14 +112,123 @@ class ProcessAutoReply implements ShouldQueue
             ->map(fn($m) => [
                 'role' => $m->direction === 'inbound' ? 'user' : 'assistant',
                 'content' => $m->content,
+                'is_ai' => $m->is_ai,
+                'send_status' => $m->send_status,
             ])
             ->toArray();
+
+        // Detect if handoff is needed
+        $handoffDetection = AICapabilitiesService::detectHandoff($message->content, $contextMessages);
+        if ($handoffDetection['should_escalate']) {
+            Log::info('ProcessAutoReply: Conversation escalated to human', [
+                'conversation_id' => $conversation->id,
+                'reasons' => $handoffDetection['reasons'],
+                'confidence' => $handoffDetection['confidence']
+            ]);
+
+            // Flag conversation for human review
+            $conversation->update([
+                'requires_human' => true,
+                'escalated_at' => now(),
+                'escalation_reason' => implode(', ', $handoffDetection['reasons']),
+                'escalation_notified' => false
+            ]);
+
+            // Notify business owner about escalation
+            // This would trigger a notification system
+            return;
+        }
+
+        // Check business hours routing
+        $businessHoursCheck = AICapabilitiesService::checkBusinessHours($channel->business);
+        if ($businessHoursCheck['should_use_hours_routing']) {
+            Log::info('ProcessAutoReply: Business hours routing activated', [
+                'conversation_id' => $conversation->id,
+                'is_after_hours' => $businessHoursCheck['is_after_hours']
+            ]);
+
+            // Send after-hours message and queue for human review
+            $afterHoursMessage = $businessHoursCheck['routing_message'];
+            $replyMessage = Message::create([
+                'conversation_id' => $message->conversation_id,
+                'content' => $afterHoursMessage,
+                'direction' => 'outbound',
+                'status' => 'auto',
+                'is_ai' => true,
+                'source' => 'ai_hours_routing',
+                'send_status' => 'pending',
+            ]);
+
+            $conversation->update([
+                'requires_human' => true,
+                'escalated_at' => now(),
+                'escalation_reason' => 'after_hours'
+            ]);
+
+            $this->sendReply($channel, $conversation, $replyMessage);
+            return;
+        }
+
+        // Apply tone/persona customization
+        $toneStyle = $channel->business->ai_tone_style ?? [
+            'tone' => 'friendly',
+            'formality' => 'casual',
+            'focus' => 'support'
+        ];
+        
+        $detectedLanguage = $this->detectLanguage($message->content);
+        $systemPrompt = AICapabilitiesService::applyTonePersona($systemPrompt, $toneStyle, $detectedLanguage);
 
         $aiResponse = $this->callConfiguredAI($systemPrompt, $contextMessages);
 
         if (!$aiResponse) {
             Log::error('ProcessAutoReply: configured AI providers returned no response', ['message_id' => $this->messageId]);
             return;
+        }
+
+        // Calculate confidence score
+        $confidenceScore = AICapabilitiesService::calculateConfidence(
+            $message->content, 
+            $aiResponse, 
+            $channel->business
+        );
+
+        $confidenceThreshold = $channel->business->ai_confidence_threshold ?? 70;
+
+        // If confidence is below threshold, escalate to human
+        if ($confidenceScore < $confidenceThreshold) {
+            Log::info('ProcessAutoReply: AI confidence below threshold, escalating to human', [
+                'conversation_id' => $conversation->id,
+                'confidence' => $confidenceScore,
+                'threshold' => $confidenceThreshold
+            ]);
+
+            $conversation->update([
+                'requires_human' => true,
+                'escalated_at' => now(),
+                'escalation_reason' => "low_confidence: {$confidenceScore}%"
+            ]);
+
+            return;
+        }
+
+        // Auto-tag conversation based on intent
+        $intentDetection = AICapabilitiesService::extractIntent($message->content, $channel->business);
+        if ($intentDetection['tag'] !== 'general') {
+            \App\Models\ConversationTag::create([
+                'conversation_id' => $conversation->id,
+                'tag' => $intentDetection['tag'],
+                'intent' => $intentDetection['intent'],
+                'confidence' => $intentDetection['confidence'],
+                'source' => 'ai'
+            ]);
+            
+            Log::info('ProcessAutoReply: Auto-tagged conversation', [
+                'conversation_id' => $conversation->id,
+                'tag' => $intentDetection['tag'],
+                'intent' => $intentDetection['intent'],
+                'confidence' => $intentDetection['confidence']
+            ]);
         }
 
         // Save AI response as outbound message
@@ -444,6 +555,20 @@ class ProcessAutoReply implements ShouldQueue
         }
 
         return $response->successful();
+    }
+
+    /**
+     * Detect language of message (simple heuristic)
+     */
+    private function detectLanguage(string $text): string
+    {
+        // Arabic character detection
+        if (preg_match('/[\x{0600}-\x{06FF}]/u', $text)) {
+            return 'arabic';
+        }
+        
+        // Default to English
+        return 'english';
     }
 
     private function sendInstagramReply(Channel $channel, string $recipientId, string $message): bool

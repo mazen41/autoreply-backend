@@ -22,11 +22,18 @@ class BusinessProfile extends Model
         'reply_style',
         'connected_channel',
         'ai_instructions',
+        'ai_confidence_threshold',
+        'ai_tone_style',
+        'business_hours_enabled',
+        'after_hours_message',
+        'ai_provider',
+        'ai_model',
     ];
 
     protected $casts = [
         'working_days' => 'array',
         'faqs'         => 'array',
+        'ai_tone_style' => 'array',
     ];
 
     public function user(): BelongsTo

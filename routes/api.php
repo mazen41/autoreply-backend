@@ -10,6 +10,9 @@ use App\Http\Controllers\Api\AdminController;
 use App\Http\Controllers\Api\WhatsAppController;
 use App\Http\Controllers\Api\ReportsController;
 use App\Http\Controllers\Api\KnowledgeController;
+use App\Http\Controllers\Api\TrainingController;
+use App\Http\Controllers\Api\ProactiveController;
+use App\Http\Controllers\Api\AutomationController;
 use App\Http\Controllers\WebhookController;
 use App\Http\Controllers\ChannelController;
 use App\Http\Controllers\GmailController;
@@ -107,6 +110,36 @@ Route::middleware('auth:sanctum')->group(function () {
         Route::get('/summary', [ReportsController::class, 'summary']);
         Route::get('/export/csv', [ReportsController::class, 'exportCsv']);
         Route::get('/export/pdf', [ReportsController::class, 'exportPdf']);
+    });
+
+    // Training & AI Learning
+    Route::prefix('training')->group(function () {
+        Route::get('/corrections', [TrainingController::class, 'getCorrections']);
+        Route::post('/corrections', [TrainingController::class, 'createCorrection']);
+        Route::post('/corrections/{id}/approve', [TrainingController::class, 'approveCorrection']);
+        Route::delete('/corrections/{id}', [TrainingController::class, 'rejectCorrection']);
+        Route::get('/stats', [TrainingController::class, 'getStats']);
+    });
+
+    // Proactive Campaigns
+    Route::prefix('proactive')->group(function () {
+        Route::get('/', [ProactiveController::class, 'index']);
+        Route::post('/', [ProactiveController::class, 'store']);
+        Route::post('/{id}/send', [ProactiveController::class, 'sendNow']);
+        Route::post('/{id}/cancel', [ProactiveController::class, 'cancel']);
+        Route::delete('/{id}', [ProactiveController::class, 'destroy']);
+        Route::get('/{id}/stats', [ProactiveController::class, 'getStats']);
+    });
+
+    // Automation Workflows
+    Route::prefix('automation')->group(function () {
+        Route::get('/', [AutomationController::class, 'index']);
+        Route::get('/templates', [AutomationController::class, 'getTemplates']);
+        Route::post('/', [AutomationController::class, 'store']);
+        Route::patch('/{id}', [AutomationController::class, 'update']);
+        Route::delete('/{id}', [AutomationController::class, 'destroy']);
+        Route::post('/{id}/test', [AutomationController::class, 'test']);
+        Route::get('/{id}/stats', [AutomationController::class, 'getStats']);
     });
 
     // Top-level dashboard stats

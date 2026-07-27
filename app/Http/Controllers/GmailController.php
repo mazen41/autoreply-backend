@@ -231,9 +231,11 @@ class GmailController extends Controller
                 $senderEmail = $m[1] ?? $from;
                 $senderName  = trim(preg_replace('/<.+?>/', '', $from)) ?: $senderEmail;
 
-                // Extract plain text body
+                // Extract plain text body (used for AI context/previews)
+                // and HTML body (used to render the styled email in the inbox UI)
                 $body = $this->extractBody($full->getPayload());
-                if (!$body) continue;
+                $bodyHtml = $this->extractHtmlBody($full->getPayload());
+                if (!$body && !$bodyHtml) continue;
 
                 // Find or create conversation keyed on threadId
                 $conversation = Conversation::firstOrCreate(
@@ -252,7 +254,10 @@ class GmailController extends Controller
 
                 $message = Message::create([
                     'conversation_id'  => $conversation->id,
-                    'content'          => $body,
+                    // Plain text always populated (falls back to a stripped
+                    // version of the HTML) — AI context and previews rely on this.
+                    'content'          => $body ?: trim(strip_tags($bodyHtml)),
+                    'content_html'     => $bodyHtml ?: null,
                     'direction'        => 'inbound',
                     'is_ai'            => false,
                     'status'           => 'received',
@@ -275,24 +280,66 @@ class GmailController extends Controller
 
     public function extractBody($payload): string
     {
-        // Try parts first (multipart)
-        $parts = $payload->getParts() ?? [];
-        foreach ($parts as $part) {
-            if ($part->getMimeType() === 'text/plain') {
-                $data = $part->getBody()->getData();
-                if ($data) return quoted_printable_decode(base64_decode(strtr($data, '-_', '+/')));
-            }
-            // Nested parts
-            $nested = $part->getParts() ?? [];
-            foreach ($nested as $sub) {
-                if ($sub->getMimeType() === 'text/plain') {
-                    $data = $sub->getBody()->getData();
-                    if ($data) return quoted_printable_decode(base64_decode(strtr($data, '-_', '+/')));
-                }
+        $found = $this->findPartByMimeType($payload, 'text/plain');
+        if ($found !== null) {
+            return $found;
+        }
+
+        // Fallback: body directly (single-part messages with no explicit
+        // text/plain part, e.g. a bare text/html or text/plain payload).
+        $data = $payload->getBody()->getData();
+        return $data ? $this->decodePartData($data) : '';
+    }
+
+    /**
+     * Extract the HTML body of an email, if one exists. Used for rendering
+     * Gmail messages as styled HTML in the inbox UI. Returns '' when the
+     * email has no text/html part (plain-text-only emails).
+     */
+    public function extractHtmlBody($payload): string
+    {
+        $found = $this->findPartByMimeType($payload, 'text/html');
+        if ($found !== null) {
+            return $found;
+        }
+
+        // Some single-part messages are sent with Content-Type: text/html
+        // directly on the top-level payload with no nested parts at all.
+        if ($payload->getMimeType() === 'text/html') {
+            $data = $payload->getBody()->getData();
+            if ($data) return $this->decodePartData($data);
+        }
+
+        return '';
+    }
+
+    /**
+     * Recursively search a Gmail message payload for the first part matching
+     * the given MIME type (e.g. 'text/plain' or 'text/html'). Gmail payloads
+     * can nest arbitrarily deep (multipart/mixed > multipart/related >
+     * multipart/alternative), so a single level of getParts() isn't enough.
+     */
+    private function findPartByMimeType($payload, string $mimeType): ?string
+    {
+        if ($payload->getMimeType() === $mimeType) {
+            $data = $payload->getBody()->getData();
+            if ($data) {
+                return $this->decodePartData($data);
             }
         }
-        // Fallback: body directly
-        $data = $payload->getBody()->getData();
-        return $data ? quoted_printable_decode(base64_decode(strtr($data, '-_', '+/'))) : '';
+
+        foreach ($payload->getParts() ?? [] as $part) {
+            $found = $this->findPartByMimeType($part, $mimeType);
+            if ($found !== null) {
+                return $found;
+            }
+        }
+
+        return null;
+    }
+
+    private function decodePartData(string $data): string
+    {
+        return quoted_printable_decode(base64_decode(strtr($data, '-_', '+/')));
     }
 }

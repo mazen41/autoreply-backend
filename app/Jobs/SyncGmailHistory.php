@@ -79,8 +79,9 @@ class SyncGmailHistory implements ShouldQueue
                 $senderName = trim(preg_replace('/<.+?>/', '', $from)) ?: $senderEmail;
 
                 $body = $gmailCtrl->extractBody($full->getPayload());
+                $bodyHtml = $gmailCtrl->extractHtmlBody($full->getPayload());
 
-                if (empty(trim($body))) {
+                if (empty(trim($body)) && empty(trim($bodyHtml))) {
                     continue;
                 }
 
@@ -103,7 +104,8 @@ class SyncGmailHistory implements ShouldQueue
                 // Create message without auto-reply dispatch
                 Message::create([
                     'conversation_id'  => $conversation->id,
-                    'content'          => $body,
+                    'content'          => $body ?: trim(strip_tags($bodyHtml)),
+                    'content_html'     => $bodyHtml ?: null,
                     'direction'        => 'inbound',
                     'is_ai'            => false,
                     'status'           => 'received',

@@ -27,9 +27,12 @@ class PostController extends Controller
                 return [
                     'id' => $post->id,
                     'title' => $post->title,
+                    'title_en' => $post->title_en,
                     'slug' => $post->slug,
                     'excerpt' => $post->excerpt,
+                    'excerpt_en' => $post->excerpt_en,
                     'category' => $post->category,
+                    'author' => $post->author,
                     'published_at' => $post->published_at,
                     'featured_image_url' => $post->featured_image_url,
                 ];

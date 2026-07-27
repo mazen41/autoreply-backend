@@ -155,25 +155,91 @@ class ReportsController extends Controller
     }
 
     /**
-     * Get top questions from conversations
+     * Get top questions from conversations using improved detection
      */
     public function topQuestions(Request $request)
     {
         $limit = $request->get('limit', 10);
 
-        // Extract questions from incoming messages (simple heuristic: messages ending with ?)
-        $questions = $this->userMessages()
+        // Get all inbound messages for analysis
+        $messages = $this->userMessages()
             ->where('direction', 'inbound')
-            ->where('content', 'like', '%?')
-            ->select(DB::raw('LOWER(content) as question'), DB::raw('COUNT(*) as count'))
-            ->groupBy('question')
-            ->orderByDesc('count')
-            ->limit($limit)
-            ->get();
+            ->select('content')
+            ->get()
+            ->pluck('content')
+            ->toArray();
+
+        // Analyze messages to extract questions using multiple patterns
+        $questions = [];
+        
+        foreach ($messages as $message) {
+            $questionPatterns = [
+                // Standard question marks (English + Arabic question mark)
+                '/\?|؟/u',
+                // Question words at start (English)
+                '/^(what|where|when|why|how|who|which|whose|is|are|do|does|did|can|could|would|should|will)/i',
+                // Question words at start (Arabic)
+                '/^(ما|متى|أين|كيف|لماذا|من|كم|هل|هل يمكن|هل كان)/i',
+                // Short queries (less than 100 chars)
+                '/^.{1,100}$/',
+            ];
+
+            $isQuestion = false;
+            foreach ($questionPatterns as $pattern) {
+                if (preg_match($pattern, trim($message))) {
+                    $isQuestion = true;
+                    break;
+                }
+            }
+
+            if ($isQuestion) {
+                // Normalize the question for grouping
+                $normalized = $this->normalizeQuestion($message);
+                $questions[$normalized] = ($questions[$normalized] ?? 0) + 1;
+            }
+        }
+
+        // Sort by frequency and limit results
+        arsort($questions);
+        $topQuestions = array_slice($questions, 0, $limit, true);
+
+        // Format for response
+        $formattedQuestions = collect($topQuestions)->map(function($count, $question) {
+            return [
+                'question' => $question,
+                'count' => $count,
+            ];
+        })->values();
 
         return response()->json([
-            'questions' => $questions,
+            'questions' => $formattedQuestions,
         ]);
+    }
+
+    /**
+     * Normalize questions for grouping by removing common variations
+     */
+    private function normalizeQuestion(string $question): string
+    {
+        // Convert to lowercase for English, keep Arabic as is
+        $normalized = mb_strtolower(trim($question));
+        
+        // Remove extra whitespace
+        $normalized = preg_replace('/\s+/', ' ', $normalized);
+        
+        // Remove common filler words
+        $fillerWords = ['please', 'plz', 'thanks', 'thank you', 'شكرا', 'شكراً'];
+        foreach ($fillerWords as $word) {
+            $normalized = str_ireplace($word, '', $normalized);
+        }
+        
+        // Remove trailing punctuation
+        $normalized = rtrim($normalized, '!?؟.،');
+        
+        // Normalize whitespace again
+        $normalized = preg_replace('/\s+/', ' ', trim($normalized));
+        
+        return $normalized;
     }
 
     /**
@@ -340,76 +406,123 @@ class ReportsController extends Controller
     }
 
     /**
-     * Export reports as PDF (simple text-based PDF for now)
+     * Export reports as PDF using FPDF library
      */
     public function exportPdf(Request $request)
     {
         $user = Auth::user();
         $type = $request->get('type', 'messages');
 
-        $filename = "report_{$type}_" . now()->format('Y-m-d') . '.pdf';
-        $headers = [
-            'Content-Type' => 'application/pdf',
-            'Content-Disposition' => "attachment; filename=\"{$filename}\"",
-        ];
+        // Create new PDF document
+        $pdf = new \FPDF();
+        $pdf->AddPage();
+        
+        // Set font
+        $pdf->SetFont('Arial', '', 12);
+        
+        // Add header
+        $pdf->SetFont('Arial', 'B', 16);
+        $pdf->Cell(0, 10, ucfirst($type) . ' Report', 0, 1, 'C');
+        $pdf->SetFont('Arial', '', 10);
+        $pdf->Cell(0, 6, 'Generated: ' . now()->toDateTimeString(), 0, 1, 'C');
+        $pdf->Cell(0, 6, 'User: ' . $user->name . ' (' . $user->email . ')', 0, 1, 'C');
+        $pdf->Ln(10);
+        
+        // Add separator line
+        $pdf->Line(10, $pdf->GetY(), 200, $pdf->GetY());
+        $pdf->Ln(10);
 
-        // For simplicity, we'll generate a basic text-based PDF
-        // In production, you'd use a proper PDF library like TCPDF or DomPDF
-        $callback = function () use ($user, $type) {
-            echo "Report: {$type}\n";
-            echo "Generated: " . now()->toDateTimeString() . "\n";
-            echo "User: {$user->name} ({$user->email})\n";
-            echo "\n========================================\n\n";
-
-            if ($type === 'messages') {
-                echo "Message Report\n\n";
-                $this->userMessages()
-                    ->with('conversation.channel')
-                    ->orderBy('created_at', 'desc')
-                    ->limit(1000)
-                    ->get()
-                    ->each(function ($msg) {
-                        echo "Date: {$msg->created_at}\n";
-                        echo "Direction: {$msg->direction}\n";
-                        echo "AI: " . ($msg->is_ai ? 'Yes' : 'No') . "\n";
-                        echo "Channel: " . ($msg->conversation->channel->type ?? 'Unknown') . "\n";
-                        echo "Content: " . substr($msg->content, 0, 200) . "\n";
-                        echo "---\n";
-                    });
-            } elseif ($type === 'channels') {
-                echo "Channel Report\n\n";
-                Channel::where('user_id', $user->id)
-                    ->withCount('messages')
-                    ->get()
-                    ->each(function ($channel) {
-                        echo "Type: {$channel->type}\n";
-                        echo "Name: " . ($channel->page_name ?? 'N/A') . "\n";
-                        echo "Messages: {$channel->messages_count}\n";
-                        echo "Status: {$channel->status}\n";
-                        echo "---\n";
-                    });
-            } elseif ($type === 'ai_performance') {
-                echo "AI Performance Report\n\n";
-                
-                $totalMessages = $this->userMessages()->count();
-                $autoReplies = $this->userMessages()->where('is_ai', true)->count();
-                $manualInterventions = $this->userMessages()
-                    ->where('is_ai', false)
-                    ->where('direction', 'outbound')
-                    ->count();
-                $avgResponseTime = $this->averageResponseTimeSeconds();
-                $responseRate = $totalMessages > 0 ? ($autoReplies / $totalMessages) * 100 : 0;
-
-                echo "Total Messages: {$totalMessages}\n";
-                echo "AI Auto Replies: {$autoReplies}\n";
-                echo "Manual Interventions: {$manualInterventions}\n";
-                echo "Auto Reply Rate: " . round($responseRate, 1) . "%\n";
-                echo "Avg Response Time: " . round($avgResponseTime, 1) . " seconds\n";
+        if ($type === 'messages') {
+            $pdf->SetFont('Arial', 'B', 14);
+            $pdf->Cell(0, 10, 'Message Report', 0, 1);
+            $pdf->SetFont('Arial', '', 10);
+            
+            $messages = $this->userMessages()
+                ->with('conversation.channel')
+                ->orderBy('created_at', 'desc')
+                ->limit(100)
+                ->get();
+            
+            // Table header
+            $pdf->SetFont('Arial', 'B', 10);
+            $pdf->Cell(30, 7, 'Date', 1);
+            $pdf->Cell(20, 7, 'Direction', 1);
+            $pdf->Cell(15, 7, 'AI', 1);
+            $pdf->Cell(25, 7, 'Channel', 1);
+            $pdf->Cell(100, 7, 'Content', 1);
+            $pdf->Ln();
+            
+            // Table data
+            $pdf->SetFont('Arial', '', 9);
+            foreach ($messages as $msg) {
+                $pdf->Cell(30, 7, $msg->created_at->format('Y-m-d H:i'), 1);
+                $pdf->Cell(20, 7, $msg->direction, 1);
+                $pdf->Cell(15, 7, $msg->is_ai ? 'Yes' : 'No', 1);
+                $pdf->Cell(25, 7, $msg->conversation->channel->type ?? 'Unknown', 1);
+                $pdf->Cell(100, 7, substr($msg->content, 0, 50) . '...', 1);
+                $pdf->Ln();
             }
-        };
+            
+        } elseif ($type === 'channels') {
+            $pdf->SetFont('Arial', 'B', 14);
+            $pdf->Cell(0, 10, 'Channel Report', 0, 1);
+            $pdf->SetFont('Arial', '', 10);
+            
+            $channels = Channel::where('user_id', $user->id)
+                ->withCount('messages')
+                ->get();
+            
+            // Table header
+            $pdf->SetFont('Arial', 'B', 10);
+            $pdf->Cell(30, 7, 'Type', 1);
+            $pdf->Cell(50, 7, 'Name', 1);
+            $pdf->Cell(30, 7, 'Messages', 1);
+            $pdf->Cell(30, 7, 'Status', 1);
+            $pdf->Ln();
+            
+            // Table data
+            $pdf->SetFont('Arial', '', 10);
+            foreach ($channels as $channel) {
+                $pdf->Cell(30, 7, $channel->type, 1);
+                $pdf->Cell(50, 7, $channel->page_name ?? 'N/A', 1);
+                $pdf->Cell(30, 7, $channel->messages_count, 1);
+                $pdf->Cell(30, 7, $channel->status, 1);
+                $pdf->Ln();
+            }
+            
+        } elseif ($type === 'ai_performance') {
+            $pdf->SetFont('Arial', 'B', 14);
+            $pdf->Cell(0, 10, 'AI Performance Report', 0, 1);
+            $pdf->SetFont('Arial', '', 10);
+            
+            $totalMessages = $this->userMessages()->count();
+            $autoReplies = $this->userMessages()->where('is_ai', true)->count();
+            $manualInterventions = $this->userMessages()
+                ->where('is_ai', false)
+                ->where('direction', 'outbound')
+                ->count();
+            $avgResponseTime = $this->averageResponseTimeSeconds();
+            $responseRate = $totalMessages > 0 ? ($autoReplies / $totalMessages) * 100 : 0;
 
-        // Note: This generates a text file with .pdf extension for simplicity
-        // For real PDFs, install a PDF library and use it here
-        return response()->stream($callback, 200, $headers);
+            $pdf->Cell(60, 10, 'Total Messages:', 0);
+            $pdf->Cell(40, 10, $totalMessages, 0, 1);
+            $pdf->Cell(60, 10, 'AI Auto Replies:', 0);
+            $pdf->Cell(40, 10, $autoReplies, 0, 1);
+            $pdf->Cell(60, 10, 'Manual Interventions:', 0);
+            $pdf->Cell(40, 10, $manualInterventions, 0, 1);
+            $pdf->Cell(60, 10, 'Auto Reply Rate:', 0);
+            $pdf->Cell(40, 10, round($responseRate, 1) . '%', 0, 1);
+            $pdf->Cell(60, 10, 'Avg Response Time:', 0);
+            $pdf->Cell(40, 10, round($avgResponseTime, 1) . ' seconds', 0, 1);
+        }
+
+        // Generate PDF content using proper FPDF output
+        $filename = "report_{$type}_" . now()->format('Y-m-d') . '.pdf';
+        
+        return response()->streamDownload(function() use ($pdf) {
+            $pdf->Output('D', $filename);
+        }, $filename, [
+            'Content-Type' => 'application/pdf',
+        ]);
     }
 }

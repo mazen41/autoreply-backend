@@ -117,21 +117,15 @@ class WebhookController extends Controller
                     ->latest('connected_at')
                     ->first();
 
-                // Fallback: use the Facebook channel for this page â€” it has the same page token
+                // No fallback - require proper Instagram channel mapping â€” it has the same page token
                 // which also works for Instagram replies
                 if (!$channel) {
-                    Log::warning('No Instagram channel found, falling back to Facebook channel', [
+                    Log::error('No Instagram channel found for instagram_account_id', [
                         'ig_account_id' => $igAccountId,
-                    ]);
-                    $channel = Channel::where('type', 'facebook')
-                        ->where('status', 'connected')
-                        ->latest('connected_at')
-                        ->first();
-                }
-
-                if (!$channel) {
-                    Log::error('No channel found at all for Instagram DM', [
-                        'ig_account_id' => $igAccountId,
+                        'available_channels' => Channel::where('type', 'instagram')
+                            ->where('status', 'connected')
+                            ->get(['id', 'instagram_account_id', 'page_name'])
+                            ->toArray(),
                     ]);
                     continue;
                 }
@@ -156,12 +150,9 @@ class WebhookController extends Controller
             ['business_id' => $channel->business_id, 'status' => 'open', 'last_message_at' => now()]
         );
 
-        // If we don't have a name for this sender yet, fetch it from the Graph API
+        // If we don't have a name for this sender yet, queue a job to fetch it from the Graph API
         if ($conversation->wasRecentlyCreated || empty($conversation->sender_name)) {
-            $senderName = $this->fetchSenderName($channel, $senderId);
-            if ($senderName) {
-                $conversation->sender_name = $senderName;
-            }
+            \App\Jobs\FetchSenderName::dispatch($conversation->id, $channel->id, $senderId);
         }
 
         $conversation->last_message_at = now();
@@ -181,45 +172,7 @@ class WebhookController extends Controller
 
         // Dispatch ProcessAutoReply job
         \App\Jobs\ProcessAutoReply::dispatch($message->id);
-
         Log::info('ProcessAutoReply job dispatched', ['message_id' => $message->id]);
-    }
-
-    /**
-     * Look up a PSID/IGSID's display name via the Graph API using the page/IG token.
-     * Returns null on failure (e.g. permission not granted, user opted out) so callers
-     * can safely fall back to showing the raw ID.
-     */
-    private function fetchSenderName(Channel $channel, string $senderId): ?string
-    {
-        try {
-            // Decrypt the access token
-            $accessToken = decrypt($channel->access_token);
-            
-            $response = Http::timeout(8)
-                ->withOptions(['verify' => false])
-                ->get("https://graph.facebook.com/v19.0/{$senderId}", [
-                    'fields'       => 'first_name,last_name,name',
-                    'access_token' => $accessToken,
-                ]);
-
-            if (!$response->successful()) {
-                Log::warning('fetchSenderName failed', [
-                    'sender_id' => $senderId,
-                    'status'    => $response->status(),
-                    'body'      => $response->json(),
-                ]);
-                return null;
-            }
-
-            $data = $response->json();
-            $name = $data['name'] ?? trim(($data['first_name'] ?? '') . ' ' . ($data['last_name'] ?? ''));
-
-            return $name !== '' ? $name : null;
-        } catch (\Exception $e) {
-            Log::error('fetchSenderName exception', ['error' => $e->getMessage(), 'sender_id' => $senderId]);
-            return null;
-        }
     }
 
     private function sendReply(Channel $channel, string $recipientId, string $message): void

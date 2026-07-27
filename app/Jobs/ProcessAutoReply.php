@@ -7,6 +7,7 @@ use App\Models\Conversation;
 use App\Models\Message;
 use App\Http\Controllers\GmailController;
 use App\Services\EvolutionApiService;
+use App\Services\KnowledgeChunker;
 use Google\Service\Gmail;
 use Google\Service\Gmail\Message as GmailMessage;
 use Illuminate\Bus\Queueable;
@@ -58,7 +59,7 @@ class ProcessAutoReply implements ShouldQueue
             return;
         }
 
-        // Check subscription limits
+        // Check subscription limits using cached counter
         $user = $channel->user;
         if (!$user) {
             Log::warning('ProcessAutoReply: channel has no user', ['channel_id' => $channel->id]);
@@ -73,13 +74,19 @@ class ProcessAutoReply implements ShouldQueue
             return;
         }
 
-        // Count AI replies this month
-        $aiRepliesThisMonth = Message::where('is_ai', true)
-            ->where('created_at', '>=', now()->startOfMonth())
-            ->whereHas('conversation.channel', function ($query) use ($user) {
-                $query->where('user_id', $user->id);
-            })
-            ->count();
+        // Use cached counter for AI replies limit check
+        $cacheKey = "user_{$user->id}_ai_replies_" . now()->format('Y-m');
+        $aiRepliesThisMonth = cache()->remember($cacheKey, now()->endOfMonth(), function () use ($user) {
+            return Message::where('is_ai', true)
+                ->where('created_at', '>=', now()->startOfMonth())
+                ->whereHas('conversation.channel', function ($query) use ($user) {
+                    $query->where('user_id', $user->id);
+                })
+                ->count();
+        });
+
+        // Increment counter for this reply
+        cache()->put($cacheKey, $aiRepliesThisMonth + 1, now()->endOfMonth());
 
         // Check limit
         if ($package->ai_replies_limit !== -1 && $aiRepliesThisMonth >= $package->ai_replies_limit) {
@@ -126,6 +133,10 @@ class ProcessAutoReply implements ShouldQueue
 
         Log::info('ProcessAutoReply: AI reply saved', ['message_id' => $replyMessage->id]);
 
+        // Increment cached AI replies counter
+        $cacheKey = "user_{$user->id}_ai_replies_" . now()->format('Y-m');
+        cache()->increment($cacheKey);
+
         if ($channel->user_id) {
             broadcast(new \App\Events\MessageReceived($replyMessage, $message->conversation, $channel->user_id));
         }
@@ -162,16 +173,28 @@ class ProcessAutoReply implements ShouldQueue
             }
         }
 
-        // Build knowledge base from individual files
+        // Build knowledge base from individual files with proper chunking
         $knowledgeText = '';
         foreach ($business->knowledgeFiles()->get() as $file) {
-            $knowledgeText .= "\n\n--- File: {$file->filename} ---\n";
-            $knowledgeText .= $file->extracted_text;
-        }
-
-        // Truncate if too long to avoid token limits (keep under 20,000 chars)
-        if (strlen($knowledgeText) > 20000) {
-            $knowledgeText = substr($knowledgeText, 0, 20000) . "\n\n[Content truncated due to length]";
+            $fullText = $file->extracted_text;
+            
+            // Chunk the file content to preserve sentence boundaries
+            if (strlen($fullText) > 2000) {
+                $chunks = KnowledgeChunker::chunkText($fullText, 2000, 200);
+                
+                // Get relevant chunks based on the user's message
+                $relevantChunks = KnowledgeChunker::getRelevantChunks(
+                    $chunks, 
+                    $contextMessages[count($contextMessages) - 1]['content'] ?? '',
+                    3
+                );
+                
+                $knowledgeText .= "\n\n--- File: {$file->filename} (Relevant Chunks) ---\n";
+                $knowledgeText .= KnowledgeChunker::formatChunksForPrompt($relevantChunks, $file->filename);
+            } else {
+                $knowledgeText .= "\n\n--- File: {$file->filename} ---\n";
+                $knowledgeText .= $fullText;
+            }
         }
 
         $prompt = "You are the AI assistant for {$business->business_name}, a {$business->business_type} business.\n";

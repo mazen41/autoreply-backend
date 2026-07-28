@@ -165,6 +165,6 @@ class ResyncGmailHtml extends Command
 
     private function decodePartData(string $data): string
     {
-        return quoted_printable_decode(base64_decode(strtr($data, '-_', '+/')));
+        return base64_decode(strtr($data, '-_', '+/'));
     }
 }

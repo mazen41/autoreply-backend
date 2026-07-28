@@ -41,10 +41,13 @@ class ResyncGmailHtml extends Command
             $gmail = new Gmail($client);
             $updatedCount = 0;
 
-            // Get messages that don't have HTML but have Gmail message ID
-            $messages = Message::where('gmail_message_id', '!=', null)
-                ->where('content_html', null)
-                ->limit(50) // Process in batches
+            // Get messages that belong to THIS channel and don't have HTML yet
+            $messages = Message::whereHas('conversation', function ($q) use ($channel) {
+                    $q->where('channel_id', $channel->id);
+                })
+                ->where('gmail_message_id', '!=', null)
+                ->whereNull('content_html')
+                ->limit(50)
                 ->get();
 
             $this->info("Found " . $messages->count() . " messages to resync");

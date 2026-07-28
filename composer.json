@@ -7,8 +7,8 @@
     "require": {
         "php": "^8.2",
         "guzzlehttp/guzzle": "^7.2",
-        "laravel/framework": "^11.0",
-        "laravel/sanctum": "^4.0",
+        "laravel/framework": "^10.0",
+        "laravel/sanctum": "^3.0",
         "laravel/tinker": "^2.9",
         "google/apiclient": "^2.15",
         "pusher/pusher-php-server": "^7.2",
@@ -63,6 +63,16 @@
         "allow-plugins": {
             "pestphp/pest-plugin": true,
             "php-http/discovery": true
+        },
+        "platform": {
+            "php": "8.2"
+        },
+        "allow-plugins": true,
+        "audit": {
+            "abandoned": false
+        },
+        "security-advisories": {
+            "block": false
         }
     },
     "minimum-stability": "stable",

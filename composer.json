@@ -66,13 +66,6 @@
         },
         "platform": {
             "php": "8.2"
-        },
-        "allow-plugins": true,
-        "audit": {
-            "abandoned": false
-        },
-        "security-advisories": {
-            "block": false
         }
     },
     "minimum-stability": "stable",

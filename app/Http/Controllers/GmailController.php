@@ -235,6 +235,16 @@ class GmailController extends Controller
                 // and HTML body (used to render the styled email in the inbox UI)
                 $body = $this->extractBody($full->getPayload());
                 $bodyHtml = $this->extractHtmlBody($full->getPayload());
+                
+                // Log for debugging
+                Log::info('Gmail message extraction', [
+                    'message_id' => $msgId,
+                    'has_plain_text' => !empty($body),
+                    'has_html' => !empty($bodyHtml),
+                    'html_length' => strlen($bodyHtml),
+                    'plain_text_length' => strlen($body),
+                ]);
+                
                 if (!$body && !$bodyHtml) continue;
 
                 // Find or create conversation keyed on threadId
@@ -298,8 +308,9 @@ class GmailController extends Controller
      */
     public function extractHtmlBody($payload): string
     {
+        // First try to find text/html part recursively
         $found = $this->findPartByMimeType($payload, 'text/html');
-        if ($found !== null) {
+        if ($found !== null && !empty($found)) {
             return $found;
         }
 
@@ -307,7 +318,27 @@ class GmailController extends Controller
         // directly on the top-level payload with no nested parts at all.
         if ($payload->getMimeType() === 'text/html') {
             $data = $payload->getBody()->getData();
-            if ($data) return $this->decodePartData($data);
+            if ($data) {
+                $decoded = $this->decodePartData($data);
+                if (!empty($decoded)) {
+                    return $decoded;
+                }
+            }
+        }
+
+        // Try multipart/alternative which usually contains both plain and HTML
+        if (strpos($payload->getMimeType(), 'multipart') === 0) {
+            foreach ($payload->getParts() ?? [] as $part) {
+                if ($part->getMimeType() === 'text/html') {
+                    $data = $part->getBody()->getData();
+                    if ($data) {
+                        $decoded = $this->decodePartData($data);
+                        if (!empty($decoded)) {
+                            return $decoded;
+                        }
+                    }
+                }
+            }
         }
 
         return '';

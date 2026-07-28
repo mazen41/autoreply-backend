@@ -266,7 +266,7 @@ class GmailController extends Controller
                     'conversation_id'  => $conversation->id,
                     // Plain text always populated (falls back to a stripped
                     // version of the HTML) — AI context and previews rely on this.
-                    'content'          => $body ?: trim(strip_tags($bodyHtml)),
+                    'content'          => $body ?: $this->htmlToPlainText($bodyHtml),
                     'content_html'     => $bodyHtml ?: null,
                     'direction'        => 'inbound',
                     'is_ai'            => false,
@@ -367,6 +367,21 @@ class GmailController extends Controller
         }
 
         return null;
+    }
+
+    /**
+     * Convert HTML email body to clean plain text for AI context / previews.
+     * Strips <style> and <script> blocks first so that CSS/JS source text
+     * does not bleed into the stored plain-text content.
+     */
+    private function htmlToPlainText(string $html): string
+    {
+        // Remove style and script blocks entirely (including their content)
+        $text = preg_replace('/<(style|script)[^>]*>.*?<\/\1>/si', '', $html);
+        // Decode HTML entities and strip remaining tags
+        $text = html_entity_decode(strip_tags($text ?? ''), ENT_QUOTES | ENT_HTML5, 'UTF-8');
+        // Collapse whitespace
+        return trim(preg_replace('/\s+/', ' ', $text));
     }
 
     private function decodePartData(string $data): string

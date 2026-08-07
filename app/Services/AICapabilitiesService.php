@@ -175,11 +175,17 @@ class AICapabilitiesService
             return self::scoreResult('unknown', 0.5, 20, ['reply_too_short']);
         }
 
-        // Vague filler phrases that signal the AI didn't actually know the answer
+        // Detect if this is a simple greeting — skip expensive AI scoring, greetings are always valid
+        $isGreeting = (bool) preg_match('/^(هاي|هي|مرحبا|أهلا|السلام|hi|hello|hey|good morning|good evening|صباح|مساء)\s*[!،.]*\s*$/iu', trim($userMessage));
+
+        if ($isGreeting) {
+            Log::info('AICapabilitiesService: greeting detected, skipping AI scoring');
+            return self::scoreResult('greeting', 0.99, 90, []);
+        }
+
+        // Vague filler phrases — only penalize on non-greeting messages
         $fillerPhrases = [
-            "i'm here to assist", "i am here to assist", "how can i help you today",
-            "أنا هنا لمساعدتك", "كيف يمكنني مساعدتك",
-            "i don't have that information",
+            "i'm here to assist", "i am here to assist",
             "i apologize, but i'm having trouble",
         ];
         foreach ($fillerPhrases as $filler) {

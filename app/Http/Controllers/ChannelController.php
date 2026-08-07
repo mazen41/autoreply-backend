@@ -312,7 +312,8 @@ class ChannelController extends Controller
             return redirect(env('FRONTEND_URL') . '/dashboard/channels?error=salla_denied');
         }
 
-        // State carries "userId:redirect"
+        // State carries "userId:redirect" for normal OAuth flow
+        // For Salla Easy Mode (app installation), state is random
         $userId   = null;
         $redirect = 'dashboard';
         if ($state) {
@@ -321,9 +322,11 @@ class ChannelController extends Controller
             $redirect = $parts[1] ?? 'dashboard';
         }
 
-        if (!$userId) {
-            Log::error('No user ID in Salla OAuth state');
-            return redirect(env('FRONTEND_URL') . '/dashboard/channels?error=session_expired');
+        // If no valid user ID in state, this is likely Salla Easy Mode installation
+        // Redirect to frontend signup/login with the OAuth code
+        if (!$userId || !is_numeric($userId)) {
+            Log::warning('No valid user ID in Salla OAuth state - redirecting to signup', ['state' => $state]);
+            return redirect(env('FRONTEND_URL') . '/auth/salla-callback?code=' . $code . '&state=' . $state);
         }
 
         try {

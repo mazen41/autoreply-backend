@@ -152,94 +152,171 @@ class AICapabilitiesService
     }
 
     /**
-     * Main handler - complete AI pipeline (optimized to reduce API calls)
+     * Score an already-generated reply for confidence + intent.
+     * Called AFTER the reply has been generated so we evaluate the actual response,
+     * not a generic placeholder.
+     *
+     * Returns:
+     *   confidence        float  0-100
+     *   intent            string
+     *   intent_confidence float  0-1
+     *   issues            array
      */
-    public static function handleMessage(string $message, array $context = []): array
-    {
-        // Step 1: Generate response (AI call #1)
-        $response = self::generateResponse($message, $context);
+    public static function scoreReply(
+        string $userMessage,
+        string $aiReply,
+        array  $conversationHistory,
+        array  $context = []
+    ): array {
+        // --- Fast heuristic pre-checks (no AI call needed) ---
 
-        // Step 2: Combine intent detection + evaluation in one AI call (AI call #2)
-        $combinedAnalysis = self::analyzeMessageAndResponse($message, $response);
+        // Too short to be useful
+        if (strlen(trim($aiReply)) < 15) {
+            return self::scoreResult('unknown', 0.5, 20, ['reply_too_short']);
+        }
 
-        // Step 3: Calculate context score
+        // Vague filler phrases that signal the AI didn't actually know the answer
+        $fillerPhrases = [
+            "i'm here to assist", "i am here to assist", "how can i help you today",
+            "أنا هنا لمساعدتك", "كيف يمكنني مساعدتك",
+            "i don't have that information",
+            "i apologize, but i'm having trouble",
+        ];
+        foreach ($fillerPhrases as $filler) {
+            if (str_contains(strtolower($aiReply), $filler)) {
+                return self::scoreResult('unknown', 0.4, 35, ['vague_filler_detected']);
+            }
+        }
+
+        // Explicit uncertainty without offering help
+        if (preg_match("/i (don't|do not|dont) know/i", $aiReply) && strlen($aiReply) < 80) {
+            return self::scoreResult('unknown', 0.4, 40, ['uncertain_no_followup']);
+        }
+
+        // Context score from data richness
         $contextScore = self::calculateContextScore($context);
 
-        // Step 4: Calculate final confidence
-        $confidence = self::calculateConfidence(
-            ['intent' => $combinedAnalysis['intent'], 'confidence' => $combinedAnalysis['intent_confidence']],
-            ['confidence' => $combinedAnalysis['response_quality'], 'issues' => $combinedAnalysis['issues']],
-            $contextScore
-        );
+        // --- Single AI call to score intent + quality together ---
+        try {
+            $historyText = implode("\n", array_map(
+                fn($m) => ($m['direction'] ?? ($m['role'] === 'user' ? 'inbound' : 'outbound')) . ': ' . $m['content'],
+                array_slice($conversationHistory, -6)
+            ));
 
+            $businessName = $context['business_name'] ?? 'this business';
+            $language     = $context['language'] ?? 'auto';
+
+            $prompt = <<<PROMPT
+You are evaluating whether an AI customer service reply is high quality and should be sent automatically.
+
+Business: {$businessName}
+Customer language: {$language}
+
+Recent conversation:
+{$historyText}
+
+Customer's latest message: "{$userMessage}"
+
+AI's proposed reply: "{$aiReply}"
+
+Score this reply and return ONLY valid JSON — no markdown, no explanation:
+{
+  "intent": "<one of: greeting, question, order, support, complaint, booking, pricing, spam, unknown>",
+  "intent_confidence": <float 0-1>,
+  "response_quality": <float 0-1>,
+  "issues": ["<list only real problems, or empty array>"],
+  "reasoning": "<one sentence>"
+}
+
+Scoring guide for response_quality:
+- 0.9-1.0: directly answers the question using specific business info, concise, correct language
+- 0.7-0.89: answers well but slightly generic or missing a small detail
+- 0.5-0.69: partially answers, vague, or slightly off-topic
+- 0.3-0.49: mostly filler, does not answer the actual question
+- 0.0-0.29: wrong, confusing, or harmful reply
+
+Issues to flag (only real ones): too_short, vague, off_topic, wrong_language, contradicts_history, missing_key_info, hallucinated_info
+PROMPT;
+
+            $raw    = self::callGemini($prompt);
+            $clean  = preg_replace('/```json|```/', '', $raw);
+            $result = json_decode(trim($clean), true);
+
+            if (
+                $result &&
+                isset($result['intent'], $result['intent_confidence'], $result['response_quality'])
+            ) {
+                $quality  = (float) $result['response_quality'];
+                $intentC  = (float) $result['intent_confidence'];
+
+                // Weighted confidence: 55% reply quality, 25% intent clarity, 20% context richness
+                $raw100 = ($quality * 0.55 + $intentC * 0.25 + $contextScore * 0.20) * 100;
+                $confidence = (int) max(0, min(100, round($raw100)));
+
+                Log::info('AICapabilitiesService: scoreReply result', [
+                    'intent'      => $result['intent'],
+                    'quality'     => $quality,
+                    'intentConf'  => $intentC,
+                    'contextScore'=> $contextScore,
+                    'confidence'  => $confidence,
+                    'issues'      => $result['issues'] ?? [],
+                    'reasoning'   => $result['reasoning'] ?? '',
+                ]);
+
+                return self::scoreResult(
+                    $result['intent'],
+                    $intentC,
+                    $confidence,
+                    $result['issues'] ?? []
+                );
+            }
+        } catch (\Exception $e) {
+            Log::warning('AICapabilitiesService: scoreReply AI call failed, using heuristic', [
+                'error' => $e->getMessage(),
+            ]);
+        }
+
+        // Heuristic fallback — reply exists and passed the pre-checks, give a reasonable middle score
+        $fallbackConf = (int) (50 + $contextScore * 20);
+        return self::scoreResult('unknown', 0.5, $fallbackConf, ['scoring_ai_unavailable']);
+    }
+
+    /**
+     * Helper to build a consistent score result array.
+     */
+    private static function scoreResult(
+        string $intent,
+        float  $intentConfidence,
+        int    $confidence,
+        array  $issues
+    ): array {
         return [
-            'intent' => $combinedAnalysis['intent'],
-            'response' => $response,
-            'confidence' => $confidence,
-            'issues' => $combinedAnalysis['issues'],
-            'intent_confidence' => $combinedAnalysis['intent_confidence'],
-            'evaluation_confidence' => $combinedAnalysis['response_quality'],
-            'context_score' => $contextScore
+            'intent'            => $intent,
+            'intent_confidence' => $intentConfidence,
+            'confidence'        => $confidence,
+            'issues'            => $issues,
         ];
     }
 
     /**
-     * Combined analysis - intent + evaluation in one AI call to reduce API usage
+     * Main handler - kept for backward compatibility only.
+     * New code should call callConfiguredAI() for the reply, then scoreReply() for scoring.
+     * @deprecated Use scoreReply() directly after generating the reply.
      */
-    private static function analyzeMessageAndResponse(string $message, string $response): array
+    public static function handleMessage(string $message, array $context = []): array
     {
-        try {
-            $prompt = "Analyze this conversation in JSON format:
+        $response = self::generateResponse($message, $context);
+        $scored   = self::scoreReply($message, $response, [], $context);
 
-User message: \"{$message}\"
-AI response: \"{$response}\"
-
-Provide:
-1. Intent classification (greeting, question, order, support, complaint, spam, unknown)
-2. Intent confidence (0-1)
-3. Response quality score (0-1) based on correctness, clarity, usefulness, completeness
-4. Any issues with the response (optional list)
-
-Return JSON:
-{
-  \"intent\": \"string\",
-  \"intent_confidence\": float,
-  \"response_quality\": float,
-  \"issues\": [\"optional list of problems\"]
-}";
-
-            $aiResponse = self::callAI($prompt);
-            $result = json_decode($aiResponse, true);
-
-            if ($result && isset($result['intent']) && isset($result['intent_confidence']) && isset($result['response_quality'])) {
-                return [
-                    'intent' => $result['intent'],
-                    'intent_confidence' => (float)$result['intent_confidence'],
-                    'response_quality' => (float)$result['response_quality'],
-                    'issues' => $result['issues'] ?? []
-                ];
-            }
-
-            // Fallback if AI fails
-            return [
-                'intent' => 'unknown',
-                'intent_confidence' => 0.5,
-                'response_quality' => 0.7,
-                'issues' => ['ai_analysis_failed']
-            ];
-
-        } catch (\Exception $e) {
-            Log::error('AI combined analysis failed', [
-                'message' => $message,
-                'error' => $e->getMessage()
-            ]);
-            return [
-                'intent' => 'unknown',
-                'intent_confidence' => 0.5,
-                'response_quality' => 0.6,
-                'issues' => ['analysis_failed']
-            ];
-        }
+        return [
+            'intent'               => $scored['intent'],
+            'response'             => $response,
+            'confidence'           => $scored['confidence'],
+            'issues'               => $scored['issues'],
+            'intent_confidence'    => $scored['intent_confidence'],
+            'evaluation_confidence'=> $scored['confidence'] / 100,
+            'context_score'        => self::calculateContextScore($context),
+        ];
     }
 
     /**
@@ -407,59 +484,66 @@ Return JSON:
     private static function callGeminiChat(array $messages): string
     {
         $apiKey = self::getAIAPIKey();
-        $model = self::getAIModel();
+        $model  = self::getAIModel();
 
         $maxRetries = 3;
         $retryDelay = 1000;
 
+        // Separate system message from conversation turns
+        $systemText = null;
+        $contents   = [];
+        $lastRole   = null;
+
+        foreach ($messages as $message) {
+            if ($message['role'] === 'system') {
+                $systemText = $message['content'];
+                continue;
+            }
+
+            $role = $message['role']; // 'user' or 'assistant'
+            $geminiRole = $role === 'assistant' ? 'model' : 'user';
+
+            // Gemini requires strictly alternating roles — merge consecutive same-role messages
+            if ($geminiRole === $lastRole && !empty($contents)) {
+                $lastIndex = count($contents) - 1;
+                $contents[$lastIndex]['parts'][0]['text'] .= "\n\n" . $message['content'];
+            } else {
+                $contents[] = [
+                    'role'  => $geminiRole,
+                    'parts' => [['text' => $message['content']]],
+                ];
+                $lastRole = $geminiRole;
+            }
+        }
+
         for ($attempt = 1; $attempt <= $maxRetries; $attempt++) {
             try {
-                $contents = [];
-                foreach ($messages as $message) {
-                    $contents[] = [
-                        'role' => $message['role'] === 'system' ? 'user' : $message['role'],
-                        'parts' => [
-                            ['text' => $message['content']]
-                        ]
+                $postData = ['contents' => $contents];
+
+                // Use systemInstruction (correct Gemini field — NOT a user turn)
+                if ($systemText) {
+                    $postData['systemInstruction'] = [
+                        'parts' => [['text' => $systemText]],
                     ];
                 }
 
-                $response = Http::withHeaders([
-                    'Content-Type' => 'application/json',
-                ])->post("https://generativelanguage.googleapis.com/v1beta/models/{$model}:generateContent?key={$apiKey}", [
-                    'contents' => $contents
-                ]);
+                $response = Http::withHeaders(['Content-Type' => 'application/json'])
+                    ->post("https://generativelanguage.googleapis.com/v1beta/models/{$model}:generateContent?key={$apiKey}", $postData);
 
-                if (!$response->successful()) {
-                    if ($response->status() === 429) {
-                        Log::warning('Gemini rate limit hit on chat, retrying', [
-                            'attempt' => $attempt,
-                            'delay' => $retryDelay
-                        ]);
-                        
-                        if ($attempt < $maxRetries) {
-                            usleep($retryDelay * 1000);
-                            $retryDelay *= 2;
-                            continue;
-                        }
-                    }
-                    
-                    throw new \Exception('Gemini API error: ' . $response->body());
+                if ($response->successful()) {
+                    return $response->json('candidates')[0]['content']['parts'][0]['text'] ?? '';
                 }
 
-                $data = $response->json();
-                return $data['candidates'][0]['content']['parts'][0]['text'] ?? '';
+                if ($response->status() === 429 && $attempt < $maxRetries) {
+                    usleep($retryDelay * 1000);
+                    $retryDelay *= 2;
+                    continue;
+                }
+
+                throw new \Exception('Gemini chat API error: ' . $response->body());
 
             } catch (\Exception $e) {
-                if ($attempt === $maxRetries) {
-                    throw $e;
-                }
-                
-                Log::warning('Gemini chat API call failed, retrying', [
-                    'attempt' => $attempt,
-                    'error' => $e->getMessage()
-                ]);
-                
+                if ($attempt === $maxRetries) throw $e;
                 usleep($retryDelay * 1000);
                 $retryDelay *= 2;
             }

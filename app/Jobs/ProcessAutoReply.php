@@ -88,10 +88,7 @@ class ProcessAutoReply implements ShouldQueue
                 ->count();
         });
 
-        // Increment counter for this reply
-        cache()->put($cacheKey, $aiRepliesThisMonth + 1, now()->endOfMonth());
-
-        // Check limit
+        // Check limit BEFORE incrementing — increment only after message is actually sent
         if ($package->ai_replies_limit !== -1 && $aiRepliesThisMonth >= $package->ai_replies_limit) {
             Log::info('ProcessAutoReply: AI replies limit reached', [
                 'user_id' => $user->id,
@@ -102,7 +99,7 @@ class ProcessAutoReply implements ShouldQueue
         }
 
         // Build system prompt from business profile
-        $systemPrompt = $this->buildSystemPrompt($channel);
+        $systemPrompt = $this->buildSystemPrompt($channel, $message->content);
 
         // Get last 10 messages for context
         $contextMessages = Message::where('conversation_id', $message->conversation_id)
@@ -111,9 +108,10 @@ class ProcessAutoReply implements ShouldQueue
             ->get()
             ->reverse()
             ->map(fn($m) => [
-                'role' => $m->direction === 'inbound' ? 'user' : 'assistant',
-                'content' => $m->content,
-                'is_ai' => $m->is_ai,
+                'role'        => $m->direction === 'inbound' ? 'user' : 'assistant',
+                'direction'   => $m->direction,
+                'content'     => $m->content,
+                'is_ai'       => $m->is_ai,
                 'send_status' => $m->send_status,
             ])
             ->toArray();
@@ -187,6 +185,7 @@ class ProcessAutoReply implements ShouldQueue
         
         $systemPrompt = AICapabilitiesService::applyTonePersona($systemPrompt, $toneStyle, $detectedLanguage);
 
+        // Generate the AI reply using the full business-aware system prompt + conversation history
         $aiResponse = $this->callConfiguredAI($systemPrompt, $contextMessages);
 
         if (!$aiResponse) {
@@ -194,17 +193,25 @@ class ProcessAutoReply implements ShouldQueue
             return;
         }
 
-        // Use new AI-driven pipeline for confidence calculation
+        // Score the reply for confidence — pass the actual reply so scoring is accurate
         $context = [
-            'business' => $channel->business,
-            'business_name' => $channel->business?->name ?? null,
-            'language' => $detectedLanguage,
+            'business'       => $channel->business,
+            'business_name'  => $channel->business?->business_name ?? null,
+            'language'       => $detectedLanguage,
             'has_store_data' => !empty($sallaContext),
-            'has_order_data' => !empty($sallaContext)
+            'has_order_data' => !empty($sallaContext),
         ];
 
-        $aiResult = AICapabilitiesService::handleMessage($message->content, $context);
-        $confidenceScore = $aiResult['confidence'];
+        $confidenceResult = AICapabilitiesService::scoreReply(
+            $message->content,
+            $aiResponse,
+            $contextMessages,
+            $context
+        );
+
+        $confidenceScore = $confidenceResult['confidence'];
+        $intent          = $confidenceResult['intent'];
+        $intentConf      = $confidenceResult['intent_confidence'];
 
         $confidenceThreshold = $channel->business?->ai_confidence_threshold ?? 70;
 
@@ -212,39 +219,27 @@ class ProcessAutoReply implements ShouldQueue
         if ($confidenceScore < $confidenceThreshold) {
             Log::info('ProcessAutoReply: AI confidence below threshold, escalating to human', [
                 'conversation_id' => $conversation->id,
-                'confidence' => $confidenceScore,
-                'threshold' => $confidenceThreshold,
-                'intent' => $aiResult['intent'],
-                'issues' => $aiResult['issues']
+                'confidence'      => $confidenceScore,
+                'threshold'       => $confidenceThreshold,
+                'intent'          => $intent,
+                'issues'          => $confidenceResult['issues'],
             ]);
 
             $conversation->update([
                 'requires_human' => true,
                 'escalated_at' => now(),
-                'escalation_reason' => "low_confidence: {$confidenceScore}% (intent: {$aiResult['intent']})"
+                'escalation_reason' => "low_confidence: {$confidenceScore}% (intent: {$intent})"
             ]);
 
             return;
         }
 
         // Auto-tag conversation based on AI-detected intent
-        if ($aiResult['intent'] !== 'unknown') {
-            \App\Models\ConversationTag::create([
-                'conversation_id' => $conversation->id,
-                'tag' => $aiResult['intent'],
-                'intent' => $aiResult['intent'],
-                'confidence' => $aiResult['intent_confidence'] * 100
-            ]);
-        }
-                'source' => 'ai'
-            ]);
-            
-            Log::info('ProcessAutoReply: Auto-tagged conversation', [
-                'conversation_id' => $conversation->id,
-                'tag' => $intentDetection['tag'],
-                'intent' => $intentDetection['intent'],
-                'confidence' => $intentDetection['confidence']
-            ]);
+        if ($intent !== 'unknown') {
+            \App\Models\ConversationTag::firstOrCreate(
+                ['conversation_id' => $conversation->id, 'tag' => $intent],
+                ['intent' => $intent, 'confidence' => $intentConf * 100]
+            );
         }
 
         // Save AI response as outbound message
@@ -260,8 +255,7 @@ class ProcessAutoReply implements ShouldQueue
 
         Log::info('ProcessAutoReply: AI reply saved', ['message_id' => $replyMessage->id]);
 
-        // Increment cached AI replies counter
-        $cacheKey = "user_{$user->id}_ai_replies_" . now()->format('Y-m');
+        // Increment the monthly counter now that the message is confirmed saved
         cache()->increment($cacheKey);
 
         if ($channel->user_id) {
@@ -272,7 +266,7 @@ class ProcessAutoReply implements ShouldQueue
         $this->sendReply($channel, $message->conversation, $replyMessage);
     }
 
-    private function buildSystemPrompt(Channel $channel): string
+    private function buildSystemPrompt(Channel $channel, string $currentMessage = ''): string
     {
         $business = $channel->business;
 
@@ -311,8 +305,8 @@ class ProcessAutoReply implements ShouldQueue
                 
                 // Get relevant chunks based on the user's message
                 $relevantChunks = KnowledgeChunker::getRelevantChunks(
-                    $chunks, 
-                    $contextMessages[count($contextMessages) - 1]['content'] ?? '',
+                    $chunks,
+                    $currentMessage,
                     3
                 );
                 

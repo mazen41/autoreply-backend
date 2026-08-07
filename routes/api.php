@@ -9,6 +9,7 @@ use App\Http\Controllers\Api\PaymentController;
 use App\Http\Controllers\Api\AdminController;
 use App\Http\Controllers\Api\WhatsAppController;
 use App\Http\Controllers\Api\ReportsController;
+use App\Http\Controllers\N8nIntegrationController;
 use App\Http\Controllers\Api\KnowledgeController;
 use App\Http\Controllers\Api\TrainingController;
 use App\Http\Controllers\Api\ProactiveController;
@@ -128,6 +129,15 @@ Route::middleware('auth:sanctum')->group(function () {
         Route::get('/summary', [ReportsController::class, 'summary']);
         Route::get('/export/csv', [ReportsController::class, 'exportCsv']);
         Route::get('/export/pdf', [ReportsController::class, 'exportPdf']);
+    });
+
+    // n8n Integration Routes
+    Route::prefix('n8n')->group(function () {
+        Route::post('/rate-limit/check', [N8nIntegrationController::class, 'checkRateLimit']);
+        Route::post('/language/detect', [N8nIntegrationController::class, 'detectLanguage']);
+        Route::post('/conversation/memory', [N8nIntegrationController::class, 'getConversationMemory']);
+        Route::post('/ai/ultimate-process', [N8nIntegrationController::class, 'ultimateAIProcess']);
+        Route::post('/escalate', [N8nIntegrationController::class, 'triggerEscalation']);
     });
 
     // n8n Integration Routes

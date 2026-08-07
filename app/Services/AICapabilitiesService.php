@@ -281,7 +281,6 @@ Rules:
 
         } catch (\Exception $e) {
             Log::error('Rate limiting failed', ['error' => $e->getMessage()]);
-            // Fail open - allow request if Redis fails
             return ['rate_limited' => false, 'remaining' => $maxRequests];
         }
     }
@@ -331,7 +330,7 @@ Rules:
                 'updated_at' => now()->toISOString()
             ]);
 
-            Redis::setex($redisKey, 3600, json_encode($newState)); // 1 hour TTL
+            Redis::setex($redisKey, 3600, json_encode($newState));
 
         } catch (\Exception $e) {
             Log::error('Conversation memory update failed', ['error' => $e->getMessage()]);
@@ -349,20 +348,17 @@ Rules:
             'warnings' => []
         ];
 
-        // Rule 1: Empty response
         if (empty(trim($response))) {
             $validation['valid'] = false;
             $validation['reasons'][] = 'empty_response';
         }
 
-        // Rule 2: Too long
         if (strlen($response) > 500) {
             $validation['valid'] = false;
             $validation['reasons'][] = 'too_long';
             $validation['warnings'][] = "Response length: " . strlen($response) . " chars";
         }
 
-        // Rule 3: Uncertain language
         $uncertainPhrases = ['i think', 'maybe', 'possibly', 'might be', 'ربما', 'قد يكون', 'أعتقد'];
         $lowerResponse = strtolower($response);
         foreach ($uncertainPhrases as $phrase) {
@@ -373,7 +369,6 @@ Rules:
             }
         }
 
-        // Rule 4: System instruction leakage
         $systemKeywords = ['system prompt', 'instructions', 'rules', 'ai assistant', 'as an ai'];
         foreach ($systemKeywords as $keyword) {
             if (str_contains($lowerResponse, $keyword)) {
@@ -383,13 +378,11 @@ Rules:
             }
         }
 
-        // Rule 5: JSON/Code leakage
         if (str_contains($response, '{') || str_contains($response, '}') || str_contains($response, '```')) {
             $validation['valid'] = false;
             $validation['reasons'][] = 'contains_code_or_json';
         }
 
-        // Rule 6: Greeting length check
         if ($intent === 'greeting' && strlen($response) > 100) {
             $validation['valid'] = false;
             $validation['reasons'][] = 'greeting_too_long';
@@ -414,7 +407,6 @@ Rules:
             $response = self::callAIChatWithRetry($messages);
             $trimmedResponse = trim($response);
 
-            // Parse JSON response
             $aiResult = json_decode($trimmedResponse, true);
 
             if (!$aiResult || !isset($aiResult['reply']) || !isset($aiResult['intent'])) {
@@ -422,7 +414,6 @@ Rules:
                 return self::getFallbackResponse();
             }
 
-            // Validate response
             $validation = self::validateResponse($aiResult['reply'], $aiResult['intent']);
 
             if (!$validation['valid']) {
@@ -479,16 +470,14 @@ Rules:
             } catch (\Exception $e) {
                 $lastError = $e;
 
-                // Don't retry on client errors (4xx)
                 if (str_contains($e->getMessage(), '429') || str_contains($e->getMessage(), '500')) {
                     if ($attempt < $maxRetries) {
                         $delay = $baseDelay * pow(2, $attempt - 1);
-                        usleep($delay * 1000); // Convert to microseconds
+                        usleep($delay * 1000);
                         continue;
                     }
                 }
 
-                // Fail fast on other errors
                 if ($attempt < $maxRetries) {
                     usleep($baseDelay * 1000);
                 }
@@ -562,7 +551,6 @@ Rules:
         $sentiment = $escalationData['sentiment'] ?? 'neutral';
         $reason = $escalationData['reason'] ?? 'standard';
 
-        // Priority rules
         if ($userTier === 'vip') {
             $priority = 'high';
             $priorityScore = 3;
@@ -594,7 +582,6 @@ Rules:
      */
     public static function handleMessage(string $message, array $context = []): array
     {
-        // Use the new optimized pipeline
         $aiResult = self::callAIWithJSON($message, $context);
 
         return [
@@ -620,7 +607,6 @@ Rules:
 
     public static function detectIntent(string $message): array
     {
-        // Fallback to simple detection
         $messageLower = strtolower(trim($message));
 
         if (strlen($message) < 2) {
@@ -646,7 +632,6 @@ Rules:
 
     public static function applyTonePersona(string $systemPrompt, array $toneStyle, string $language): string
     {
-        // Legacy method - kept for backward compatibility
         return $systemPrompt;
     }
 
@@ -691,7 +676,6 @@ Rules:
 
     public static function detectHandoff(string $message, array $conversationHistory): array
     {
-        // Simple keyword-based handoff detection
         $hardEscalation = self::checkHardEscalation($message);
 
         if ($hardEscalation['force_escalation']) {

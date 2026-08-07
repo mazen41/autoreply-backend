@@ -22,6 +22,36 @@ class AICapabilitiesService
     {
         $confidence = 50; // Base confidence
 
+        // Detect message type and adjust base confidence accordingly
+        $messageLower = strtolower(trim($userMessage));
+
+        // Greetings - should be very confident
+        $greetings = ['السلام عليكم', 'مرحبا', 'أهلا', 'hi', 'hello', 'hey', 'good morning', 'good evening', 'صباح الخير', 'مساء الخير'];
+        foreach ($greetings as $greeting) {
+            if (str_contains($messageLower, $greeting)) {
+                $confidence = 95; // High confidence for greetings
+                break;
+            }
+        }
+
+        // Common social phrases - should be confident
+        $socialPhrases = ['شكرا', 'thank you', 'شكراً', 'how are you', 'كيف حالك', 'nice to meet you', 'تشرفت بك'];
+        foreach ($socialPhrases as $phrase) {
+            if (str_contains($messageLower, $phrase)) {
+                $confidence = 90; // High confidence for social phrases
+                break;
+            }
+        }
+
+        // Simple questions that don't require business knowledge
+        $simpleQuestions = ['ما هذا', 'what is this', 'من أنت', 'who are you', 'ماذا تفعل', 'what do you do'];
+        foreach ($simpleQuestions as $question) {
+            if (str_contains($messageLower, $question)) {
+                $confidence = 85; // High confidence for simple questions
+                break;
+            }
+        }
+
         // Check if AI response contains uncertain phrases
         $uncertainPhrases = [
             "I don't know", "I'm not sure", "I don't have that information",
@@ -72,7 +102,8 @@ class AICapabilitiesService
         }
 
         // Check response length - too short suggests vagueness
-        if (strlen($aiResponse) < 50) {
+        // But for greetings, short responses are acceptable
+        if (strlen($aiResponse) < 50 && $confidence < 90) {
             $confidence -= 20;
         }
 

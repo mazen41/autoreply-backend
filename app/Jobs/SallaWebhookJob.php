@@ -31,6 +31,12 @@ class SallaWebhookJob implements ShouldQueue
             'data_keys' => array_keys($this->data),
         ]);
 
+        // Handle app.installed event (Salla Easy Mode)
+        if ($this->event === 'app.installed') {
+            $this->handleAppInstalled($this->data);
+            return;
+        }
+
         // Find the Salla channel by store ID
         $storeId = $this->data['store_id'] ?? null;
         if (!$storeId) {
@@ -205,5 +211,72 @@ class SallaWebhookJob implements ShouldQueue
         Log::info('Salla shipment cancelled', [
             'shipment_id' => $data['id'] ?? null,
         ]);
+    }
+
+    /**
+     * Handle app.installed event (Salla Easy Mode)
+     */
+    protected function handleAppInstalled(array $data): void
+    {
+        $merchantId = $data['merchant'] ?? null;
+        $appId      = $data['id'] ?? null;
+        $storeType  = $data['store_type'] ?? null;
+        $storeName  = $data['app_name'] ?? 'Salla Store';
+
+        Log::info('Salla app installed', [
+            'merchant_id' => $merchantId,
+            'app_id'      => $appId,
+            'store_type'  => $storeType,
+        ]);
+
+        if (!$merchantId) {
+            Log::error('Salla app.installed: missing merchant ID in payload', ['data_keys' => array_keys($data)]);
+            return;
+        }
+
+        // Look for an existing Salla channel that matched this merchant.
+        // Channels connected via OAuth store the merchant/store id in page_id.
+        $channel = Channel::where('type', 'salla')
+            ->where('page_id', (string) $merchantId)
+            ->first();
+
+        if ($channel) {
+            // Mark as active in case it was previously disconnected.
+            $channel->update([
+                'status'      => 'connected',
+                'connected_at' => now(),
+                'metadata'    => array_merge($channel->metadata ?? [], [
+                    'merchant_id' => $merchantId,
+                    'app_id'      => $appId,
+                    'store_type'  => $storeType,
+                    'installed_at' => now()->toISOString(),
+                ]),
+            ]);
+            Log::info('Salla channel re-activated for merchant', [
+                'channel_id'  => $channel->id,
+                'merchant_id' => $merchantId,
+            ]);
+        } else {
+            // No channel yet — create a placeholder so the merchant appears
+            // in the system. A proper OAuth connection will overwrite this.
+            $channel = Channel::create([
+                'user_id'     => null, // unknown until OAuth completes
+                'type'        => 'salla',
+                'page_id'     => (string) $merchantId,
+                'page_name'   => $storeName,
+                'status'      => 'pending_oauth',
+                'connected_at' => now(),
+                'metadata'    => [
+                    'merchant_id'  => $merchantId,
+                    'app_id'       => $appId,
+                    'store_type'   => $storeType,
+                    'installed_at' => now()->toISOString(),
+                ],
+            ]);
+            Log::info('Salla placeholder channel created for new merchant', [
+                'channel_id'  => $channel->id,
+                'merchant_id' => $merchantId,
+            ]);
+        }
     }
 }

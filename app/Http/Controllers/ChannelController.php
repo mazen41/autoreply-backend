@@ -282,9 +282,17 @@ class ChannelController extends Controller
         $state = $user->id . ':' . $request->query('redirect', 'dashboard');
 
         $sallaService = new SallaService();
-        $authUrl = $sallaService->getAuthorizationUrl($state);
-
-        return redirect($authUrl);
+        
+        try {
+            $authUrl = $sallaService->getAuthorizationUrl($state);
+            return redirect($authUrl);
+        } catch (\Exception $e) {
+            Log::error('Salla connect error', [
+                'user_id' => $user->id,
+                'error' => $e->getMessage(),
+            ]);
+            return redirect(env('FRONTEND_URL') . '/dashboard/channels?error=salla_config_error');
+        }
     }
 
     /**
@@ -296,14 +304,23 @@ class ChannelController extends Controller
         Log::info('Request params', $request->all());
 
         $code = $request->get('code');
-        $stateParts = explode(':', $request->get('state') ?? '');
-        $userId = $stateParts[0] ?? null;
+        $state = $request->get('state');
         $error = $request->get('error');
 
         // Handle errors
         if ($error || !$code) {
             Log::error('Salla OAuth denied or no code', ['error' => $error]);
             return redirect(env('FRONTEND_URL') . '/dashboard/channels?error=salla_denied');
+        }
+
+        // Parse state - it might be user_id:redirect or just user_id
+        $userId = null;
+        $redirect = 'dashboard';
+        
+        if ($state) {
+            $stateParts = explode(':', $state);
+            $userId = $stateParts[0] ?? null;
+            $redirect = $stateParts[1] ?? 'dashboard';
         }
 
         if (!$userId) {
@@ -328,7 +345,7 @@ class ChannelController extends Controller
             $storeName = $storeInfo['name'] ?? 'Unknown Store';
 
             if (!$storeId) {
-                Log::error('Could not get store ID from Salla');
+                Log::error('Could not get store ID from Salla', ['store_info' => $storeInfo]);
                 return redirect(env('FRONTEND_URL') . '/dashboard/channels?error=store_info_failed');
             }
 
@@ -359,6 +376,7 @@ class ChannelController extends Controller
             Log::info('Salla channel saved', [
                 'channel_id' => $channel->id,
                 'store_name' => $storeName,
+                'store_id' => $storeId,
             ]);
 
             // Subscribe to Salla webhooks
@@ -381,46 +399,19 @@ class ChannelController extends Controller
     protected function subscribeSallaWebhooks(Channel $channel, string $accessToken)
     {
         $webhookUrl = env('APP_URL') . '/api/salla/webhook';
-        $events = [
-            'order.created',
-            'order.status.updated',
-            'order.shipment.created',
-            'order.canceled',
-            'order.refunded',
-            'order.customer.updated',
-            'order.shipping.address.updated',
-            'order.products.updated',
-            'customer.created',
-            'customer.updated',
-            'shipment.created',
-            'shipment.updated',
-            'shipment.cancelled',
-        ];
-
-        try {
-            $response = Http::withToken($accessToken)
-                ->accept('application/json')
-                ->post('https://api.salla.dev/webhooks', [
-                    'url' => $webhookUrl,
-                    'events' => $events,
-                ]);
-
-            if ($response->successful()) {
-                Log::info('Salla webhooks subscribed successfully', [
-                    'channel_id' => $channel->id,
-                    'webhook_id' => $response->json('id'),
-                ]);
-            } else {
-                Log::error('Failed to subscribe Salla webhooks', [
-                    'status' => $response->status(),
-                    'body' => $response->body(),
-                ]);
-            }
-        } catch (\Exception $e) {
-            Log::error('Exception subscribing Salla webhooks', [
-                'message' => $e->getMessage(),
-            ]);
-        }
+        
+        // Note: Salla webhooks are configured in the Salla app dashboard
+        // We don't need to subscribe programmatically if already configured there
+        // This method is kept for future programmatic webhook management
+        
+        Log::info('Salla webhooks should be configured in app dashboard', [
+            'channel_id' => $channel->id,
+            'webhook_url' => $webhookUrl,
+        ]);
+        
+        // If you want to implement programmatic webhook subscription,
+        // you would need to use the correct Salla API endpoint
+        // which might be different from the one we assumed
     }
 }
 

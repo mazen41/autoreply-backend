@@ -46,7 +46,7 @@ class SallaService
             'client_id' => $this->clientId,
             'redirect_uri' => $this->redirectUri,
             'response_type' => 'code',
-            'scope' => 'orders.read products.read customers.read offline_access',
+            'scope' => 'orders.read offline_access products.read customers.read',
             'state' => $state,
         ];
 
@@ -139,7 +139,13 @@ class SallaService
      */
     public function getStoreInfo(string $accessToken): array
     {
-        return $this->apiCall('GET', '/store/info', [], $accessToken);
+        $response = $this->apiCall('GET', '/store', [], $accessToken);
+        // Salla wraps responses: { "status": 200, "success": true, "data": { "id": ..., "name": ... } }
+        // Unwrap so callers get the store object directly.
+        if (isset($response['data']) && is_array($response['data'])) {
+            return $response['data'];
+        }
+        return $response;
     }
 
     /**

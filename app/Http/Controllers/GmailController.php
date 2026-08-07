@@ -18,7 +18,7 @@ class GmailController extends Controller
         $client->setClientId(env('GOOGLE_CLIENT_ID'));
         $client->setClientSecret(env('GOOGLE_CLIENT_SECRET'));
         $client->setRedirectUri(env('GOOGLE_REDIRECT_URI'));
-        $client->addScope(Gmail::GMAIL_READONLY);
+        $client->addScope(Gmail::GMAIL_MODIFY); // superset of READONLY; also allows marking messages read
         $client->addScope(Gmail::GMAIL_SEND);
         $client->setAccessType('offline');
         $client->setPrompt('consent');

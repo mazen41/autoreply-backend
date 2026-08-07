@@ -141,7 +141,7 @@ class ProcessAutoReply implements ShouldQueue
         }
 
         // Check business hours routing
-        $businessHoursCheck = AICapabilitiesService::checkBusinessHours($channel->business);
+        $businessHoursCheck = AICapabilitiesService::checkBusinessHours($channel->business ?? null);
         if ($businessHoursCheck['should_use_hours_routing']) {
             Log::info('ProcessAutoReply: Business hours routing activated', [
                 'conversation_id' => $conversation->id,
@@ -171,7 +171,7 @@ class ProcessAutoReply implements ShouldQueue
         }
 
         // Apply tone/persona customization
-        $toneStyle = $channel->business->ai_tone_style ?? [
+        $toneStyle = $channel->business?->ai_tone_style ?? [
             'tone' => 'friendly',
             'formality' => 'casual',
             'focus' => 'support'
@@ -196,12 +196,12 @@ class ProcessAutoReply implements ShouldQueue
 
         // Calculate confidence score
         $confidenceScore = AICapabilitiesService::calculateConfidence(
-            $message->content, 
-            $aiResponse, 
-            $channel->business
+            $message->content,
+            $aiResponse,
+            $channel->business ?? null
         );
 
-        $confidenceThreshold = $channel->business->ai_confidence_threshold ?? 70;
+        $confidenceThreshold = $channel->business?->ai_confidence_threshold ?? 70;
 
         // If confidence is below threshold, escalate to human
         if ($confidenceScore < $confidenceThreshold) {
@@ -221,7 +221,7 @@ class ProcessAutoReply implements ShouldQueue
         }
 
         // Auto-tag conversation based on intent
-        $intentDetection = AICapabilitiesService::extractIntent($message->content, $channel->business);
+        $intentDetection = AICapabilitiesService::extractIntent($message->content, $channel->business ?? null);
         if ($intentDetection['tag'] !== 'general') {
             \App\Models\ConversationTag::create([
                 'conversation_id' => $conversation->id,

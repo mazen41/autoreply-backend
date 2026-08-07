@@ -12,13 +12,13 @@ class AICapabilitiesService
 {
     /**
      * Get confidence score for AI response based on knowledge base coverage
-     * 
+     *
      * @param string $userMessage The customer's message
      * @param string $aiResponse The AI's generated response
-     * @param BusinessProfile $business The business profile with knowledge base
+     * @param BusinessProfile|null $business The business profile with knowledge base
      * @return int Confidence score 0-100
      */
-    public static function calculateConfidence(string $userMessage, string $aiResponse, BusinessProfile $business): int
+    public static function calculateConfidence(string $userMessage, string $aiResponse, ?BusinessProfile $business): int
     {
         $confidence = 50; // Base confidence
 
@@ -50,8 +50,10 @@ class AICapabilitiesService
 
         // Check if response uses knowledge base content
         $knowledgeContent = '';
-        foreach ($business->knowledgeFiles()->get() as $file) {
-            $knowledgeContent .= ' ' . strtolower($file->extracted_text);
+        if ($business) {
+            foreach ($business->knowledgeFiles()->get() as $file) {
+                $knowledgeContent .= ' ' . strtolower($file->extracted_text);
+            }
         }
 
         $userWords = array_filter(explode(' ', strtolower($userMessage)));
@@ -262,13 +264,13 @@ class AICapabilitiesService
 
     /**
      * Check if business hours routing should be used
-     * 
-     * @param BusinessProfile $business Business profile with hours settings
+     *
+     * @param BusinessProfile|null $business Business profile with hours settings
      * @return array [should_use_hours_routing, is_after_hours, routing_message]
      */
-    public static function checkBusinessHours(BusinessProfile $business): array
+    public static function checkBusinessHours(?BusinessProfile $business): array
     {
-        if (!$business->business_hours_enabled) {
+        if (!$business || !$business->business_hours_enabled) {
             return [
                 'should_use_hours_routing' => false,
                 'is_after_hours' => false,
@@ -307,12 +309,12 @@ class AICapabilitiesService
 
     /**
      * Extract intent/topic from conversation for auto-tagging
-     * 
+     *
      * @param string $message The customer's message
-     * @param BusinessProfile $business Business profile for context
+     * @param BusinessProfile|null $business Business profile for context
      * @return array [tag, intent, confidence]
      */
-    public static function extractIntent(string $message, BusinessProfile $business): array
+    public static function extractIntent(string $message, ?BusinessProfile $business): array
     {
         $messageLower = strtolower($message);
         $intents = [

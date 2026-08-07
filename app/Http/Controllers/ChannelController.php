@@ -323,10 +323,10 @@ class ChannelController extends Controller
         }
 
         // If no valid user ID in state, this is likely Salla Easy Mode installation
-        // Redirect to frontend signup/login with the OAuth code
+        // Redirect to frontend dashboard (authentication middleware will handle redirect to login if needed)
         if (!$userId || !is_numeric($userId)) {
-            Log::warning('No valid user ID in Salla OAuth state - redirecting to signup', ['state' => $state]);
-            return redirect(env('FRONTEND_URL') . '/signup?salla_code=' . $code . '&salla_state=' . $state);
+            Log::warning('No valid user ID in Salla OAuth state - redirecting to dashboard', ['state' => $state]);
+            return redirect(env('FRONTEND_URL') . '/dashboard?salla_code=' . $code . '&salla_state=' . $state);
         }
 
         try {

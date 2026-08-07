@@ -209,8 +209,10 @@ class AICapabilitiesService
             $prompt = <<<PROMPT
 You are evaluating whether an AI customer service reply is high quality and should be sent automatically.
 
-Business: {$businessName}
+Business name: {$businessName}
 Customer language: {$language}
+
+IMPORTANT: The business name "{$businessName}" is real and correct — do NOT flag it as hallucinated.
 
 Recent conversation:
 {$historyText}
@@ -235,7 +237,8 @@ Scoring guide for response_quality:
 - 0.3-0.49: mostly filler, does not answer the actual question
 - 0.0-0.29: wrong, confusing, or harmful reply
 
-Issues to flag (only real ones): too_short, vague, off_topic, wrong_language, contradicts_history, missing_key_info, hallucinated_info
+Issues to flag (ONLY real problems): too_short, vague, off_topic, wrong_language, contradicts_history, missing_key_info
+DO NOT flag hallucinated_info unless the reply contains clearly invented facts like fake prices, fake addresses, or fake product names that were never provided.
 PROMPT;
 
             $raw    = self::callGemini($prompt);
@@ -248,13 +251,23 @@ PROMPT;
             ) {
                 $quality  = (float) $result['response_quality'];
                 $intentC  = (float) $result['intent_confidence'];
+                $intent   = $result['intent'] ?? 'unknown';
 
-                // Weighted confidence: 55% reply quality, 25% intent clarity, 20% context richness
-                $raw100 = ($quality * 0.55 + $intentC * 0.25 + $contextScore * 0.20) * 100;
+                // For simple intents (greeting, spam) context richness is irrelevant
+                // For business intents (order, pricing, support) context richness matters more
+                $simpleIntents = ['greeting', 'spam', 'unknown'];
+                if (in_array($intent, $simpleIntents)) {
+                    // Pure quality + intent score, no context penalty
+                    $raw100 = ($quality * 0.70 + $intentC * 0.30) * 100;
+                } else {
+                    // Business intent: quality 55%, intent 25%, context richness 20%
+                    $raw100 = ($quality * 0.55 + $intentC * 0.25 + $contextScore * 0.20) * 100;
+                }
+
                 $confidence = (int) max(0, min(100, round($raw100)));
 
                 Log::info('AICapabilitiesService: scoreReply result', [
-                    'intent'      => $result['intent'],
+                    'intent'      => $intent,
                     'quality'     => $quality,
                     'intentConf'  => $intentC,
                     'contextScore'=> $contextScore,
@@ -264,7 +277,7 @@ PROMPT;
                 ]);
 
                 return self::scoreResult(
-                    $result['intent'],
+                    $intent,
                     $intentC,
                     $confidence,
                     $result['issues'] ?? []

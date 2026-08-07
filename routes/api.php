@@ -20,6 +20,7 @@ use App\Http\Controllers\ChannelController;
 use App\Http\Controllers\GmailController;
 use App\Http\Controllers\InboxController;
 use App\Http\Controllers\PostController;
+use App\Http\Controllers\N8nIntegrationController;
 use Illuminate\Support\Facades\Route;
 use Illuminate\Support\Facades\RateLimiter;
 
@@ -129,6 +130,15 @@ Route::middleware('auth:sanctum')->group(function () {
         Route::get('/export/pdf', [ReportsController::class, 'exportPdf']);
     });
 
+    // n8n Integration Routes
+    Route::prefix('n8n')->group(function () {
+        Route::post('/rate-limit/check', [N8nIntegrationController::class, 'checkRateLimit']);
+        Route::post('/language/detect', [N8nIntegrationController::class, 'detectLanguage']);
+        Route::post('/conversation/memory', [N8nIntegrationController::class, 'getConversationMemory']);
+        Route::post('/ai/ultimate-process', [N8nIntegrationController::class, 'ultimateAIProcess']);
+        Route::post('/escalate', [N8nIntegrationController::class, 'triggerEscalation']);
+    });
+
     // Training & AI Learning
     Route::prefix('training')->group(function () {
         Route::get('/corrections', [TrainingController::class, 'getCorrections']);
@@ -165,6 +175,15 @@ Route::middleware('auth:sanctum')->group(function () {
 
 // Gmail Webhook - public, Google Pub/Sub calls this
 Route::post('/webhook/gmail', [WebhookController::class, 'handleGmail']);
+
+// n8n Integration Routes (public with auth)
+Route::prefix('n8n')->group(function () {
+    Route::post('/rate-limit/check', [N8nIntegrationController::class, 'checkRateLimit']);
+    Route::post('/language/detect', [N8nIntegrationController::class, 'detectLanguage']);
+    Route::post('/conversation/memory', [N8nIntegrationController::class, 'getConversationMemory']);
+    Route::post('/ai/ultimate-process', [N8nIntegrationController::class, 'ultimateAIProcess']);
+    Route::post('/escalate', [N8nIntegrationController::class, 'triggerEscalation']);
+});
 
 // Public blog routes
 Route::get('/posts', [PostController::class, 'index']);

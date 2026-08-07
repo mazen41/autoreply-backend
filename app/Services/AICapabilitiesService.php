@@ -6,6 +6,7 @@ use App\Models\BusinessProfile;
 use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\Http;
 use Illuminate\Support\Facades\Log;
+use Illuminate\Support\Facades\Redis;
 
 class AICapabilitiesService
 {
@@ -16,7 +17,7 @@ class AICapabilitiesService
 
     private static function getAIModel(): string
     {
-        return env('GEMINI_MODEL', 'gemini-3.5-flash');
+        return env('GEMINI_MODEL', 'gemini-2.5-flash');
     }
 
     private static function getAIAPIKey(): string
@@ -25,400 +26,480 @@ class AICapabilitiesService
     }
 
     /**
-     * Detect intent using AI (semantic understanding) - DEPRECATED: Use analyzeMessageAndResponse instead
+     * Ultimate Master System Prompt with JSON Output
      */
-    public static function detectIntent(string $message): array
+    private static function getUltimateSystemPrompt(array $context = []): string
     {
-        // Fallback to simple detection for backward compatibility
-        $cacheKey = 'intent_' . md5($message);
-        $cached = Cache::get($cacheKey);
-        if ($cached !== null) {
-            return $cached;
+        $businessName = $context['business_name'] ?? 'our business';
+        $platform = $context['platform'] ?? 'whatsapp';
+        $language = $context['language'] ?? 'english';
+        $hasKnowledgeBase = !empty($context['knowledge_base']);
+        $hasOrderData = !empty($context['order_data']);
+
+        $prompt = "You are an AI Customer Support Assistant for a business.
+
+You ONLY generate replies.
+You DO NOT control workflows, APIs, logic, or databases.
+
+The system handles:
+- Platform detection (WhatsApp, Instagram, Facebook)
+- Customer lookup (Salla)
+- Order retrieval
+- Knowledge base retrieval
+- Escalation routing
+
+You ONLY respond using provided data.
+
+--------------------------------------------------
+🔴 CORE RULES (STRICT)
+--------------------------------------------------
+
+1. You MUST always reply.
+2. You MUST ONLY use:
+   - Provided knowledge base
+   - Provided documents
+   - Provided order data
+3. You MUST NEVER:
+   - Guess
+   - Invent information
+   - Assume missing data
+4. If info is missing → fallback + escalation
+
+--------------------------------------------------
+🟢 GREETING
+--------------------------------------------------
+
+If user says greeting (hi, hello, hey, السلام عليكم):
+
+Reply:
+\"Hi 👋 Welcome to {$businessName}! How can I help you today?\"
+
+Intent = greeting
+
+--------------------------------------------------
+🟢 GENERAL QUESTIONS
+--------------------------------------------------
+
+";
+
+        if ($hasKnowledgeBase) {
+            $prompt .= "You have access to this knowledge base:\n" . $context['knowledge_base'] . "\n\n";
+            $prompt .= "IF answer exists in knowledge:\n→ Answer clearly\n\n";
         }
 
-        // Simple keyword-based fallback for rate limiting
-        $messageLower = strtolower(trim($message));
-        
-        // Very short messages
-        if (strlen($message) < 2) {
-            return ['intent' => 'unknown', 'confidence' => 0.5, 'from_cache' => false];
-        }
+        $prompt .= "IF NOT:\n→ Reply EXACTLY:\n\n\"I'm really sorry 😔 I couldn't find the exact information for your request, but no worries — I'll forward this to our team and they'll get back to you shortly.\"\n\n→ needs_escalation = true\n→ intent = escalation\n\n";
 
-        // Simple greeting detection
-        $greetings = ['السلام', 'مرحبا', 'أهلا', 'hi', 'hello', 'hey', 'هاي', 'good morning', 'good evening', 'صباح', 'مساء'];
-        foreach ($greetings as $greeting) {
-            if (str_contains($messageLower, $greeting)) {
-                $result = ['intent' => 'greeting', 'confidence' => 0.9, 'from_cache' => false];
-                Cache::put($cacheKey, $result, 3600);
-                return $result;
+        $prompt .= "--------------------------------------------------
+🟢 ORDER SUPPORT (SALLA)
+--------------------------------------------------
+
+You will RECEIVE order data. NEVER fetch anything.
+
+";
+
+        if ($hasOrderData) {
+            $prompt .= "ORDER DATA PROVIDED:\n" . json_encode($context['order_data'], JSON_PRETTY_PRINT) . "\n\n";
+            $prompt .= "Reply:\n\n\"Here are your order details 📦\n\n• Order Number: {$context['order_data']['order_number']}\n• Status: {$context['order_data']['status']}\n• Shipping Status: {$context['order_data']['shipping_status']}\n• Estimated Delivery: {$context['order_data']['delivery_date']}\"\n\nIntent = order\n\n";
+        } else {
+            $prompt .= "-------------------------\nIF ORDER DATA MISSING:\n-------------------------\n\n";
+            if ($platform === 'whatsapp') {
+                $prompt .= "Reply: \"Could you please send your order number so I can check your order? 😊\"\n\n";
+            } else {
+                $prompt .= "Reply: \"Please send your phone number or order number so I can check your order 😊\"\n\n";
             }
+            $prompt .= "Intent = order\n\n";
         }
 
-        // Order-related keywords
-        $orderKeywords = ['طلب', 'طلب', 'order', 'فين', 'حالة', 'سعر', 'price'];
-        foreach ($orderKeywords as $keyword) {
-            if (str_contains($messageLower, $keyword)) {
-                $result = ['intent' => 'order', 'confidence' => 0.8, 'from_cache' => false];
-                Cache::put($cacheKey, $result, 3600);
-                return $result;
-            }
+        $prompt .= "--------------------------------------------------
+🔴 ESCALATION RULES
+--------------------------------------------------
+
+Trigger escalation if:
+
+- User asks for human/agent/support
+- User is angry or frustrated
+- You cannot answer
+
+Reply:
+
+\"Sure 👍 I'm connecting you with a human agent now. Please wait a moment.\"
+
+Intent = escalation
+needs_escalation = true
+
+--------------------------------------------------
+🟡 STYLE
+--------------------------------------------------
+
+- Friendly
+- Short
+- Clear
+- Light emojis
+
+";
+
+        if ($language === 'arabic') {
+            $prompt .= "--------------------------------------------------
+🔵 LANGUAGE REQUIREMENT
+--------------------------------------------------
+
+You MUST respond in Arabic.
+Use appropriate Arabic greetings and cultural context.\n\n";
+        } else {
+            $prompt .= "--------------------------------------------------
+🔵 LANGUAGE REQUIREMENT
+--------------------------------------------------
+
+You MUST respond in English.
+Use appropriate English greetings and cultural context.\n\n";
         }
 
-        $result = ['intent' => 'unknown', 'confidence' => 0.5, 'from_cache' => false];
-        Cache::put($cacheKey, $result, 3600);
-        return $result;
+        $prompt .= "--------------------------------------------------
+⚫ FINAL RULE
+--------------------------------------------------
+
+You MUST ALWAYS:
+1. Answer
+2. Ask for info
+3. Or escalate
+
+NEVER stay silent. NEVER guess.
+
+--------------------------------------------------
+🔴 OUTPUT FORMAT (STRICT)
+--------------------------------------------------
+
+Return ONLY valid JSON:
+
+{
+  \"reply\": \"your message to the user\",
+  \"intent\": \"greeting | question | order | escalation\",
+  \"needs_escalation\": true/false,
+  \"confidence\": 0.0-1.0
+}
+
+Rules:
+- No extra text
+- No explanation
+- No markdown
+- Only JSON";
+
+        return $prompt;
     }
 
     /**
-     * Generate AI response
+     * Hard Escalation Override (Pre-AI Check)
      */
-    public static function generateResponse(string $message, array $context = []): string
+    public static function checkHardEscalation(string $message): array
+    {
+        $messageLower = strtolower(trim($message));
+        $escalationKeywords = [
+            'human', 'agent', 'support', 'person', 'representative',
+            'موظف', 'انسان', 'شخص', 'دعم', 'خدمة عملاء', 'كلم انسان'
+        ];
+
+        foreach ($escalationKeywords as $keyword) {
+            if (str_contains($messageLower, $keyword)) {
+                return [
+                    'force_escalation' => true,
+                    'matched_keyword' => $keyword,
+                    'reason' => 'hard_keyword_override'
+                ];
+            }
+        }
+
+        return ['force_escalation' => false];
+    }
+
+    /**
+     * Language Detection
+     */
+    public static function detectLanguage(string $message): array
+    {
+        $arabicChars = preg_match_all('/[\u0600-\u06FF]/u', $message, $matches);
+        $englishChars = preg_match_all('/[a-zA-Z]/', $message, $matches);
+        $totalChars = $arabicChars + $englishChars;
+
+        if ($totalChars === 0) {
+            return ['language' => 'english', 'confidence' => 0.5];
+        }
+
+        $arabicRatio = $arabicChars / $totalChars;
+        $englishRatio = $englishChars / $totalChars;
+
+        if ($arabicRatio > 0.7) {
+            return ['language' => 'arabic', 'confidence' => 0.95];
+        } elseif ($englishRatio > 0.7) {
+            return ['language' => 'english', 'confidence' => 0.95];
+        } else {
+            return ['language' => 'mixed', 'confidence' => 0.7];
+        }
+    }
+
+    /**
+     * Rate Limiting Check
+     */
+    public static function checkRateLimit(string $userId, string $tenantId = 'default'): array
+    {
+        $redisKey = "rate_limit:{$tenantId}:{$userId}";
+        $windowSeconds = 60;
+        $maxRequests = 10;
+
+        try {
+            $currentCount = Redis::get($redisKey);
+
+            if ($currentCount === null) {
+                Redis::setex($redisKey, $windowSeconds, 1);
+                return [
+                    'rate_limited' => false,
+                    'remaining' => $maxRequests - 1,
+                    'reset_in' => $windowSeconds
+                ];
+            }
+
+            $count = (int)$currentCount;
+
+            if ($count >= $maxRequests) {
+                $ttl = Redis::ttl($redisKey);
+                return [
+                    'rate_limited' => true,
+                    'reason' => 'too_many_requests',
+                    'limit' => $maxRequests,
+                    'window' => $windowSeconds,
+                    'reset_in' => $ttl,
+                    'retry_after' => $ttl
+                ];
+            }
+
+            Redis::incr($redisKey);
+
+            return [
+                'rate_limited' => false,
+                'remaining' => $maxRequests - ($count + 1),
+                'reset_in' => Redis::ttl($redisKey)
+            ];
+
+        } catch (\Exception $e) {
+            Log::error('Rate limiting failed', ['error' => $e->getMessage()]);
+            // Fail open - allow request if Redis fails
+            return ['rate_limited' => false, 'remaining' => $maxRequests];
+        }
+    }
+
+    /**
+     * Conversation Memory Check
+     */
+    public static function getConversationMemory(string $conversationId): array
+    {
+        $redisKey = "conversation:{$conversationId}:state";
+
+        try {
+            $existingState = Redis::get($redisKey);
+
+            if ($existingState) {
+                return json_decode($existingState, true);
+            }
+
+            return [
+                'phone_provided' => false,
+                'order_number_provided' => false,
+                'last_asked' => null,
+                'attempts' => 0
+            ];
+
+        } catch (\Exception $e) {
+            Log::error('Conversation memory check failed', ['error' => $e->getMessage()]);
+            return [
+                'phone_provided' => false,
+                'order_number_provided' => false,
+                'last_asked' => null,
+                'attempts' => 0
+            ];
+        }
+    }
+
+    /**
+     * Update Conversation Memory
+     */
+    public static function updateConversationMemory(string $conversationId, array $updates): void
+    {
+        $redisKey = "conversation:{$conversationId}:state";
+
+        try {
+            $currentState = self::getConversationMemory($conversationId);
+            $newState = array_merge($currentState, $updates, [
+                'updated_at' => now()->toISOString()
+            ]);
+
+            Redis::setex($redisKey, 3600, json_encode($newState)); // 1 hour TTL
+
+        } catch (\Exception $e) {
+            Log::error('Conversation memory update failed', ['error' => $e->getMessage()]);
+        }
+    }
+
+    /**
+     * Response Validation
+     */
+    public static function validateResponse(string $response, string $intent): array
+    {
+        $validation = [
+            'valid' => true,
+            'reasons' => [],
+            'warnings' => []
+        ];
+
+        // Rule 1: Empty response
+        if (empty(trim($response))) {
+            $validation['valid'] = false;
+            $validation['reasons'][] = 'empty_response';
+        }
+
+        // Rule 2: Too long
+        if (strlen($response) > 500) {
+            $validation['valid'] = false;
+            $validation['reasons'][] = 'too_long';
+            $validation['warnings'][] = "Response length: " . strlen($response) . " chars";
+        }
+
+        // Rule 3: Uncertain language
+        $uncertainPhrases = ['i think', 'maybe', 'possibly', 'might be', 'ربما', 'قد يكون', 'أعتقد'];
+        $lowerResponse = strtolower($response);
+        foreach ($uncertainPhrases as $phrase) {
+            if (str_contains($lowerResponse, $phrase)) {
+                $validation['valid'] = false;
+                $validation['reasons'][] = 'uncertain_language';
+                break;
+            }
+        }
+
+        // Rule 4: System instruction leakage
+        $systemKeywords = ['system prompt', 'instructions', 'rules', 'ai assistant', 'as an ai'];
+        foreach ($systemKeywords as $keyword) {
+            if (str_contains($lowerResponse, $keyword)) {
+                $validation['valid'] = false;
+                $validation['reasons'][] = 'system_instruction_leak';
+                break;
+            }
+        }
+
+        // Rule 5: JSON/Code leakage
+        if (str_contains($response, '{') || str_contains($response, '}') || str_contains($response, '```')) {
+            $validation['valid'] = false;
+            $validation['reasons'][] = 'contains_code_or_json';
+        }
+
+        // Rule 6: Greeting length check
+        if ($intent === 'greeting' && strlen($response) > 100) {
+            $validation['valid'] = false;
+            $validation['reasons'][] = 'greeting_too_long';
+        }
+
+        return $validation;
+    }
+
+    /**
+     * Main AI Call with JSON Output
+     */
+    public static function callAIWithJSON(string $message, array $context = []): array
     {
         try {
-            $systemPrompt = self::buildSystemPrompt($context);
+            $systemPrompt = self::getUltimateSystemPrompt($context);
 
             $messages = [
                 ['role' => 'system', 'content' => $systemPrompt],
                 ['role' => 'user', 'content' => $message]
             ];
 
-            $response = self::callAIChat($messages);
-            return trim($response);
+            $response = self::callAIChatWithRetry($messages);
+            $trimmedResponse = trim($response);
+
+            // Parse JSON response
+            $aiResult = json_decode($trimmedResponse, true);
+
+            if (!$aiResult || !isset($aiResult['reply']) || !isset($aiResult['intent'])) {
+                Log::error('AI returned invalid JSON', ['response' => $trimmedResponse]);
+                return self::getFallbackResponse();
+            }
+
+            // Validate response
+            $validation = self::validateResponse($aiResult['reply'], $aiResult['intent']);
+
+            if (!$validation['valid']) {
+                Log::warning('AI response validation failed', [
+                    'reasons' => $validation['reasons'],
+                    'intent' => $aiResult['intent']
+                ]);
+                return self::getFallbackResponse();
+            }
+
+            return [
+                'success' => true,
+                'reply' => $aiResult['reply'],
+                'intent' => $aiResult['intent'],
+                'needs_escalation' => $aiResult['needs_escalation'] ?? false,
+                'confidence' => $aiResult['confidence'] ?? 0.7,
+                'validation' => $validation
+            ];
 
         } catch (\Exception $e) {
-            Log::error('AI response generation failed', [
+            Log::error('AI call failed', [
                 'message' => $message,
                 'error' => $e->getMessage()
             ]);
-            return "I apologize, but I'm having trouble generating a response right now. Please try again later.";
+            return self::getFallbackResponse();
         }
     }
 
     /**
-     * Evaluate response quality using AI - DEPRECATED: Use analyzeMessageAndResponse instead
+     * Fallback Response
      */
-    public static function evaluateResponse(string $message, string $response): array
+    private static function getFallbackResponse(): array
     {
-        // Simple heuristic fallback for rate limiting
-        if (strlen($response) < 20) {
-            return ['confidence' => 0.4, 'issues' => ['too_short']];
-        }
-
-        if (str_contains(strtolower($response), 'don\'t know') || str_contains(strtolower($response), 'not sure')) {
-            return ['confidence' => 0.5, 'issues' => ['uncertain']];
-        }
-
-        return ['confidence' => 0.7, 'issues' => []];
-    }
-
-    /**
-     * Calculate final confidence using AI-driven formula
-     */
-    public static function calculateConfidence(array $intent, array $evaluation, float $contextScore = 0): float
-    {
-        $intentConfidence = $intent['confidence'] ?? 0.5;
-        $evaluationConfidence = $evaluation['confidence'] ?? 0.7;
-
-        // Weighted formula as specified
-        $confidence = ($intentConfidence * 0.5) + ($evaluationConfidence * 0.3) + ($contextScore * 0.2);
-
-        // Convert to 0-100 range
-        return max(0, min(100, $confidence * 100));
-    }
-
-    /**
-     * Calculate context score based on data usage
-     */
-    public static function calculateContextScore(array $context): float
-    {
-        $score = 0;
-
-        // Check if response uses store data
-        if (isset($context['has_store_data']) && $context['has_store_data']) {
-            $score += 0.3;
-        }
-
-        // Check if response uses product info
-        if (isset($context['has_product_info']) && $context['has_product_info']) {
-            $score += 0.3;
-        }
-
-        // Check if response uses order data
-        if (isset($context['has_order_data']) && $context['has_order_data']) {
-            $score += 0.4;
-        }
-
-        return min(1.0, $score);
-    }
-
-    /**
-     * Score an already-generated reply for confidence + intent.
-     * Called AFTER the reply has been generated so we evaluate the actual response,
-     * not a generic placeholder.
-     *
-     * Returns:
-     *   confidence        float  0-100
-     *   intent            string
-     *   intent_confidence float  0-1
-     *   issues            array
-     */
-    public static function scoreReply(
-        string $userMessage,
-        string $aiReply,
-        array  $conversationHistory,
-        array  $context = []
-    ): array {
-        // --- Fast heuristic pre-checks (no AI call needed) ---
-
-        // Too short to be useful
-        if (strlen(trim($aiReply)) < 15) {
-            return self::scoreResult('unknown', 0.5, 20, ['reply_too_short']);
-        }
-
-        // Detect if this is a simple greeting — skip expensive AI scoring, greetings are always valid
-        $isGreeting = (bool) preg_match('/^(هاي|هي|مرحبا|أهلا|السلام|hi|hello|hey|good morning|good evening|صباح|مساء)\s*[!،.]*\s*$/iu', trim($userMessage));
-
-        if ($isGreeting) {
-            Log::info('AICapabilitiesService: greeting detected, skipping AI scoring');
-            return self::scoreResult('greeting', 0.99, 90, []);
-        }
-
-        // Vague filler phrases — only penalize on non-greeting messages
-        $fillerPhrases = [
-            "i'm here to assist", "i am here to assist",
-            "i apologize, but i'm having trouble",
+        return [
+            'success' => false,
+            'reply' => "I apologize, but I'm having trouble processing your request right now. Let me connect you with a human agent who can help you better.",
+            'intent' => 'escalation',
+            'needs_escalation' => true,
+            'confidence' => 0.5,
+            'validation' => ['valid' => false, 'reasons' => ['ai_failure']]
         ];
-        foreach ($fillerPhrases as $filler) {
-            if (str_contains(strtolower($aiReply), $filler)) {
-                return self::scoreResult('unknown', 0.4, 35, ['vague_filler_detected']);
-            }
-        }
+    }
 
-        // Explicit uncertainty without offering help
-        if (preg_match("/i (don't|do not|dont) know/i", $aiReply) && strlen($aiReply) < 80) {
-            return self::scoreResult('unknown', 0.4, 40, ['uncertain_no_followup']);
-        }
+    /**
+     * AI Chat with Retry Logic
+     */
+    private static function callAIChatWithRetry(array $messages, int $maxRetries = 3, int $baseDelay = 1000): string
+    {
+        $lastError = null;
 
-        // Context score from data richness
-        $contextScore = self::calculateContextScore($context);
+        for ($attempt = 1; $attempt <= $maxRetries; $attempt++) {
+            try {
+                return self::callAIChat($messages);
+            } catch (\Exception $e) {
+                $lastError = $e;
 
-        // --- Single AI call to score intent + quality together ---
-        try {
-            $historyText = implode("\n", array_map(
-                fn($m) => ($m['direction'] ?? ($m['role'] === 'user' ? 'inbound' : 'outbound')) . ': ' . $m['content'],
-                array_slice($conversationHistory, -6)
-            ));
-
-            $businessName = $context['business_name'] ?? 'this business';
-            $language     = $context['language'] ?? 'auto';
-
-            $prompt = <<<PROMPT
-You are evaluating whether an AI customer service reply is high quality and should be sent automatically.
-
-Business name: {$businessName}
-Customer language: {$language}
-
-IMPORTANT: The business name "{$businessName}" is real and correct — do NOT flag it as hallucinated.
-
-Recent conversation:
-{$historyText}
-
-Customer's latest message: "{$userMessage}"
-
-AI's proposed reply: "{$aiReply}"
-
-Score this reply and return ONLY valid JSON — no markdown, no explanation:
-{
-  "intent": "<one of: greeting, question, order, support, complaint, booking, pricing, spam, unknown>",
-  "intent_confidence": <float 0-1>,
-  "response_quality": <float 0-1>,
-  "issues": ["<list only real problems, or empty array>"],
-  "reasoning": "<one sentence>"
-}
-
-Scoring guide for response_quality:
-- 0.9-1.0: directly answers the question using specific business info, concise, correct language
-- 0.7-0.89: answers well but slightly generic or missing a small detail
-- 0.5-0.69: partially answers, vague, or slightly off-topic
-- 0.3-0.49: mostly filler, does not answer the actual question
-- 0.0-0.29: wrong, confusing, or harmful reply
-
-Issues to flag (ONLY real problems): too_short, vague, off_topic, wrong_language, contradicts_history, missing_key_info
-DO NOT flag hallucinated_info unless the reply contains clearly invented facts like fake prices, fake addresses, or fake product names that were never provided.
-PROMPT;
-
-            $raw    = self::callGemini($prompt);
-            $clean  = preg_replace('/```json|```/', '', $raw);
-            $result = json_decode(trim($clean), true);
-
-            if (
-                $result &&
-                isset($result['intent'], $result['intent_confidence'], $result['response_quality'])
-            ) {
-                $quality  = (float) $result['response_quality'];
-                $intentC  = (float) $result['intent_confidence'];
-                $intent   = $result['intent'] ?? 'unknown';
-
-                // For simple intents (greeting, spam) context richness is irrelevant
-                // For business intents (order, pricing, support) context richness matters more
-                $simpleIntents = ['greeting', 'spam', 'unknown'];
-                if (in_array($intent, $simpleIntents)) {
-                    // Pure quality + intent score, no context penalty
-                    $raw100 = ($quality * 0.70 + $intentC * 0.30) * 100;
-                } else {
-                    // Business intent: quality 55%, intent 25%, context richness 20%
-                    $raw100 = ($quality * 0.55 + $intentC * 0.25 + $contextScore * 0.20) * 100;
+                // Don't retry on client errors (4xx)
+                if (str_contains($e->getMessage(), '429') || str_contains($e->getMessage(), '500')) {
+                    if ($attempt < $maxRetries) {
+                        $delay = $baseDelay * pow(2, $attempt - 1);
+                        usleep($delay * 1000); // Convert to microseconds
+                        continue;
+                    }
                 }
 
-                $confidence = (int) max(0, min(100, round($raw100)));
-
-                Log::info('AICapabilitiesService: scoreReply result', [
-                    'intent'      => $intent,
-                    'quality'     => $quality,
-                    'intentConf'  => $intentC,
-                    'contextScore'=> $contextScore,
-                    'confidence'  => $confidence,
-                    'issues'      => $result['issues'] ?? [],
-                    'reasoning'   => $result['reasoning'] ?? '',
-                ]);
-
-                return self::scoreResult(
-                    $intent,
-                    $intentC,
-                    $confidence,
-                    $result['issues'] ?? []
-                );
+                // Fail fast on other errors
+                if ($attempt < $maxRetries) {
+                    usleep($baseDelay * 1000);
+                }
             }
-        } catch (\Exception $e) {
-            Log::warning('AICapabilitiesService: scoreReply AI call failed, using heuristic', [
-                'error' => $e->getMessage(),
-            ]);
         }
 
-        // Heuristic fallback — reply exists and passed the pre-checks, give a reasonable middle score
-        $fallbackConf = (int) (50 + $contextScore * 20);
-        return self::scoreResult('unknown', 0.5, $fallbackConf, ['scoring_ai_unavailable']);
+        throw $lastError;
     }
 
     /**
-     * Helper to build a consistent score result array.
-     */
-    private static function scoreResult(
-        string $intent,
-        float  $intentConfidence,
-        int    $confidence,
-        array  $issues
-    ): array {
-        return [
-            'intent'            => $intent,
-            'intent_confidence' => $intentConfidence,
-            'confidence'        => $confidence,
-            'issues'            => $issues,
-        ];
-    }
-
-    /**
-     * Main handler - kept for backward compatibility only.
-     * New code should call callConfiguredAI() for the reply, then scoreReply() for scoring.
-     * @deprecated Use scoreReply() directly after generating the reply.
-     */
-    public static function handleMessage(string $message, array $context = []): array
-    {
-        $response = self::generateResponse($message, $context);
-        $scored   = self::scoreReply($message, $response, [], $context);
-
-        return [
-            'intent'               => $scored['intent'],
-            'response'             => $response,
-            'confidence'           => $scored['confidence'],
-            'issues'               => $scored['issues'],
-            'intent_confidence'    => $scored['intent_confidence'],
-            'evaluation_confidence'=> $scored['confidence'] / 100,
-            'context_score'        => self::calculateContextScore($context),
-        ];
-    }
-
-    /**
-     * Detect if conversation should be escalated using AI
-     */
-    public static function detectHandoff(string $message, array $conversationHistory): array
-    {
-        try {
-            $historyText = implode("\n", array_map(fn($msg) => 
-                ($msg['direction'] ?? 'unknown') . ': ' . ($msg['content'] ?? ''),
-                array_slice($conversationHistory, -5)
-            ));
-
-            $prompt = "Analyze if this conversation should be escalated to a human agent.
-
-Latest message: \"{$message}\"
-
-Recent conversation history:
-{$historyText}
-
-Consider:
-- Customer frustration or anger
-- Requests for human agent
-- Complex or unresolved issues
-- Urgency indicators
-- Repeated failed AI responses
-
-Return JSON:
-{
-  \"should_escalate\": boolean,
-  \"confidence\": float (0-1),
-  \"reasons\": [\"optional list of reasons\"]
-}";
-
-            $response = self::callAI($prompt);
-            $result = json_decode($response, true);
-
-            if ($result && isset($result['should_escalate'])) {
-                return [
-                    'should_escalate' => $result['should_escalate'],
-                    'confidence' => ($result['confidence'] ?? 0.7) * 100,
-                    'reasons' => $result['reasons'] ?? []
-                ];
-            }
-
-            // Fallback
-            return [
-                'should_escalate' => false,
-                'confidence' => 30,
-                'reasons' => ['ai_evaluation_failed']
-            ];
-
-        } catch (\Exception $e) {
-            Log::error('AI handoff detection failed', [
-                'message' => $message,
-                'error' => $e->getMessage()
-            ]);
-            return [
-                'should_escalate' => false,
-                'confidence' => 30,
-                'reasons' => ['handoff_detection_failed']
-            ];
-        }
-    }
-
-    /**
-     * Call AI with prompt (for non-chat requests)
-     */
-    private static function callAI(string $prompt): string
-    {
-        $provider = self::getAIProvider();
-        $apiKey = self::getAIAPIKey();
-
-        if ($provider === 'gemini') {
-            return self::callGemini($prompt);
-        }
-
-        // Fallback for other providers
-        return self::callGemini($prompt);
-    }
-
-    /**
-     * Call AI with chat messages
+     * Call AI Chat
      */
     private static function callAIChat(array $messages): string
     {
@@ -429,232 +510,146 @@ Return JSON:
             return self::callGeminiChat($messages);
         }
 
-        // Fallback
         return self::callGeminiChat($messages);
     }
 
     /**
-     * Call Gemini API with retry logic and rate limiting
-     */
-    private static function callGemini(string $prompt): string
-    {
-        $apiKey = self::getAIAPIKey();
-        $model = self::getAIModel();
-
-        $maxRetries = 3;
-        $retryDelay = 1000; // Start with 1 second
-
-        for ($attempt = 1; $attempt <= $maxRetries; $attempt++) {
-            try {
-                $response = Http::withHeaders([
-                    'Content-Type' => 'application/json',
-                ])->post("https://generativelanguage.googleapis.com/v1beta/models/{$model}:generateContent?key={$apiKey}", [
-                    'contents' => [
-                        [
-                            'parts' => [
-                                ['text' => $prompt]
-                            ]
-                        ]
-                    ]
-                ]);
-
-                if (!$response->successful()) {
-                    // Check if it's a rate limit error
-                    if ($response->status() === 429) {
-                        Log::warning('Gemini rate limit hit, retrying', [
-                            'attempt' => $attempt,
-                            'delay' => $retryDelay
-                        ]);
-                        
-                        if ($attempt < $maxRetries) {
-                            usleep($retryDelay * 1000); // Convert to microseconds
-                            $retryDelay *= 2; // Exponential backoff
-                            continue;
-                        }
-                    }
-                    
-                    throw new \Exception('Gemini API error: ' . $response->body());
-                }
-
-                $data = $response->json();
-                return $data['candidates'][0]['content']['parts'][0]['text'] ?? '';
-
-            } catch (\Exception $e) {
-                if ($attempt === $maxRetries) {
-                    throw $e;
-                }
-                
-                Log::warning('Gemini API call failed, retrying', [
-                    'attempt' => $attempt,
-                    'error' => $e->getMessage()
-                ]);
-                
-                usleep($retryDelay * 1000);
-                $retryDelay *= 2;
-            }
-        }
-
-        throw new \Exception('Gemini API failed after retries');
-    }
-
-    /**
-     * Call Gemini API with chat messages and retry logic
+     * Call Gemini API
      */
     private static function callGeminiChat(array $messages): string
     {
         $apiKey = self::getAIAPIKey();
-        $model  = self::getAIModel();
+        $model = self::getAIModel();
 
-        $maxRetries = 3;
-        $retryDelay = 1000;
-
-        // Separate system message from conversation turns
-        $systemText = null;
-        $contents   = [];
-        $lastRole   = null;
-
+        $contents = [];
         foreach ($messages as $message) {
-            if ($message['role'] === 'system') {
-                $systemText = $message['content'];
-                continue;
-            }
-
-            $role = $message['role']; // 'user' or 'assistant'
-            $geminiRole = $role === 'assistant' ? 'model' : 'user';
-
-            // Gemini requires strictly alternating roles — merge consecutive same-role messages
-            if ($geminiRole === $lastRole && !empty($contents)) {
-                $lastIndex = count($contents) - 1;
-                $contents[$lastIndex]['parts'][0]['text'] .= "\n\n" . $message['content'];
-            } else {
-                $contents[] = [
-                    'role'  => $geminiRole,
-                    'parts' => [['text' => $message['content']]],
-                ];
-                $lastRole = $geminiRole;
-            }
+            $contents[] = [
+                'role' => $message['role'] === 'system' ? 'user' : $message['role'],
+                'parts' => [
+                    ['text' => $message['content']]
+                ]
+            ];
         }
 
-        for ($attempt = 1; $attempt <= $maxRetries; $attempt++) {
-            try {
-                $postData = ['contents' => $contents];
+        $response = Http::withHeaders([
+            'Content-Type' => 'application/json',
+        ])->post("https://generativelanguage.googleapis.com/v1beta/models/{$model}:generateContent?key={$apiKey}", [
+            'contents' => $contents,
+            'generationConfig' => [
+                'temperature' => 0.7,
+                'maxOutputTokens' => 500
+            ]
+        ]);
 
-                // Use systemInstruction (correct Gemini field — NOT a user turn)
-                if ($systemText) {
-                    $postData['systemInstruction'] = [
-                        'parts' => [['text' => $systemText]],
-                    ];
-                }
-
-                $response = Http::withHeaders(['Content-Type' => 'application/json'])
-                    ->post("https://generativelanguage.googleapis.com/v1beta/models/{$model}:generateContent?key={$apiKey}", $postData);
-
-                if ($response->successful()) {
-                    return $response->json('candidates')[0]['content']['parts'][0]['text'] ?? '';
-                }
-
-                if ($response->status() === 429 && $attempt < $maxRetries) {
-                    usleep($retryDelay * 1000);
-                    $retryDelay *= 2;
-                    continue;
-                }
-
-                throw new \Exception('Gemini chat API error: ' . $response->body());
-
-            } catch (\Exception $e) {
-                if ($attempt === $maxRetries) throw $e;
-                usleep($retryDelay * 1000);
-                $retryDelay *= 2;
-            }
+        if (!$response->successful()) {
+            throw new \Exception('Gemini API error: ' . $response->body());
         }
 
-        throw new \Exception('Gemini chat API failed after retries');
+        $data = $response->json();
+        return $data['candidates'][0]['content']['parts'][0]['text'] ?? '';
     }
 
     /**
-     * Build system prompt with context
+     * Priority Escalation Classification
      */
-    private static function buildSystemPrompt(array $context = []): string
+    public static function classifyEscalationPriority(array $escalationData): array
     {
-        $basePrompt = "You are an AI customer support assistant for a business. Answer questions truthfully and helpfully. If you don't know the answer, politely state that you don't know and offer to connect them with a human agent.";
+        $priority = 'normal';
+        $priorityScore = 1;
+        $responseTime = '5_minutes';
 
-        // Add business context if available
-        if (isset($context['business_name'])) {
-            $basePrompt .= "\n\nBusiness: {$context['business_name']}";
+        $userTier = $escalationData['user_tier'] ?? 'regular';
+        $sentiment = $escalationData['sentiment'] ?? 'neutral';
+        $reason = $escalationData['reason'] ?? 'standard';
+
+        // Priority rules
+        if ($userTier === 'vip') {
+            $priority = 'high';
+            $priorityScore = 3;
+            $responseTime = '1_minute';
         }
 
-        // Add language context
-        if (isset($context['language'])) {
-            $basePrompt .= "\n\nLanguage: Respond in {$context['language']}";
+        if ($sentiment === 'negative' || $sentiment === 'angry') {
+            $priority = 'high';
+            $priorityScore = 4;
+            $responseTime = 'immediate';
         }
 
-        // Add product/order context if available
-        if (isset($context['order_context'])) {
-            $basePrompt .= "\n\nOrder Context: {$context['order_context']}";
+        if ($reason === 'system_failure') {
+            $priority = 'high';
+            $priorityScore = 3;
+            $responseTime = 'immediate';
         }
 
-        return $basePrompt;
+        return [
+            'priority' => $priority,
+            'priority_score' => $priorityScore,
+            'response_time_sla' => $responseTime,
+            'notification_level' => $priorityScore
+        ];
     }
 
     /**
-     * Get AI response with structured tone/persona (kept for backward compatibility)
+     * Legacy methods for backward compatibility
      */
+    public static function handleMessage(string $message, array $context = []): array
+    {
+        // Use the new optimized pipeline
+        $aiResult = self::callAIWithJSON($message, $context);
+
+        return [
+            'intent' => $aiResult['intent'],
+            'response' => $aiResult['reply'],
+            'confidence' => $aiResult['confidence'] * 100,
+            'issues' => $aiResult['validation']['reasons'],
+            'intent_confidence' => $aiResult['confidence'],
+            'evaluation_confidence' => $aiResult['confidence'],
+            'context_score' => 0.8
+        ];
+    }
+
+    public static function calculateConfidence(array $intent, array $evaluation, float $contextScore = 0): float
+    {
+        $intentConfidence = $intent['confidence'] ?? 0.5;
+        $evaluationConfidence = $evaluation['confidence'] ?? 0.7;
+
+        $confidence = ($intentConfidence * 0.5) + ($evaluationConfidence * 0.3) + ($contextScore * 0.2);
+
+        return max(0, min(100, $confidence * 100));
+    }
+
+    public static function detectIntent(string $message): array
+    {
+        // Fallback to simple detection
+        $messageLower = strtolower(trim($message));
+
+        if (strlen($message) < 2) {
+            return ['intent' => 'unknown', 'confidence' => 0.5];
+        }
+
+        $greetings = ['السلام', 'مرحبا', 'أهلا', 'hi', 'hello', 'hey', 'هاي', 'good morning', 'good evening', 'صباح', 'مساء'];
+        foreach ($greetings as $greeting) {
+            if (str_contains($messageLower, $greeting)) {
+                return ['intent' => 'greeting', 'confidence' => 0.9];
+            }
+        }
+
+        $orderKeywords = ['طلب', 'طلب', 'order', 'فين', 'حالة', 'سعر', 'price'];
+        foreach ($orderKeywords as $keyword) {
+            if (str_contains($messageLower, $keyword)) {
+                return ['intent' => 'order', 'confidence' => 0.8];
+            }
+        }
+
+        return ['intent' => 'unknown', 'confidence' => 0.5];
+    }
+
     public static function applyTonePersona(string $systemPrompt, array $toneStyle, string $language): string
     {
-        $toneInstructions = "\n### TONE & PERSONA ###\n";
-
-        $tone = $toneStyle['tone'] ?? 'friendly';
-        $formality = $toneStyle['formality'] ?? 'casual';
-        $focus = $toneStyle['focus'] ?? 'support';
-
-        // Tone instructions
-        $toneMap = [
-            'friendly' => 'Be warm, approachable, and conversational. Use casual language and personal touches.',
-            'professional' => 'Be formal, polite, and business-like. Use proper titles and professional salutations.',
-            'enthusiastic' => 'Be energetic, positive, and engaging. Use exclamation points sparingly but effectively.',
-            'empathetic' => 'Be understanding, caring, and supportive. Acknowledge customer feelings.',
-        ];
-
-        $toneInstructions .= ($toneMap[$tone] ?? $toneMap['friendly']) . "\n";
-
-        // Formality instructions
-        $formalityMap = [
-            'formal' => 'Use formal language (Dear Mr./Ms., Sincerely, etc.). Avoid contractions.',
-            'casual' => 'Use natural, conversational language. Contractions are fine.',
-            'semi-formal' => 'Balance professional warmth with appropriate formality.',
-        ];
-
-        $toneInstructions .= ($formalityMap[$formality] ?? $formalityMap['casual']) . "\n";
-
-        // Focus instructions
-        $focusMap = [
-            'support' => 'Focus on solving problems and providing helpful information.',
-            'sales' => 'Focus on features, benefits, and guiding toward conversions while being helpful.',
-            'information' => 'Focus on providing accurate information and being comprehensive.',
-        ];
-
-        $toneInstructions .= ($focusMap[$focus] ?? $focusMap['support']) . "\n";
-
-        // Language-specific adjustments
-        if ($language === 'arabic') {
-            $toneInstructions .= "### ARABIC LANGUAGE SPECIFIC ###\n";
-            $toneInstructions .= "- Use appropriate Arabic honorifics (حضرة، شكراً، etc.)\n";
-            $toneInstructions .= "- Start with Islamic greeting when appropriate (السلام عليكم ورحمة الله وبركاته)\n";
-            $toneInstructions .= "- Use polite forms (تفضل، من فضلك، إلخ)\n";
-            $toneInstructions .= "- End with polite closing (مع تحياتي، شكراً لك)\n";
-        } else {
-            $toneInstructions .= "### ENGLISH LANGUAGE SPECIFIC ###\n";
-            $toneInstructions .= "- Use appropriate greetings (Hello, Hi, Good morning)\n";
-            $toneInstructions .= "- Be polite and professional (Please, Thank you, Appreciate)\n";
-            $toneInstructions .= "- Use friendly closings (Best regards, Thank you, Have a great day)\n";
-        }
-
-        return $systemPrompt . $toneInstructions;
+        // Legacy method - kept for backward compatibility
+        return $systemPrompt;
     }
 
-    /**
-     * Check if business hours routing should be used (kept as business logic)
-     */
     public static function checkBusinessHours(?BusinessProfile $business): array
     {
         if (!$business || !$business->business_hours_enabled) {
@@ -694,31 +689,23 @@ Return JSON:
         ];
     }
 
-    /**
-     * Legacy method for backward compatibility - uses new AI pipeline
-     */
-    public static function calculateConfidenceLegacy(string $userMessage, string $aiResponse, ?BusinessProfile $business): int
+    public static function detectHandoff(string $message, array $conversationHistory): array
     {
-        // Use the new AI-driven pipeline
-        $result = self::handleMessage($userMessage, [
-            'business' => $business
-        ]);
+        // Simple keyword-based handoff detection
+        $hardEscalation = self::checkHardEscalation($message);
 
-        return (int)$result['confidence'];
-    }
-
-    /**
-     * Legacy method for backward compatibility - uses new AI intent detection
-     */
-    public static function extractIntent(string $message, ?BusinessProfile $business): array
-    {
-        // Use the new AI-driven intent detection
-        $intent = self::detectIntent($message);
+        if ($hardEscalation['force_escalation']) {
+            return [
+                'should_escalate' => true,
+                'confidence' => 100,
+                'reasons' => [$hardEscalation['reason']]
+            ];
+        }
 
         return [
-            'tag' => $intent['intent'],
-            'intent' => $intent['intent'],
-            'confidence' => (int)($intent['confidence'] * 100)
+            'should_escalate' => false,
+            'confidence' => 30,
+            'reasons' => []
         ];
     }
 }

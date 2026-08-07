@@ -1,0 +1,669 @@
+{
+  "name": "Ultimate AI Customer Support - Complete System",
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "ai-support",
+        "responseMode": "responseNode",
+        "options": {}
+      },
+      "id": "webhook-trigger",
+      "name": "📥 Webhook Trigger",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 1.1,
+      "position": [200, 400],
+      "webhookId": "ultimate-ai-support-complete"
+    },
+    {
+      "parameters": {
+        "assignments": {
+          "assignments": [
+            {
+              "id": "extract-platform",
+              "name": "platform",
+              "value": "={{ $json.body.platform }}",
+              "type": "string"
+            },
+            {
+              "id": "extract-message",
+              "name": "message",
+              "value": "={{ $json.body.message }}",
+              "type": "string"
+            },
+            {
+              "id": "extract-sender",
+              "name": "sender_id",
+              "value": "={{ $json.body.sender_id }}",
+              "type": "string"
+            },
+            {
+              "id": "extract-conversation",
+              "name": "conversation_id",
+              "value": "={{ $json.body.conversation_id }}",
+              "type": "string"
+            },
+            {
+              "id": "extract-user",
+              "name": "user_id",
+              "value": "={{ $json.body.user_id }}",
+              "type": "string"
+            },
+            {
+              "id": "extract-business",
+              "name": "business_id",
+              "value": "={{ $json.body.business_id }}",
+              "type": "string"
+            }
+          ]
+        }
+      },
+      "id": "parse-data",
+      "name": "📋 Parse Message Data",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [400, 400]
+    },
+    {
+      "parameters": {
+        "assignments": {
+          "assignments": [
+            {
+              "id": "lowercase-message",
+              "name": "message_lower",
+              "value": "={{ $json.message.toLowerCase() }}",
+              "type": "string"
+            }
+          ]
+        }
+      },
+      "id": "lowercase-message",
+      "name": "🔤 Lowercase Message",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [600, 400]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict"
+          },
+          "conditions": [
+            {
+              "id": "escalation-keyword-1",
+              "leftValue": "={{ $json.message_lower }}",
+              "rightValue": "human",
+              "operator": {
+                "type": "string",
+                "operation": "contains"
+              }
+            },
+            {
+              "id": "escalation-keyword-2",
+              "leftValue": "={{ $json.message_lower }}",
+              "rightValue": "agent",
+              "operator": {
+                "type": "string",
+                "operation": "contains"
+              }
+            },
+            {
+              "id": "escalation-keyword-3",
+              "leftValue": "={{ $json.message_lower }}",
+              "rightValue": "support",
+              "operator": {
+                "type": "string",
+                "operation": "contains"
+              }
+            },
+            {
+              "id": "escalation-keyword-4",
+              "leftValue": "={{ $json.message_lower }}",
+              "rightValue": "موظف",
+              "operator": {
+                "type": "string",
+                "operation": "contains"
+              }
+            },
+            {
+              "id": "escalation-keyword-5",
+              "leftValue": "={{ $json.message_lower }}",
+              "rightValue": "انسان",
+              "operator": {
+                "type": "string",
+                "operation": "contains"
+              }
+            },
+            {
+              "id": "escalation-keyword-6",
+              "leftValue": "={{ $json.message_lower }}",
+              "rightValue": "person",
+              "operator": {
+                "type": "string",
+                "operation": "contains"
+              }
+            }
+          ],
+          "combinator": "any"
+        }
+      },
+      "id": "hard-escalation-check",
+      "name": "🔴 Hard Escalation Check",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [800, 400]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://api.nazbiz.io/api/escalate",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ { conversation_id: $json.conversation_id, reason: 'hard_keyword_override', priority: 'high', user_id: $json.user_id, matched_keyword: 'detected_in_n8n' } }}",
+        "options": {
+          "timeout": 10000
+        }
+      },
+      "id": "trigger-escalation",
+      "name": "🚨 Trigger Immediate Escalation",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [1000, 300],
+      "retryOnFail": true,
+      "maxTries": 2,
+      "waitBetweenTries": 1000
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ { success: true, action: 'escalated', requires_human: true, message: 'Connecting you with a human agent now.', priority: 'high' } }}"
+      },
+      "id": "escalation-webhook-response",
+      "name": "📤 Escalation Response",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [1200, 300]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://api.nazbiz.io/api/rate-limit/check",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ { user_id: $json.user_id, business_id: $json.business_id } }}",
+        "options": {
+          "timeout": 5000
+        }
+      },
+      "id": "rate-limit-check",
+      "name": "⏱️ Rate Limit Check",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [1000, 500],
+      "continueOnFail": true
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict"
+          },
+          "conditions": [
+            {
+              "id": "rate-limited-check",
+              "leftValue": "={{ $json.rate_limited }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        }
+      },
+      "id": "rate-limit-decision",
+      "name": "⏱️ Rate Limit Decision",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [1200, 500]
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ { success: false, action: 'rate_limited', message: '⚠️ You\\'ve reached the message limit. Please wait before sending more messages.', retry_after: $json.retry_after } }}"
+      },
+      "id": "rate-limit-response",
+      "name": "📤 Rate Limit Response",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [1400, 500]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://api.nazbiz.io/api/language/detect",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ { message: $json.message } }}",
+        "options": {
+          "timeout": 5000
+        }
+      },
+      "id": "language-detection",
+      "name": "🌍 Language Detection",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [1400, 400],
+      "continueOnFail": true
+    },
+    {
+      "parameters": {
+        "assignments": {
+          "assignments": [
+            {
+              "id": "add-language",
+              "name": "detected_language",
+              "value": "={{ $json.language || 'english' }}",
+              "type": "string"
+            }
+          ]
+        }
+      },
+      "id": "add-language-context",
+      "name": "🌍 Add Language Context",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [1600, 400]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://api.nazbiz.io/api/conversation/memory",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ { conversation_id: $json.conversation_id } }}",
+        "options": {
+          "timeout": 5000
+        }
+      },
+      "id": "memory-check",
+      "name": "🧠 Conversation Memory Check",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [1800, 400],
+      "continueOnFail": true
+    },
+    {
+      "parameters": {
+        "assignments": {
+          "assignments": [
+            {
+              "id": "add-memory",
+              "name": "conversation_memory",
+              "value": "={{ $json || { phone_provided: false, order_number_provided: false, attempts: 0 } }}",
+              "type": "object"
+            }
+          ]
+        }
+      },
+      "id": "add-memory-context",
+      "name": "🧠 Add Memory Context",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [2000, 400]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://api.nazbiz.io/api/ai/ultimate-process",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ { message: $json.message, platform: $json.platform, conversation_id: $json.conversation_id, user_id: $json.user_id, business_id: $json.business_id, language: $json.detected_language, memory: $json.conversation_memory } }}",
+        "options": {
+          "timeout": 15000
+        }
+      },
+      "id": "ultimate-ai-call",
+      "name": "🧠 Ultimate AI Call (JSON Output)",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [2200, 400],
+      "retryOnFail": true,
+      "maxTries": 2,
+      "waitBetweenTries": 2000
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict"
+          },
+          "conditions": [
+            {
+              "id": "ai-success-check",
+              "leftValue": "={{ $json.success }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        }
+      },
+      "id": "ai-success-check",
+      "name": "✅ AI Success Check",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [2400, 400]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict"
+          },
+          "conditions": [
+            {
+              "id": "escalation-decision",
+              "leftValue": "={{ $json.needs_escalation }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "equals"
+              }
+            },
+            {
+              "id": "confidence-decision",
+              "leftValue": "={{ $json.confidence * 100 }}",
+              "rightValue": 70,
+              "operator": {
+                "type": "number",
+                "operation": "smaller"
+              }
+            }
+          ],
+          "combinator": "any"
+        }
+      },
+      "id": "escalation-decision",
+      "name": "🔴 Escalation Decision",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [2600, 400]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://api.nazbiz.io/api/escalate",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ { conversation_id: $json.conversation_id, reason: 'ai_decision', intent: $json.intent, confidence: $json.confidence, priority: 'normal', user_id: $json.user_id } }}",
+        "options": {
+          "timeout": 10000
+        }
+      },
+      "id": "ai-escalation",
+      "name": "🚨 AI Escalation",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [2800, 300],
+      "retryOnFail": true,
+      "maxTries": 2
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ { success: true, action: 'escalated', message: 'Sure 👍 I\\'m connecting you with a human agent now. Please wait a moment.', requires_human: true, intent: $json.intent, confidence: $json.confidence } }}"
+      },
+      "id": "escalation-response",
+      "name": "📤 Escalation Response",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [3000, 300]
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ { success: true, action: 'ai_response', message: $json.reply, intent: $json.intent, confidence: $json.confidence, requires_human: false } }}"
+      },
+      "id": "ai-success-response",
+      "name": "📤 AI Success Response",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [2800, 500]
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ { success: false, action: 'ai_failed', message: 'I apologize, but I\\'m having trouble processing your request. Let me connect you with a human agent.', requires_human: true } }}"
+      },
+      "id": "ai-fallback-response",
+      "name": "📤 AI Fallback Response",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [2600, 500]
+    }
+  ],
+  "connections": {
+    "📥 Webhook Trigger": {
+      "main": [
+        [
+          {
+            "node": "📋 Parse Message Data",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "📋 Parse Message Data": {
+      "main": [
+        [
+          {
+            "node": "🔤 Lowercase Message",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "🔤 Lowercase Message": {
+      "main": [
+        [
+          {
+            "node": "🔴 Hard Escalation Check",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "🔴 Hard Escalation Check": {
+      "main": [
+        [
+          {
+            "node": "🚨 Trigger Immediate Escalation",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "⏱️ Rate Limit Check",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "🚨 Trigger Immediate Escalation": {
+      "main": [
+        [
+          {
+            "node": "📤 Escalation Response",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "⏱️ Rate Limit Check": {
+      "main": [
+        [
+          {
+            "node": "⏱️ Rate Limit Decision",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "⏱️ Rate Limit Decision": {
+      "main": [
+        [
+          {
+            "node": "📤 Rate Limit Response",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "🌍 Language Detection",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "🌍 Language Detection": {
+      "main": [
+        [
+          {
+            "node": "🌍 Add Language Context",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "🌍 Add Language Context": {
+      "main": [
+        [
+          {
+            "node": "🧠 Conversation Memory Check",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "🧠 Conversation Memory Check": {
+      "main": [
+        [
+          {
+            "node": "🧠 Add Memory Context",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "🧠 Add Memory Context": {
+      "main": [
+        [
+          {
+            "node": "🧠 Ultimate AI Call (JSON Output)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "🧠 Ultimate AI Call (JSON Output)": {
+      "main": [
+        [
+          {
+            "node": "✅ AI Success Check",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "✅ AI Success Check": {
+      "main": [
+        [
+          {
+            "node": "🔴 Escalation Decision",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "📤 AI Fallback Response",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "🔴 Escalation Decision": {
+      "main": [
+        [
+          {
+            "node": "🚨 AI Escalation",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "📤 AI Success Response",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "🚨 AI Escalation": {
+      "main": [
+        [
+          {
+            "node": "📤 Escalation Response",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "staticData": null,
+  "tags": [
+    {
+      "createdAt": "2026-08-07T19:00:00.000Z",
+      "updatedAt": "2026-08-07T19:00:00.000Z",
+      "id": "production",
+      "name": "Production"
+    }
+  ],
+  "triggerCount": 0,
+  "updatedAt": "2026-08-07T19:00:00.000Z",
+  "versionId": "ultimate-ai-v1"
+}

@@ -307,62 +307,156 @@ class ProcessAutoReply implements ShouldQueue
         }
         // ── END SALLA FLOW ────────────────────────────────────────────────────
         
-        $systemPrompt = AICapabilitiesService::applyTonePersona($systemPrompt, $toneStyle, $detectedLanguage);
+        // Ultimate AI System - Single Call with JSON Output
+        $userId = $user->id ?? $conversation->user_id;
+        $conversationId = $conversation->id;
 
-        // Generate the AI reply using the full business-aware system prompt + conversation history
-        $aiResponse = $this->callConfiguredAI($systemPrompt, $contextMessages);
+        // Step 1: Rate Limiting Check
+        $rateLimitCheck = AICapabilitiesService::checkRateLimit($userId, $channel->business?->id ?? 'default');
+        if ($rateLimitCheck['rate_limited']) {
+            Log::warning('ProcessAutoReply: Rate limit exceeded', [
+                'user_id' => $userId,
+                'retry_after' => $rateLimitCheck['retry_after']
+            ]);
 
-        if (!$aiResponse) {
-            Log::error('ProcessAutoReply: configured AI providers returned no response', ['message_id' => $this->messageId]);
+            $rateLimitMessage = "⚠️ You've reached the message limit. Please wait before sending more messages.";
+            $replyMessage = Message::create([
+                'conversation_id' => $message->conversation_id,
+                'content' => $rateLimitMessage,
+                'direction' => 'outbound',
+                'status' => 'auto',
+                'is_ai' => false,
+                'source' => 'rate_limit',
+                'send_status' => 'pending',
+            ]);
+
+            if ($channel->user_id) {
+                broadcast(new \App\Events\MessageReceived($replyMessage, $conversation, $channel->user_id));
+            }
+            $this->sendReply($channel, $conversation, $replyMessage);
             return;
         }
 
-        // Score the reply for confidence — pass the actual reply so scoring is accurate
-        $context = [
-            'business'       => $channel->business,
-            'business_name'  => $channel->business?->business_name ?? null,
-            'language'       => $detectedLanguage,
-            'has_store_data' => !empty($sallaContext),
-            'has_order_data' => !empty($sallaContext),
-        ];
-
-        $confidenceResult = AICapabilitiesService::scoreReply(
-            $message->content,
-            $aiResponse,
-            $contextMessages,
-            $context
-        );
-
-        $confidenceScore = $confidenceResult['confidence'];
-        $intent          = $confidenceResult['intent'];
-        $intentConf      = $confidenceResult['intent_confidence'];
-
-        $confidenceThreshold = $channel->business?->ai_confidence_threshold ?? 70;
-
-        // If confidence is below threshold, escalate to human
-        if ($confidenceScore < $confidenceThreshold) {
-            Log::info('ProcessAutoReply: AI confidence below threshold, escalating to human', [
+        // Step 2: Hard Escalation Override (Pre-AI Check)
+        $hardEscalation = AICapabilitiesService::checkHardEscalation($message->content);
+        if ($hardEscalation['force_escalation']) {
+            Log::info('ProcessAutoReply: Hard escalation override triggered', [
                 'conversation_id' => $conversation->id,
-                'confidence'      => $confidenceScore,
-                'threshold'       => $confidenceThreshold,
-                'intent'          => $intent,
-                'issues'          => $confidenceResult['issues'],
+                'matched_keyword' => $hardEscalation['matched_keyword']
             ]);
 
             $conversation->update([
                 'requires_human' => true,
                 'escalated_at' => now(),
-                'escalation_reason' => "low_confidence: {$confidenceScore}% (intent: {$intent})"
+                'escalation_reason' => "hard_keyword_override: {$hardEscalation['matched_keyword']}"
             ]);
 
+            $escalationMessage = "Sure 👍 I'm connecting you with a human agent now. Please wait a moment.";
+            $replyMessage = Message::create([
+                'conversation_id' => $message->conversation_id,
+                'content' => $escalationMessage,
+                'direction' => 'outbound',
+                'status' => 'auto',
+                'is_ai' => false,
+                'source' => 'escalation',
+                'send_status' => 'pending',
+            ]);
+
+            if ($channel->user_id) {
+                broadcast(new \App\Events\MessageReceived($replyMessage, $conversation, $channel->user_id));
+            }
+            $this->sendReply($channel, $conversation, $replyMessage);
             return;
         }
 
+        // Step 3: Build AI Context
+        $context = [
+            'business_name' => $channel->business?->business_name ?? 'our business',
+            'platform' => $channel->type,
+            'language' => $detectedLanguage,
+            'knowledge_base' => $channel->business?->knowledgeFiles->pluck('extracted_text')->implode("\n\n") ?? '',
+            'order_data' => !empty($sallaContext) ? json_decode($sallaContext, true) : null
+        ];
+
+        // Step 4: Single AI Call with JSON Output
+        $aiResult = AICapabilitiesService::callAIWithJSON($message->content, $context);
+
+        if (!$aiResult['success']) {
+            Log::error('ProcessAutoReply: AI call failed', [
+                'conversation_id' => $conversation->id,
+                'fallback_used' => true
+            ]);
+
+            // Fallback + Escalate
+            $conversation->update([
+                'requires_human' => true,
+                'escalated_at' => now(),
+                'escalation_reason' => 'ai_failure_fallback'
+            ]);
+
+            $replyMessage = Message::create([
+                'conversation_id' => $message->conversation_id,
+                'content' => $aiResult['reply'],
+                'direction' => 'outbound',
+                'status' => 'auto',
+                'is_ai' => false,
+                'source' => 'fallback',
+                'send_status' => 'pending',
+            ]);
+
+            if ($channel->user_id) {
+                broadcast(new \App\Events\MessageReceived($replyMessage, $conversation, $channel->user_id));
+            }
+            $this->sendReply($channel, $conversation, $replyMessage);
+            return;
+        }
+
+        // Step 5: Simple Decision Logic (3 lines)
+        $confidenceThreshold = $channel->business?->ai_confidence_threshold ?? 70;
+        $aiConfidence = $aiResult['confidence'] * 100;
+
+        if ($aiResult['needs_escalation'] || $aiConfidence < $confidenceThreshold) {
+            // Escalate
+            Log::info('ProcessAutoReply: Escalating based on AI decision', [
+                'conversation_id' => $conversation->id,
+                'ai_intent' => $aiResult['intent'],
+                'ai_needs_escalation' => $aiResult['needs_escalation'],
+                'ai_confidence' => $aiConfidence,
+                'threshold' => $confidenceThreshold
+            ]);
+
+            $conversation->update([
+                'requires_human' => true,
+                'escalated_at' => now(),
+                'escalation_reason' => "ai_decision: intent={$aiResult['intent']}, confidence={$aiConfidence}%"
+            ]);
+
+            $escalationMessage = "Sure 👍 I'm connecting you with a human agent now. Please wait a moment.";
+            $replyMessage = Message::create([
+                'conversation_id' => $message->conversation_id,
+                'content' => $escalationMessage,
+                'direction' => 'outbound',
+                'status' => 'auto',
+                'is_ai' => false,
+                'source' => 'escalation',
+                'send_status' => 'pending',
+            ]);
+
+            if ($channel->user_id) {
+                broadcast(new \App\Events\MessageReceived($replyMessage, $conversation, $channel->user_id));
+            }
+            $this->sendReply($channel, $conversation, $replyMessage);
+            return;
+        }
+
+        // Step 6: Send AI Response
+        $aiResponse = $aiResult['reply'];
+
         // Auto-tag conversation based on AI-detected intent
-        if ($intent !== 'unknown') {
+        if ($aiResult['intent'] !== 'unknown') {
             \App\Models\ConversationTag::firstOrCreate(
-                ['conversation_id' => $conversation->id, 'tag' => $intent],
-                ['intent' => $intent, 'confidence' => $intentConf * 100]
+                ['conversation_id' => $conversation->id, 'tag' => $aiResult['intent']],
+                ['intent' => $aiResult['intent'], 'confidence' => $aiResult['confidence'] * 100]
             );
         }
 

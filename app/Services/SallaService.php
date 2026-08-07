@@ -139,13 +139,32 @@ class SallaService
      */
     public function getStoreInfo(string $accessToken): array
     {
-        $response = $this->apiCall('GET', '/store', [], $accessToken);
-        // Salla wraps responses: { "status": 200, "success": true, "data": { "id": ..., "name": ... } }
-        // Unwrap so callers get the store object directly.
-        if (isset($response['data']) && is_array($response['data'])) {
-            return $response['data'];
+        // Try multiple possible Salla API endpoints for store info
+        $endpoints = ['/oauth2/user/info', '/admin/store', '/store'];
+        
+        foreach ($endpoints as $endpoint) {
+            try {
+                $response = $this->apiCall('GET', $endpoint, [], $accessToken);
+                
+                // Salla wraps responses: { "status": 200, "success": true, "data": { "id": ..., "name": ... } }
+                if (isset($response['data']) && is_array($response['data'])) {
+                    Log::info("Successfully fetched store info from {$endpoint}");
+                    return $response['data'];
+                }
+                
+                // If response looks like store data directly, return it
+                if (isset($response['id']) || isset($response['name'])) {
+                    Log::info("Successfully fetched store info from {$endpoint} (direct format)");
+                    return $response;
+                }
+                
+            } catch (\Exception $e) {
+                Log::warning("Failed to fetch store info from {$endpoint}", ['error' => $e->getMessage()]);
+                continue; // Try next endpoint
+            }
         }
-        return $response;
+        
+        throw new \Exception('Failed to fetch store info from all available endpoints');
     }
 
     /**

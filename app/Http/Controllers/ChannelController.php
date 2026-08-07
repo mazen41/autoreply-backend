@@ -326,7 +326,7 @@ class ChannelController extends Controller
         // Redirect to frontend signup/login with the OAuth code
         if (!$userId || !is_numeric($userId)) {
             Log::warning('No valid user ID in Salla OAuth state - redirecting to signup', ['state' => $state]);
-            return redirect(env('FRONTEND_URL') . '/auth/salla-callback?code=' . $code . '&state=' . $state);
+            return redirect(env('FRONTEND_URL') . '/signup?salla_code=' . $code . '&salla_state=' . $state);
         }
 
         try {

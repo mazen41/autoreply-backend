@@ -9,6 +9,7 @@ use App\Http\Controllers\GmailController;
 use App\Services\EvolutionApiService;
 use App\Services\KnowledgeChunker;
 use App\Services\AICapabilitiesService;
+use App\Services\SallaService;
 use Google\Service\Gmail;
 use Google\Service\Gmail\Message as GmailMessage;
 use Illuminate\Bus\Queueable;
@@ -177,6 +178,13 @@ class ProcessAutoReply implements ShouldQueue
         ];
         
         $detectedLanguage = $this->detectLanguage($message->content);
+        
+        // Check if this is an order-related query and user has Salla connected
+        $sallaContext = $this->getSallaOrderContext($message, $channel);
+        if ($sallaContext) {
+            $systemPrompt .= "\n\n### ORDER CONTEXT ###\n" . $sallaContext;
+        }
+        
         $systemPrompt = AICapabilitiesService::applyTonePersona($systemPrompt, $toneStyle, $detectedLanguage);
 
         $aiResponse = $this->callConfiguredAI($systemPrompt, $contextMessages);
@@ -664,6 +672,101 @@ class ProcessAutoReply implements ShouldQueue
             Log::error('ProcessAutoReply: WhatsApp send exception', ['error' => $e->getMessage()]);
             return false;
         }
+    }
+
+    /**
+     * Get Salla order context if message is order-related and user has Salla connected
+     */
+    private function getSallaOrderContext(Message $message, Channel $currentChannel): ?string
+    {
+        // Check if message contains order-related keywords in Arabic
+        $orderKeywords = [
+            'فين طلبي', 'حالة الطلب', 'متى يوصل', 'أبغى أعرف طلبي',
+            'طلبي', 'الطلب', 'شحن', 'توصيل', 'استلم'
+        ];
+
+        $messageLower = strtolower($message->content);
+        $isOrderRelated = false;
+        foreach ($orderKeywords as $keyword) {
+            if (str_contains($messageLower, $keyword)) {
+                $isOrderRelated = true;
+                break;
+            }
+        }
+
+        if (!$isOrderRelated) {
+            return null;
+        }
+
+        // Find Salla channel for this user
+        $sallaChannel = Channel::where('user_id', $currentChannel->user_id)
+            ->where('type', 'salla')
+            ->where('status', 'connected')
+            ->first();
+
+        if (!$sallaChannel) {
+            Log::info('User does not have connected Salla channel');
+            return null;
+        }
+
+        try {
+            $sallaService = new SallaService();
+            
+            // Extract phone number from conversation sender
+            $phone = $this->extractPhoneNumber($message);
+            if (!$phone) {
+                Log::info('Could not extract phone number for Salla lookup');
+                return null;
+            }
+
+            // Get latest order for this phone number
+            $order = $sallaService->getLatestOrderByPhone($sallaChannel->access_token, $phone);
+            
+            if ($order) {
+                Log::info('Found Salla order for customer', [
+                    'order_id' => $order['id'] ?? null,
+                    'phone' => $phone,
+                ]);
+                return $sallaService->formatOrderForAI($order);
+            }
+
+            Log::info('No Salla order found for phone number', ['phone' => $phone]);
+            return null;
+
+        } catch (\Exception $e) {
+            Log::error('Error getting Salla order context', [
+                'error' => $e->getMessage(),
+            ]);
+            return null;
+        }
+    }
+
+    /**
+     * Extract phone number from message or conversation
+     */
+    private function extractPhoneNumber(Message $message): ?string
+    {
+        // Try to get from conversation sender
+        $conversation = $message->conversation;
+        
+        // Check different possible phone number fields
+        $phone = $conversation->sender_phone ?? 
+                 $conversation->sender_id ?? // For WhatsApp, sender_id might be phone
+                 null;
+
+        if ($phone) {
+            // Clean phone number - remove non-numeric characters
+            $phone = preg_replace('/[^0-9]/', '', $phone);
+            
+            // Ensure it starts with country code if needed
+            if (strlen($phone) === 10 && str_starts_with($phone, '0')) {
+                $phone = '966' . substr($phone, 1); // Convert Saudi format
+            }
+            
+            return $phone;
+        }
+
+        return null;
     }
 }
 

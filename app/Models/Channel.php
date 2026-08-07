@@ -13,15 +13,21 @@ class Channel extends Model
         'page_id',
         'page_name',
         'instagram_account_id',
+        'store_id',
+        'store_name',
         'access_token',
         'refresh_token',
         'status',
         'connected_at',
+        'token_expires_at',
+        'metadata',
         'ai_enabled',
     ];
 
     protected $casts = [
         'connected_at' => 'datetime',
+        'token_expires_at' => 'datetime',
+        'metadata' => 'array',
     ];
 
     public function setAccessTokenAttribute($value)
@@ -45,6 +51,28 @@ class Channel extends Model
             return decrypt($value);
         } catch (\Exception $e) {
             // If decryption fails, return the value as-is (might be already decrypted)
+            return $value;
+        }
+    }
+
+    public function setRefreshTokenAttribute($value)
+    {
+        if (empty($value)) {
+            $this->attributes['refresh_token'] = null;
+        } else {
+            $this->attributes['refresh_token'] = encrypt($value);
+        }
+    }
+
+    public function getRefreshTokenAttribute($value)
+    {
+        if (empty($value)) {
+            return null;
+        }
+
+        try {
+            return decrypt($value);
+        } catch (\Exception $e) {
             return $value;
         }
     }

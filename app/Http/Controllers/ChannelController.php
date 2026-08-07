@@ -3,6 +3,7 @@
 namespace App\Http\Controllers;
 
 use App\Models\Channel;
+use App\Services\SallaService;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\Http;
 use Illuminate\Support\Facades\Log;
@@ -263,6 +264,163 @@ class ChannelController extends Controller
         $channel->update($validated);
 
         return response()->json(['message' => 'Channel updated', 'channel' => $channel]);
+    }
+
+    /**
+     * Connect Salla store
+     */
+    public function connectSalla(Request $request)
+    {
+        $token = $request->query('token');
+        $accessToken = \Laravel\Sanctum\PersonalAccessToken::findToken($token);
+        
+        if (!$accessToken) {
+            return redirect(env('FRONTEND_URL') . '/dashboard/channels?error=unauthorized');
+        }
+        
+        $user = $accessToken->tokenable;
+        $state = $user->id . ':' . $request->query('redirect', 'dashboard');
+
+        $sallaService = new SallaService();
+        $authUrl = $sallaService->getAuthorizationUrl($state);
+
+        return redirect($authUrl);
+    }
+
+    /**
+     * Handle Salla OAuth callback
+     */
+    public function callbackSalla(Request $request)
+    {
+        Log::info('=== SALLA CALLBACK START ===');
+        Log::info('Request params', $request->all());
+
+        $code = $request->get('code');
+        $stateParts = explode(':', $request->get('state') ?? '');
+        $userId = $stateParts[0] ?? null;
+        $error = $request->get('error');
+
+        // Handle errors
+        if ($error || !$code) {
+            Log::error('Salla OAuth denied or no code', ['error' => $error]);
+            return redirect(env('FRONTEND_URL') . '/dashboard/channels?error=salla_denied');
+        }
+
+        if (!$userId) {
+            Log::error('No user ID in state');
+            return redirect(env('FRONTEND_URL') . '/dashboard/channels?error=session_expired');
+        }
+
+        try {
+            $sallaService = new SallaService();
+            
+            // Exchange code for tokens
+            $tokenData = $sallaService->exchangeCodeForToken($code);
+            
+            $accessToken = $tokenData['access_token'];
+            $refreshToken = $tokenData['refresh_token'] ?? null;
+            $expiresIn = $tokenData['expires_in'] ?? 3600;
+
+            // Get store information
+            $storeInfo = $sallaService->getStoreInfo($accessToken);
+            
+            $storeId = $storeInfo['id'] ?? null;
+            $storeName = $storeInfo['name'] ?? 'Unknown Store';
+
+            if (!$storeId) {
+                Log::error('Could not get store ID from Salla');
+                return redirect(env('FRONTEND_URL') . '/dashboard/channels?error=store_info_failed');
+            }
+
+            // Get business profile
+            $businessProfile = \App\Models\BusinessProfile::where('user_id', $userId)->first();
+
+            // Create or update Salla channel
+            $channel = Channel::updateOrCreate(
+                [
+                    'user_id' => $userId,
+                    'type' => 'salla',
+                    'store_id' => $storeId,
+                ],
+                [
+                    'store_name' => $storeName,
+                    'access_token' => $accessToken,
+                    'refresh_token' => $refreshToken,
+                    'token_expires_at' => now()->addSeconds($expiresIn),
+                    'status' => 'connected',
+                    'connected_at' => now(),
+                    'business_id' => $businessProfile ? $businessProfile->id : null,
+                    'metadata' => [
+                        'scopes' => $tokenData['scope'] ?? null,
+                    ],
+                ]
+            );
+
+            Log::info('Salla channel saved', [
+                'channel_id' => $channel->id,
+                'store_name' => $storeName,
+            ]);
+
+            // Subscribe to Salla webhooks
+            $this->subscribeSallaWebhooks($channel, $accessToken);
+
+            return redirect(env('FRONTEND_URL') . '/dashboard/channels?success=salla_connected');
+
+        } catch (\Exception $e) {
+            Log::error('Salla OAuth callback error', [
+                'message' => $e->getMessage(),
+                'trace' => $e->getTraceAsString(),
+            ]);
+            return redirect(env('FRONTEND_URL') . '/dashboard/channels?error=salla_oauth_failed');
+        }
+    }
+
+    /**
+     * Subscribe to Salla webhooks
+     */
+    protected function subscribeSallaWebhooks(Channel $channel, string $accessToken)
+    {
+        $webhookUrl = env('APP_URL') . '/api/salla/webhook';
+        $events = [
+            'order.created',
+            'order.status.updated',
+            'order.shipment.created',
+            'order.canceled',
+            'order.refunded',
+            'order.customer.updated',
+            'order.shipping.address.updated',
+            'order.products.updated',
+            'customer.created',
+            'customer.updated',
+            'shipment.created',
+            'shipment.updated',
+            'shipment.cancelled',
+        ];
+
+        try {
+            $response = Http::withToken($accessToken)
+                ->accept('application/json')
+                ->post('https://api.salla.dev/webhooks', [
+                    'url' => $webhookUrl,
+                    'events' => $events,
+                ]);
+
+            if ($response->successful()) {
+                Log::info('Salla webhooks subscribed successfully', [
+                    'channel_id' => $channel->id,
+                    'webhook_id' => $response->json('id'),
+                ]);
+            } else {
+                Log::error('Failed to subscribe Salla webhooks', [
+                    'status' => $response->status(),
+                    'body' => $response->body(),
+                ]);
+            }
+        } catch (\Exception $e) {
+            Log::error('Exception subscribing Salla webhooks', [
+                'message' => $e->getMessage(),
+            ]);
+        }
     }
 }
 

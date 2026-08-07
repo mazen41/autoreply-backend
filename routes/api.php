@@ -14,6 +14,7 @@ use App\Http\Controllers\Api\TrainingController;
 use App\Http\Controllers\Api\ProactiveController;
 use App\Http\Controllers\Api\AutomationController;
 use App\Http\Controllers\Api\ToolsController;
+use App\Http\Controllers\Api\SallaWebhookController;
 use App\Http\Controllers\WebhookController;
 use App\Http\Controllers\ChannelController;
 use App\Http\Controllers\GmailController;
@@ -58,6 +59,11 @@ Route::post('/webhook/meta', [WebhookController::class, 'handle']);
 Route::get('/channels/connect/facebook',  [ChannelController::class, 'connectFacebook']);
 Route::get('/channels/callback/facebook', [ChannelController::class, 'callbackFacebook']);
 Route::get('/channels/callback/gmail',    [GmailController::class, 'callback']);
+Route::get('/channels/connect/salla',     [ChannelController::class, 'connectSalla']);
+Route::get('/channels/callback/salla',    [ChannelController::class, 'callbackSalla']);
+
+// Salla Webhook - public, Salla calls these directly
+Route::post('/salla/webhook', [SallaWebhookController::class, 'handle']);
 
 // â”€â”€ Protected routes â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 Route::middleware('auth:sanctum')->group(function () {
@@ -92,6 +98,16 @@ Route::middleware('auth:sanctum')->group(function () {
     Route::get('/channels',                   [ChannelController::class, 'index']);
     Route::patch('/channels/{id}',            [ChannelController::class, 'update']);
     Route::delete('/channels/{id}',           [ChannelController::class, 'disconnect']);
+    
+    // Salla sync routes
+    Route::post('/channels/{id}/sync/customers', function ($id) {
+        \App\Jobs\SyncSallaCustomers::dispatch($id);
+        return response()->json(['message' => 'Customer sync started']);
+    });
+    Route::post('/channels/{id}/sync/orders', function ($id) {
+        \App\Jobs\SyncSallaOrders::dispatch($id);
+        return response()->json(['message' => 'Order sync started']);
+    });
 
     // Inbox — conversations + messages + manual reply
     Route::get('/inbox',                                [InboxController::class, 'index']);

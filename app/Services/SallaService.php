@@ -13,12 +13,24 @@ class SallaService
     protected string $clientSecret;
     protected string $redirectUri;
 
+    protected function isConfigured(): bool
+    {
+        return !empty($this->clientId) && !empty($this->clientSecret);
+    }
+
     public function __construct()
     {
         $this->apiBaseUrl = env('SALLA_API_BASE_URL', 'https://api.salla.dev');
-        $this->clientId = env('SALLA_CLIENT_ID');
-        $this->clientSecret = env('SALLA_CLIENT_SECRET');
+        $this->clientId = env('SALLA_CLIENT_ID', '');
+        $this->clientSecret = env('SALLA_CLIENT_SECRET', '');
         $this->redirectUri = env('SALLA_REDIRECT_URI', env('APP_URL') . '/api/salla/callback');
+        
+        if (empty($this->clientId) || empty($this->clientSecret)) {
+            Log::error('Salla credentials not configured', [
+                'client_id_set' => !empty($this->clientId),
+                'client_secret_set' => !empty($this->clientSecret),
+            ]);
+        }
     }
 
     /**
@@ -26,6 +38,10 @@ class SallaService
      */
     public function getAuthorizationUrl(string $state): string
     {
+        if (!$this->isConfigured()) {
+            throw new \Exception('Salla credentials are not configured');
+        }
+
         $params = [
             'client_id' => $this->clientId,
             'redirect_uri' => $this->redirectUri,
@@ -224,8 +240,13 @@ class SallaService
     /**
      * Verify webhook signature
      */
-    public function verifyWebhookSignature(string $payload, string $signature): bool
+    public function verifyWebhookSignature(string $payload, ?string $signature): bool
     {
+        if (empty($signature)) {
+            Log::warning('Webhook signature is empty');
+            return false;
+        }
+
         $webhookSecret = env('SALLA_WEBHOOK_SECRET');
         if (empty($webhookSecret)) {
             Log::error('SALLA_WEBHOOK_SECRET not configured');

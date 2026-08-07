@@ -46,7 +46,7 @@ class SallaService
             'client_id' => $this->clientId,
             'redirect_uri' => $this->redirectUri,
             'response_type' => 'code',
-            'scope' => 'orders.read offline_access products.read customers.read',
+            'scope' => 'basic_info.read settings.read customers.read orders.read products.read offline_access',
             'state' => $state,
         ];
 
@@ -74,7 +74,15 @@ class SallaService
             throw new \Exception('Failed to exchange authorization code for token');
         }
 
-        return $response->json();
+        $tokenData = $response->json();
+        
+        Log::info('Salla OAuth Token Response', [
+            'status' => $response->status(),
+            'body' => $tokenData,
+            'granted_scopes' => $tokenData['scope'] ?? 'none',
+        ]);
+
+        return $tokenData;
     }
 
     /**

@@ -16,7 +16,7 @@ class AICapabilitiesService
 
     private static function getAIModel(): string
     {
-        return env('GEMINI_MODEL', 'gemini-2.5-flash');
+        return env('GEMINI_MODEL', 'gemini-3.5-flash');
     }
 
     private static function getAIAPIKey(): string

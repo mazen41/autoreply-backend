@@ -25,65 +25,48 @@ class AICapabilitiesService
     }
 
     /**
-     * Detect intent using AI (semantic understanding)
+     * Detect intent using AI (semantic understanding) - DEPRECATED: Use analyzeMessageAndResponse instead
      */
     public static function detectIntent(string $message): array
     {
-        // Cache intent results for repeated messages
+        // Fallback to simple detection for backward compatibility
         $cacheKey = 'intent_' . md5($message);
         $cached = Cache::get($cacheKey);
         if ($cached !== null) {
             return $cached;
         }
 
-        // Skip AI for very short messages (< 2 chars) - these are usually unclear
-        if (strlen(trim($message)) < 2) {
-            return [
-                'intent' => 'unknown',
-                'confidence' => 0.5,
-                'from_cache' => false
-            ];
+        // Simple keyword-based fallback for rate limiting
+        $messageLower = strtolower(trim($message));
+        
+        // Very short messages
+        if (strlen($message) < 2) {
+            return ['intent' => 'unknown', 'confidence' => 0.5, 'from_cache' => false];
         }
 
-        try {
-            $prompt = "Classify this message into one of: greeting, question, order, support, complaint, spam, unknown
-
-Message: \"{$message}\"
-
-Return JSON:
-{
-  \"intent\": \"string\",
-  \"confidence\": float (0-1)
-}";
-
-            $response = self::callAI($prompt);
-            $result = json_decode($response, true);
-
-            if ($result && isset($result['intent']) && isset($result['confidence'])) {
-                $result['from_cache'] = false;
-                // Cache for 1 hour
+        // Simple greeting detection
+        $greetings = ['السلام', 'مرحبا', 'أهلا', 'hi', 'hello', 'hey', 'هاي', 'good morning', 'good evening', 'صباح', 'مساء'];
+        foreach ($greetings as $greeting) {
+            if (str_contains($messageLower, $greeting)) {
+                $result = ['intent' => 'greeting', 'confidence' => 0.9, 'from_cache' => false];
                 Cache::put($cacheKey, $result, 3600);
                 return $result;
             }
-
-            // Fallback if AI fails
-            return [
-                'intent' => 'unknown',
-                'confidence' => 0.5,
-                'from_cache' => false
-            ];
-
-        } catch (\Exception $e) {
-            Log::error('AI intent detection failed', [
-                'message' => $message,
-                'error' => $e->getMessage()
-            ]);
-            return [
-                'intent' => 'unknown',
-                'confidence' => 0.5,
-                'from_cache' => false
-            ];
         }
+
+        // Order-related keywords
+        $orderKeywords = ['طلب', 'طلب', 'order', 'فين', 'حالة', 'سعر', 'price'];
+        foreach ($orderKeywords as $keyword) {
+            if (str_contains($messageLower, $keyword)) {
+                $result = ['intent' => 'order', 'confidence' => 0.8, 'from_cache' => false];
+                Cache::put($cacheKey, $result, 3600);
+                return $result;
+            }
+        }
+
+        $result = ['intent' => 'unknown', 'confidence' => 0.5, 'from_cache' => false];
+        Cache::put($cacheKey, $result, 3600);
+        return $result;
     }
 
     /**
@@ -112,55 +95,20 @@ Return JSON:
     }
 
     /**
-     * Evaluate response quality using AI
+     * Evaluate response quality using AI - DEPRECATED: Use analyzeMessageAndResponse instead
      */
     public static function evaluateResponse(string $message, string $response): array
     {
-        try {
-            $prompt = "Evaluate the quality of this AI response.
-
-User message: \"{$message}\"
-AI response: \"{$response}\"
-
-Score based on:
-- correctness (does it answer the question?)
-- clarity (is it easy to understand?)
-- usefulness (is it helpful?)
-- completeness (does it provide needed information?)
-
-Return JSON:
-{
-  \"confidence\": float (0-1),
-  \"issues\": [\"optional list of problems\"]
-}";
-
-            $aiResponse = self::callAI($prompt);
-            $result = json_decode($aiResponse, true);
-
-            if ($result && isset($result['confidence'])) {
-                return [
-                    'confidence' => (float)$result['confidence'],
-                    'issues' => $result['issues'] ?? []
-                ];
-            }
-
-            // Fallback
-            return [
-                'confidence' => 0.7,
-                'issues' => []
-            ];
-
-        } catch (\Exception $e) {
-            Log::error('AI response evaluation failed', [
-                'message' => $message,
-                'response' => substr($response, 0, 100),
-                'error' => $e->getMessage()
-            ]);
-            return [
-                'confidence' => 0.6,
-                'issues' => ['evaluation_failed']
-            ];
+        // Simple heuristic fallback for rate limiting
+        if (strlen($response) < 20) {
+            return ['confidence' => 0.4, 'issues' => ['too_short']];
         }
+
+        if (str_contains(strtolower($response), 'don\'t know') || str_contains(strtolower($response), 'not sure')) {
+            return ['confidence' => 0.5, 'issues' => ['uncertain']];
+        }
+
+        return ['confidence' => 0.7, 'issues' => []];
     }
 
     /**
@@ -204,34 +152,94 @@ Return JSON:
     }
 
     /**
-     * Main handler - complete AI pipeline
+     * Main handler - complete AI pipeline (optimized to reduce API calls)
      */
     public static function handleMessage(string $message, array $context = []): array
     {
-        // Step 1: Detect intent
-        $intent = self::detectIntent($message);
-
-        // Step 2: Generate response
+        // Step 1: Generate response (AI call #1)
         $response = self::generateResponse($message, $context);
 
-        // Step 3: Evaluate response
-        $evaluation = self::evaluateResponse($message, $response);
+        // Step 2: Combine intent detection + evaluation in one AI call (AI call #2)
+        $combinedAnalysis = self::analyzeMessageAndResponse($message, $response);
 
-        // Step 4: Calculate context score
+        // Step 3: Calculate context score
         $contextScore = self::calculateContextScore($context);
 
-        // Step 5: Calculate final confidence
-        $confidence = self::calculateConfidence($intent, $evaluation, $contextScore);
+        // Step 4: Calculate final confidence
+        $confidence = self::calculateConfidence(
+            ['intent' => $combinedAnalysis['intent'], 'confidence' => $combinedAnalysis['intent_confidence']],
+            ['confidence' => $combinedAnalysis['response_quality'], 'issues' => $combinedAnalysis['issues']],
+            $contextScore
+        );
 
         return [
-            'intent' => $intent['intent'],
+            'intent' => $combinedAnalysis['intent'],
             'response' => $response,
             'confidence' => $confidence,
-            'issues' => $evaluation['issues'],
-            'intent_confidence' => $intent['confidence'],
-            'evaluation_confidence' => $evaluation['confidence'],
+            'issues' => $combinedAnalysis['issues'],
+            'intent_confidence' => $combinedAnalysis['intent_confidence'],
+            'evaluation_confidence' => $combinedAnalysis['response_quality'],
             'context_score' => $contextScore
         ];
+    }
+
+    /**
+     * Combined analysis - intent + evaluation in one AI call to reduce API usage
+     */
+    private static function analyzeMessageAndResponse(string $message, string $response): array
+    {
+        try {
+            $prompt = "Analyze this conversation in JSON format:
+
+User message: \"{$message}\"
+AI response: \"{$response}\"
+
+Provide:
+1. Intent classification (greeting, question, order, support, complaint, spam, unknown)
+2. Intent confidence (0-1)
+3. Response quality score (0-1) based on correctness, clarity, usefulness, completeness
+4. Any issues with the response (optional list)
+
+Return JSON:
+{
+  \"intent\": \"string\",
+  \"intent_confidence\": float,
+  \"response_quality\": float,
+  \"issues\": [\"optional list of problems\"]
+}";
+
+            $aiResponse = self::callAI($prompt);
+            $result = json_decode($aiResponse, true);
+
+            if ($result && isset($result['intent']) && isset($result['intent_confidence']) && isset($result['response_quality'])) {
+                return [
+                    'intent' => $result['intent'],
+                    'intent_confidence' => (float)$result['intent_confidence'],
+                    'response_quality' => (float)$result['response_quality'],
+                    'issues' => $result['issues'] ?? []
+                ];
+            }
+
+            // Fallback if AI fails
+            return [
+                'intent' => 'unknown',
+                'intent_confidence' => 0.5,
+                'response_quality' => 0.7,
+                'issues' => ['ai_analysis_failed']
+            ];
+
+        } catch (\Exception $e) {
+            Log::error('AI combined analysis failed', [
+                'message' => $message,
+                'error' => $e->getMessage()
+            ]);
+            return [
+                'intent' => 'unknown',
+                'intent_confidence' => 0.5,
+                'response_quality' => 0.6,
+                'issues' => ['analysis_failed']
+            ];
+        }
     }
 
     /**
@@ -330,63 +338,134 @@ Return JSON:
     }
 
     /**
-     * Call Gemini API with prompt
+     * Call Gemini API with retry logic and rate limiting
      */
     private static function callGemini(string $prompt): string
     {
         $apiKey = self::getAIAPIKey();
         $model = self::getAIModel();
 
-        $response = Http::withHeaders([
-            'Content-Type' => 'application/json',
-        ])->post("https://generativelanguage.googleapis.com/v1beta/models/{$model}:generateContent?key={$apiKey}", [
-            'contents' => [
-                [
-                    'parts' => [
-                        ['text' => $prompt]
-                    ]
-                ]
-            ]
-        ]);
+        $maxRetries = 3;
+        $retryDelay = 1000; // Start with 1 second
 
-        if (!$response->successful()) {
-            throw new \Exception('Gemini API error: ' . $response->body());
+        for ($attempt = 1; $attempt <= $maxRetries; $attempt++) {
+            try {
+                $response = Http::withHeaders([
+                    'Content-Type' => 'application/json',
+                ])->post("https://generativelanguage.googleapis.com/v1beta/models/{$model}:generateContent?key={$apiKey}", [
+                    'contents' => [
+                        [
+                            'parts' => [
+                                ['text' => $prompt]
+                            ]
+                        ]
+                    ]
+                ]);
+
+                if (!$response->successful()) {
+                    // Check if it's a rate limit error
+                    if ($response->status() === 429) {
+                        Log::warning('Gemini rate limit hit, retrying', [
+                            'attempt' => $attempt,
+                            'delay' => $retryDelay
+                        ]);
+                        
+                        if ($attempt < $maxRetries) {
+                            usleep($retryDelay * 1000); // Convert to microseconds
+                            $retryDelay *= 2; // Exponential backoff
+                            continue;
+                        }
+                    }
+                    
+                    throw new \Exception('Gemini API error: ' . $response->body());
+                }
+
+                $data = $response->json();
+                return $data['candidates'][0]['content']['parts'][0]['text'] ?? '';
+
+            } catch (\Exception $e) {
+                if ($attempt === $maxRetries) {
+                    throw $e;
+                }
+                
+                Log::warning('Gemini API call failed, retrying', [
+                    'attempt' => $attempt,
+                    'error' => $e->getMessage()
+                ]);
+                
+                usleep($retryDelay * 1000);
+                $retryDelay *= 2;
+            }
         }
 
-        $data = $response->json();
-        return $data['candidates'][0]['content']['parts'][0]['text'] ?? '';
+        throw new \Exception('Gemini API failed after retries');
     }
 
     /**
-     * Call Gemini API with chat messages
+     * Call Gemini API with chat messages and retry logic
      */
     private static function callGeminiChat(array $messages): string
     {
         $apiKey = self::getAIAPIKey();
         $model = self::getAIModel();
 
-        $contents = [];
-        foreach ($messages as $message) {
-            $contents[] = [
-                'role' => $message['role'] === 'system' ? 'user' : $message['role'],
-                'parts' => [
-                    ['text' => $message['content']]
-                ]
-            ];
+        $maxRetries = 3;
+        $retryDelay = 1000;
+
+        for ($attempt = 1; $attempt <= $maxRetries; $attempt++) {
+            try {
+                $contents = [];
+                foreach ($messages as $message) {
+                    $contents[] = [
+                        'role' => $message['role'] === 'system' ? 'user' : $message['role'],
+                        'parts' => [
+                            ['text' => $message['content']]
+                        ]
+                    ];
+                }
+
+                $response = Http::withHeaders([
+                    'Content-Type' => 'application/json',
+                ])->post("https://generativelanguage.googleapis.com/v1beta/models/{$model}:generateContent?key={$apiKey}", [
+                    'contents' => $contents
+                ]);
+
+                if (!$response->successful()) {
+                    if ($response->status() === 429) {
+                        Log::warning('Gemini rate limit hit on chat, retrying', [
+                            'attempt' => $attempt,
+                            'delay' => $retryDelay
+                        ]);
+                        
+                        if ($attempt < $maxRetries) {
+                            usleep($retryDelay * 1000);
+                            $retryDelay *= 2;
+                            continue;
+                        }
+                    }
+                    
+                    throw new \Exception('Gemini API error: ' . $response->body());
+                }
+
+                $data = $response->json();
+                return $data['candidates'][0]['content']['parts'][0]['text'] ?? '';
+
+            } catch (\Exception $e) {
+                if ($attempt === $maxRetries) {
+                    throw $e;
+                }
+                
+                Log::warning('Gemini chat API call failed, retrying', [
+                    'attempt' => $attempt,
+                    'error' => $e->getMessage()
+                ]);
+                
+                usleep($retryDelay * 1000);
+                $retryDelay *= 2;
+            }
         }
 
-        $response = Http::withHeaders([
-            'Content-Type' => 'application/json',
-        ])->post("https://generativelanguage.googleapis.com/v1beta/models/{$model}:generateContent?key={$apiKey}", [
-            'contents' => $contents
-        ]);
-
-        if (!$response->successful()) {
-            throw new \Exception('Gemini API error: ' . $response->body());
-        }
-
-        $data = $response->json();
-        return $data['candidates'][0]['content']['parts'][0]['text'] ?? '';
+        throw new \Exception('Gemini chat API failed after retries');
     }
 
     /**

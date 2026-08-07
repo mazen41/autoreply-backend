@@ -40,9 +40,18 @@ class MessageReceived implements ShouldBroadcast
 
     public function broadcastWith(): array
     {
+        // Send only a lightweight payload to stay under Pusher's 10 KB limit.
+        // The frontend fetches full details via the REST API using these IDs.
         return [
-            'message' => $this->message,
-            'conversation' => $this->conversation,
+            'message_id'      => $this->message->id,
+            'conversation_id' => $this->message->conversation_id,
+            'channel_id'      => $this->conversation->channel_id ?? null,
+            'channel_type'    => $this->conversation->channel->type ?? null,
+            'sender_id'       => $this->message->sender_id ?? null,
+            'sender_name'     => $this->message->sender_name ?? null,
+            'direction'       => $this->message->direction ?? null,
+            'preview'         => mb_substr(strip_tags($this->message->body ?? ''), 0, 120),
+            'created_at'      => $this->message->created_at?->toISOString(),
         ];
     }
 }

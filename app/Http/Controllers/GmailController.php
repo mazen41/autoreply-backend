@@ -97,22 +97,50 @@ class GmailController extends Controller
 
             if ($client->isAccessTokenExpired()) {
                 $refreshToken = $channel->refresh_token ?? ($tokenData['refresh_token'] ?? null);
+
                 if (!$refreshToken) {
-                    Log::error('Gmail token expired and no refresh token', ['channel_id' => $channel->id]);
+                    Log::error('Gmail token expired and no refresh token — marking disconnected', [
+                        'channel_id' => $channel->id,
+                    ]);
+                    $channel->update([
+                        'status'   => 'disconnected',
+                        'metadata' => array_merge($channel->metadata ?? [], [
+                            'disconnect_reason' => 'no_refresh_token',
+                            'disconnected_at'   => now()->toISOString(),
+                        ]),
+                    ]);
                     return null;
                 }
+
                 // If refresh_token is stored separately (encrypted), decrypt it
                 try {
                     $refreshToken = decrypt($refreshToken);
                 } catch (\Exception $e) {
                     // Already plain string from tokenData
                 }
-                $client->fetchAccessTokenWithRefreshToken($refreshToken);
-                $newToken = $client->getAccessToken();
 
-                // Persist updated token
+                $newToken = $client->fetchAccessTokenWithRefreshToken($refreshToken);
+
+                // Detect invalid_grant (revoked / expired refresh token)
+                if (isset($newToken['error'])) {
+                    $errorCode = $newToken['error'];
+                    Log::error('Gmail refresh token error — marking channel disconnected', [
+                        'channel_id' => $channel->id,
+                        'error'      => $errorCode,
+                    ]);
+                    $channel->update([
+                        'status'   => 'disconnected',
+                        'metadata' => array_merge($channel->metadata ?? [], [
+                            'disconnect_reason' => $errorCode,   // e.g. "invalid_grant"
+                            'disconnected_at'   => now()->toISOString(),
+                        ]),
+                    ]);
+                    return null;  // Stop retrying — caller must prompt user to reconnect
+                }
+
+                // Persist refreshed token
                 Channel::where('id', $channel->id)->update([
-                    'access_token' => encrypt(json_encode($newToken)),
+                    'access_token' => encrypt(json_encode($client->getAccessToken())),
                     'updated_at'   => now(),
                 ]);
             }

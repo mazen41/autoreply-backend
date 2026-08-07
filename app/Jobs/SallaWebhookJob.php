@@ -214,16 +214,24 @@ class SallaWebhookJob implements ShouldQueue
     }
 
     /**
-     * Handle app.installed event (Salla Easy Mode)
+     * Handle app.installed event.
+     *
+     * ARCHITECTURE NOTE:
+     * The webhook payload only contains merchant ID — it does NOT contain a Naz user ID.
+     * Therefore we MUST NOT create a Channel here (user_id would be null → DB error).
+     *
+     * The OAuth callback (callbackSalla) is solely responsible for creating/claiming
+     * the Channel and linking it to the correct Naz user.
+     *
+     * Here we only: update an ALREADY EXISTING channel for this merchant (e.g. re-install).
      */
     protected function handleAppInstalled(array $data): void
     {
         $merchantId = $data['merchant'] ?? null;
         $appId      = $data['id'] ?? null;
         $storeType  = $data['store_type'] ?? null;
-        $storeName  = $data['app_name'] ?? 'Salla Store';
 
-        Log::info('Salla app installed', [
+        Log::info('Salla app.installed webhook received', [
             'merchant_id' => $merchantId,
             'app_id'      => $appId,
             'store_type'  => $storeType,
@@ -234,47 +242,33 @@ class SallaWebhookJob implements ShouldQueue
             return;
         }
 
-        // Look for an existing Salla channel that matched this merchant.
-        // Channels connected via OAuth store the merchant/store id in page_id.
+        // Only update an EXISTING channel (created by OAuth). Never create a new one here.
         $channel = Channel::where('type', 'salla')
             ->where('page_id', (string) $merchantId)
+            ->whereNotNull('user_id')
+            ->where('user_id', '!=', 0)
             ->first();
 
         if ($channel) {
-            // Mark as active in case it was previously disconnected.
             $channel->update([
-                'status'      => 'connected',
+                'status'       => 'connected',
                 'connected_at' => now(),
-                'metadata'    => array_merge($channel->metadata ?? [], [
-                    'merchant_id' => $merchantId,
-                    'app_id'      => $appId,
-                    'store_type'  => $storeType,
-                    'installed_at' => now()->toISOString(),
-                ]),
-            ]);
-            Log::info('Salla channel re-activated for merchant', [
-                'channel_id'  => $channel->id,
-                'merchant_id' => $merchantId,
-            ]);
-        } else {
-            // No channel yet — create a placeholder so the merchant appears
-            // in the system. A proper OAuth connection will overwrite this.
-            $channel = Channel::create([
-                'user_id'     => null, // unknown until OAuth completes
-                'type'        => 'salla',
-                'page_id'     => (string) $merchantId,
-                'page_name'   => $storeName,
-                'status'      => 'pending_oauth',
-                'connected_at' => now(),
-                'metadata'    => [
+                'metadata'     => array_merge($channel->metadata ?? [], [
                     'merchant_id'  => $merchantId,
                     'app_id'       => $appId,
                     'store_type'   => $storeType,
-                    'installed_at' => now()->toISOString(),
-                ],
+                    'reinstalled_at' => now()->toISOString(),
+                ]),
             ]);
-            Log::info('Salla placeholder channel created for new merchant', [
+            Log::info('Salla channel re-activated on app.installed', [
                 'channel_id'  => $channel->id,
+                'merchant_id' => $merchantId,
+                'user_id'     => $channel->user_id,
+            ]);
+        } else {
+            // No channel exists yet — merchant has not completed OAuth yet.
+            // Do nothing. When they complete OAuth the channel will be created properly.
+            Log::info('Salla app.installed: no OAuth channel found for merchant yet — awaiting OAuth', [
                 'merchant_id' => $merchantId,
             ]);
         }

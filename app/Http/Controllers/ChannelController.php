@@ -303,83 +303,125 @@ class ChannelController extends Controller
         Log::info('=== SALLA CALLBACK START ===');
         Log::info('Request params', $request->all());
 
-        $code = $request->get('code');
+        $code  = $request->get('code');
         $state = $request->get('state');
         $error = $request->get('error');
 
-        // Handle errors
         if ($error || !$code) {
             Log::error('Salla OAuth denied or no code', ['error' => $error]);
             return redirect(env('FRONTEND_URL') . '/dashboard/channels?error=salla_denied');
         }
 
-        // Parse state - it might be user_id:redirect or just user_id
-        $userId = null;
+        // State carries "userId:redirect"
+        $userId   = null;
         $redirect = 'dashboard';
-        
         if ($state) {
-            $stateParts = explode(':', $state);
-            $userId = $stateParts[0] ?? null;
-            $redirect = $stateParts[1] ?? 'dashboard';
+            $parts    = explode(':', $state, 2);
+            $userId   = $parts[0] ?? null;
+            $redirect = $parts[1] ?? 'dashboard';
         }
 
         if (!$userId) {
-            Log::error('No user ID in state');
+            Log::error('No user ID in Salla OAuth state');
             return redirect(env('FRONTEND_URL') . '/dashboard/channels?error=session_expired');
         }
 
         try {
             $sallaService = new SallaService();
-            
-            // Exchange code for tokens
-            $tokenData = $sallaService->exchangeCodeForToken($code);
-            
-            $accessToken = $tokenData['access_token'];
+
+            // 1. Exchange code for tokens
+            $tokenData    = $sallaService->exchangeCodeForToken($code);
+            $accessToken  = $tokenData['access_token'];
             $refreshToken = $tokenData['refresh_token'] ?? null;
-            $expiresIn = $tokenData['expires_in'] ?? 3600;
+            $expiresIn    = $tokenData['expires_in'] ?? 3600;
 
-            // Get store information
+            // 2a. Fetch user/merchant info from the OAuth user info endpoint
+            //     This gives us the merchant ID (used as our page_id / store identifier)
+            $userInfo   = $sallaService->getUserInfo($accessToken);
+            $merchantId = (string) ($userInfo['merchant']['id'] ?? $userInfo['id'] ?? '');
+
+            Log::info('Salla user info received', [
+                'user_id'     => $userInfo['id'] ?? null,
+                'merchant_id' => $merchantId,
+                'email'       => $userInfo['email'] ?? null,
+            ]);
+
+            // 2b. Fetch store details from the Admin API (name, domain, etc.)
             $storeInfo = $sallaService->getStoreInfo($accessToken);
-            
-            $storeId = $storeInfo['id'] ?? null;
-            $storeName = $storeInfo['name'] ?? 'Unknown Store';
+            $storeId   = $merchantId ?: (string) ($storeInfo['id'] ?? '');
+            $storeName = $storeInfo['name'] ?? $userInfo['name'] ?? 'Salla Store';
 
-            if (!$storeId) {
-                Log::error('Could not get store ID from Salla', ['store_info' => $storeInfo]);
+            if (empty($storeId)) {
+                Log::error('Salla callback: could not resolve store/merchant ID', [
+                    'user_info'  => $userInfo,
+                    'store_info' => $storeInfo,
+                ]);
                 return redirect(env('FRONTEND_URL') . '/dashboard/channels?error=store_info_failed');
             }
 
-            // Get business profile
             $businessProfile = \App\Models\BusinessProfile::where('user_id', $userId)->first();
 
-            // Create or update Salla channel
-            $channel = Channel::updateOrCreate(
-                [
-                    'user_id' => $userId,
-                    'type' => 'salla',
-                    'store_id' => $storeId,
-                ],
-                [
-                    'store_name' => $storeName,
-                    'access_token' => $accessToken,
-                    'refresh_token' => $refreshToken,
+            // 3. Check for an orphaned placeholder created by app.installed webhook
+            $existing = Channel::where('type', 'salla')
+                ->where('page_id', $storeId)
+                ->whereNull('user_id')
+                ->orWhere(fn ($q) => $q->where('type', 'salla')
+                    ->where('page_id', $storeId)
+                    ->where('user_id', 0))
+                ->first();
+
+            if ($existing) {
+                // Claim the placeholder for this user
+                $existing->update([
+                    'user_id'          => $userId,
+                    'page_name'        => $storeName,
+                    'access_token'     => $accessToken,
+                    'refresh_token'    => $refreshToken,
                     'token_expires_at' => now()->addSeconds($expiresIn),
-                    'status' => 'connected',
-                    'connected_at' => now(),
-                    'business_id' => $businessProfile ? $businessProfile->id : null,
-                    'metadata' => [
-                        'scopes' => $tokenData['scope'] ?? null,
+                    'status'           => 'connected',
+                    'connected_at'     => now(),
+                    'business_id'      => $businessProfile?->id,
+                    'metadata'         => array_merge($existing->metadata ?? [], [
+                        'scopes'      => $tokenData['scope'] ?? null,
+                        'merchant_id' => $merchantId,
+                        'user_info'   => $userInfo,
+                        'store_info'  => $storeInfo,
+                    ]),
+                ]);
+                $channel = $existing->fresh();
+            } else {
+                // Normal upsert keyed on (user_id, type, page_id)
+                $channel = Channel::updateOrCreate(
+                    [
+                        'user_id' => $userId,
+                        'type'    => 'salla',
+                        'page_id' => $storeId,
+                    ],
+                    [
+                        'page_name'        => $storeName,
+                        'access_token'     => $accessToken,
+                        'refresh_token'    => $refreshToken,
+                        'token_expires_at' => now()->addSeconds($expiresIn),
+                        'status'           => 'connected',
+                        'connected_at'     => now(),
+                        'business_id'      => $businessProfile?->id,
+                        'metadata'         => [
+                        'scopes'      => $tokenData['scope'] ?? null,
+                        'merchant_id' => $merchantId,
+                        'user_info'   => $userInfo,
+                        'store_info'  => $storeInfo,
                     ],
                 ]
-            );
+                );
+            }
 
             Log::info('Salla channel saved', [
                 'channel_id' => $channel->id,
                 'store_name' => $storeName,
-                'store_id' => $storeId,
+                'store_id'   => $storeId,
+                'user_id'    => $userId,
             ]);
 
-            // Subscribe to Salla webhooks
             $this->subscribeSallaWebhooks($channel, $accessToken);
 
             return redirect(env('FRONTEND_URL') . '/dashboard/channels?success=salla_connected');
@@ -387,7 +429,7 @@ class ChannelController extends Controller
         } catch (\Exception $e) {
             Log::error('Salla OAuth callback error', [
                 'message' => $e->getMessage(),
-                'trace' => $e->getTraceAsString(),
+                'trace'   => $e->getTraceAsString(),
             ]);
             return redirect(env('FRONTEND_URL') . '/dashboard/channels?error=salla_oauth_failed');
         }

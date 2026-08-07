@@ -194,12 +194,17 @@ class ProcessAutoReply implements ShouldQueue
             return;
         }
 
-        // Calculate confidence score
-        $confidenceScore = AICapabilitiesService::calculateConfidence(
-            $message->content,
-            $aiResponse,
-            $channel->business ?? null
-        );
+        // Use new AI-driven pipeline for confidence calculation
+        $context = [
+            'business' => $channel->business,
+            'business_name' => $channel->business?->name ?? null,
+            'language' => $detectedLanguage,
+            'has_store_data' => !empty($sallaContext),
+            'has_order_data' => !empty($sallaContext)
+        ];
+
+        $aiResult = AICapabilitiesService::handleMessage($message->content, $context);
+        $confidenceScore = $aiResult['confidence'];
 
         $confidenceThreshold = $channel->business?->ai_confidence_threshold ?? 70;
 
@@ -208,20 +213,29 @@ class ProcessAutoReply implements ShouldQueue
             Log::info('ProcessAutoReply: AI confidence below threshold, escalating to human', [
                 'conversation_id' => $conversation->id,
                 'confidence' => $confidenceScore,
-                'threshold' => $confidenceThreshold
+                'threshold' => $confidenceThreshold,
+                'intent' => $aiResult['intent'],
+                'issues' => $aiResult['issues']
             ]);
 
             $conversation->update([
                 'requires_human' => true,
                 'escalated_at' => now(),
-                'escalation_reason' => "low_confidence: {$confidenceScore}%"
+                'escalation_reason' => "low_confidence: {$confidenceScore}% (intent: {$aiResult['intent']})"
             ]);
 
             return;
         }
 
-        // Auto-tag conversation based on intent
-        $intentDetection = AICapabilitiesService::extractIntent($message->content, $channel->business ?? null);
+        // Auto-tag conversation based on AI-detected intent
+        if ($aiResult['intent'] !== 'unknown') {
+            \App\Models\ConversationTag::create([
+                'conversation_id' => $conversation->id,
+                'tag' => $aiResult['intent'],
+                'intent' => $aiResult['intent'],
+                'confidence' => $aiResult['intent_confidence'] * 100
+            ]);
+        }
         if ($intentDetection['tag'] !== 'general') {
             \App\Models\ConversationTag::create([
                 'conversation_id' => $conversation->id,

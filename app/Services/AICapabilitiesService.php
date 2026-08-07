@@ -3,247 +3,424 @@
 namespace App\Services;
 
 use App\Models\BusinessProfile;
-use App\Models\Conversation;
-use App\Models\Message;
+use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\Http;
 use Illuminate\Support\Facades\Log;
 
 class AICapabilitiesService
 {
-    /**
-     * Get confidence score for AI response based on knowledge base coverage
-     *
-     * @param string $userMessage The customer's message
-     * @param string $aiResponse The AI's generated response
-     * @param BusinessProfile|null $business The business profile with knowledge base
-     * @return int Confidence score 0-100
-     */
-    public static function calculateConfidence(string $userMessage, string $aiResponse, ?BusinessProfile $business): int
+    private static function getAIProvider(): string
     {
-        $confidence = 50; // Base confidence
+        return env('AI_PROVIDER', 'gemini');
+    }
 
-        // Detect message type and adjust base confidence accordingly
-        $messageLower = strtolower(trim($userMessage));
+    private static function getAIModel(): string
+    {
+        return env('GEMINI_MODEL', 'gemini-2.5-flash');
+    }
 
-        // Greetings - should be very confident
-        $greetings = ['السلام عليكم', 'مرحبا', 'أهلا', 'hi', 'hello', 'hey', 'good morning', 'good evening', 'صباح الخير', 'مساء الخير'];
-        foreach ($greetings as $greeting) {
-            if (str_contains($messageLower, $greeting)) {
-                $confidence = 95; // High confidence for greetings
-                break;
-            }
-        }
-
-        // Common social phrases - should be confident
-        $socialPhrases = ['شكرا', 'thank you', 'شكراً', 'how are you', 'كيف حالك', 'nice to meet you', 'تشرفت بك'];
-        foreach ($socialPhrases as $phrase) {
-            if (str_contains($messageLower, $phrase)) {
-                $confidence = 90; // High confidence for social phrases
-                break;
-            }
-        }
-
-        // Simple questions that don't require business knowledge
-        $simpleQuestions = ['ما هذا', 'what is this', 'من أنت', 'who are you', 'ماذا تفعل', 'what do you do'];
-        foreach ($simpleQuestions as $question) {
-            if (str_contains($messageLower, $question)) {
-                $confidence = 85; // High confidence for simple questions
-                break;
-            }
-        }
-
-        // Check if AI response contains uncertain phrases
-        $uncertainPhrases = [
-            "I don't know", "I'm not sure", "I don't have that information",
-            "لا أعرف", "لست متأكدا", "ليس لدي هذه المعلومات",
-            "might", "could be", "possibly", "ربما", "قد يكون"
-        ];
-
-        foreach ($uncertainPhrases as $phrase) {
-            if (stripos($aiResponse, $phrase) !== false) {
-                $confidence -= 30;
-                break;
-            }
-        }
-
-        // Check if response is specific and actionable
-        $specificIndicators = [
-            'specific details', 'exact', 'precisely', 'دقيقة', 'تحديداً',
-            '€', '$', 'SAR', 'ريال', 'AM', 'PM', 'صباحاً', 'مساءً'
-        ];
-
-        foreach ($specificIndicators as $indicator) {
-            if (stripos($aiResponse, $indicator) !== false) {
-                $confidence += 15;
-            }
-        }
-
-        // Check if response uses knowledge base content
-        $knowledgeContent = '';
-        if ($business) {
-            foreach ($business->knowledgeFiles()->get() as $file) {
-                $knowledgeContent .= ' ' . strtolower($file->extracted_text);
-            }
-        }
-
-        $userWords = array_filter(explode(' ', strtolower($userMessage)));
-        $responseWords = array_filter(explode(' ', strtolower($aiResponse)));
-
-        $matchingWords = 0;
-        foreach ($responseWords as $word) {
-            if (strlen($word) > 3 && str_contains($knowledgeContent, $word)) {
-                $matchingWords++;
-            }
-        }
-
-        if (count($responseWords) > 0) {
-            $matchRatio = $matchingWords / count($responseWords);
-            $confidence += ($matchRatio * 20);
-        }
-
-        // Check response length - too short suggests vagueness
-        // But for greetings, short responses are acceptable
-        if (strlen($aiResponse) < 50 && $confidence < 90) {
-            $confidence -= 20;
-        }
-
-        // Check if response contains placeholders or filler
-        $fillerPhrases = [
-            "I'll help you with that", "Let me help you", "I'm here to assist",
-            "سأساعدك بذلك", "دعني أساعدك", "أنا هنا للمساعدة"
-        ];
-
-        foreach ($fillerPhrases as $phrase) {
-            if (stripos($aiResponse, $phrase) !== false) {
-                $confidence -= 25;
-                break;
-            }
-        }
-
-        // Normalize to 0-100 range
-        return max(0, min(100, (int)$confidence));
+    private static function getAIAPIKey(): string
+    {
+        return env('GEMINI_API_KEY', '');
     }
 
     /**
-     * Detect if conversation should be escalated to human
-     * 
-     * @param string $message The user's message
-     * @param array $conversationHistory Recent messages in conversation
-     * @return array [should_escalate, reason, confidence]
+     * Detect intent using AI (semantic understanding)
+     */
+    public static function detectIntent(string $message): array
+    {
+        // Cache intent results for repeated messages
+        $cacheKey = 'intent_' . md5($message);
+        $cached = Cache::get($cacheKey);
+        if ($cached !== null) {
+            return $cached;
+        }
+
+        // Skip AI for very short messages (< 2 chars) - these are usually unclear
+        if (strlen(trim($message)) < 2) {
+            return [
+                'intent' => 'unknown',
+                'confidence' => 0.5,
+                'from_cache' => false
+            ];
+        }
+
+        try {
+            $prompt = "Classify this message into one of: greeting, question, order, support, complaint, spam, unknown
+
+Message: \"{$message}\"
+
+Return JSON:
+{
+  \"intent\": \"string\",
+  \"confidence\": float (0-1)
+}";
+
+            $response = self::callAI($prompt);
+            $result = json_decode($response, true);
+
+            if ($result && isset($result['intent']) && isset($result['confidence'])) {
+                $result['from_cache'] = false;
+                // Cache for 1 hour
+                Cache::put($cacheKey, $result, 3600);
+                return $result;
+            }
+
+            // Fallback if AI fails
+            return [
+                'intent' => 'unknown',
+                'confidence' => 0.5,
+                'from_cache' => false
+            ];
+
+        } catch (\Exception $e) {
+            Log::error('AI intent detection failed', [
+                'message' => $message,
+                'error' => $e->getMessage()
+            ]);
+            return [
+                'intent' => 'unknown',
+                'confidence' => 0.5,
+                'from_cache' => false
+            ];
+        }
+    }
+
+    /**
+     * Generate AI response
+     */
+    public static function generateResponse(string $message, array $context = []): string
+    {
+        try {
+            $systemPrompt = self::buildSystemPrompt($context);
+
+            $messages = [
+                ['role' => 'system', 'content' => $systemPrompt],
+                ['role' => 'user', 'content' => $message]
+            ];
+
+            $response = self::callAIChat($messages);
+            return trim($response);
+
+        } catch (\Exception $e) {
+            Log::error('AI response generation failed', [
+                'message' => $message,
+                'error' => $e->getMessage()
+            ]);
+            return "I apologize, but I'm having trouble generating a response right now. Please try again later.";
+        }
+    }
+
+    /**
+     * Evaluate response quality using AI
+     */
+    public static function evaluateResponse(string $message, string $response): array
+    {
+        try {
+            $prompt = "Evaluate the quality of this AI response.
+
+User message: \"{$message}\"
+AI response: \"{$response}\"
+
+Score based on:
+- correctness (does it answer the question?)
+- clarity (is it easy to understand?)
+- usefulness (is it helpful?)
+- completeness (does it provide needed information?)
+
+Return JSON:
+{
+  \"confidence\": float (0-1),
+  \"issues\": [\"optional list of problems\"]
+}";
+
+            $aiResponse = self::callAI($prompt);
+            $result = json_decode($aiResponse, true);
+
+            if ($result && isset($result['confidence'])) {
+                return [
+                    'confidence' => (float)$result['confidence'],
+                    'issues' => $result['issues'] ?? []
+                ];
+            }
+
+            // Fallback
+            return [
+                'confidence' => 0.7,
+                'issues' => []
+            ];
+
+        } catch (\Exception $e) {
+            Log::error('AI response evaluation failed', [
+                'message' => $message,
+                'response' => substr($response, 0, 100),
+                'error' => $e->getMessage()
+            ]);
+            return [
+                'confidence' => 0.6,
+                'issues' => ['evaluation_failed']
+            ];
+        }
+    }
+
+    /**
+     * Calculate final confidence using AI-driven formula
+     */
+    public static function calculateConfidence(array $intent, array $evaluation, float $contextScore = 0): float
+    {
+        $intentConfidence = $intent['confidence'] ?? 0.5;
+        $evaluationConfidence = $evaluation['confidence'] ?? 0.7;
+
+        // Weighted formula as specified
+        $confidence = ($intentConfidence * 0.5) + ($evaluationConfidence * 0.3) + ($contextScore * 0.2);
+
+        // Convert to 0-100 range
+        return max(0, min(100, $confidence * 100));
+    }
+
+    /**
+     * Calculate context score based on data usage
+     */
+    public static function calculateContextScore(array $context): float
+    {
+        $score = 0;
+
+        // Check if response uses store data
+        if (isset($context['has_store_data']) && $context['has_store_data']) {
+            $score += 0.3;
+        }
+
+        // Check if response uses product info
+        if (isset($context['has_product_info']) && $context['has_product_info']) {
+            $score += 0.3;
+        }
+
+        // Check if response uses order data
+        if (isset($context['has_order_data']) && $context['has_order_data']) {
+            $score += 0.4;
+        }
+
+        return min(1.0, $score);
+    }
+
+    /**
+     * Main handler - complete AI pipeline
+     */
+    public static function handleMessage(string $message, array $context = []): array
+    {
+        // Step 1: Detect intent
+        $intent = self::detectIntent($message);
+
+        // Step 2: Generate response
+        $response = self::generateResponse($message, $context);
+
+        // Step 3: Evaluate response
+        $evaluation = self::evaluateResponse($message, $response);
+
+        // Step 4: Calculate context score
+        $contextScore = self::calculateContextScore($context);
+
+        // Step 5: Calculate final confidence
+        $confidence = self::calculateConfidence($intent, $evaluation, $contextScore);
+
+        return [
+            'intent' => $intent['intent'],
+            'response' => $response,
+            'confidence' => $confidence,
+            'issues' => $evaluation['issues'],
+            'intent_confidence' => $intent['confidence'],
+            'evaluation_confidence' => $evaluation['confidence'],
+            'context_score' => $contextScore
+        ];
+    }
+
+    /**
+     * Detect if conversation should be escalated using AI
      */
     public static function detectHandoff(string $message, array $conversationHistory): array
     {
-        $messageLower = strtolower($message);
-        $escalationScore = 0;
-        $reasons = [];
+        try {
+            $historyText = implode("\n", array_map(fn($msg) => 
+                ($msg['direction'] ?? 'unknown') . ': ' . ($msg['content'] ?? ''),
+                array_slice($conversationHistory, -5)
+            ));
 
-        // Frustration indicators
-        $frustrationKeywords = [
-            'angry', 'frustrated', 'upset', 'disappointed', 'terrible',
-            'غاضب', 'محبط', ' disappointed', 'سيء', 'فظيع'
-        ];
+            $prompt = "Analyze if this conversation should be escalated to a human agent.
 
-        foreach ($frustrationKeywords as $keyword) {
-            if (str_contains($messageLower, $keyword)) {
-                $escalationScore += 30;
-                $reasons[] = "frustration_detected: {$keyword}";
+Latest message: \"{$message}\"
+
+Recent conversation history:
+{$historyText}
+
+Consider:
+- Customer frustration or anger
+- Requests for human agent
+- Complex or unresolved issues
+- Urgency indicators
+- Repeated failed AI responses
+
+Return JSON:
+{
+  \"should_escalate\": boolean,
+  \"confidence\": float (0-1),
+  \"reasons\": [\"optional list of reasons\"]
+}";
+
+            $response = self::callAI($prompt);
+            $result = json_decode($response, true);
+
+            if ($result && isset($result['should_escalate'])) {
+                return [
+                    'should_escalate' => $result['should_escalate'],
+                    'confidence' => ($result['confidence'] ?? 0.7) * 100,
+                    'reasons' => $result['reasons'] ?? []
+                ];
             }
+
+            // Fallback
+            return [
+                'should_escalate' => false,
+                'confidence' => 30,
+                'reasons' => ['ai_evaluation_failed']
+            ];
+
+        } catch (\Exception $e) {
+            Log::error('AI handoff detection failed', [
+                'message' => $message,
+                'error' => $e->getMessage()
+            ]);
+            return [
+                'should_escalate' => false,
+                'confidence' => 30,
+                'reasons' => ['handoff_detection_failed']
+            ];
         }
-
-        // Request for human
-        $humanRequestKeywords = [
-            'human', 'person', 'agent', 'representative', 'talk to someone',
-            'إنسان', 'شخص', 'موظف', 'أريد التحدث مع شخص'
-        ];
-
-        foreach ($humanRequestKeywords as $keyword) {
-            if (str_contains($messageLower, $keyword)) {
-                $escalationScore += 40;
-                $reasons[] = "human_requested: {$keyword}";
-            }
-        }
-
-        // Complex indicators
-        $complexityKeywords = [
-            'complicated', 'complex', 'confusing', 'not clear',
-            'complicated situation', 'special case', 'exception',
-            'معقد', 'معقد', 'غامض', 'غير واضح', 'حالة خاصة'
-        ];
-
-        foreach ($complexityKeywords as $keyword) {
-            if (str_contains($messageLower, $keyword)) {
-                $escalationScore += 25;
-                $reasons[] = "complexity_detected: {$keyword}";
-            }
-        }
-
-        // Urgency indicators
-        $urgencyKeywords = [
-            'urgent', 'emergency', 'asap', 'immediately', 'right now',
-            'طوارئ', 'عاجل', 'فوراً', 'حالاً', 'بسرعة'
-        ];
-
-        foreach ($urgencyKeywords as $keyword) {
-            if (str_contains($messageLower, $keyword)) {
-                $escalationScore += 20;
-                $reasons[] = "urgency_detected: {$keyword}";
-            }
-        }
-
-        // Check conversation context for repeated failed AI responses
-        $recentAIFailures = 0;
-        foreach (array_slice($conversationHistory, -5) as $msg) {
-            if (isset($msg['is_ai']) && $msg['is_ai'] && 
-                isset($msg['send_status']) && $msg['send_status'] === 'failed') {
-                $recentAIFailures++;
-            }
-        }
-
-        if ($recentAIFailures >= 2) {
-            $escalationScore += 35;
-            $reasons[] = "repeated_ai_failures: {$recentAIFailures}";
-        }
-
-        // Check for customer complaints
-        $complaintKeywords = [
-            'complaint', 'issue', 'problem', 'wrong', 'error', 'mistake',
-            'شكوى', 'مشكلة', 'خطأ', 'غير صحيح', 'عطل'
-        ];
-
-        foreach ($complaintKeywords as $keyword) {
-            if (str_contains($messageLower, $keyword)) {
-                $escalationScore += 15;
-                $reasons[] = "complaint_detected: {$keyword}";
-            }
-        }
-
-        // Check message length - very long messages often indicate complex issues
-        if (strlen($message) > 500) {
-            $escalationScore += 10;
-            $reasons[] = "long_message_complexity";
-        }
-
-        $shouldEscalate = $escalationScore >= 50;
-
-        return [
-            'should_escalate' => $shouldEscalate,
-            'confidence' => min(100, $escalationScore),
-            'reasons' => $reasons,
-        ];
     }
 
     /**
-     * Get AI response with structured tone/persona
-     * 
-     * @param string $systemPrompt Base system prompt
-     * @param string $toneStyle Configured tone style
-     * @param string $language Customer's language
-     * @return string Modified system prompt with tone instructions
+     * Call AI with prompt (for non-chat requests)
+     */
+    private static function callAI(string $prompt): string
+    {
+        $provider = self::getAIProvider();
+        $apiKey = self::getAIAPIKey();
+
+        if ($provider === 'gemini') {
+            return self::callGemini($prompt);
+        }
+
+        // Fallback for other providers
+        return self::callGemini($prompt);
+    }
+
+    /**
+     * Call AI with chat messages
+     */
+    private static function callAIChat(array $messages): string
+    {
+        $provider = self::getAIProvider();
+        $apiKey = self::getAIAPIKey();
+
+        if ($provider === 'gemini') {
+            return self::callGeminiChat($messages);
+        }
+
+        // Fallback
+        return self::callGeminiChat($messages);
+    }
+
+    /**
+     * Call Gemini API with prompt
+     */
+    private static function callGemini(string $prompt): string
+    {
+        $apiKey = self::getAIAPIKey();
+        $model = self::getAIModel();
+
+        $response = Http::withHeaders([
+            'Content-Type' => 'application/json',
+        ])->post("https://generativelanguage.googleapis.com/v1beta/models/{$model}:generateContent?key={$apiKey}", [
+            'contents' => [
+                [
+                    'parts' => [
+                        ['text' => $prompt]
+                    ]
+                ]
+            ]
+        ]);
+
+        if (!$response->successful()) {
+            throw new \Exception('Gemini API error: ' . $response->body());
+        }
+
+        $data = $response->json();
+        return $data['candidates'][0]['content']['parts'][0]['text'] ?? '';
+    }
+
+    /**
+     * Call Gemini API with chat messages
+     */
+    private static function callGeminiChat(array $messages): string
+    {
+        $apiKey = self::getAIAPIKey();
+        $model = self::getAIModel();
+
+        $contents = [];
+        foreach ($messages as $message) {
+            $contents[] = [
+                'role' => $message['role'] === 'system' ? 'user' : $message['role'],
+                'parts' => [
+                    ['text' => $message['content']]
+                ]
+            ];
+        }
+
+        $response = Http::withHeaders([
+            'Content-Type' => 'application/json',
+        ])->post("https://generativelanguage.googleapis.com/v1beta/models/{$model}:generateContent?key={$apiKey}", [
+            'contents' => $contents
+        ]);
+
+        if (!$response->successful()) {
+            throw new \Exception('Gemini API error: ' . $response->body());
+        }
+
+        $data = $response->json();
+        return $data['candidates'][0]['content']['parts'][0]['text'] ?? '';
+    }
+
+    /**
+     * Build system prompt with context
+     */
+    private static function buildSystemPrompt(array $context = []): string
+    {
+        $basePrompt = "You are an AI customer support assistant for a business. Answer questions truthfully and helpfully. If you don't know the answer, politely state that you don't know and offer to connect them with a human agent.";
+
+        // Add business context if available
+        if (isset($context['business_name'])) {
+            $basePrompt .= "\n\nBusiness: {$context['business_name']}";
+        }
+
+        // Add language context
+        if (isset($context['language'])) {
+            $basePrompt .= "\n\nLanguage: Respond in {$context['language']}";
+        }
+
+        // Add product/order context if available
+        if (isset($context['order_context'])) {
+            $basePrompt .= "\n\nOrder Context: {$context['order_context']}";
+        }
+
+        return $basePrompt;
+    }
+
+    /**
+     * Get AI response with structured tone/persona (kept for backward compatibility)
      */
     public static function applyTonePersona(string $systemPrompt, array $toneStyle, string $language): string
     {
         $toneInstructions = "\n### TONE & PERSONA ###\n";
-        
+
         $tone = $toneStyle['tone'] ?? 'friendly';
         $formality = $toneStyle['formality'] ?? 'casual';
         $focus = $toneStyle['focus'] ?? 'support';
@@ -294,10 +471,7 @@ class AICapabilitiesService
     }
 
     /**
-     * Check if business hours routing should be used
-     *
-     * @param BusinessProfile|null $business Business profile with hours settings
-     * @return array [should_use_hours_routing, is_after_hours, routing_message]
+     * Check if business hours routing should be used (kept as business logic)
      */
     public static function checkBusinessHours(?BusinessProfile $business): array
     {
@@ -310,7 +484,7 @@ class AICapabilitiesService
         }
 
         $currentTime = now();
-        $currentDay = strtolower($currentTime->format('l')); // Monday, Tuesday, etc.
+        $currentDay = strtolower($currentTime->format('l'));
         $currentTimeHours = $currentTime->format('H:i');
 
         $workingDays = is_array($business->working_days) ? $business->working_days : [];
@@ -323,9 +497,9 @@ class AICapabilitiesService
         $isAfterHours = !$isWorkingDay || !$isWorkingHours;
 
         if ($isAfterHours) {
-            $routingMessage = $business->after_hours_message ?? 
-                ($currentDay === 'friday' || $currentDay === 'saturday' 
-                    ? "نحن مغلقون حالياً. سنعود إليك في اليوم التالي." 
+            $routingMessage = $business->after_hours_message ??
+                ($currentDay === 'friday' || $currentDay === 'saturday'
+                    ? "نحن مغلقون حالياً. سنعود إليك في اليوم التالي."
                     : "We're currently closed. We'll follow up with you during business hours.");
         } else {
             $routingMessage = null;
@@ -339,55 +513,30 @@ class AICapabilitiesService
     }
 
     /**
-     * Extract intent/topic from conversation for auto-tagging
-     *
-     * @param string $message The customer's message
-     * @param BusinessProfile|null $business Business profile for context
-     * @return array [tag, intent, confidence]
+     * Legacy method for backward compatibility - uses new AI pipeline
+     */
+    public static function calculateConfidenceLegacy(string $userMessage, string $aiResponse, ?BusinessProfile $business): int
+    {
+        // Use the new AI-driven pipeline
+        $result = self::handleMessage($userMessage, [
+            'business' => $business
+        ]);
+
+        return (int)$result['confidence'];
+    }
+
+    /**
+     * Legacy method for backward compatibility - uses new AI intent detection
      */
     public static function extractIntent(string $message, ?BusinessProfile $business): array
     {
-        $messageLower = strtolower($message);
-        $intents = [
-            'pricing' => ['price', 'cost', 'how much', 'سعر', 'كم تكلفة', 'ثمن'],
-            'delivery' => ['delivery', 'shipping', 'when will it arrive', 'توصيل', 'شحن', 'متى يصل'],
-            'hours' => ['hours', 'when are you open', 'working hours', 'ساعات', 'متى تفتحون', 'أوقات العمل'],
-            'complaint' => ['complaint', 'issue', 'problem', 'wrong', 'شكوى', 'مشكلة', 'خطأ', 'غير صحيح'],
-            'inquiry' => ['information', 'tell me about', 'what is', 'معلومات', 'أخبرني عن', 'ما هو'],
-            'support' => ['help', 'assist', 'support', 'مساعدة', 'دعم', 'خدمة'],
-            'booking' => ['book', 'reserve', 'appointment', 'حجز', 'احجز', 'موعد'],
-            'payment' => ['payment', 'pay', 'credit card', 'دفع', 'دفع', 'بطاقة ائتمان'],
-        ];
-
-        $bestMatch = null;
-        $highestScore = 0;
-
-        foreach ($intents as $intent => $keywords) {
-            $score = 0;
-            foreach ($keywords as $keyword) {
-                if (str_contains($messageLower, $keyword)) {
-                    $score += 20;
-                }
-            }
-
-            if ($score > $highestScore) {
-                $highestScore = $score;
-                $bestMatch = $intent;
-            }
-        }
-
-        if ($bestMatch && $highestScore > 20) {
-            return [
-                'tag' => $bestMatch,
-                'intent' => $bestMatch,
-                'confidence' => min(100, $highestScore + 20) // Boost confidence
-            ];
-        }
+        // Use the new AI-driven intent detection
+        $intent = self::detectIntent($message);
 
         return [
-            'tag' => 'general',
-            'intent' => 'general',
-            'confidence' => 30
+            'tag' => $intent['intent'],
+            'intent' => $intent['intent'],
+            'confidence' => (int)($intent['confidence'] * 100)
         ];
     }
 }

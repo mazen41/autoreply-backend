@@ -98,8 +98,10 @@ class ProcessAutoReply implements ShouldQueue
             return;
         }
 
+        $detectedLanguage = $this->detectLanguage($message->content);
+        
         // Build system prompt from business profile
-        $systemPrompt = $this->buildSystemPrompt($channel, $message->content);
+        $systemPrompt = $this->buildSystemPrompt($channel, $message->content, $detectedLanguage);
 
         // Get last 10 messages for context
         $contextMessages = Message::where('conversation_id', $message->conversation_id)
@@ -174,8 +176,6 @@ class ProcessAutoReply implements ShouldQueue
             'formality' => 'casual',
             'focus' => 'support'
         ];
-        
-        $detectedLanguage = $this->detectLanguage($message->content);
         
         // Check if this is an order-related query and user has Salla connected
         $sallaContext = $this->getSallaOrderContext($message, $channel);
@@ -266,7 +266,7 @@ class ProcessAutoReply implements ShouldQueue
         $this->sendReply($channel, $message->conversation, $replyMessage);
     }
 
-    private function buildSystemPrompt(Channel $channel, string $currentMessage = ''): string
+    private function buildSystemPrompt(Channel $channel, string $currentMessage = '', string $language = 'english'): string
     {
         $business = $channel->business;
 
@@ -275,8 +275,13 @@ class ProcessAutoReply implements ShouldQueue
             $business = \App\Models\BusinessProfile::where('user_id', $channel->user_id)->first();
         }
 
+        // Hard language instruction at the very top — Gemini respects this when placed first
+        $langInstruction = $language === 'arabic'
+            ? "CRITICAL: You MUST reply in Arabic only. Do not use English under any circumstances.\n\n"
+            : "CRITICAL: You MUST reply in English only. Do not use Arabic under any circumstances.\n\n";
+
         if (!$business) {
-            return "You are an AI customer support assistant. Answer questions truthfully. If you do not know the answer, politely state that you don't know and offer to connect them with a human agent.";
+            return $langInstruction . "You are an AI customer support assistant. Answer questions truthfully. If you do not know the answer, politely state that you don't know and offer to connect them with a human agent.";
         }
 
         $workingDays = is_array($business->working_days) ? implode(', ', $business->working_days) : ($business->working_days ?? 'N/A');
@@ -318,7 +323,8 @@ class ProcessAutoReply implements ShouldQueue
             }
         }
 
-        $prompt = "You are the AI assistant for {$business->business_name}, a {$business->business_type} business.\n";
+        $prompt = $langInstruction;
+        $prompt .= "You are the AI assistant for {$business->business_name}, a {$business->business_type} business.\n";
         $prompt .= "Your job is to answer customer questions accurately using ONLY the information provided below.\n\n";
 
         $prompt .= "### BUSINESS INFORMATION ###\n";

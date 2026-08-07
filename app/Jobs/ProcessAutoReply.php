@@ -236,12 +236,6 @@ class ProcessAutoReply implements ShouldQueue
                 'confidence' => $aiResult['intent_confidence'] * 100
             ]);
         }
-        if ($intentDetection['tag'] !== 'general') {
-            \App\Models\ConversationTag::create([
-                'conversation_id' => $conversation->id,
-                'tag' => $intentDetection['tag'],
-                'intent' => $intentDetection['intent'],
-                'confidence' => $intentDetection['confidence'],
                 'source' => 'ai'
             ]);
             

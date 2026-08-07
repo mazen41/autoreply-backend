@@ -353,7 +353,7 @@ class ProcessAutoReply implements ShouldQueue
         $prompt .= "1. NEVER say vague filler like 'I am here to assist you with any questions' as a substitute for a real answer.\n";
         $prompt .= "2. If you do not know the answer based on the provided information, DO NOT guess or make things up. Honestly say you don't have that information and offer to have a human follow up.\n";
         $prompt .= "3. Actively use the conversation history context provided. Do not repeat or contradict yourself.\n";
-        $prompt .= "4. Keep replies concise, clear, and friendly.\n";
+        $prompt .= "4. Keep replies concise and under 3 sentences where possible — never write long paragraphs.\n";
         $prompt .= "5. Reply in the same language the customer used (Arabic or English).\n";
         $prompt .= "6. Reply style should be: " . ($business->reply_style ?? 'friendly and professional') . ".\n";
 
@@ -463,8 +463,8 @@ class ProcessAutoReply implements ShouldQueue
                 $postData = [
                     'contents' => $contents,
                     'generationConfig' => [
-                        'maxOutputTokens' => (int) config('services.ai.max_tokens', 500),
-                        'temperature' => 0.4, // Lower temperature to avoid hallucinations and vague filler
+                        'maxOutputTokens' => (int) config('services.ai.max_tokens', 1000),
+                        'temperature' => 0.4,
                     ],
                 ];
 

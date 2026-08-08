@@ -402,10 +402,23 @@ class EvolutionApiService
             ]);
         }
         
-        // Skip messages sent FROM this WhatsApp instance (our own outgoing messages)
-        // Evolution sends MESSAGES_UPSERT for all messages including ones we send,
-        // marked with fromMe=true in the key.
+        // Skip messages sent FROM this WhatsApp instance (our own outgoing messages).
+        // The full early-exit logic is immediately below.
         $fromMe = $message['fromMe'] ?? false;
+
+        // Skip our own outgoing messages from the unified inbox path.
+        // Evolution fires MESSAGES_UPSERT for every message including ones we
+        // sent (fromMe=true). Those are already saved by sendReply() via
+        // Message::create() — saving them again here creates duplicates and,
+        // more critically, previously triggered a second ProcessAutoReply
+        // dispatch that caused the AI to reply to itself.
+        if ($fromMe) {
+            Log::info("Skipping fromMe=true MESSAGES_UPSERT (already stored by sender)", [
+                'instance'   => $instanceName,
+                'message_id' => $message['id'] ?? null,
+            ]);
+            return;
+        }
 
         $body = $messageContent['conversation'] ?? $messageContent['extendedTextMessage']['text'] ?? null;
         $messageType = $this->detectMessageType($messageContent);
@@ -450,6 +463,23 @@ class EvolutionApiService
     protected function saveToUnifiedInbox(WhatsAppInstance $instance, ?string $fromPhone, ?string $fromName, ?string $body, string $messageType, ?array $media = null, array $messageKey = [], bool $fromMe = false): void
     {
         try {
+            // Deduplicate: the same WhatsApp message ID can arrive on multiple
+            // Evolution instances (e.g. user_1 and user_2 both subscribed to
+            // the same webhook URL). Use a cache lock on the message ID so only
+            // the first instance processes it and creates the inbox record.
+            $waMessageId = $messageKey['id'] ?? null;
+            if ($waMessageId) {
+                $lockKey = 'wa_msg_processed:' . $waMessageId;
+                if (\Illuminate\Support\Facades\Cache::has($lockKey)) {
+                    Log::info('Duplicate WhatsApp message skipped (already processed by another instance)', [
+                        'message_id' => $waMessageId,
+                        'instance'   => $instance->instance_name,
+                    ]);
+                    return;
+                }
+                // Mark as processed for 5 minutes (long enough to cover any retry window)
+                \Illuminate\Support\Facades\Cache::put($lockKey, 1, now()->addMinutes(5));
+            }
             // Find the WhatsApp channel
             $channel = Channel::where('user_id', $instance->user_id)
                 ->where('type', 'whatsapp')
@@ -553,7 +583,10 @@ class EvolutionApiService
                 broadcast(new \App\Events\MessageReceived($message, $conversation, $channel->user_id));
             }
 
-            // Trigger AI auto-reply only for incoming messages
+            // Trigger AI auto-reply ONLY for genuinely incoming messages.
+            // fromMe=true means WE sent this message (our own AI/agent reply
+            // coming back through the webhook) — never trigger on those or the
+            // AI will reply to itself in an infinite loop.
             if (!$fromMe && $channel->ai_enabled) {
                 \App\Jobs\ProcessAutoReply::dispatch($message->id);
             }

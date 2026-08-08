@@ -211,11 +211,21 @@ class SallaService
         return $result['data'][0] ?? null;
     }
 
-    public function getCustomerOrders(string $accessToken, string $customerId, array $params = []): array
+    /**
+     * Get orders list, optionally filtered.
+     *
+     * Correct endpoint: GET /orders  (NOT /customers/{id}/orders — that does not exist)
+     * Filter by customer_id via query param.
+     */
+    public function getOrders(string $accessToken, array $params = []): array
     {
-        return $this->apiCall('GET', "/customers/{$customerId}/orders", $params, $accessToken);
+        return $this->apiCall('GET', '/orders', $params, $accessToken);
     }
 
+    /**
+     * Get a single order by its ID.
+     * Correct endpoint: GET /orders/{id}
+     */
     public function getOrder(string $accessToken, string $orderId): array
     {
         return $this->apiCall('GET', "/orders/{$orderId}", [], $accessToken);
@@ -231,15 +241,58 @@ class SallaService
         return $this->apiCall('GET', "/products/{$productId}", [], $accessToken);
     }
 
+    /**
+     * Get orders for a specific customer.
+     *
+     * Salla has NO /customers/{id}/orders route.
+     * The correct approach is GET /orders?customer_id={id}
+     */
+    public function getCustomerOrders(string $accessToken, string $customerId, array $params = []): array
+    {
+        return $this->apiCall('GET', '/orders', array_merge(['customer_id' => $customerId], $params), $accessToken);
+    }
+
+    /**
+     * Get latest order by phone number.
+     *
+     * Flow:
+     *  1. Search customers by mobile → get customer ID
+     *  2. GET /orders?customer_id={id}&per_page=1 sorted by newest
+     */
     public function getLatestOrderByPhone(string $accessToken, string $phone): ?array
     {
-        $customer = $this->getCustomerByPhone($accessToken, $phone);
-        if (!$customer) return null;
+        // Normalise phone: strip leading zeros and country code variations
+        // Salla stores Saudi numbers as 05XXXXXXXX or 9665XXXXXXXX
+        $cleanPhone = preg_replace('/[^0-9]/', '', $phone);
 
-        $orders = $this->getCustomerOrders($accessToken, $customer['id'], [
-            'sort' => 'created_at', 'page' => 1, 'per_page' => 1,
+        // Try looking up by the raw number first, then with leading 0 stripped
+        $customer = $this->getCustomerByPhone($accessToken, $cleanPhone);
+
+        if (!$customer && strlen($cleanPhone) > 9) {
+            // Try without country code prefix (e.g. 966 → 0...)
+            $localPhone = '0' . substr($cleanPhone, -9);
+            $customer   = $this->getCustomerByPhone($accessToken, $localPhone);
+        }
+
+        if (!$customer) {
+            Log::info('Salla: no customer found for phone', ['phone' => $cleanPhone]);
+            return null;
+        }
+
+        $orders = $this->getCustomerOrders($accessToken, (string) $customer['id'], [
+            'per_page' => 1,
         ]);
-        return $orders['data'][0] ?? null;
+
+        $order = $orders['data'][0] ?? null;
+
+        if ($order) {
+            Log::info('Salla: latest order found', [
+                'customer_id' => $customer['id'],
+                'order_id'    => $order['id'] ?? null,
+            ]);
+        }
+
+        return $order;
     }
 
     public function formatOrderForAI(array $order): string

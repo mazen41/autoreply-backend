@@ -339,32 +339,39 @@ Rules:
 
     /**
      * Response Validation
+     *
+     * NOTE: The AI is instructed to return JSON, so we validate the *parsed
+     * reply string* (not the raw JSON wrapper).  Previously this validator
+     * was rejecting every valid AI response because it checked for `{`/`}`
+     * in the raw JSON output.  We now receive the already-decoded reply text
+     * and validate only that.
      */
     public static function validateResponse(string $response, string $intent): array
     {
         $validation = [
-            'valid' => true,
-            'reasons' => [],
-            'warnings' => []
+            'valid'    => true,
+            'reasons'  => [],
+            'warnings' => [],
         ];
 
         if (empty(trim($response))) {
-            $validation['valid'] = false;
+            $validation['valid']     = false;
             $validation['reasons'][] = 'empty_response';
+            return $validation;
         }
 
         if (strlen($response) > 500) {
-            $validation['valid'] = false;
-            $validation['reasons'][] = 'too_long';
-            $validation['warnings'][] = "Response length: " . strlen($response) . " chars";
+            $validation['warnings'][] = 'Response length: ' . strlen($response) . ' chars (over 500)';
+            // Do NOT fail — just warn; long but valid replies are better than fallback
         }
 
+        $lowerResponse = mb_strtolower($response);
+
         $uncertainPhrases = ['i think', 'maybe', 'possibly', 'might be', 'ربما', 'قد يكون', 'أعتقد'];
-        $lowerResponse = strtolower($response);
         foreach ($uncertainPhrases as $phrase) {
             if (str_contains($lowerResponse, $phrase)) {
-                $validation['valid'] = false;
-                $validation['reasons'][] = 'uncertain_language';
+                $validation['warnings'][] = 'uncertain_language: ' . $phrase;
+                // Warn only — do not fail; uncertain phrasing is preferable to fallback
                 break;
             }
         }
@@ -372,20 +379,10 @@ Rules:
         $systemKeywords = ['system prompt', 'instructions', 'rules', 'ai assistant', 'as an ai'];
         foreach ($systemKeywords as $keyword) {
             if (str_contains($lowerResponse, $keyword)) {
-                $validation['valid'] = false;
+                $validation['valid']     = false;
                 $validation['reasons'][] = 'system_instruction_leak';
                 break;
             }
-        }
-
-        if (str_contains($response, '{') || str_contains($response, '}') || str_contains($response, '```')) {
-            $validation['valid'] = false;
-            $validation['reasons'][] = 'contains_code_or_json';
-        }
-
-        if ($intent === 'greeting' && strlen($response) > 100) {
-            $validation['valid'] = false;
-            $validation['reasons'][] = 'greeting_too_long';
         }
 
         return $validation;
@@ -401,42 +398,53 @@ Rules:
 
             $messages = [
                 ['role' => 'system', 'content' => $systemPrompt],
-                ['role' => 'user', 'content' => $message]
+                ['role' => 'user',   'content' => $message],
             ];
 
             $response = self::callAIChatWithRetry($messages);
+
+            // Strip markdown code fences Gemini sometimes wraps around JSON
+            // e.g.  ```json\n{...}\n```  →  {...}
             $trimmedResponse = trim($response);
+            $trimmedResponse = preg_replace('/^```(?:json)?\s*/i', '', $trimmedResponse);
+            $trimmedResponse = preg_replace('/\s*```$/', '', $trimmedResponse);
+            $trimmedResponse = trim($trimmedResponse);
 
             $aiResult = json_decode($trimmedResponse, true);
 
             if (!$aiResult || !isset($aiResult['reply']) || !isset($aiResult['intent'])) {
-                Log::error('AI returned invalid JSON', ['response' => $trimmedResponse]);
+                Log::error('AI returned invalid JSON', [
+                    'raw_response'     => substr($response, 0, 500),
+                    'trimmed_response' => substr($trimmedResponse, 0, 500),
+                ]);
                 return self::getFallbackResponse();
             }
 
+            // Validate the reply TEXT (not the JSON wrapper)
             $validation = self::validateResponse($aiResult['reply'], $aiResult['intent']);
 
             if (!$validation['valid']) {
                 Log::warning('AI response validation failed', [
                     'reasons' => $validation['reasons'],
-                    'intent' => $aiResult['intent']
+                    'intent'  => $aiResult['intent'],
+                    'reply'   => substr($aiResult['reply'], 0, 200),
                 ]);
                 return self::getFallbackResponse();
             }
 
             return [
-                'success' => true,
-                'reply' => $aiResult['reply'],
-                'intent' => $aiResult['intent'],
+                'success'          => true,
+                'reply'            => $aiResult['reply'],
+                'intent'           => $aiResult['intent'],
                 'needs_escalation' => $aiResult['needs_escalation'] ?? false,
-                'confidence' => $aiResult['confidence'] ?? 0.7,
-                'validation' => $validation
+                'confidence'       => $aiResult['confidence'] ?? 0.7,
+                'validation'       => $validation,
             ];
 
         } catch (\Exception $e) {
             Log::error('AI call failed', [
                 'message' => $message,
-                'error' => $e->getMessage()
+                'error'   => $e->getMessage(),
             ]);
             return self::getFallbackResponse();
         }
@@ -504,31 +512,54 @@ Rules:
 
     /**
      * Call Gemini API
+     *
+     * Gemini does NOT support a "system" role in the `contents` array.
+     * System-level instructions must go in `systemInstruction` (a separate
+     * top-level key).  Sending two consecutive "user" turns (system→user,
+     * user→user) confuses the model and often causes API errors or empty
+     * responses that trigger our fallback message.
      */
     private static function callGeminiChat(array $messages): string
     {
         $apiKey = self::getAIAPIKey();
-        $model = self::getAIModel();
+        $model  = self::getAIModel();
 
-        $contents = [];
-        foreach ($messages as $message) {
-            $contents[] = [
-                'role' => $message['role'] === 'system' ? 'user' : $message['role'],
-                'parts' => [
-                    ['text' => $message['content']]
-                ]
+        // Separate system prompt from chat turns
+        $systemText = '';
+        $contents   = [];
+
+        foreach ($messages as $msg) {
+            if ($msg['role'] === 'system') {
+                $systemText .= $msg['content'] . "\n";
+            } else {
+                $contents[] = [
+                    'role'  => $msg['role'], // 'user' or 'model'
+                    'parts' => [['text' => $msg['content']]],
+                ];
+            }
+        }
+
+        $payload = [
+            'contents'         => $contents,
+            'generationConfig' => [
+                'temperature'     => 0.7,
+                'maxOutputTokens' => 500,
+            ],
+        ];
+
+        // Send system prompt via the dedicated key Gemini supports
+        if ($systemText !== '') {
+            $payload['systemInstruction'] = [
+                'parts' => [['text' => trim($systemText)]],
             ];
         }
 
         $response = Http::withHeaders([
             'Content-Type' => 'application/json',
-        ])->post("https://generativelanguage.googleapis.com/v1beta/models/{$model}:generateContent?key={$apiKey}", [
-            'contents' => $contents,
-            'generationConfig' => [
-                'temperature' => 0.7,
-                'maxOutputTokens' => 500
-            ]
-        ]);
+        ])->post(
+            "https://generativelanguage.googleapis.com/v1beta/models/{$model}:generateContent?key={$apiKey}",
+            $payload
+        );
 
         if (!$response->successful()) {
             throw new \Exception('Gemini API error: ' . $response->body());

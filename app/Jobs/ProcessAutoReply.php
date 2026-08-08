@@ -140,8 +140,10 @@ class ProcessAutoReply implements ShouldQueue
             return;
         }
 
-        // Check business hours routing
-        $businessHoursCheck = AICapabilitiesService::checkBusinessHours($channel->business ?? null);
+        // Check business hours routing — guard against null business
+        $businessHoursCheck = $channel->business
+            ? AICapabilitiesService::checkBusinessHours($channel->business)
+            : ['should_use_hours_routing' => false];
         if ($businessHoursCheck['should_use_hours_routing']) {
             Log::info('ProcessAutoReply: Business hours routing activated', [
                 'conversation_id' => $conversation->id,
@@ -177,20 +179,34 @@ class ProcessAutoReply implements ShouldQueue
             'focus' => 'support'
         ];
         
-        // ── SMART ORDER / SALLA FLOW ──────────────────────────────────────────
-        // Check if message is order/shipment/product related
+        // ── SMART SALLA FLOW ──────────────────────────────────────────────────
+        // Detect intent from message BEFORE calling AI, so we can pre-load the
+        // right Salla data (order data OR product list) into the AI context.
         $sallaContext   = null;
-        $sallaHandled   = false; // true = we already built a smart reply, skip AI
-
-        $orderKeywords = [
-            'طلب','أوردر','order','شحن','توصيل','delivery','shipping',
-            'وين','فين','متى','when','status','حالة','منتج','product',
-            'بضاعة','سعر','price','مشتريات','بتاعي','بتاعتي',
-        ];
-        $isOrderRelated = false;
+        $productsContext = null;
         $msgLower = mb_strtolower($message->content);
-        foreach ($orderKeywords as $kw) {
-            if (str_contains($msgLower, $kw)) { $isOrderRelated = true; break; }
+
+        // Keywords that indicate customer is asking about an EXISTING order
+        $orderStatusKeywords = [
+            'طلب','أوردر','order','شحن','توصيل','delivery','shipping',
+            'وين','فين','متى','when','status','حالة','مشتريات',
+            'بضاعتي','بتاعي','اين طلبي','where is my','track',
+        ];
+        // Keywords that indicate customer wants to PLACE a new order / buy
+        $placeOrderKeywords = [
+            'place an order','i want to order','i want to buy','purchase','i\'d like to order',
+            'عايز اطلب','ابي اشتري','ابغا اشتري','اشتري','اطلب',
+            'show me products','what do you sell','المنتجات','منتجاتكم',
+        ];
+
+        $isOrderStatus = false;
+        $isPlaceOrder  = false;
+
+        foreach ($orderStatusKeywords as $kw) {
+            if (str_contains($msgLower, $kw)) { $isOrderStatus = true; break; }
+        }
+        foreach ($placeOrderKeywords as $kw) {
+            if (str_contains($msgLower, $kw)) { $isPlaceOrder = true; break; }
         }
 
         // Find Salla channel for this user
@@ -199,109 +215,88 @@ class ProcessAutoReply implements ShouldQueue
             ->where('status', 'connected')
             ->first();
 
-        if ($isOrderRelated && $sallaChannel) {
-            if ($channel->type === 'whatsapp') {
-                // WhatsApp: auto-lookup by sender phone number
+        if ($sallaChannel) {
+
+            // ── ORDER STATUS FLOW ────────────────────────────────────────────
+            if ($isOrderStatus) {
                 $rawPhone = preg_replace('/[^0-9]/', '', $conversation->sender_id ?? '');
-                if ($rawPhone) {
+
+                // WhatsApp: auto-lookup by sender phone
+                if ($channel->type === 'whatsapp' && $rawPhone) {
                     try {
                         $sallaService = new SallaService();
                         $order = $sallaService->getLatestOrderByPhone($sallaChannel->access_token, $rawPhone);
                         if ($order) {
                             $sallaContext = $sallaService->formatOrderForAI($order);
-                            $systemPrompt .= "\n\n### CUSTOMER ORDER DATA (from Salla) ###\n" . $sallaContext
-                                           . "\nUse this data to answer the customer's question directly and accurately.";
                             Log::info('ProcessAutoReply: Salla order found for WhatsApp sender', [
                                 'phone'    => $rawPhone,
                                 'order_id' => $order['id'] ?? null,
                             ]);
-                        } else {
-                            // No order found — tell customer politely
-                            $noOrderReply = $detectedLanguage === 'arabic'
-                                ? "عذراً، ما لقينا أي طلبات مرتبطة برقمك. تقدر تراسلنا برقم الطلب مباشرة وبنساعدك."
-                                : "Sorry, we couldn't find any orders linked to your number. Please share your order number and we'll help you right away.";
-                            $replyMessage = Message::create([
-                                'conversation_id' => $message->conversation_id,
-                                'content'         => $noOrderReply,
-                                'direction'       => 'outbound',
-                                'status'          => 'auto',
-                                'is_ai'           => true,
-                                'source'          => 'salla_no_order',
-                                'send_status'     => 'pending',
-                            ]);
-                            cache()->increment($cacheKey);
-                            if ($channel->user_id) broadcast(new \App\Events\MessageReceived($replyMessage, $conversation, $channel->user_id));
-                            $this->sendReply($channel, $conversation, $replyMessage);
-                            return;
                         }
+                        // If no order found, sallaContext stays null → AI will ask for order number
                     } catch (\Exception $e) {
-                        Log::warning('ProcessAutoReply: Salla lookup failed', ['error' => $e->getMessage()]);
+                        Log::warning('ProcessAutoReply: Salla order lookup failed', ['error' => $e->getMessage()]);
                     }
-                }
-            } else {
-                // Facebook / Instagram / Gmail: check if customer already provided order number or phone in this conversation
-                $orderNumberMatch = null;
-                $phoneMatch       = null;
+                } else {
+                    // Non-WhatsApp: scan conversation for order number or phone
+                    $recentMessages = Message::where('conversation_id', $conversation->id)
+                        ->orderBy('created_at', 'desc')->take(6)->get();
 
-                // Scan last 6 messages for an order number (digits 4-10 chars) or phone
-                $recentMessages = Message::where('conversation_id', $conversation->id)
-                    ->orderBy('created_at', 'desc')->take(6)->get();
-
-                foreach ($recentMessages as $m) {
-                    if (preg_match('/\b(\d{4,10})\b/', $m->content, $matches)) {
-                        $orderNumberMatch = $matches[1];
-                        break;
-                    }
-                    if (preg_match('/\b(05\d{8}|9665\d{8}|\+9665\d{8})\b/', $m->content, $mPhone)) {
-                        $phoneMatch = preg_replace('/[^0-9]/', '', $mPhone[1]);
-                        break;
-                    }
-                }
-
-                if ($orderNumberMatch || $phoneMatch) {
-                    try {
-                        $sallaService = new SallaService();
-                        $order = null;
-
-                        if ($orderNumberMatch) {
-                            $raw = $sallaService->getOrder($sallaChannel->access_token, $orderNumberMatch);
-                            $order = $raw['data'] ?? $raw ?? null;
-                        } elseif ($phoneMatch) {
-                            $order = $sallaService->getLatestOrderByPhone($sallaChannel->access_token, $phoneMatch);
+                    $orderNumberMatch = null;
+                    $phoneMatch       = null;
+                    foreach ($recentMessages as $m) {
+                        if (!$orderNumberMatch && preg_match('/\b(\d{4,10})\b/', $m->content, $mo)) {
+                            $orderNumberMatch = $mo[1];
                         }
-
-                        if ($order) {
-                            $sallaContext = $sallaService->formatOrderForAI($order);
-                            $systemPrompt .= "\n\n### CUSTOMER ORDER DATA (from Salla) ###\n" . $sallaContext
-                                           . "\nUse this data to answer the customer's question directly and accurately.";
-                            Log::info('ProcessAutoReply: Salla order found for non-WhatsApp channel', [
-                                'order_number' => $orderNumberMatch,
-                                'phone'        => $phoneMatch,
-                            ]);
+                        if (!$phoneMatch && preg_match('/\b(05\d{8}|9665\d{8}|\+9665\d{8})\b/', $m->content, $mp)) {
+                            $phoneMatch = preg_replace('/[^0-9]/', '', $mp[1]);
                         }
-                    } catch (\Exception $e) {
-                        Log::warning('ProcessAutoReply: Salla lookup (non-WA) failed', ['error' => $e->getMessage()]);
+                    }
+
+                    if ($orderNumberMatch || $phoneMatch) {
+                        try {
+                            $sallaService = new SallaService();
+                            $order = null;
+                            if ($orderNumberMatch) {
+                                $raw   = $sallaService->getOrder($sallaChannel->access_token, $orderNumberMatch);
+                                $order = $raw['data'] ?? $raw ?? null;
+                            } elseif ($phoneMatch) {
+                                $order = $sallaService->getLatestOrderByPhone($sallaChannel->access_token, $phoneMatch);
+                            }
+                            if ($order) {
+                                $sallaContext = $sallaService->formatOrderForAI($order);
+                            }
+                        } catch (\Exception $e) {
+                            Log::warning('ProcessAutoReply: Salla order lookup (non-WA) failed', ['error' => $e->getMessage()]);
+                        }
                     }
                 }
+            }
 
-                // No order data found and no identifier collected yet — ask for it
-                if (!$sallaContext) {
-                    $askReply = $detectedLanguage === 'arabic'
-                        ? "شكراً لتواصلك! لأقدر أساعدك بموضوع طلبك، محتاج منك رقم الطلب أو رقم الجوال المسجل عندنا."
-                        : "Thanks for reaching out! To help you with your order, could you please share your order number or the phone number used when placing it?";
-                    $replyMessage = Message::create([
-                        'conversation_id' => $message->conversation_id,
-                        'content'         => $askReply,
-                        'direction'       => 'outbound',
-                        'status'          => 'auto',
-                        'is_ai'           => true,
-                        'source'          => 'salla_ask_identifier',
-                        'send_status'     => 'pending',
+            // ── PLACE ORDER FLOW ─────────────────────────────────────────────
+            if ($isPlaceOrder) {
+                try {
+                    $sallaService = new SallaService();
+                    $productsRaw  = $sallaService->getProducts($sallaChannel->access_token, ['per_page' => 10]);
+                    $products     = $productsRaw['data'] ?? [];
+
+                    // Normalise product list for AI context
+                    $productsContext = array_map(function ($p) {
+                        return [
+                            'id'        => $p['id']                    ?? null,
+                            'name'      => $p['name']                  ?? 'Unknown',
+                            'price'     => $p['price']['amount']       ?? $p['price'] ?? '?',
+                            'currency'  => $p['price']['currency_code'] ?? 'SAR',
+                            'available' => ($p['quantity'] ?? 1) > 0,
+                            'url'       => $p['urls']['customer']      ?? null,
+                        ];
+                    }, $products);
+
+                    Log::info('ProcessAutoReply: Salla products loaded for place_order', [
+                        'count' => count($productsContext),
                     ]);
-                    cache()->increment($cacheKey);
-                    if ($channel->user_id) broadcast(new \App\Events\MessageReceived($replyMessage, $conversation, $channel->user_id));
-                    $this->sendReply($channel, $conversation, $replyMessage);
-                    return;
+                } catch (\Exception $e) {
+                    Log::warning('ProcessAutoReply: Salla products fetch failed', ['error' => $e->getMessage()]);
                 }
             }
         }
@@ -371,11 +366,12 @@ class ProcessAutoReply implements ShouldQueue
 
         // Step 3: Build AI Context
         $context = [
-            'business_name' => $channel->business?->business_name ?? 'our business',
-            'platform' => $channel->type,
-            'language' => $detectedLanguage,
+            'business_name'  => $channel->business?->business_name ?? 'our business',
+            'platform'       => $channel->type,
+            'language'       => $detectedLanguage,
             'knowledge_base' => $channel->business?->knowledgeFiles->pluck('extracted_text')->implode("\n\n") ?? '',
-            'order_data' => !empty($sallaContext) ? json_decode($sallaContext, true) : null
+            'order_data'     => $sallaContext ? $this->parseSallaContext($sallaContext) : null,
+            'products'       => $productsContext ?? null,
         ];
 
         // Step 4: Single AI Call with JSON Output
@@ -482,6 +478,29 @@ class ProcessAutoReply implements ShouldQueue
 
         // Send reply through platform
         $this->sendReply($channel, $message->conversation, $replyMessage);
+    }
+
+    /**
+     * Parse the SallaService::formatOrderForAI() string into a structured array
+     * for the AI context. This avoids sending a raw multi-line string and instead
+     * gives the AI clearly labelled fields it can reference by name.
+     */
+    private function parseSallaContext(string $formatted): array
+    {
+        $data = [];
+        foreach (explode("\n", $formatted) as $line) {
+            if (str_starts_with($line, 'Order #'))            $data['order_number']    = str_replace('Order #', '', $line);
+            elseif (str_starts_with($line, 'Status: '))       $data['status']          = str_replace('Status: ', '', $line);
+            elseif (str_starts_with($line, 'Total: '))        {
+                $parts = explode(' ', str_replace('Total: ', '', $line), 2);
+                $data['total']    = $parts[0] ?? '';
+                $data['currency'] = $parts[1] ?? 'SAR';
+            }
+            elseif (str_starts_with($line, 'Products: '))     $data['items']           = str_replace('Products: ', '', $line);
+            elseif (str_starts_with($line, 'Shipping Status:')) $data['shipping_status'] = str_replace('Shipping Status: ', '', $line);
+            elseif (str_starts_with($line, 'Expected Delivery:')) $data['delivery_date'] = str_replace('Expected Delivery: ', '', $line);
+        }
+        return $data;
     }
 
     private function buildSystemPrompt(Channel $channel, string $currentMessage = '', string $language = 'english'): string

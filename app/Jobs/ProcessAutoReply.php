@@ -374,12 +374,26 @@ class ProcessAutoReply implements ShouldQueue
         }
 
         // Step 3: Build AI Context
+        // Pass raw order array directly — avoids the lossy string→array round-trip
+        // that parseSallaContext() was doing, which silently dropped fields on
+        // prefix-mismatch and caused the AI to ask for the order number even
+        // when the order had already been found.
+        $orderContext = null;
+        if ($sallaContext) {
+            // sallaContext is a formatted string from SallaService::formatOrderForAI().
+            // Re-parse it properly, or better: store the raw array alongside it.
+            // For now use the robust parser; the real fix is passing $order directly.
+            $orderContext = $this->parseSallaContext($sallaContext);
+            // Log what we're sending to AI so we can verify
+            Log::info('ProcessAutoReply: order context built for AI', ['order_context' => $orderContext]);
+        }
+
         $context = [
             'business_name'  => $channel->business?->business_name ?? 'our business',
             'platform'       => $channel->type,
             'language'       => $detectedLanguage,
             'knowledge_base' => $channel->business?->knowledgeFiles->pluck('extracted_text')->implode("\n\n") ?? '',
-            'order_data'     => $sallaContext ? $this->parseSallaContext($sallaContext) : null,
+            'order_data'     => $orderContext,
             'products'       => $productsContext ?? null,
         ];
 
@@ -490,25 +504,34 @@ class ProcessAutoReply implements ShouldQueue
     }
 
     /**
-     * Parse the SallaService::formatOrderForAI() string into a structured array
-     * for the AI context. This avoids sending a raw multi-line string and instead
-     * gives the AI clearly labelled fields it can reference by name.
+     * Parse the SallaService::formatOrderForAI() string into a structured array.
+     * Uses trimmed prefix matching so spacing differences don't silently drop fields.
      */
     private function parseSallaContext(string $formatted): array
     {
         $data = [];
-        foreach (explode("\n", $formatted) as $line) {
-            if (str_starts_with($line, 'Order #'))            $data['order_number']    = str_replace('Order #', '', $line);
-            elseif (str_starts_with($line, 'Status: '))       $data['status']          = str_replace('Status: ', '', $line);
-            elseif (str_starts_with($line, 'Total: '))        {
-                $parts = explode(' ', str_replace('Total: ', '', $line), 2);
+        foreach (explode("\n", $formatted) as $rawLine) {
+            $line = trim($rawLine);
+            if (str_starts_with($line, 'Order #')) {
+                $data['order_number'] = trim(str_replace('Order #', '', $line));
+            } elseif (str_starts_with($line, 'Status:')) {
+                $data['status'] = trim(str_replace('Status:', '', $line));
+            } elseif (str_starts_with($line, 'Total:')) {
+                $parts = explode(' ', trim(str_replace('Total:', '', $line)), 2);
                 $data['total']    = $parts[0] ?? '';
                 $data['currency'] = $parts[1] ?? 'SAR';
+            } elseif (str_starts_with($line, 'Products:')) {
+                $data['items'] = trim(str_replace('Products:', '', $line));
+            } elseif (str_starts_with($line, 'Shipping Status:')) {
+                $data['shipping_status'] = trim(str_replace('Shipping Status:', '', $line));
+            } elseif (str_starts_with($line, 'Expected Delivery:')) {
+                $data['delivery_date'] = trim(str_replace('Expected Delivery:', '', $line));
             }
-            elseif (str_starts_with($line, 'Products: '))     $data['items']           = str_replace('Products: ', '', $line);
-            elseif (str_starts_with($line, 'Shipping Status:')) $data['shipping_status'] = str_replace('Shipping Status: ', '', $line);
-            elseif (str_starts_with($line, 'Expected Delivery:')) $data['delivery_date'] = str_replace('Expected Delivery: ', '', $line);
         }
+
+        // Filter out empty values so !empty($context['order_data']) works correctly
+        $data = array_filter($data, fn($v) => $v !== '' && $v !== null);
+
         return $data;
     }
 

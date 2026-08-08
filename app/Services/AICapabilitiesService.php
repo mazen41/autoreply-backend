@@ -446,19 +446,62 @@ JSON;
 
             $response = self::callAIChatWithRetry($messages);
 
-            // Strip markdown code fences Gemini sometimes wraps around JSON
-            // e.g.  ```json\n{...}\n```  →  {...}
-            $trimmedResponse = trim($response);
-            $trimmedResponse = preg_replace('/^```(?:json)?\s*/i', '', $trimmedResponse);
-            $trimmedResponse = preg_replace('/\s*```$/', '', $trimmedResponse);
-            $trimmedResponse = trim($trimmedResponse);
+            // ── Robust JSON extraction ────────────────────────────────────────
+            // Gemini sometimes wraps the JSON in markdown fences, adds a preamble
+            // sentence, or returns pretty-printed multi-line blocks.
+            // We try four strategies in order until one produces valid JSON.
+            $aiResult = null;
 
-            $aiResult = json_decode($trimmedResponse, true);
+            // Strategy 1: strip markdown fences and direct decode
+            $cleaned = trim($response);
+            $cleaned = preg_replace('/^```(?:json)?\s*/i', '', $cleaned);
+            $cleaned = preg_replace('/\s*```\s*$/i', '', $cleaned);
+            $cleaned = trim($cleaned);
+            $aiResult = json_decode($cleaned, true);
+
+            // Strategy 2: extract the first { ... } block from anywhere in the string
+            if (!$aiResult) {
+                if (preg_match('/\{[\s\S]*\}/u', $response, $m)) {
+                    $aiResult = json_decode($m[0], true);
+                }
+            }
+
+            // Strategy 3: try every { ... } block and pick the first one that has a "reply" key
+            if (!$aiResult) {
+                if (preg_match_all('/\{[\s\S]*?\}/u', $response, $allMatches)) {
+                    foreach ($allMatches[0] as $candidate) {
+                        $decoded = json_decode($candidate, true);
+                        if ($decoded && isset($decoded['reply'])) {
+                            $aiResult = $decoded;
+                            break;
+                        }
+                    }
+                }
+            }
+
+            // Strategy 4: Gemini returned plain text with no JSON at all —
+            // wrap it as a valid reply so the customer gets an answer
+            // instead of the generic fallback message.
+            if (!$aiResult && !empty(trim($response))) {
+                $plainText = trim(preg_replace('/^```[a-z]*\s*/i', '', trim($response)));
+                $plainText = trim(preg_replace('/\s*```$/i', '', $plainText));
+                if (strlen($plainText) > 5) {
+                    Log::warning('AI returned plain text instead of JSON — wrapping as reply', [
+                        'raw_response' => substr($response, 0, 300),
+                    ]);
+                    $aiResult = [
+                        'reply'            => $plainText,
+                        'intent'           => 'question',
+                        'needs_escalation' => false,
+                        'confidence'       => 0.6,
+                    ];
+                }
+            }
 
             if (!$aiResult || !isset($aiResult['reply']) || !isset($aiResult['intent'])) {
-                Log::error('AI returned invalid JSON', [
-                    'raw_response'     => substr($response, 0, 500),
-                    'trimmed_response' => substr($trimmedResponse, 0, 500),
+                Log::error('AI returned invalid JSON — all strategies failed', [
+                    'raw_response' => substr($response, 0, 800),
+                    'cleaned'      => substr($cleaned, 0, 400),
                 ]);
                 return self::getFallbackResponse();
             }
@@ -586,7 +629,7 @@ JSON;
             'contents'         => $contents,
             'generationConfig' => [
                 'temperature'     => 0.7,
-                'maxOutputTokens' => 500,
+                'maxOutputTokens' => 1024,
             ],
         ];
 
@@ -709,9 +752,9 @@ JSON;
         return $systemPrompt;
     }
 
-    public static function checkBusinessHours(?BusinessProfile $business): array
+    public static function checkBusinessHours(mixed $business): array
     {
-        if (!$business || !$business->business_hours_enabled) {
+        if (!$business || !($business instanceof BusinessProfile) || !$business->business_hours_enabled) {
             return [
                 'should_use_hours_routing' => false,
                 'is_after_hours' => false,

@@ -3,6 +3,9 @@
 namespace App\Http\Controllers;
 
 use App\Services\AICapabilitiesService;
+use App\Models\Channel;
+use App\Models\Conversation;
+use App\Models\Message;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\Log;
 
@@ -153,6 +156,62 @@ class N8nIntegrationController extends Controller
             return response()->json([
                 'success' => false,
                 'error' => $e->getMessage()
+            ], 500);
+        }
+    }
+
+    /**
+     * n8n calls this with a message_id.
+     * Runs ProcessAutoReply synchronously and returns what was sent.
+     * This is the single entry point for n8n — no fragmented calls needed.
+     */
+    public function processMessage(Request $request)
+    {
+        try {
+            $messageId = $request->input('message_id');
+
+            if (!$messageId) {
+                return response()->json(['success' => false, 'error' => 'message_id is required'], 422);
+            }
+
+            $message = Message::with(['conversation.channel', 'conversation.channel.business', 'conversation.channel.user'])
+                ->find($messageId);
+
+            if (!$message) {
+                return response()->json(['success' => false, 'error' => 'Message not found'], 404);
+            }
+
+            // Run the full ProcessAutoReply job synchronously (not queued)
+            // so n8n gets the result back in the same HTTP response
+            $job = new \App\Jobs\ProcessAutoReply($messageId);
+            $job->handle();
+
+            // Find the outbound reply that was just created
+            $reply = Message::where('conversation_id', $message->conversation_id)
+                ->where('direction', 'outbound')
+                ->orderBy('created_at', 'desc')
+                ->first();
+
+            return response()->json([
+                'success'        => true,
+                'message_id'     => $messageId,
+                'reply'          => $reply?->content,
+                'reply_id'       => $reply?->id,
+                'send_status'    => $reply?->send_status,
+                'is_ai'          => $reply?->is_ai,
+                'source'         => $reply?->source,
+                'requires_human' => $message->conversation->requires_human ?? false,
+            ]);
+
+        } catch (\Exception $e) {
+            Log::error('N8n processMessage failed', [
+                'error'      => $e->getMessage(),
+                'message_id' => $request->input('message_id'),
+            ]);
+
+            return response()->json([
+                'success' => false,
+                'error'   => $e->getMessage(),
             ], 500);
         }
     }

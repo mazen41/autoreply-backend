@@ -1,892 +1,188 @@
 {
-  "name": "Ultimate AI Customer Support - Complete Production System",
+  "name": "NazBiz AutoReply - n8n Gateway",
   "nodes": [
     {
       "parameters": {
         "httpMethod": "POST",
-        "path": "ai-support",
+        "path": "nazbiz-ultimate-ai-support",
         "responseMode": "responseNode",
         "options": {}
       },
       "id": "webhook-trigger",
-      "name": "📥 Webhook Trigger",
+      "name": "Webhook Trigger",
       "type": "n8n-nodes-base.webhook",
       "typeVersion": 1.1,
-      "position": [200, 300],
-      "webhookId": "ultimate-ai-support-complete-v2"
-    },
-    {
-      "parameters": {
-        "assignments": {
-          "assignments": [
-            {
-              "id": "platform-detection",
-              "name": "platform",
-              "value": "={{ $json.body.platform }}",
-              "type": "string"
-            },
-            {
-              "id": "message-extract",
-              "name": "message",
-              "value": "={{ $json.body.message }}",
-              "type": "string"
-            },
-            {
-              "id": "sender-extract",
-              "name": "sender_id",
-              "value": "={{ $json.body.sender_id }}",
-              "type": "string"
-            },
-            {
-              "id": "conversation-extract",
-              "name": "conversation_id",
-              "value": "={{ $json.body.conversation_id }}",
-              "type": "string"
-            },
-            {
-              "id": "user-extract",
-              "name": "user_id",
-              "value": "={{ $json.body.user_id }}",
-              "type": "string"
-            },
-            {
-              "id": "business-extract",
-              "name": "business_id",
-              "value": "={{ $json.body.business_id }}",
-              "type": "string"
-            }
-          ]
-        }
-      },
-      "id": "parse-webhook",
-      "name": "📋 Parse Message Data",
-      "type": "n8n-nodes-base.set",
-      "typeVersion": 3.4,
-      "position": [400, 300]
-    },
-    {
-      "parameters": {
-        "assignments": {
-          "assignments": [
-            {
-              "id": "lowercase-message",
-              "name": "message_lower",
-              "value": "={{ $json.message.toLowerCase() }}",
-              "type": "string"
-            }
-          ]
-        }
-      },
-      "id": "lowercase-message",
-      "name": "🔤 Lowercase Message",
-      "type": "n8n-nodes-base.set",
-      "typeVersion": 3.4,
-      "position": [600, 300]
+      "position": [200, 400],
+      "webhookId": "nazbiz-ultimate-ai-support"
     },
     {
       "parameters": {
         "conditions": {
-          "options": {
-            "caseSensitive": false,
-            "leftValue": "",
-            "typeValidation": "strict"
-          },
+          "options": { "caseSensitive": false, "typeValidation": "strict" },
           "conditions": [
             {
-              "id": "escalation-keyword-1",
-              "leftValue": "={{ $json.message_lower }}",
+              "leftValue": "={{ $json.message_lower ?? ($json.message ?? '').toLowerCase() }}",
               "rightValue": "human",
-              "operator": {
-                "type": "string",
-                "operation": "contains"
-              }
+              "operator": { "type": "string", "operation": "contains" }
             },
             {
-              "id": "escalation-keyword-2",
-              "leftValue": "={{ $json.message_lower }}",
+              "leftValue": "={{ $json.message_lower ?? ($json.message ?? '').toLowerCase() }}",
               "rightValue": "agent",
-              "operator": {
-                "type": "string",
-                "operation": "contains"
-              }
+              "operator": { "type": "string", "operation": "contains" }
             },
             {
-              "id": "escalation-keyword-3",
-              "leftValue": "={{ $json.message_lower }}",
-              "rightValue": "support",
-              "operator": {
-                "type": "string",
-                "operation": "contains"
-              }
-            },
-            {
-              "id": "escalation-keyword-4",
-              "leftValue": "={{ $json.message_lower }}",
+              "leftValue": "={{ $json.message_lower ?? ($json.message ?? '').toLowerCase() }}",
               "rightValue": "موظف",
-              "operator": {
-                "type": "string",
-                "operation": "contains"
-              }
+              "operator": { "type": "string", "operation": "contains" }
             },
             {
-              "id": "escalation-keyword-5",
-              "leftValue": "={{ $json.message_lower }}",
+              "leftValue": "={{ $json.message_lower ?? ($json.message ?? '').toLowerCase() }}",
               "rightValue": "انسان",
-              "operator": {
-                "type": "string",
-                "operation": "contains"
-              }
+              "operator": { "type": "string", "operation": "contains" }
             },
             {
-              "id": "escalation-keyword-6",
-              "leftValue": "={{ $json.message_lower }}",
-              "rightValue": "person",
-              "operator": {
-                "type": "string",
-                "operation": "contains"
-              }
+              "leftValue": "={{ $json.message_lower ?? ($json.message ?? '').toLowerCase() }}",
+              "rightValue": "بشري",
+              "operator": { "type": "string", "operation": "contains" }
             }
           ],
           "combinator": "any"
         }
       },
       "id": "hard-escalation-check",
-      "name": "🔴 Hard Escalation Check",
+      "name": "Hard Escalation?",
       "type": "n8n-nodes-base.if",
       "typeVersion": 2,
-      "position": [800, 300]
+      "position": [440, 400]
     },
     {
       "parameters": {
         "method": "POST",
-        "url": "https://api.nazbiz.io/api/escalate",
-        "authentication": "genericCredentialType",
-        "genericAuthType": "httpHeaderAuth",
+        "url": "https://api.nazbiz.io/api/n8n/escalate",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            { "name": "Authorization", "value": "Bearer 31|w2M5w0OYeVZGmDabtqZFyjTm3Ux6fqXYZi3few9I9677df7d" },
+            { "name": "Content-Type", "value": "application/json" },
+            { "name": "Accept", "value": "application/json" }
+          ]
+        },
         "sendBody": true,
         "specifyBody": "json",
-        "jsonBody": "={{ { conversation_id: $json.conversation_id, reason: 'hard_keyword_override', priority: 'high', user_id: $json.user_id, matched_keyword: 'detected_in_n8n' } }}",
-        "options": {
-          "timeout": 10000
-        }
+        "jsonBody": "={{ { conversation_id: $json.conversation_id, reason: 'customer_requested_human', priority: 'high', user_id: $json.user_id, intent: 'escalation', confidence: 1 } }}",
+        "options": { "timeout": 10000 }
       },
-      "id": "immediate-escalation",
-      "name": "🚨 Trigger Immediate Escalation",
+      "id": "trigger-escalation",
+      "name": "Trigger Escalation",
       "type": "n8n-nodes-base.httpRequest",
       "typeVersion": 4.2,
-      "position": [1000, 200],
-      "retryOnFail": true,
-      "maxTries": 2,
-      "waitBetweenTries": 1000
-    },
-    {
-      "parameters": {
-        "respondWith": "json",
-        "responseBody": "={{ { success: true, action: 'escalated', requires_human: true, message: 'Sure 👍 I\\'m connecting you with a human agent now. Please wait a moment.', priority: 'high' } }}"
-      },
-      "id": "escalation-response",
-      "name": "📤 Escalation Response",
-      "type": "n8n-nodes-base.respondToWebhook",
-      "typeVersion": 1.1,
-      "position": [1200, 200]
-    },
-    {
-      "parameters": {
-        "method": "POST",
-        "url": "https://api.nazbiz.io/api/n8n/rate-limit/check",
-        "authentication": "genericCredentialType",
-        "genericAuthType": "httpHeaderAuth",
-        "sendBody": true,
-        "specifyBody": "json",
-        "jsonBody": "={{ { user_id: $json.user_id, business_id: $json.business_id } }}",
-        "options": {
-          "timeout": 5000
-        }
-      },
-      "id": "rate-limit-check",
-      "name": "⏱️ Rate Limit Check",
-      "type": "n8n-nodes-base.httpRequest",
-      "typeVersion": 4.2,
-      "position": [1000, 400],
+      "position": [680, 260],
       "continueOnFail": true
     },
     {
       "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ JSON.stringify({ success: true, action: 'escalated', reply: 'حسناً 👍 سأحولك لأحد فريقنا الآن، انتظر لحظة.', requires_human: true }) }}",
+        "options": { "responseCode": 200 }
+      },
+      "id": "escalation-response",
+      "name": "Escalation Response",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [900, 260]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://api.nazbiz.io/api/n8n/process-message",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            { "name": "Authorization", "value": "Bearer 31|w2M5w0OYeVZGmDabtqZFyjTm3Ux6fqXYZi3few9I9677df7d" },
+            { "name": "Content-Type", "value": "application/json" },
+            { "name": "Accept", "value": "application/json" }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ { message_id: $json.message_id } }}",
+        "options": { "timeout": 60000 }
+      },
+      "id": "process-message",
+      "name": "Process Message (Laravel)",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [680, 540],
+      "continueOnFail": true
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ JSON.stringify({ success: $json.success, action: $json.source ?? 'ai_response', reply: $json.reply, requires_human: $json.requires_human ?? false, send_status: $json.send_status }) }}",
+        "options": { "responseCode": 200 }
+      },
+      "id": "success-response",
+      "name": "Success Response",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [900, 460]
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ JSON.stringify({ success: false, action: 'error', reply: 'نعتذر، حدث خطأ مؤقت. سيتواصل معك أحد فريقنا قريباً.', requires_human: true }) }}",
+        "options": { "responseCode": 200 }
+      },
+      "id": "error-response",
+      "name": "Error Response",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [900, 620]
+    },
+    {
+      "parameters": {
         "conditions": {
-          "options": {
-            "caseSensitive": true,
-            "leftValue": "",
-            "typeValidation": "strict"
-          },
+          "options": { "caseSensitive": true, "typeValidation": "strict" },
           "conditions": [
-            {
-              "id": "rate-limited-check",
-              "leftValue": "={{ $json.rate_limited }}",
-              "rightValue": true,
-              "operator": {
-                "type": "boolean",
-                "operation": "equals"
-              }
-            }
+            { "leftValue": "={{ $json.success }}", "rightValue": true, "operator": { "type": "boolean", "operation": "true" } }
           ],
           "combinator": "and"
         }
       },
-      "id": "rate-limit-decision",
-      "name": "⏱️ Rate Limit Decision",
+      "id": "success-check",
+      "name": "Success?",
       "type": "n8n-nodes-base.if",
       "typeVersion": 2,
-      "position": [1200, 400]
-    },
-    {
-      "parameters": {
-        "respondWith": "json",
-        "responseBody": "={{ { success: false, action: 'rate_limited', message: '⚠️ You\\'ve reached the message limit. Please wait before sending more messages.', retry_after: $json.retry_after } }}"
-      },
-      "id": "rate-limit-response",
-      "name": "📤 Rate Limit Response",
-      "type": "n8n-nodes-base.respondToWebhook",
-      "typeVersion": 1.1,
-      "position": [1400, 500]
-    },
-    {
-      "parameters": {
-        "method": "POST",
-        "url": "https://api.nazbiz.io/api/n8n/language/detect",
-        "authentication": "genericCredentialType",
-        "genericAuthType": "httpHeaderAuth",
-        "sendBody": true,
-        "specifyBody": "json",
-        "jsonBody": "={{ { message: $json.message } }}",
-        "options": {
-          "timeout": 5000
-        }
-      },
-      "id": "language-detection",
-      "name": "🌍 Language Detection",
-      "type": "n8n-nodes-base.httpRequest",
-      "typeVersion": 4.2,
-      "position": [1400, 400],
-      "continueOnFail": true
-    },
-    {
-      "parameters": {
-        "assignments": {
-          "assignments": [
-            {
-              "id": "add-language",
-              "name": "detected_language",
-              "value": "={{ $json.language || 'english' }}",
-              "type": "string"
-            }
-          ]
-        }
-      },
-      "id": "add-language-context",
-      "name": "🌍 Add Language Context",
-      "type": "n8n-nodes-base.set",
-      "typeVersion": 3.4,
-      "position": [1600, 400]
-    },
-    {
-      "parameters": {
-        "method": "POST",
-        "url": "https://api.nazbiz.io/api/n8n/conversation/memory",
-        "authentication": "genericCredentialType",
-        "genericAuthType": "httpHeaderAuth",
-        "sendBody": true,
-        "specifyBody": "json",
-        "jsonBody": "={{ { conversation_id: $json.conversation_id } }}",
-        "options": {
-          "timeout": 5000
-        }
-      },
-      "id": "memory-check",
-      "name": "🧠 Conversation Memory Check",
-      "type": "n8n-nodes-base.httpRequest",
-      "typeVersion": 4.2,
-      "position": [1800, 400],
-      "continueOnFail": true
-    },
-    {
-      "parameters": {
-        "assignments": {
-          "assignments": [
-            {
-              "id": "add-memory",
-              "name": "conversation_memory",
-              "value": "={{ $json || { phone_provided: false, order_number_provided: false, attempts: 0 } }}",
-              "type": "object"
-            }
-          ]
-        }
-      },
-      "id": "add-memory-context",
-      "name": "🧠 Add Memory Context",
-      "type": "n8n-nodes-base.set",
-      "typeVersion": 3.4,
-      "position": [2000, 400]
-    },
-    {
-      "parameters": {
-        "jsCode": "// Intent Classification Logic\nconst message = $input.item.json.message.toLowerCase();\nconst platform = $input.item.json.platform;\n\n// Order-related keywords\nconst orderKeywords = ['order', 'طلب', 'tracking', 'حالة', 'status', 'delivery', 'توصيل', 'shipping', 'شحن', 'فين', 'سعر', 'price'];\n\n// Greeting keywords\nconst greetingKeywords = ['hi', 'hello', 'hey', 'السلام', 'مرحبا', 'أهلا', 'هاي', 'good morning', 'good evening', 'صباح', 'مساء'];\n\nlet intent = 'question';\nlet confidence = 0.7;\n\n// Check for order intent\nfor (const keyword of orderKeywords) {\n  if (message.includes(keyword)) {\n    intent = 'order';\n    confidence = 0.85;\n    break;\n  }\n}\n\n// Check for greeting intent\nfor (const keyword of greetingKeywords) {\n  if (message.includes(keyword)) {\n    intent = 'greeting';\n    confidence = 0.95;\n    break;\n  }\n}\n\nreturn {\n  json: {\n    ...$input.item.json,\n    detected_intent: intent,\n    intent_confidence: confidence\n  }\n};"
-      },
-      "id": "intent-classification",
-      "name": "🎯 Intent Classification",
-      "type": "n8n-nodes-base.code",
-      "typeVersion": 2,
-      "position": [2200, 400]
-    },
-    {
-      "parameters": {
-        "rules": {
-          "values": [
-            {
-              "conditions": {
-                "options": {
-                  "caseSensitive": true,
-                  "leftValue": "",
-                  "typeValidation": "strict"
-                },
-                "conditions": [
-                  {
-                    "leftValue": "={{ $json.detected_intent }}",
-                    "rightValue": "order",
-                    "operator": {
-                      "type": "string",
-                      "operation": "equals"
-                    }
-                  }
-                ],
-                "combinator": "and"
-              },
-              "outputKey": "order_request"
-            },
-            {
-              "conditions": {
-                "options": {
-                  "caseSensitive": true,
-                  "leftValue": "",
-                  "typeValidation": "strict"
-                },
-                "conditions": [
-                  {
-                    "leftValue": "={{ $json.detected_intent }}",
-                    "rightValue": "greeting",
-                    "operator": {
-                      "type": "string",
-                      "operation": "equals"
-                    }
-                  }
-                ],
-                "combinator": "and"
-              },
-              "outputKey": "greeting"
-            },
-            {
-              "conditions": {
-                "options": {
-                  "caseSensitive": true,
-                  "leftValue": "",
-                  "typeValidation": "strict"
-                },
-                "conditions": [
-                  {
-                    "leftValue": "={{ $json.detected_intent }}",
-                    "rightValue": "question",
-                    "operator": {
-                      "type": "string",
-                      "operation": "equals"
-                    }
-                  }
-                ],
-                "combinator": "and"
-              },
-              "outputKey": "question"
-            }
-          ]
-        }
-      },
-      "id": "platform-routing",
-      "name": "🔀 Platform Routing",
-      "type": "n8n-nodes-base.switch",
-      "typeVersion": 3,
-      "position": [2400, 400]
-    },
-    {
-      "parameters": {
-        "method": "POST",
-        "url": "https://api.nazbiz.io/api/salla/lookup-by-phone",
-        "authentication": "genericCredentialType",
-        "genericAuthType": "httpHeaderAuth",
-        "sendBody": true,
-        "specifyBody": "json",
-        "jsonBody": "={{ { phone: $json.sender_id, business_id: $json.business_id } }}",
-        "options": {
-          "timeout": 10000
-        }
-      },
-      "id": "whatsapp-lookup",
-      "name": "📱 WhatsApp Auto Lookup",
-      "type": "n8n-nodes-base.httpRequest",
-      "typeVersion": 4.2,
-      "position": [2600, 300],
-      "continueOnFail": true
-    },
-    {
-      "parameters": {
-        "assignments": {
-          "assignments": [
-            {
-              "id": "ask-for-info",
-              "name": "ask_for_info",
-              "value": true,
-              "type": "boolean"
-            },
-            {
-              "id": "ask-message",
-              "name": "ask_message",
-              "value": "Please send your phone number or order number so I can check your order 😊",
-              "type": "string"
-            }
-          ]
-        }
-      },
-      "id": "ask-for-info",
-      "name": "❓ Ask for Phone/Order",
-      "type": "n8n-nodes-base.set",
-      "typeVersion": 3.4,
-      "position": [2600, 500]
-    },
-    {
-      "parameters": {
-        "method": "GET",
-        "url": "https://api.nazbiz.io/api/knowledge/{{ $json.business_id }}",
-        "authentication": "genericCredentialType",
-        "genericAuthType": "httpHeaderAuth",
-        "options": {
-          "timeout": 5000
-        }
-      },
-      "id": "knowledge-fetch",
-      "name": "📚 Knowledge Base Fetch",
-      "type": "n8n-nodes-base.httpRequest",
-      "typeVersion": 4.2,
-      "position": [2600, 400],
-      "continueOnFail": true
-    },
-    {
-      "parameters": {
-        "method": "POST",
-        "url": "https://api.nazbiz.io/api/n8n/ai/ultimate-process",
-        "authentication": "genericCredentialType",
-        "genericAuthType": "httpHeaderAuth",
-        "sendBody": true,
-        "specifyBody": "json",
-        "jsonBody": "={{ { message: $json.message, platform: $json.platform, conversation_id: $json.conversation_id, user_id: $json.user_id, business_id: $json.business_id, language: $json.detected_language, memory: $json.conversation_memory, intent: $json.detected_intent, order_data: $json.order_data || null, knowledge_base: $json.knowledge_base || '' } }}",
-        "options": {
-          "timeout": 15000
-        }
-      },
-      "id": "ultimate-ai-call",
-      "name": "🧠 Ultimate AI Call (JSON Output)",
-      "type": "n8n-nodes-base.httpRequest",
-      "typeVersion": 4.2,
-      "position": [2800, 400],
-      "retryOnFail": true,
-      "maxTries": 2,
-      "waitBetweenTries": 2000
-    },
-    {
-      "parameters": {
-        "jsCode": "// JSON Response Parsing Logic\nconst aiResponse = $input.item.json;\n\ntry {\n  const parsed = {\n    success: aiResponse.success || false,\n    reply: aiResponse.reply || '',\n    intent: aiResponse.intent || 'unknown',\n    needs_escalation: aiResponse.needs_escalation || false,\n    confidence: aiResponse.confidence || 0.5,\n    validation: aiResponse.validation || { valid: true, reasons: [] }\n  };\n  \n  return {\n    json: {\n      ...$input.item.json,\n      ai_parsed: parsed\n    }\n  };\n} catch (error) {\n  return {\n    json: {\n      ...$input.item.json,\n      ai_parsed: {\n        success: false,\n        reply: \"I apologize, but I'm having trouble processing your request.\",\n        intent: 'escalation',\n        needs_escalation: true,\n        confidence: 0.5,\n        validation: { valid: false, reasons: ['parse_error'] }\n      }\n    }\n  };\n}"
-      },
-      "id": "json-parsing",
-      "name": "📊 JSON Response Parsing",
-      "type": "n8n-nodes-base.code",
-      "typeVersion": 2,
-      "position": [3000, 400]
-    },
-    {
-      "parameters": {
-        "jsCode": "// Response Validation Logic\nconst aiResult = $input.item.json.ai_parsed;\nconst intent = aiResult.intent;\nconst reply = aiResult.reply;\n\nconst validation = {\n  valid: true,\n  reasons: [],\n  warnings: []\n};\n\n// Rule 1: Empty response\nif (!reply || reply.trim().length === 0) {\n  validation.valid = false;\n  validation.reasons.push('empty_response');\n}\n\n// Rule 2: Too long\nif (reply.length > 500) {\n  validation.valid = false;\n  validation.reasons.push('too_long');\n  validation.warnings.push(`Response length: ${reply.length} chars`);\n}\n\n// Rule 3: Uncertain language\nconst uncertainPhrases = ['i think', 'maybe', 'possibly', 'might be', 'ربما', 'قد يكون', 'أعتقد'];\nconst lowerReply = reply.toLowerCase();\nfor (const phrase of uncertainPhrases) {\n  if (lowerReply.includes(phrase)) {\n    validation.valid = false;\n    validation.reasons.push('uncertain_language');\n    break;\n  }\n}\n\n// Rule 4: System instruction leakage\nconst systemKeywords = ['system prompt', 'instructions', 'rules', 'ai assistant', 'as an ai'];\nfor (const keyword of systemKeywords) {\n  if (lowerReply.includes(keyword)) {\n    validation.valid = false;\n    validation.reasons.push('system_instruction_leak');\n    break;\n  }\n}\n\n// Rule 5: JSON/Code leakage\nif (reply.includes('{') || reply.includes('}') || reply.includes('```')) {\n  validation.valid = false;\n  validation.reasons.push('contains_code_or_json');\n}\n\n// Rule 6: Greeting length check\nif (intent === 'greeting' && reply.length > 100) {\n  validation.valid = false;\n  validation.reasons.push('greeting_too_long');\n}\n\nreturn {\n  json: {\n    ...$input.item.json,\n    ai_result: aiResult,\n    validation: validation\n  }\n};"
-      },
-      "id": "response-validation",
-      "name": "🔴 Response Validation",
-      "type": "n8n-nodes-base.code",
-      "typeVersion": 2,
-      "position": [3200, 400]
-    },
-    {
-      "parameters": {
-        "conditions": {
-          "options": {
-            "caseSensitive": true,
-            "leftValue": "",
-            "typeValidation": "strict"
-          },
-          "conditions": [
-            {
-              "id": "escalation-decision",
-              "leftValue": "={{ $json.ai_result.needs_escalation }}",
-              "rightValue": true,
-              "operator": {
-                "type": "boolean",
-                "operation": "equals"
-              }
-            },
-            {
-              "id": "confidence-decision",
-              "leftValue": "={{ $json.ai_result.confidence * 100 }}",
-              "rightValue": 70,
-              "operator": {
-                "type": "number",
-                "operation": "smaller"
-              }
-            },
-            {
-              "id": "validation-decision",
-              "leftValue": "={{ $json.validation.valid }}",
-              "rightValue": false,
-              "operator": {
-                "type": "boolean",
-                "operation": "equals"
-              }
-            }
-          ],
-          "combinator": "any"
-        }
-      },
-      "id": "decision-gate",
-      "name": "🎯 Decision Gate",
-      "type": "n8n-nodes-base.if",
-      "typeVersion": 2,
-      "position": [3400, 400]
-    },
-    {
-      "parameters": {
-        "method": "POST",
-        "url": "https://api.nazbiz.io/api/escalate",
-        "authentication": "genericCredentialType",
-        "genericAuthType": "httpHeaderAuth",
-        "sendBody": true,
-        "specifyBody": "json",
-        "jsonBody": "={{ { conversation_id: $json.conversation_id, reason: 'ai_decision', intent: $json.ai_result.intent, confidence: $json.ai_result.confidence, priority: 'normal', user_id: $json.user_id } }}",
-        "options": {
-          "timeout": 10000
-        }
-      },
-      "id": "ai-escalation",
-      "name": "🚨 AI Escalation",
-      "type": "n8n-nodes-base.httpRequest",
-      "typeVersion": 4.2,
-      "position": [3600, 300],
-      "retryOnFail": true,
-      "maxTries": 2
-    },
-    {
-      "parameters": {
-        "respondWith": "json",
-        "responseBody": "={{ { success: true, action: 'escalated', message: 'Sure 👍 I\\'m connecting you with a human agent now. Please wait a moment.', requires_human: true, intent: $json.ai_result.intent, confidence: $json.ai_result.confidence } }}"
-      },
-      "id": "escalation-response-final",
-      "name": "📤 Escalation Response",
-      "type": "n8n-nodes-base.respondToWebhook",
-      "typeVersion": 1.1,
-      "position": [3800, 300]
-    },
-    {
-      "parameters": {
-        "respondWith": "json",
-        "responseBody": "={{ { success: true, action: 'ai_response', message: $json.ai_result.reply, intent: $json.ai_result.intent, confidence: $json.ai_result.confidence, requires_human: false } }}"
-      },
-      "id": "send-ai-response",
-      "name": "📤 Send AI Response",
-      "type": "n8n-nodes-base.respondToWebhook",
-      "typeVersion": 1.1,
-      "position": [3600, 500]
+      "position": [900, 540]
     }
   ],
   "connections": {
-    "📥 Webhook Trigger": {
+    "Webhook Trigger": {
+      "main": [[{ "node": "Hard Escalation?", "type": "main", "index": 0 }]]
+    },
+    "Hard Escalation?": {
       "main": [
-        [
-          {
-            "node": "📋 Parse Message Data",
-            "type": "main",
-            "index": 0
-          }
-        ]
+        [{ "node": "Trigger Escalation", "type": "main", "index": 0 }],
+        [{ "node": "Process Message (Laravel)", "type": "main", "index": 0 }]
       ]
     },
-    "📋 Parse Message Data": {
-      "main": [
-        [
-          {
-            "node": "🔤 Lowercase Message",
-            "type": "main",
-            "index": 0
-          }
-        ]
-      ]
+    "Trigger Escalation": {
+      "main": [[{ "node": "Escalation Response", "type": "main", "index": 0 }]]
     },
-    "🔤 Lowercase Message": {
-      "main": [
-        [
-          {
-            "node": "🔴 Hard Escalation Check",
-            "type": "main",
-            "index": 0
-          }
-        ]
-      ]
+    "Process Message (Laravel)": {
+      "main": [[{ "node": "Success?", "type": "main", "index": 0 }]]
     },
-    "🔴 Hard Escalation Check": {
+    "Success?": {
       "main": [
-        [
-          {
-            "node": "🚨 Trigger Immediate Escalation",
-            "type": "main",
-            "index": 0
-          }
-        ],
-        [
-          {
-            "node": "⏱️ Rate Limit Check",
-            "type": "main",
-            "index": 0
-          }
-        ]
-      ]
-    },
-    "🚨 Trigger Immediate Escalation": {
-      "main": [
-        [
-          {
-            "node": "📤 Escalation Response",
-            "type": "main",
-            "index": 0
-          }
-        ]
-      ]
-    },
-    "⏱️ Rate Limit Check": {
-      "main": [
-        [
-          {
-            "node": "⏱️ Rate Limit Decision",
-            "type": "main",
-            "index": 0
-          }
-        ]
-      ]
-    },
-    "⏱️ Rate Limit Decision": {
-      "main": [
-        [
-          {
-            "node": "📤 Rate Limit Response",
-            "type": "main",
-            "index": 0
-          }
-        ],
-        [
-          {
-            "node": "🌍 Language Detection",
-            "type": "main",
-            "index": 0
-          }
-        ]
-      ]
-    },
-    "🌍 Language Detection": {
-      "main": [
-        [
-          {
-            "node": "🌍 Add Language Context",
-            "type": "main",
-            "index": 0
-          }
-        ]
-      ]
-    },
-    "🌍 Add Language Context": {
-      "main": [
-        [
-          {
-            "node": "🧠 Conversation Memory Check",
-            "type": "main",
-            "index": 0
-          }
-        ]
-      ]
-    },
-    "🧠 Conversation Memory Check": {
-      "main": [
-        [
-          {
-            "node": "🧠 Add Memory Context",
-            "type": "main",
-            "index": 0
-          }
-        ]
-      ]
-    },
-    "🧠 Add Memory Context": {
-      "main": [
-        [
-          {
-            "node": "🎯 Intent Classification",
-            "type": "main",
-            "index": 0
-          }
-        ]
-      ]
-    },
-    "🎯 Intent Classification": {
-      "main": [
-        [
-          {
-            "node": "🔀 Platform Routing",
-            "type": "main",
-            "index": 0
-          }
-        ]
-      ]
-    },
-    "🔀 Platform Routing": {
-      "main": [
-        [
-          {
-            "node": "📱 WhatsApp Auto Lookup",
-            "type": "main",
-            "index": 0
-          }
-        ],
-        [
-          {
-            "node": "❓ Ask for Phone/Order",
-            "type": "main",
-            "index": 0
-          }
-        ],
-        [
-          {
-            "node": "📚 Knowledge Base Fetch",
-            "type": "main",
-            "index": 0
-          }
-        ]
-      ]
-    },
-    "📱 WhatsApp Auto Lookup": {
-      "main": [
-        [
-          {
-            "node": "🧠 Ultimate AI Call (JSON Output)",
-            "type": "main",
-            "index": 0
-          }
-        ]
-      ]
-    },
-    "❓ Ask for Phone/Order": {
-      "main": [
-        [
-          {
-            "node": "🧠 Ultimate AI Call (JSON Output)",
-            "type": "main",
-            "index": 0
-          }
-        ]
-      ]
-    },
-    "📚 Knowledge Base Fetch": {
-      "main": [
-        [
-          {
-            "node": "🧠 Ultimate AI Call (JSON Output)",
-            "type": "main",
-            "index": 0
-          }
-        ]
-      ]
-    },
-    "🧠 Ultimate AI Call (JSON Output)": {
-      "main": [
-        [
-          {
-            "node": "📊 JSON Response Parsing",
-            "type": "main",
-            "index": 0
-          }
-        ]
-      ]
-    },
-    "📊 JSON Response Parsing": {
-      "main": [
-        [
-          {
-            "node": "🔴 Response Validation",
-            "type": "main",
-            "index": 0
-          }
-        ]
-      ]
-    },
-    "🔴 Response Validation": {
-      "main": [
-        [
-          {
-            "node": "🎯 Decision Gate",
-            "type": "main",
-            "index": 0
-          }
-        ]
-      ]
-    },
-    "🎯 Decision Gate": {
-      "main": [
-        [
-          {
-            "node": "🚨 AI Escalation",
-            "type": "main",
-            "index": 0
-          }
-        ],
-        [
-          {
-            "node": "📤 Send AI Response",
-            "type": "main",
-            "index": 0
-          }
-        ]
-      ]
-    },
-    "🚨 AI Escalation": {
-      "main": [
-        [
-          {
-            "node": "📤 Escalation Response",
-            "type": "main",
-            "index": 0
-          }
-        ]
+        [{ "node": "Success Response", "type": "main", "index": 0 }],
+        [{ "node": "Error Response", "type": "main", "index": 0 }]
       ]
     }
   },
-  "settings": {
-    "executionOrder": "v1"
-  },
+  "settings": { "executionOrder": "v1", "saveManualExecutions": true },
   "staticData": null,
-  "tags": [
-    {
-      "createdAt": "2026-08-07T20:00:00.000Z",
-      "updatedAt": "2026-08-07T20:00:00.000Z",
-      "id": "production",
-      "name": "Production"
-    }
-  ],
+  "tags": [],
   "triggerCount": 0,
-  "updatedAt": "2026-08-07T20:00:00.000Z",
-  "versionId": "ultimate-ai-v2"
+  "updatedAt": "2026-08-08T00:00:00.000Z",
+  "versionId": "nazbiz-gateway-v1"
 }

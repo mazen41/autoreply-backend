@@ -176,7 +176,7 @@ Route::middleware('auth:sanctum')->group(function () {
 // Gmail Webhook - public, Google Pub/Sub calls this
 Route::post('/webhook/gmail', [WebhookController::class, 'handleGmail']);
 
-// n8n Integration Routes (public with auth)
+// n8n Integration Routes (public — kept for legacy/future use)
 Route::prefix('n8n')->group(function () {
     Route::post('/rate-limit/check', [N8nIntegrationController::class, 'checkRateLimit']);
     Route::post('/language/detect', [N8nIntegrationController::class, 'detectLanguage']);

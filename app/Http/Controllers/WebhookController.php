@@ -170,7 +170,6 @@ class WebhookController extends Controller
             broadcast(new \App\Events\MessageReceived($message, $conversation, $channel->user_id));
         }
 
-        // Dispatch ProcessAutoReply job
         \App\Jobs\ProcessAutoReply::dispatch($message->id);
         Log::info('ProcessAutoReply job dispatched', ['message_id' => $message->id]);
     }
@@ -476,7 +475,6 @@ Reply:";
                 broadcast(new \App\Events\MessageReceived($messageModel, $conversation, $channel->user_id));
             }
 
-            // Dispatch ProcessAutoReply job
             \App\Jobs\ProcessAutoReply::dispatch($messageModel->id);
 
         } catch (\Exception $e) {

@@ -197,7 +197,7 @@ class TrainingController extends Controller
         // Create a knowledge file from the correction
         $knowledgeFile = \App\Models\BusinessKnowledgeFile::create([
             'business_id' => $business->id,
-            'filename' => 'learning_correction_' . now()->format('Y-m-d_His') . '. md5($correction->human_correction) . '.txt',
+            'filename' => 'learning_correction_' . now()->format('Y-m-d_His') . '_' . md5($correction->human_correction) . '.txt',
             'file_type' => 'text/plain',
             'file_size' => strlen($correction->human_correction),
             'extracted_text' => "Question: {$correction->originalMessage->content}\n\nAnswer: {$correction->human_correction}",

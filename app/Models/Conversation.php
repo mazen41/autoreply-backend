@@ -14,11 +14,20 @@ class Conversation extends Model
         'sender_email',
         'subject',
         'status',
+        'ai_enabled',
+        'requires_human',
+        'escalated_at',
+        'escalation_reason',
+        'escalation_notified',
         'last_message_at',
     ];
 
     protected $casts = [
-        'last_message_at' => 'datetime',
+        'last_message_at'      => 'datetime',
+        'escalated_at'         => 'datetime',
+        'ai_enabled'           => 'boolean',
+        'requires_human'       => 'boolean',
+        'escalation_notified'  => 'boolean',
     ];
 
     public function channel()

@@ -52,8 +52,17 @@ class ProcessAutoReply implements ShouldQueue
             return;
         }
 
-        if (!$conversation || !$conversation->ai_enabled) {
-            Log::info('ProcessAutoReply: AI not enabled for conversation', ['conversation_id' => $conversation?->id]);
+        // ai_enabled on Conversation lets agents disable AI per-conversation (e.g. after escalation)
+        if (!$conversation) {
+            Log::info('ProcessAutoReply: conversation not found', ['message_id' => $this->messageId]);
+            return;
+        }
+
+        // Default true if column is null (old rows before migration)
+        if ($conversation->ai_enabled === false) {
+            Log::info('ProcessAutoReply: AI disabled for this conversation (human took over)', [
+                'conversation_id' => $conversation->id,
+            ]);
             return;
         }
 

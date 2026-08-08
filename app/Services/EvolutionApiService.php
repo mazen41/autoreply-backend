@@ -515,13 +515,14 @@ class EvolutionApiService
 
             if (!$conversation) {
                 $conversation = Conversation::create([
-                    'channel_id' => $channel->id,
-                    'business_id' => $channel->business_id,
-                    'sender_id' => $fromPhone,
-                    'sender_name' => $fromName,
+                    'channel_id'   => $channel->id,
+                    'business_id'  => $channel->business_id,
+                    'sender_id'    => $fromPhone,
+                    'sender_name'  => $fromName,
                     'sender_email' => null,
-                    'subject' => null,
-                    'status' => 'active',
+                    'subject'      => null,
+                    'status'       => 'active',
+                    'ai_enabled'   => true,   // must be explicit — model default is not DB default
                     'last_message_at' => now(),
                 ]);
 

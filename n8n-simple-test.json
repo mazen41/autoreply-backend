@@ -1,0 +1,224 @@
+{
+  "name": "NazBiz AI Support - Production",
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "ai-support",
+        "responseMode": "responseNode",
+        "options": {}
+      },
+      "id": "webhook-trigger",
+      "name": "Webhook Trigger",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 1.1,
+      "position": [200, 300],
+      "webhookId": "nazbiz-ai-support"
+    },
+    {
+      "parameters": {
+        "assignments": {
+          "assignments": [
+            {
+              "name": "platform",
+              "value": "={{ $json.platform ?? $json.body.platform ?? 'whatsapp' }}",
+              "type": "string"
+            },
+            {
+              "name": "message",
+              "value": "={{ $json.message ?? $json.body.message ?? '' }}",
+              "type": "string"
+            },
+            {
+              "name": "sender_id",
+              "value": "={{ $json.sender_id ?? $json.body.sender_id ?? '' }}",
+              "type": "string"
+            },
+            {
+              "name": "conversation_id",
+              "value": "={{ $json.conversation_id ?? $json.body.conversation_id ?? '' }}",
+              "type": "string"
+            },
+            {
+              "name": "user_id",
+              "value": "={{ $json.user_id ?? $json.body.user_id ?? '1' }}",
+              "type": "string"
+            },
+            {
+              "name": "business_id",
+              "value": "={{ $json.business_id ?? $json.body.business_id ?? '1' }}",
+              "type": "string"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "parse-data",
+      "name": "Parse Data",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [420, 300]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://api.nazbiz.io/api/n8n/ai/ultimate-process",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Authorization",
+              "value": "Bearer 31|w2M5w0OYeVZGmDabtqZFyjTm3Ux6fqXYZi3few9I9677df7d"
+            },
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            },
+            {
+              "name": "Accept",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={\n  \"message\": \"{{ $json.message }}\",\n  \"platform\": \"{{ $json.platform }}\",\n  \"conversation_id\": \"{{ $json.conversation_id }}\",\n  \"user_id\": \"{{ $json.user_id }}\",\n  \"business_id\": \"{{ $json.business_id }}\",\n  \"sender_id\": \"{{ $json.sender_id }}\",\n  \"language\": \"auto\",\n  \"memory\": {}\n}",
+        "options": {
+          "timeout": 30000,
+          "response": {
+            "response": {
+              "fullResponse": false
+            }
+          }
+        }
+      },
+      "id": "ai-call",
+      "name": "AI Call",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [640, 300],
+      "continueOnFail": true
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict"
+          },
+          "conditions": [
+            {
+              "id": "success-check",
+              "leftValue": "={{ $json.success }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "true"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "check-success",
+      "name": "Success?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [860, 300]
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={\n  \"success\": true,\n  \"reply\": \"{{ $json.reply }}\",\n  \"intent\": \"{{ $json.intent }}\",\n  \"confidence\": {{ $json.confidence ?? 0 }},\n  \"requires_human\": {{ $json.requires_human ?? false }}\n}",
+        "options": {
+          "responseCode": 200
+        }
+      },
+      "id": "respond-success",
+      "name": "Respond Success",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [1080, 200]
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={\n  \"success\": false,\n  \"reply\": \"نعتذر، حدث خطأ مؤقت. سيتواصل معك أحد فريقنا قريباً.\",\n  \"intent\": \"error\",\n  \"confidence\": 0,\n  \"requires_human\": true,\n  \"error\": \"{{ $json.error ?? 'AI service unavailable' }}\"\n}",
+        "options": {
+          "responseCode": 200
+        }
+      },
+      "id": "respond-error",
+      "name": "Respond Error",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [1080, 420]
+    }
+  ],
+  "connections": {
+    "Webhook Trigger": {
+      "main": [
+        [
+          {
+            "node": "Parse Data",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Parse Data": {
+      "main": [
+        [
+          {
+            "node": "AI Call",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "AI Call": {
+      "main": [
+        [
+          {
+            "node": "Success?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Success?": {
+      "main": [
+        [
+          {
+            "node": "Respond Success",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Respond Error",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1",
+    "saveManualExecutions": true,
+    "callerPolicy": "workflowsFromSameOwner",
+    "errorWorkflow": ""
+  },
+  "staticData": null,
+  "tags": [],
+  "triggerCount": 0,
+  "updatedAt": "2026-08-08T00:00:00.000Z",
+  "versionId": "nazbiz-production-v1"
+}

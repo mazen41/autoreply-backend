@@ -256,26 +256,59 @@ class SallaService
      * Get latest order by phone number.
      *
      * Flow:
-     *  1. Search customers by mobile → get customer ID
-     *  2. GET /orders?customer_id={id}&per_page=1 sorted by newest
+     *  1. Search customers by mobile → verify the returned customer's phone matches
+     *  2. GET /orders?customer_id={id}&per_page=1
+     *
+     * IMPORTANT: Salla's /customers?mobile= filter can return fuzzy/partial matches.
+     * We always verify the returned customer's phone before trusting the order,
+     * so we never return an order belonging to a different customer.
      */
     public function getLatestOrderByPhone(string $accessToken, string $phone): ?array
     {
-        // Normalise phone: strip leading zeros and country code variations
-        // Salla stores Saudi numbers as 05XXXXXXXX or 9665XXXXXXXX
         $cleanPhone = preg_replace('/[^0-9]/', '', $phone);
 
-        // Try looking up by the raw number first, then with leading 0 stripped
-        $customer = $this->getCustomerByPhone($accessToken, $cleanPhone);
+        // Build all phone variants we'll accept as a match
+        $last9     = substr($cleanPhone, -9);
+        $local     = '0' . $last9;               // 0XXXXXXXXX
+        $saudi966  = '966' . $last9;              // 966XXXXXXXXX
+        $intl      = '+966' . $last9;             // +966XXXXXXXXX
 
-        if (!$customer && strlen($cleanPhone) > 9) {
-            // Try without country code prefix (e.g. 966 → 0...)
-            $localPhone = '0' . substr($cleanPhone, -9);
-            $customer   = $this->getCustomerByPhone($accessToken, $localPhone);
+        $acceptedVariants = array_unique([$cleanPhone, $local, $saudi966, $intl, $last9]);
+
+        $customer = null;
+
+        // Try each variant until we find a customer whose stored phone actually matches
+        foreach ([$cleanPhone, $local] as $searchPhone) {
+            $result    = $this->getCustomers($accessToken, ['mobile' => $searchPhone]);
+            $candidates = $result['data'] ?? [];
+
+            foreach ($candidates as $candidate) {
+                $storedRaw = preg_replace('/[^0-9]/', '', $candidate['mobile'] ?? '');
+                $storedLast9 = substr($storedRaw, -9);
+
+                if ($storedLast9 === $last9) {
+                    $customer = $candidate;
+                    Log::info('Salla: customer phone verified', [
+                        'searched'    => $searchPhone,
+                        'stored'      => $candidate['mobile'] ?? 'N/A',
+                        'customer_id' => $candidate['id'],
+                    ]);
+                    break 2; // found a verified match — stop searching
+                }
+
+                Log::warning('Salla: customer phone mismatch — skipping', [
+                    'searched'       => $searchPhone,
+                    'returned_phone' => $candidate['mobile'] ?? 'N/A',
+                    'customer_id'    => $candidate['id'] ?? 'N/A',
+                ]);
+            }
         }
 
         if (!$customer) {
-            Log::info('Salla: no customer found for phone', ['phone' => $cleanPhone]);
+            Log::info('Salla: no verified customer found for phone', [
+                'phone'    => $cleanPhone,
+                'variants' => $acceptedVariants,
+            ]);
             return null;
         }
 
@@ -286,9 +319,14 @@ class SallaService
         $order = $orders['data'][0] ?? null;
 
         if ($order) {
-            Log::info('Salla: latest order found', [
+            Log::info('Salla: latest order found for verified customer', [
+                'customer_id'    => $customer['id'],
+                'customer_phone' => $customer['mobile'] ?? 'N/A',
+                'order_id'       => $order['id'] ?? null,
+            ]);
+        } else {
+            Log::info('Salla: customer found but has no orders', [
                 'customer_id' => $customer['id'],
-                'order_id'    => $order['id'] ?? null,
             ]);
         }
 

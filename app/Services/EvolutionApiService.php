@@ -470,15 +470,19 @@ class EvolutionApiService
             $waMessageId = $messageKey['id'] ?? null;
             if ($waMessageId) {
                 $lockKey = 'wa_msg_processed:' . $waMessageId;
-                if (\Illuminate\Support\Facades\Cache::has($lockKey)) {
+
+                // Use an atomic lock so two webhook workers racing on the same
+                // message ID cannot both pass the has() check before either
+                // has written the put(). Cache::add() is atomic: it only writes
+                // when the key does NOT yet exist and returns true/false.
+                $isFirst = \Illuminate\Support\Facades\Cache::add($lockKey, 1, now()->addMinutes(5));
+                if (!$isFirst) {
                     Log::info('Duplicate WhatsApp message skipped (already processed by another instance)', [
                         'message_id' => $waMessageId,
                         'instance'   => $instance->instance_name,
                     ]);
                     return;
                 }
-                // Mark as processed for 5 minutes (long enough to cover any retry window)
-                \Illuminate\Support\Facades\Cache::put($lockKey, 1, now()->addMinutes(5));
             }
             // Find the WhatsApp channel
             $channel = Channel::where('user_id', $instance->user_id)
@@ -746,6 +750,34 @@ class EvolutionApiService
         if ($state === 'open') {
             $instance->connected_at = now();
             $instance->disconnected_at = null;
+
+            // ── SHARED-PHONE DETECTION ──────────────────────────────────────
+            // Warn clearly when two different users have connected the same
+            // physical WhatsApp number. This is the root cause of the duplicate
+            // webhook deliveries seen in production logs.
+            // We use phone_number as the match key; fall back to profile_name.
+            $phoneToCheck = $instance->phone_number ?? $instance->profile_name ?? null;
+            if ($phoneToCheck) {
+                $conflict = WhatsAppInstance::where('id', '!=', $instance->id)
+                    ->where(function ($q) use ($phoneToCheck) {
+                        $q->where('phone_number', $phoneToCheck)
+                          ->orWhere('profile_name', $phoneToCheck);
+                    })
+                    ->where('status', 'connected')
+                    ->first();
+
+                if ($conflict) {
+                    Log::error('SHARED PHONE DETECTED: two instances are connected to the same WhatsApp number. ' .
+                        'This causes duplicate webhook deliveries. The conflicting instance should be disconnected.', [
+                        'new_instance'      => $instance->instance_name,
+                        'new_user_id'       => $instance->user_id,
+                        'conflict_instance' => $conflict->instance_name,
+                        'conflict_user_id'  => $conflict->user_id,
+                        'phone'             => $phoneToCheck,
+                    ]);
+                }
+            }
+            // ── END SHARED-PHONE DETECTION ──────────────────────────────────
 
             // Create or update Channel for WhatsApp integration
             $this->ensureWhatsAppChannel($instance);

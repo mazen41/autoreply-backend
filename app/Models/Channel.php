@@ -114,4 +114,9 @@ class Channel extends Model
     {
         return $this->hasMany(Conversation::class);
     }
+
+    public function messages()
+    {
+        return $this->hasManyThrough(Message::class, Conversation::class);
+    }
 }

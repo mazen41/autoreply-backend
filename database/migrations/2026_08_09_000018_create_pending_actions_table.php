@@ -16,7 +16,7 @@ return new class extends Migration
             $table->foreignId('conversation_id')->constrained()->onDelete('cascade');
             $table->string('action_type');
             $table->json('action_payload');
-            $table->enum('priority', 'low', 'medium', 'high')->default('medium');
+            $table->enum('priority', ['low', 'medium', 'high'])->default('medium');
             $table->enum('status', ['pending', 'processing', 'completed', 'failed'])->default('pending');
             $table->text('error_message')->nullable();
             $table->integer('retry_count')->default(0);

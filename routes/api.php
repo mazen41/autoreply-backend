@@ -12,7 +12,7 @@ use App\Http\Controllers\Api\TeamController;
 use App\Http\Controllers\Api\AutomationController;
 use App\Http\Controllers\Api\CampaignController;
 use App\Http\Controllers\Api\SequenceController;
-use App\Http\Controllers\Api\WebhookController;
+use App\Http\Controllers\Api\WebhookController as ApiWebhookController;
 use App\Http\Controllers\Api\PublicApiController;
 use App\Http\Controllers\Api\AnalyticsController;
 use App\Http\Controllers\Api\BillingController;
@@ -29,7 +29,7 @@ use App\Http\Controllers\Api\ProactiveController;
 use App\Http\Controllers\Api\ToolsController;
 use App\Http\Controllers\Api\SallaWebhookController;
 use App\Http\Controllers\Api\PusherAuthController;
-use App\Http\Controllers\WebhookController;
+use App\Http\Controllers\WebhookController as MetaWebhookController;
 use App\Http\Controllers\ChannelController;
 use App\Http\Controllers\GmailController;
 use App\Http\Controllers\InboxController;
@@ -77,8 +77,8 @@ Route::middleware('auth:sanctum')->prefix('broadcasting')->group(function () {
 });
 
 // â”€â”€ Meta Webhook â€” public, Meta calls these directly â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-Route::get('/webhook/meta',  [WebhookController::class, 'verify']);
-Route::post('/webhook/meta', [WebhookController::class, 'handle']);
+Route::get('/webhook/meta',  [MetaWebhookController::class, 'verify']);
+Route::post('/webhook/meta', [MetaWebhookController::class, 'handle']);
 
 // â”€â”€ Public OAuth channels callbacks â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 Route::get('/channels/connect/facebook',  [ChannelController::class, 'connectFacebook']);
@@ -185,11 +185,11 @@ Route::middleware('auth:sanctum')->group(function () {
     Route::get('/businesses/{businessId}/sequences/{sequenceId}/enrollments', [SequenceController::class, 'enrollments']);
 
     // Webhooks
-    Route::get('/businesses/{businessId}/webhooks',     [WebhookController::class, 'index']);
-    Route::post('/businesses/{businessId}/webhooks',    [WebhookController::class, 'store']);
-    Route::put('/businesses/{businessId}/webhooks/{webhookId}', [WebhookController::class, 'update']);
-    Route::delete('/businesses/{businessId}/webhooks/{webhookId}', [WebhookController::class, 'destroy']);
-    Route::post('/businesses/{businessId}/webhooks/{webhookId}/test', [WebhookController::class, 'test']);
+    Route::get('/businesses/{businessId}/webhooks',     [ApiWebhookController::class, 'index']);
+    Route::post('/businesses/{businessId}/webhooks',    [ApiWebhookController::class, 'store']);
+    Route::put('/businesses/{businessId}/webhooks/{webhookId}', [ApiWebhookController::class, 'update']);
+    Route::delete('/businesses/{businessId}/webhooks/{webhookId}', [ApiWebhookController::class, 'destroy']);
+    Route::post('/businesses/{businessId}/webhooks/{webhookId}/test', [ApiWebhookController::class, 'test']);
 
     // Analytics
     Route::get('/businesses/{businessId}/analytics/csat', [AnalyticsController::class, 'getCsatScore']);
@@ -294,7 +294,7 @@ Route::middleware('auth:sanctum')->group(function () {
 });
 
 // Gmail Webhook - public, Google Pub/Sub calls this
-Route::post('/webhook/gmail', [WebhookController::class, 'handleGmail']);
+Route::post('/webhook/gmail', [MetaWebhookController::class, 'handleGmail']);
 
 // n8n Integration Routes (public — kept for legacy/future use)
 Route::prefix('n8n')->group(function () {

@@ -372,6 +372,65 @@ class ProcessAutoReply implements ShouldQueue
                         } catch (\Exception $e) {
                             Log::warning('ProcessAutoReply: Salla order lookup (non-WA) failed', ['error' => $e->getMessage()]);
                         }
+
+                        // Fallback to Shopify if Salla lookup failed
+                        if (!$sallaContext) {
+                            try {
+                                $shopifyChannel = Channel::where('user_id', $channel->user_id)
+                                    ->where('type', 'shopify')
+                                    ->where('status', 'connected')
+                                    ->first();
+                                
+                                if ($shopifyChannel && $phoneMatch) {
+                                    $shopifyResponse = Http::withToken($shopifyChannel->access_token)
+                                        ->get("https://{$shopifyChannel->page_id}/admin/api/2024-01/orders.json", [
+                                            'customer_phone' => $phoneMatch,
+                                            'status' => 'any',
+                                            'limit' => 1,
+                                            'sort_by' => 'created_at',
+                                            'sort_order' => 'desc',
+                                        ]);
+                                    
+                                    if ($shopifyResponse->successful() && !empty($shopifyResponse->json()['orders'])) {
+                                        $shopifyOrder = $shopifyResponse->json()['orders'][0];
+                                        $sallaContext = $this->formatShopifyOrderForAI($shopifyOrder);
+                                        Log::info('ProcessAutoReply: Shopify order lookup succeeded');
+                                    }
+                                }
+                            } catch (\Exception $e) {
+                                Log::warning('ProcessAutoReply: Shopify order lookup failed', ['error' => $e->getMessage()]);
+                            }
+                        }
+
+                        // Fallback to WooCommerce if Shopify lookup also failed
+                        if (!$sallaContext) {
+                            try {
+                                $wooCommerceChannel = Channel::where('user_id', $channel->user_id)
+                                    ->where('type', 'woocommerce')
+                                    ->where('status', 'connected')
+                                    ->first();
+                                
+                                if ($wooCommerceChannel && $phoneMatch) {
+                                    $wooCommerceResponse = Http::get("{$wooCommerceChannel->page_id}/wp-json/wc/v3/orders", [
+                                        'consumer_key' => $wooCommerceChannel->access_token,
+                                        'consumer_secret' => $wooCommerceChannel->refresh_token,
+                                        'phone' => $phoneMatch,
+                                        'status' => 'any',
+                                        'orderby' => 'date',
+                                        'order' => 'desc',
+                                        'per_page' => 1,
+                                    ]);
+                                    
+                                    if ($wooCommerceResponse->successful() && !empty($wooCommerceResponse->json())) {
+                                        $wooCommerceOrder = $wooCommerceResponse->json()[0];
+                                        $sallaContext = $this->formatWooCommerceOrderForAI($wooCommerceOrder);
+                                        Log::info('ProcessAutoReply: WooCommerce order lookup succeeded');
+                                    }
+                                }
+                            } catch (\Exception $e) {
+                                Log::warning('ProcessAutoReply: WooCommerce order lookup failed', ['error' => $e->getMessage()]);
+                            }
+                        }
                     }
                 }
             }
@@ -776,6 +835,10 @@ class ProcessAutoReply implements ShouldQueue
                 $success = $this->sendGmailReply($channel, $conversation, $content);
             } elseif ($channel->type === 'whatsapp') {
                 $success = $this->sendWhatsAppReply($channel, $senderId, $content);
+            } elseif ($channel->type === 'telegram') {
+                $success = $this->sendTelegramReply($channel, $senderId, $content);
+            } elseif ($channel->type === 'tiktok') {
+                $success = $this->sendTikTokReply($channel, $senderId, $content);
             }
 
             if ($success) {
@@ -946,6 +1009,99 @@ class ProcessAutoReply implements ShouldQueue
             Log::error('ProcessAutoReply: WhatsApp send exception', ['error' => $e->getMessage()]);
             return false;
         }
+    }
+
+    private function sendTelegramReply(Channel $channel, string $chatId, string $message): bool
+    {
+        try {
+            $botToken = $channel->access_token;
+            $url = "https://api.telegram.org/bot{$botToken}/sendMessage";
+
+            $response = Http::timeout(10)
+                ->post($url, [
+                    'chat_id' => $chatId,
+                    'text' => $message,
+                ]);
+
+            if (!$response->successful()) {
+                Log::error('ProcessAutoReply: Telegram send failed', [
+                    'status' => $response->status(),
+                    'body' => $response->json(),
+                    'chat_id' => $chatId,
+                ]);
+            }
+
+            return $response->successful();
+
+        } catch (\Exception $e) {
+            Log::error('ProcessAutoReply: Telegram send exception', ['error' => $e->getMessage()]);
+            return false;
+        }
+    }
+
+    private function sendTikTokReply(Channel $channel, string $userId, string $message): bool
+    {
+        try {
+            // TikTok API requires specific OAuth scopes for commenting
+            // This is a placeholder implementation - actual TikTok commenting requires
+            // additional API setup and permissions
+            $accessToken = $channel->access_token;
+            $openId = $channel->metadata['open_id'] ?? null;
+
+            if (!$openId) {
+                Log::error('ProcessAutoReply: TikTok reply failed - no open_id', ['channel_id' => $channel->id]);
+                return false;
+            }
+
+            // TikTok API for sending comments is restricted and requires special permissions
+            // For now, we'll log this as a limitation
+            Log::warning('ProcessAutoReply: TikTok direct replies are not supported via public API', [
+                'channel_id' => $channel->id,
+                'user_id' => $userId,
+            ]);
+
+            return false;
+
+        } catch (\Exception $e) {
+            Log::error('ProcessAutoReply: TikTok send exception', ['error' => $e->getMessage()]);
+            return false;
+        }
+    }
+
+    private function formatShopifyOrderForAI(array $order): string
+    {
+        $orderNumber = $order['order_number'] ?? $order['id'] ?? 'N/A';
+        $status = $order['financial_status'] ?? 'Unknown';
+        $total = $order['total_price'] ?? '0';
+        $currency = $order['currency'] ?? 'USD';
+        $processedAt = $order['processed_at'] ?? 'Not specified';
+
+        $products = [];
+        foreach ($order['line_items'] ?? [] as $item) {
+            $products[] = ($item['title'] ?? 'Unknown') . ' x' . ($item['quantity'] ?? 1);
+        }
+
+        return "Order #{$orderNumber}\nStatus: {$status}\nTotal: {$total} {$currency}\n" .
+               "Products: " . implode(', ', $products) . "\n" .
+               "Processed At: {$processedAt}";
+    }
+
+    private function formatWooCommerceOrderForAI(array $order): string
+    {
+        $orderNumber = $order['number'] ?? $order['id'] ?? 'N/A';
+        $status = $order['status'] ?? 'Unknown';
+        $total = $order['total'] ?? '0';
+        $currency = $order['currency'] ?? 'USD';
+        $dateCreated = $order['date_created'] ?? 'Not specified';
+
+        $products = [];
+        foreach ($order['line_items'] ?? [] as $item) {
+            $products[] = ($item['name'] ?? 'Unknown') . ' x' . ($item['quantity'] ?? 1);
+        }
+
+        return "Order #{$orderNumber}\nStatus: {$status}\nTotal: {$total} {$currency}\n" .
+               "Products: " . implode(', ', $products) . "\n" .
+               "Date Created: {$dateCreated}";
     }
 
     /**

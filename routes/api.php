@@ -34,6 +34,10 @@ use App\Http\Controllers\ChannelController;
 use App\Http\Controllers\GmailController;
 use App\Http\Controllers\InboxController;
 use App\Http\Controllers\PostController;
+use App\Http\Controllers\TelegramController;
+use App\Http\Controllers\TikTokController;
+use App\Http\Controllers\ShopifyController;
+use App\Http\Controllers\WooCommerceController;
 use Illuminate\Support\Facades\Route;
 use Illuminate\Support\Facades\RateLimiter;
 
@@ -87,6 +91,17 @@ Route::get('/channels/callback/gmail',    [GmailController::class, 'callback']);
 Route::get('/channels/connect/salla',     [ChannelController::class, 'connectSalla']);
 Route::get('/channels/callback/salla',    [ChannelController::class, 'callbackSalla']);
 
+// New channel OAuth endpoints
+Route::get('/channels/connect/tiktok',     [TikTokController::class, 'connect']);
+Route::get('/channels/callback/tiktok',    [TikTokController::class, 'callback']);
+Route::get('/channels/connect/shopify',    [ShopifyController::class, 'connect']);
+Route::get('/channels/callback/shopify',   [ShopifyController::class, 'callback']);
+
+// Webhook endpoints (public)
+Route::post('/telegram/webhook',           [TelegramController::class, 'webhook']);
+Route::post('/tiktok/webhook',             [TikTokController::class, 'webhook']);
+Route::post('/shopify/webhook',            [ShopifyController::class, 'webhook']);
+
 // Salla Webhook - public, Salla calls these directly
 Route::post('/salla/webhook', [SallaWebhookController::class, 'handle']);
 
@@ -123,6 +138,13 @@ Route::middleware('auth:sanctum')->group(function () {
     Route::get('/channels',                   [ChannelController::class, 'index']);
     Route::patch('/channels/{id}',            [ChannelController::class, 'update']);
     Route::delete('/channels/{id}',           [ChannelController::class, 'disconnect']);
+    
+    // New channel endpoints (protected)
+    Route::post('/channels/telegram/connect', [TelegramController::class, 'connect']);
+    Route::post('/channels/telegram/set-webhook', [TelegramController::class, 'setWebhook']);
+    Route::post('/channels/woocommerce/connect', [WooCommerceController::class, 'connect']);
+    Route::get('/channels/shopify/orders',    [ShopifyController::class, 'getOrders']);
+    Route::get('/channels/woocommerce/orders', [WooCommerceController::class, 'getOrders']);
     
     // Salla sync routes
     Route::post('/channels/{id}/sync/customers', function ($id) {

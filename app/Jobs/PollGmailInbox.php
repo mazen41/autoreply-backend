@@ -13,6 +13,7 @@ use Illuminate\Queue\InteractsWithQueue;
 use Illuminate\Queue\SerializesModels;
 use Illuminate\Support\Facades\Http;
 use Illuminate\Support\Facades\Log;
+use Illuminate\Support\Facades\Cache;
 use Google\Service\Gmail;
 use Google\Service\Gmail\Message as GmailMessage;
 
@@ -120,10 +121,20 @@ class PollGmailInbox implements ShouldQueue
             'gmail_message_id' => $msgId,
         ]);
 
-        // Dispatch ProcessAutoReply job
-        ProcessAutoReply::dispatch($message->id);
-
-        Log::info('Gmail: ProcessAutoReply job dispatched', ['message_id' => $message->id]);
+        // Implement message debounce for Gmail polling
+        $debounceKey = "debounce:conversation:{$conversation->id}";
+        $debounceWindow = 10; // 10 seconds debounce window
+        
+        if (Cache::has($debounceKey)) {
+            Log::info('Gmail polling message debounced - AI reply skipped', [
+                'conversation_id' => $conversation->id,
+                'message_id' => $message->id
+            ]);
+        } else {
+            ProcessAutoReply::dispatch($message->id);
+            Cache::put($debounceKey, true, $debounceWindow);
+            Log::info('Gmail: ProcessAutoReply job dispatched', ['message_id' => $message->id]);
+        }
     }
 
     private function extractBody(\Google\Service\Gmail\MessagePart $payload): string
@@ -176,7 +187,6 @@ class PollGmailInbox implements ShouldQueue
 
         try {
             $response = Http::timeout(20)
-                ->withOptions(['verify' => false])
                 ->post(
                     "https://generativelanguage.googleapis.com/v1beta/models/{$model}:generateContent?key={$apiKey}",
                     [

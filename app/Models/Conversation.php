@@ -20,11 +20,14 @@ class Conversation extends Model
         'escalation_reason',
         'escalation_notified',
         'last_message_at',
+        'assigned_agent_id',
+        'assigned_at',
     ];
 
     protected $casts = [
         'last_message_at'      => 'datetime',
         'escalated_at'         => 'datetime',
+        'assigned_at'          => 'datetime',
         'ai_enabled'           => 'boolean',
         'requires_human'       => 'boolean',
         'escalation_notified'  => 'boolean',
@@ -48,5 +51,15 @@ class Conversation extends Model
     public function latestMessage()
     {
         return $this->hasOne(Message::class)->latestOfMany();
+    }
+
+    public function business()
+    {
+        return $this->belongsTo(BusinessProfile::class, 'business_id');
+    }
+
+    public function assignedAgent()
+    {
+        return $this->belongsTo(User::class, 'assigned_agent_id');
     }
 }

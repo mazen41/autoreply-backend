@@ -102,13 +102,12 @@ class ChannelController extends Controller
 
         // Step 1: Exchange code for user access token
         \Log::info('Exchanging code for token...');
-        $tokenResponse = Http::withOptions(['verify' => false])
-            ->get('https://graph.facebook.com/v19.0/oauth/access_token', [
-                'client_id'     => $appId,
-                'client_secret' => $appSecret,
-                'redirect_uri'  => $redirectUri,
-                'code'          => $code,
-            ]);
+        $tokenResponse = Http::get('https://graph.facebook.com/v19.0/oauth/access_token', [
+            'client_id'     => $appId,
+            'client_secret' => $appSecret,
+            'redirect_uri'  => $redirectUri,
+            'code'          => $code,
+        ]);
 
         \Log::info('Token exchange response', [
             'status' => $tokenResponse->status(),
@@ -133,11 +132,10 @@ class ChannelController extends Controller
 
         // Step 2: Get pages this user manages
         \Log::info('Fetching user pages...');
-        $pagesResponse = Http::withOptions(['verify' => false])
-            ->get('https://graph.facebook.com/v19.0/me/accounts', [
-                'access_token' => $userAccessToken,
-                'fields'       => 'id,name,access_token,instagram_business_account',
-            ]);
+        $pagesResponse = Http::get('https://graph.facebook.com/v19.0/me/accounts', [
+            'access_token' => $userAccessToken,
+            'fields'       => 'id,name,access_token,instagram_business_account',
+        ]);
 
         \Log::info('Pages response', [
             'status' => $pagesResponse->status(),
@@ -165,13 +163,12 @@ class ChannelController extends Controller
             \Log::info('Processing page', ['id' => $pageId, 'name' => $pageName]);
 
             // Exchange short-lived page token for long-lived token
-            $longLivedResponse = Http::withOptions(['verify' => false])
-                ->get('https://graph.facebook.com/v19.0/oauth/access_token', [
-                    'grant_type'        => 'fb_exchange_token',
-                    'client_id'         => $appId,
-                    'client_secret'     => $appSecret,
-                    'fb_exchange_token' => $pageAccessToken,
-                ]);
+            $longLivedResponse = Http::get('https://graph.facebook.com/v19.0/oauth/access_token', [
+                'grant_type'        => 'fb_exchange_token',
+                'client_id'         => $appId,
+                'client_secret'     => $appSecret,
+                'fb_exchange_token' => $pageAccessToken,
+            ]);
 
             $longLivedToken = $longLivedResponse->successful() 
                 ? ($longLivedResponse->json()['access_token'] ?? $pageAccessToken)
@@ -201,11 +198,10 @@ class ChannelController extends Controller
             $igAccountId = $page['instagram_business_account']['id'] ?? null;
 
             if (!$igAccountId) {
-                $igResponse = Http::withOptions(['verify' => false])
-                    ->get("https://graph.facebook.com/v19.0/{$pageId}", [
-                        'fields'       => 'instagram_business_account',
-                        'access_token' => $longLivedToken,
-                    ]);
+                $igResponse = Http::get("https://graph.facebook.com/v19.0/{$pageId}", [
+                    'fields'       => 'instagram_business_account',
+                    'access_token' => $longLivedToken,
+                ]);
                 $igAccountId = $igResponse->json()['instagram_business_account']['id'] ?? null;
             }
 
@@ -228,11 +224,10 @@ class ChannelController extends Controller
             }
 
             // Step 5: Subscribe page to webhook
-            Http::withOptions(['verify' => false])
-                ->post("https://graph.facebook.com/v19.0/{$pageId}/subscribed_apps", [
-                    'subscribed_fields' => 'messages,messaging_postbacks,message_echoes',
-                    'access_token'      => $longLivedToken,
-                ]);
+            Http::post("https://graph.facebook.com/v19.0/{$pageId}/subscribed_apps", [
+                'subscribed_fields' => 'messages,messaging_postbacks,message_echoes',
+                'access_token'      => $longLivedToken,
+            ]);
         }
 
         \Log::info('=== FACEBOOK CALLBACK SUCCESS ===');

@@ -368,7 +368,6 @@ class ProcessAutoReplyWithRetry implements ShouldQueue
         $url = "https://graph.facebook.com/v19.0/me/messages?access_token={$accessToken}";
 
         $response = Http::timeout(10)
-            ->withOptions(['verify' => false])
             ->post($url, [
                 'recipient' => ['id' => $conversation->sender_id],
                 'message'   => ['text' => $replyMessage->content],

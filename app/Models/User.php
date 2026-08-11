@@ -54,5 +54,41 @@ class User extends Authenticatable
     {
         return $this->hasMany(Channel::class);
     }
+
+    public function teamMemberships()
+    {
+        return $this->hasMany(TeamMember::class);
+    }
+
+    public function businesses()
+    {
+        return $this->belongsToMany(BusinessProfile::class, 'team_members', 'user_id', 'business_id');
+    }
+
+    public function ownedBusinesses()
+    {
+        return $this->belongsToMany(BusinessProfile::class, 'team_members', 'user_id', 'business_id')
+            ->where('role', 'owner');
+    }
+
+    public function csatRatings()
+    {
+        return $this->hasMany(CsatRating::class);
+    }
+
+    public function overages()
+    {
+        return $this->hasMany(Overage::class);
+    }
+
+    public function notifications()
+    {
+        return $this->hasMany(Notification::class);
+    }
+
+    public function onboardingProgress()
+    {
+        return $this->hasOne(OnboardingProgress::class);
+    }
 }
 

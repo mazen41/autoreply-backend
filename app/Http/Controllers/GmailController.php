@@ -7,6 +7,7 @@ use App\Models\Conversation;
 use App\Models\Message;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\Log;
+use Illuminate\Support\Facades\Cache;
 use Google\Client as GoogleClient;
 use Google\Service\Gmail;
 
@@ -304,7 +305,19 @@ class GmailController extends Controller
                     'updated_at'       => $sentAt,
                 ]);
 
-                \App\Jobs\ProcessAutoReply::dispatch($message->id);
+                // Implement message debounce for Gmail
+                $debounceKey = "debounce:conversation:{$conversation->id}";
+                $debounceWindow = 10; // 10 seconds debounce window
+                
+                if (Cache::has($debounceKey)) {
+                    Log::info('Gmail message debounced - AI reply skipped', [
+                        'conversation_id' => $conversation->id,
+                        'message_id' => $message->id
+                    ]);
+                } else {
+                    \App\Jobs\ProcessAutoReply::dispatch($message->id);
+                    Cache::put($debounceKey, true, $debounceWindow);
+                }
                 $newCount++;
             }
 

@@ -14,6 +14,7 @@ class BusinessProfile extends Model
         'phone',
         'city',
         'country',
+        'timezone',
         'working_days',
         'working_from',
         'working_to',
@@ -28,6 +29,8 @@ class BusinessProfile extends Model
         'after_hours_message',
         'ai_provider',
         'ai_model',
+        'google_access_token',
+        'google_refresh_token',
     ];
 
     protected $casts = [
@@ -44,5 +47,80 @@ class BusinessProfile extends Model
     public function knowledgeFiles()
     {
         return $this->hasMany(\App\Models\BusinessKnowledgeFile::class);
+    }
+
+    public function teamMembers()
+    {
+        return $this->hasMany(TeamMember::class);
+    }
+
+    public function users()
+    {
+        return $this->belongsToMany(User::class, 'team_members', 'business_id', 'user_id');
+    }
+
+    public function businessHours()
+    {
+        return $this->hasMany(BusinessHour::class, 'business_id');
+    }
+
+    public function autoMessages()
+    {
+        return $this->hasMany(AutoMessage::class, 'business_id');
+    }
+
+    public function campaigns()
+    {
+        return $this->hasMany(Campaign::class, 'business_id');
+    }
+
+    public function sequences()
+    {
+        return $this->hasMany(Sequence::class, 'business_id');
+    }
+
+    public function webChatSessions()
+    {
+        return $this->hasMany(WebChatSession::class, 'business_id');
+    }
+
+    public function products()
+    {
+        return $this->hasMany(Product::class, 'business_id');
+    }
+
+    public function webhooks()
+    {
+        return $this->hasMany(Webhook::class, 'business_id');
+    }
+
+    public function calendarEvents()
+    {
+        return $this->hasMany(CalendarEvent::class, 'business_id');
+    }
+
+    public function csatRatings()
+    {
+        return $this->hasMany(CsatRating::class, 'business_id');
+    }
+
+    public function analyticsDaily()
+    {
+        return $this->hasMany(AnalyticsDaily::class, 'business_id');
+    }
+
+    public function aiMetrics()
+    {
+        return $this->hasMany(AiMetric::class, 'business_id');
+    }
+
+    public function subscription()
+    {
+        return $this->hasOne(Subscription::class, 'business_id');
+    }
+
+    public function conversations()
+    {
+        return $this->hasMany(Conversation::class, 'business_id');
     }
 }

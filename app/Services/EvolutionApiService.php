@@ -4,6 +4,7 @@ namespace App\Services;
 
 use Illuminate\Support\Facades\Http;
 use Illuminate\Support\Facades\Log;
+use Illuminate\Support\Facades\Cache;
 use App\Models\WhatsAppInstance;
 use App\Models\WhatsAppMessage;
 use App\Models\Channel;
@@ -593,7 +594,19 @@ class EvolutionApiService
             // coming back through the webhook) — never trigger on those or the
             // AI will reply to itself in an infinite loop.
             if (!$fromMe && $channel->ai_enabled) {
-                \App\Jobs\ProcessAutoReply::dispatch($message->id);
+                // Implement message debounce for WhatsApp
+                $debounceKey = "debounce:conversation:{$conversation->id}";
+                $debounceWindow = 10; // 10 seconds debounce window
+                
+                if (Cache::has($debounceKey)) {
+                    Log::info('WhatsApp message debounced - AI reply skipped', [
+                        'conversation_id' => $conversation->id,
+                        'message_id' => $message->id
+                    ]);
+                } else {
+                    \App\Jobs\ProcessAutoReply::dispatch($message->id);
+                    Cache::put($debounceKey, true, $debounceWindow);
+                }
             }
 
             Log::info("WhatsApp message saved to unified inbox", [

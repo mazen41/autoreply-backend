@@ -18,18 +18,81 @@ class InboxController extends Controller
 {
     /**
      * List all conversations for the authenticated user, newest first.
+     * Supports search and advanced filtering.
      */
     public function index(Request $request)
     {
-        $conversations = Conversation::whereHas('channel', function ($q) {
+        $query = Conversation::whereHas('channel', function ($q) {
                 $q->where('user_id', auth()->id());
             })
             ->with([
-    'channel:id,type,page_name',
-    'latestMessage',
-])
-            ->orderBy('last_message_at', 'desc')
-            ->paginate(50);
+                'channel:id,type,page_name',
+                'latestMessage',
+            ])
+            ->select(['id', 'channel_id', 'business_id', 'sender_id', 'sender_name', 'sender_email', 'subject', 'status', 'ai_enabled', 'requires_human', 'escalated_at', 'escalation_reason', 'last_message_at', 'assigned_agent_id', 'assigned_at']);
+
+        // Agent-specific filter
+        if ($request->has('assigned_to_me')) {
+            $query->where('assigned_agent_id', auth()->id());
+        }
+
+        // Search functionality
+        if ($request->has('search') && !empty($request->search)) {
+            $searchTerm = $request->search;
+            $query->where(function ($q) use ($searchTerm) {
+                $q->where('sender_name', 'like', "%{$searchTerm}%")
+                  ->orWhere('sender_email', 'like', "%{$searchTerm}%")
+                  ->orWhere('sender_id', 'like', "%{$searchTerm}%")
+                  ->orWhereHas('messages', function ($messageQuery) use ($searchTerm) {
+                      $messageQuery->where('content', 'like', "%{$searchTerm}%");
+                  });
+            });
+        }
+
+        // Channel filter
+        if ($request->has('channel_type') && !empty($request->channel_type)) {
+            $query->whereHas('channel', function ($q) use ($request) {
+                $q->where('type', $request->channel_type);
+            });
+        }
+
+        // Status filter
+        if ($request->has('status') && !empty($request->status)) {
+            $query->where('status', $request->status);
+        }
+
+        // AI enabled filter
+        if ($request->has('ai_enabled') && $request->ai_enabled !== null) {
+            $query->where('ai_enabled', $request->boolean('ai_enabled'));
+        }
+
+        // Unread filter (conversations with recent inbound messages)
+        if ($request->has('unread') && $request->boolean('unread')) {
+            $query->whereHas('messages', function ($q) {
+                $q->where('direction', 'inbound')
+                  ->where('created_at', '>=', now()->subHours(24));
+            });
+        }
+
+        // Date range filter
+        if ($request->has('date_from') && !empty($request->date_from)) {
+            $query->where('last_message_at', '>=', $request->date_from);
+        }
+        if ($request->has('date_to') && !empty($request->date_to)) {
+            $query->where('last_message_at', '<=', $request->date_to);
+        }
+
+        // Escalation queue filter (requires human intervention)
+        if ($request->has('requires_human') && $request->boolean('requires_human')) {
+            $query->where('requires_human', true)
+                  ->whereNotNull('escalated_at')
+                  ->orderBy('escalated_at', 'desc');
+        } else {
+            // Default sort by last message time
+            $query->orderBy('last_message_at', 'desc');
+        }
+
+        $conversations = $query->paginate(50);
 
         return response()->json($conversations);
     }
@@ -258,13 +321,10 @@ class InboxController extends Controller
      */
     private function sendFacebookReply(Request $request, Conversation $conversation, Channel $channel)
     {
-        $certPath = base_path('cacert.pem');
-        
         // Decrypt the access token
         $accessToken = decrypt($channel->access_token);
 
         $fbResponse = Http::timeout(10)
-            ->withOptions(['verify' => file_exists($certPath) ? $certPath : false])
             ->post(
                 "https://graph.facebook.com/v19.0/me/messages?access_token={$accessToken}",
                 [
@@ -428,6 +488,85 @@ class InboxController extends Controller
             Log::error('WhatsApp reaction error', ['error' => $e->getMessage(), 'message_id' => $messageId]);
             return response()->json(['error' => 'Failed to send reaction: ' . $e->getMessage()], 500);
         }
+    }
+
+    /**
+     * Get tags for a conversation
+     */
+    public function getTags(Request $request, $conversationId)
+    {
+        $conversation = Conversation::whereHas('channel', function ($q) {
+                $q->where('user_id', auth()->id());
+            })
+            ->findOrFail($conversationId);
+
+        $tags = \App\Models\ConversationTag::where('conversation_id', $conversationId)
+            ->get(['id', 'tag', 'intent', 'confidence', 'created_at']);
+
+        return response()->json($tags);
+    }
+
+    /**
+     * Add tag to conversation
+     */
+    public function addTag(Request $request, $conversationId)
+    {
+        $request->validate([
+            'tag' => 'required|string|max:50',
+        ]);
+
+        $conversation = Conversation::whereHas('channel', function ($q) {
+                $q->where('user_id', auth()->id());
+            })
+            ->findOrFail($conversationId);
+
+        $tag = \App\Models\ConversationTag::firstOrCreate(
+            [
+                'conversation_id' => $conversationId,
+                'tag' => $request->tag
+            ],
+            [
+                'intent' => 'manual',
+                'confidence' => 100,
+            ]
+        );
+
+        return response()->json($tag);
+    }
+
+    /**
+     * Remove tag from conversation
+     */
+    public function removeTag(Request $request, $conversationId, $tagId)
+    {
+        $conversation = Conversation::whereHas('channel', function ($q) {
+                $q->where('user_id', auth()->id());
+            })
+            ->findOrFail($conversationId);
+
+        $tag = \App\Models\ConversationTag::where('id', $tagId)
+            ->where('conversation_id', $conversationId)
+            ->firstOrFail();
+
+        $tag->delete();
+
+        return response()->json(['success' => true]);
+    }
+
+    /**
+     * Get all unique tags for user's conversations
+     */
+    public function getAllTags(Request $request)
+    {
+        $tags = \App\Models\ConversationTag::whereHas('conversation.channel', function ($q) {
+                $q->where('user_id', auth()->id());
+            })
+            ->select('tag')
+            ->distinct()
+            ->get()
+            ->pluck('tag');
+
+        return response()->json($tags);
     }
 
     private function mediaTypeFromMime(string $mimeType): string

@@ -38,7 +38,7 @@ return [
     'google' => [
         'client_id' => env('GOOGLE_CLIENT_ID'),
         'client_secret' => env('GOOGLE_CLIENT_SECRET'),
-        'redirect' => env('GOOGLE_LOGIN_REDIRECT_URI'),
+        'redirect' => env('GOOGLE_REDIRECT_URI'),
     ],
 
     'facebook' => [
@@ -48,6 +48,7 @@ return [
     ],
 
     'meta' => [
+        'app_secret' => env('META_APP_SECRET'),
         'webhook_verify_token' => env('META_WEBHOOK_VERIFY_TOKEN'),
     ],
 

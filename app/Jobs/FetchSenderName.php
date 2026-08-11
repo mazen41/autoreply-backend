@@ -51,7 +51,6 @@ class FetchSenderName implements ShouldQueue
             $accessToken = decrypt($channel->access_token);
             
             $response = Http::timeout(8)
-                ->withOptions(['verify' => false])
                 ->get("https://graph.facebook.com/v19.0/{$this->senderId}", [
                     'fields'       => 'first_name,last_name,name',
                     'access_token' => $accessToken,

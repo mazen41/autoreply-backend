@@ -7,15 +7,28 @@ use App\Http\Controllers\Api\PackageController;
 use App\Http\Controllers\Api\SubscriptionController;
 use App\Http\Controllers\Api\PaymentController;
 use App\Http\Controllers\Api\AdminController;
+use App\Http\Controllers\Api\FeedbackController;
+use App\Http\Controllers\Api\TeamController;
+use App\Http\Controllers\Api\AutomationController;
+use App\Http\Controllers\Api\CampaignController;
+use App\Http\Controllers\Api\SequenceController;
+use App\Http\Controllers\Api\WebhookController;
+use App\Http\Controllers\Api\PublicApiController;
+use App\Http\Controllers\Api\AnalyticsController;
+use App\Http\Controllers\Api\BillingController;
+use App\Http\Controllers\Api\CsatController;
+use App\Http\Controllers\Api\NotificationController;
+use App\Http\Controllers\Api\WebChatController;
+use App\Http\Controllers\Api\AiActionsController;
 use App\Http\Controllers\Api\WhatsAppController;
 use App\Http\Controllers\Api\ReportsController;
 use App\Http\Controllers\N8nIntegrationController;
 use App\Http\Controllers\Api\KnowledgeController;
 use App\Http\Controllers\Api\TrainingController;
 use App\Http\Controllers\Api\ProactiveController;
-use App\Http\Controllers\Api\AutomationController;
 use App\Http\Controllers\Api\ToolsController;
 use App\Http\Controllers\Api\SallaWebhookController;
+use App\Http\Controllers\Api\PusherAuthController;
 use App\Http\Controllers\WebhookController;
 use App\Http\Controllers\ChannelController;
 use App\Http\Controllers\GmailController;
@@ -50,6 +63,17 @@ Route::prefix('auth')->group(function () {
     Route::get('/google/callback',  [SocialAuthController::class, 'handleGoogleCallback']);
     Route::get('/facebook/redirect', [SocialAuthController::class, 'redirectToFacebook']);
     Route::get('/facebook/callback', [SocialAuthController::class, 'handleFacebookCallback']);
+});
+
+// Pusher authentication routes
+Route::middleware('auth:sanctum')->prefix('pusher')->group(function () {
+    Route::post('/auth', [PusherAuthController::class, 'authenticate']);
+    Route::get('/test', [PusherAuthController::class, 'testConnection']);
+});
+
+// Broadcasting authentication (for Laravel Echo)
+Route::middleware('auth:sanctum')->prefix('broadcasting')->group(function () {
+    Route::post('/auth', [PusherAuthController::class, 'authenticate']);
 });
 
 // â”€â”€ Meta Webhook â€” public, Meta calls these directly â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
@@ -117,6 +141,102 @@ Route::middleware('auth:sanctum')->group(function () {
     Route::post('/inbox/{conversationId}/media',        [InboxController::class, 'mediaReply']);
     Route::patch('/inbox/{conversationId}/toggle-ai',   [InboxController::class, 'toggleAi']);
     Route::post('/messages/{messageId}/react',          [InboxController::class, 'reactToMessage']);
+    
+    // Tag management
+    Route::get('/inbox/{conversationId}/tags',         [InboxController::class, 'getTags']);
+    Route::post('/inbox/{conversationId}/tags',        [InboxController::class, 'addTag']);
+    Route::delete('/inbox/{conversationId}/tags/{tagId}', [InboxController::class, 'removeTag']);
+    Route::get('/tags/all',                             [InboxController::class, 'getAllTags']);
+
+    // AI Feedback
+    Route::post('/messages/{messageId}/feedback',     [FeedbackController::class, 'submit']);
+    Route::get('/feedback/statistics',                [FeedbackController::class, 'statistics']);
+    Route::get('/feedback/recent',                     [FeedbackController::class, 'recent']);
+
+    // Team Management
+    Route::get('/businesses/{businessId}/team',       [TeamController::class, 'index']);
+    Route::post('/businesses/{businessId}/team/invite', [TeamController::class, 'invite']);
+    Route::patch('/businesses/{businessId}/team/{memberId}/role', [TeamController::class, 'updateRole']);
+    Route::delete('/businesses/{businessId}/team/{memberId}', [TeamController::class, 'remove']);
+    Route::post('/conversations/{conversationId}/assign', [TeamController::class, 'assignConversation']);
+    Route::get('/team/assignments',                    [TeamController::class, 'myAssignments']);
+
+    // Automation
+    Route::get('/businesses/{businessId}/hours',      [AutomationController::class, 'getBusinessHours']);
+    Route::put('/businesses/{businessId}/hours',      [AutomationController::class, 'updateBusinessHours']);
+    Route::get('/businesses/{businessId}/auto-messages', [AutomationController::class, 'getAutoMessages']);
+    Route::put('/businesses/{businessId}/auto-messages', [AutomationController::class, 'updateAutoMessage']);
+    Route::put('/businesses/{businessId}/timezone',    [AutomationController::class, 'updateTimezone']);
+
+    // Campaigns
+    Route::get('/businesses/{businessId}/campaigns',   [CampaignController::class, 'index']);
+    Route::post('/businesses/{businessId}/campaigns',  [CampaignController::class, 'store']);
+    Route::put('/businesses/{businessId}/campaigns/{campaignId}', [CampaignController::class, 'update']);
+    Route::delete('/businesses/{businessId}/campaigns/{campaignId}', [CampaignController::class, 'destroy']);
+    Route::post('/businesses/{businessId}/campaigns/{campaignId}/launch', [CampaignController::class, 'launch']);
+    Route::get('/businesses/{businessId}/campaigns/{campaignId}/logs', [CampaignController::class, 'logs']);
+
+    // Sequences
+    Route::get('/businesses/{businessId}/sequences',   [SequenceController::class, 'index']);
+    Route::post('/businesses/{businessId}/sequences',  [SequenceController::class, 'store']);
+    Route::put('/businesses/{businessId}/sequences/{sequenceId}', [SequenceController::class, 'update']);
+    Route::delete('/businesses/{businessId}/sequences/{sequenceId}', [SequenceController::class, 'destroy']);
+    Route::post('/businesses/{businessId}/sequences/{sequenceId}/enroll', [SequenceController::class, 'enroll']);
+    Route::get('/businesses/{businessId}/sequences/{sequenceId}/enrollments', [SequenceController::class, 'enrollments']);
+
+    // Webhooks
+    Route::get('/businesses/{businessId}/webhooks',     [WebhookController::class, 'index']);
+    Route::post('/businesses/{businessId}/webhooks',    [WebhookController::class, 'store']);
+    Route::put('/businesses/{businessId}/webhooks/{webhookId}', [WebhookController::class, 'update']);
+    Route::delete('/businesses/{businessId}/webhooks/{webhookId}', [WebhookController::class, 'destroy']);
+    Route::post('/businesses/{businessId}/webhooks/{webhookId}/test', [WebhookController::class, 'test']);
+
+    // Analytics
+    Route::get('/businesses/{businessId}/analytics/csat', [AnalyticsController::class, 'getCsatScore']);
+    Route::get('/businesses/{businessId}/analytics/daily', [AnalyticsController::class, 'getDailyAnalytics']);
+    Route::get('/businesses/{businessId}/analytics/ai-metrics', [AnalyticsController::class, 'getAiMetrics']);
+    Route::get('/businesses/{businessId}/analytics/ratings', [AnalyticsController::class, 'getRecentRatings']);
+    Route::post('/businesses/{businessId}/analytics/calculate', [AnalyticsController::class, 'calculateAnalytics']);
+
+    // CSAT Ratings
+    Route::post('/conversations/{conversationId}/csat', [CsatController::class, 'submitRating']);
+    Route::get('/conversations/{conversationId}/csat', [CsatController::class, 'getRating']);
+
+    // Billing
+    Route::get('/billing/subscription', [BillingController::class, 'getCurrentSubscription']);
+    Route::get('/billing/usage', [BillingController::class, 'getUsageStats']);
+    Route::get('/billing/service-status', [BillingController::class, 'checkServiceStatus']);
+    Route::post('/billing/upgrade', [BillingController::class, 'upgradePlan']);
+    Route::get('/billing/history', [BillingController::class, 'getBillingHistory']);
+
+    // Notifications
+    Route::get('/notifications', [NotificationController::class, 'index']);
+    Route::get('/notifications/unread-count', [NotificationController::class, 'unreadCount']);
+    Route::post('/notifications/{notificationId}/read', [NotificationController::class, 'markAsRead']);
+    Route::post('/notifications/mark-all-read', [NotificationController::class, 'markAllAsRead']);
+    Route::delete('/notifications/{notificationId}', [NotificationController::class, 'destroy']);
+
+    // Onboarding
+    Route::get('/onboarding/status', [OnboardingController::class, 'getStatus']);
+    Route::post('/onboarding/progress', [OnboardingController::class, 'updateProgress']);
+    Route::post('/onboarding/complete-step', [OnboardingController::class, 'completeStep']);
+    Route::post('/onboarding/skip', [OnboardingController::class, 'skip']);
+    Route::post('/onboarding/initialize', [OnboardingController::class, 'initialize']);
+
+    // Web Chat (public endpoints for widget)
+    Route::prefix('web-chat')->group(function () {
+        Route::post('/sessions', [WebChatController::class, 'createSession']);
+        Route::post('/messages', [WebChatController::class, 'sendMessage']);
+        Route::get('/sessions/{sessionId}/messages', [WebChatController::class, 'getMessages']);
+        Route::post('/sessions/{sessionId}/status', [WebChatController::class, 'updateOnlineStatus']);
+    });
+
+    // AI Actions
+    Route::get('/businesses/{businessId}/ai-actions', [AiActionsController::class, 'index']);
+    Route::get('/businesses/{businessId}/ai-actions/pending', [AiActionsController::class, 'pending']);
+    Route::post('/businesses/{businessId}/ai-actions/{actionId}/approve', [AiActionsController::class, 'approve']);
+    Route::post('/businesses/{businessId}/ai-actions/{actionId}/reject', [AiActionsController::class, 'reject']);
+    Route::get('/businesses/{businessId}/ai-actions/statistics', [AiActionsController::class, 'statistics']);
 
     // Reports
     Route::prefix('reports')->group(function () {
@@ -200,6 +320,13 @@ Route::middleware(['auth:sanctum', 'admin'])->group(function () {
 // Public blog approval webhooks
 Route::get('/blog/approve/{id}', [PostController::class, 'approveWebhook']);
 Route::get('/blog/reject/{id}', [PostController::class, 'rejectWebhook']);
+
+// Public API (with API key authentication)
+Route::prefix('public')->group(function () {
+    Route::post('/messages/send', [PublicApiController::class, 'sendMessage']);
+    Route::get('/conversations', [PublicApiController::class, 'getConversations']);
+    Route::get('/conversations/{conversationId}/messages', [PublicApiController::class, 'getMessages']);
+});
 
 // Public package routes
 Route::get('/packages', [PackageController::class, 'index']);

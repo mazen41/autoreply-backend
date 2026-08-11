@@ -18,6 +18,10 @@ class Subscription extends Model
         'ends_at',
         'cancelled_at',
         'trial_ends_at',
+        'grace_period_ends_at',
+        'usage_count',
+        'usage_limit',
+        'last_usage_alert_at',
     ];
 
     protected $casts = [
@@ -25,6 +29,8 @@ class Subscription extends Model
         'ends_at' => 'datetime',
         'cancelled_at' => 'datetime',
         'trial_ends_at' => 'datetime',
+        'grace_period_ends_at' => 'datetime',
+        'last_usage_alert_at' => 'datetime',
     ];
 
     public function user()

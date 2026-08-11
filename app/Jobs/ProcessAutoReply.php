@@ -10,6 +10,9 @@ use App\Services\EvolutionApiService;
 use App\Services\KnowledgeChunker;
 use App\Services\AICapabilitiesService;
 use App\Services\SallaService;
+use App\Services\ArabicDialectService;
+use App\Services\BusinessHoursService;
+use App\Services\ProductAwarenessService;
 use Google\Service\Gmail;
 use Google\Service\Gmail\Message as GmailMessage;
 use Illuminate\Bus\Queueable;
@@ -20,6 +23,9 @@ use Illuminate\Queue\SerializesModels;
 use Illuminate\Support\Facades\Http;
 use Illuminate\Support\Facades\Log;
 use Illuminate\Support\Facades\Cache;
+use Illuminate\Support\Facades\DB;
+use Illuminate\Support\Facades\Redis;
+use Illuminate\Support\Facades\Mail;
 
 class ProcessAutoReply implements ShouldQueue
 {
@@ -27,6 +33,8 @@ class ProcessAutoReply implements ShouldQueue
 
     public $tries = 3;
     public $backoff = 30;
+    
+    public int $aiRepliesCount = 0;
 
     public function __construct(public int $messageId)
     {
@@ -71,6 +79,42 @@ class ProcessAutoReply implements ShouldQueue
             return;
         }
 
+        // Check business hours and send away message if closed
+        $business = $conversation->business ?? $channel->business;
+        if ($business) {
+            $businessHoursService = new BusinessHoursService();
+            
+            if (!$businessHoursService->isBusinessOpen($business)) {
+                $awayMessage = $businessHoursService->getAwayMessage($business);
+                
+                if ($awayMessage) {
+                    Log::info('ProcessAutoReply: Business closed, sending away message', [
+                        'conversation_id' => $conversation->id,
+                        'business_id' => $business->id,
+                    ]);
+
+                    // Send away message
+                    $replyMessage = Message::create([
+                        'conversation_id' => $conversation->id,
+                        'content' => $awayMessage,
+                        'direction' => 'outbound',
+                        'status' => 'auto',
+                        'is_ai' => false,
+                        'source' => 'away_message',
+                        'send_status' => 'pending',
+                    ]);
+
+                    // Send the away message through the channel
+                    $this->sendReply($channel, $conversation, $replyMessage);
+                    
+                    // Skip AI processing if configured
+                    if ($businessHoursService->shouldDisableAI($business)) {
+                        return;
+                    }
+                }
+            }
+        }
+
         // Check subscription limits using cached counter
         $user = $channel->user;
         if (!$user) {
@@ -86,25 +130,69 @@ class ProcessAutoReply implements ShouldQueue
             return;
         }
 
-        // Use cached counter for AI replies limit check
+        // Use atomic counter for AI replies limit check to prevent race conditions
         $cacheKey = "user_{$user->id}_ai_replies_" . now()->format('Y-m');
-        $aiRepliesThisMonth = cache()->remember($cacheKey, now()->endOfMonth(), function () use ($user) {
-            return Message::where('is_ai', true)
-                ->where('created_at', '>=', now()->startOfMonth())
-                ->whereHas('conversation.channel', function ($query) use ($user) {
-                    $query->where('user_id', $user->id);
-                })
-                ->count();
-        });
-
-        // Check limit BEFORE incrementing — increment only after message is actually sent
-        if ($package->ai_replies_limit !== -1 && $aiRepliesThisMonth >= $package->ai_replies_limit) {
-            Log::info('ProcessAutoReply: AI replies limit reached', [
-                'user_id' => $user->id,
-                'limit' => $package->ai_replies_limit,
-                'used' => $aiRepliesThisMonth
-            ]);
-            return;
+        $lockKey = "lock:{$cacheKey}";
+        
+        // Try to acquire a lock for atomic operation
+        $lock = Cache::lock($lockKey, 10);
+        
+        try {
+            if ($lock->get()) {
+                // Initialize counter if not exists
+                if (!Cache::has($cacheKey)) {
+                    $count = Message::where('is_ai', true)
+                        ->where('created_at', '>=', now()->startOfMonth())
+                        ->whereHas('conversation.channel', function ($query) use ($user) {
+                            $query->where('user_id', $user->id);
+                        })
+                        ->count();
+                    Cache::put($cacheKey, $count, now()->endOfMonth());
+                }
+                
+                $aiRepliesThisMonth = (int) Cache::get($cacheKey);
+                
+                // Check limit BEFORE incrementing — increment only after message is actually sent
+                if ($package->ai_replies_limit !== -1 && $aiRepliesThisMonth >= $package->ai_replies_limit) {
+                    Log::info('ProcessAutoReply: AI replies limit reached', [
+                        'user_id' => $user->id,
+                        'limit' => $package->ai_replies_limit,
+                        'used' => $aiRepliesThisMonth
+                    ]);
+                    return;
+                }
+                
+                // Increment counter atomically
+                Cache::increment($cacheKey);
+                
+                // Store the incremented value for later use
+                $this->aiRepliesCount = $aiRepliesThisMonth + 1;
+            } else {
+                // Failed to acquire lock, fall back to database check
+                Log::warning('ProcessAutoReply: Failed to acquire lock, using database fallback', [
+                    'user_id' => $user->id
+                ]);
+                
+                $aiRepliesThisMonth = Message::where('is_ai', true)
+                    ->where('created_at', '>=', now()->startOfMonth())
+                    ->whereHas('conversation.channel', function ($query) use ($user) {
+                        $query->where('user_id', $user->id);
+                    })
+                    ->count();
+                
+                if ($package->ai_replies_limit !== -1 && $aiRepliesThisMonth >= $package->ai_replies_limit) {
+                    Log::info('ProcessAutoReply: AI replies limit reached (fallback)', [
+                        'user_id' => $user->id,
+                        'limit' => $package->ai_replies_limit,
+                        'used' => $aiRepliesThisMonth
+                    ]);
+                    return;
+                }
+                
+                $this->aiRepliesCount = $aiRepliesThisMonth + 1;
+            }
+        } finally {
+            $lock?->release();
         }
 
         $detectedLanguage = $this->detectLanguage($message->content);
@@ -194,6 +282,12 @@ class ProcessAutoReply implements ShouldQueue
         $sallaContext   = null;
         $productsContext = null;
         $msgLower = mb_strtolower($message->content);
+
+        // Add product awareness to AI context
+        if ($business) {
+            $productService = new ProductAwarenessService();
+            $productsContext = $productService->buildProductContext($business->id);
+        }
 
         // Keywords that indicate customer is asking about an EXISTING order
         $orderStatusKeywords = [
@@ -413,9 +507,12 @@ class ProcessAutoReply implements ShouldQueue
                 'escalation_reason' => 'ai_failure_fallback'
             ]);
 
+            // Provide a user-friendly fallback message
+            $fallbackMessage = $aiResult['reply'] ?? "I apologize, but I'm having technical difficulties right now. A human agent will be with you shortly to help with your request.";
+            
             $replyMessage = Message::create([
                 'conversation_id' => $message->conversation_id,
-                'content' => $aiResult['reply'],
+                'content' => $fallbackMessage,
                 'direction' => 'outbound',
                 'status' => 'auto',
                 'is_ai' => false,
@@ -425,6 +522,9 @@ class ProcessAutoReply implements ShouldQueue
 
             if ($channel->user_id) {
                 broadcast(new \App\Events\MessageReceived($replyMessage, $conversation, $channel->user_id));
+                
+                // Notify business owner about AI failure
+                $this->notifyAIFailure($channel->user, $conversation, $aiResult['error'] ?? 'Unknown AI error');
             }
             $this->sendReply($channel, $conversation, $replyMessage);
             return;
@@ -479,7 +579,10 @@ class ProcessAutoReply implements ShouldQueue
             );
         }
 
-        // Save AI response as outbound message
+        // Detect Arabic dialect for training purposes
+        $detectedDialect = ArabicDialectService::detectDialect($message->content);
+
+        // Save AI response as outbound message with confidence and dialect info
         $replyMessage = Message::create([
             'conversation_id' => $message->conversation_id,
             'content' => $aiResponse,
@@ -488,6 +591,8 @@ class ProcessAutoReply implements ShouldQueue
             'is_ai' => true,
             'source' => 'ai',
             'send_status' => 'pending',
+            'confidence_score' => $aiResult['confidence'] ?? null,
+            'detected_dialect' => $detectedDialect,
         ]);
 
         Log::info('ProcessAutoReply: AI reply saved', ['message_id' => $replyMessage->id]);
@@ -500,7 +605,33 @@ class ProcessAutoReply implements ShouldQueue
         }
 
         // Send reply through platform
-        $this->sendReply($channel, $message->conversation, $replyMessage);
+        $sendSuccess = $this->sendReply($channel, $message->conversation, $replyMessage);
+        
+        // If send failed, provide fallback response to user
+        if (!$sendSuccess) {
+            Log::warning('ProcessAutoReply: Initial send failed, using fallback', [
+                'conversation_id' => $conversation->id,
+                'message_id' => $replyMessage->id
+            ]);
+            
+            $fallbackMessage = "I apologize, but I'm having trouble sending my response right now. A human agent will follow up with you shortly.";
+            
+            $fallbackReply = Message::create([
+                'conversation_id' => $message->conversation_id,
+                'content' => $fallbackMessage,
+                'direction' => 'outbound',
+                'status' => 'auto',
+                'is_ai' => false,
+                'source' => 'send_failure_fallback',
+                'send_status' => 'pending',
+            ]);
+            
+            // Try one more time with simpler message
+            $this->sendReply($channel, $message->conversation, $fallbackReply);
+            
+            // Notify about the send failure
+            $this->notifyAIFailure($channel->user, $conversation, 'Message send failure');
+        }
     }
 
     /**
@@ -629,7 +760,7 @@ class ProcessAutoReply implements ShouldQueue
         return $prompt;
     }
 
-    private function sendReply(Channel $channel, Conversation $conversation, Message $replyMessage): void
+    private function sendReply(Channel $channel, Conversation $conversation, Message $replyMessage): bool
     {
         $senderId = $conversation->sender_id;
         $content = $replyMessage->content;
@@ -652,21 +783,35 @@ class ProcessAutoReply implements ShouldQueue
                 Log::info('ProcessAutoReply: reply sent successfully', [
                     'platform' => $channel->type,
                     'message_id' => $replyMessage->id,
+                    'ai_replies_count' => $this->aiRepliesCount,
                 ]);
             } else {
                 $replyMessage->update(['send_status' => 'failed']);
+                // Decrement counter since message failed to send
+                if ($this->aiRepliesCount > 0) {
+                    $cacheKey = "user_{$channel->user_id}_ai_replies_" . now()->format('Y-m');
+                    Cache::decrement($cacheKey);
+                }
                 Log::error('ProcessAutoReply: reply send failed', [
                     'platform' => $channel->type,
                     'message_id' => $replyMessage->id,
                 ]);
             }
 
+            return $success;
+
         } catch (\Exception $e) {
             $replyMessage->update(['send_status' => 'failed']);
+            // Decrement counter since message failed to send
+            if ($this->aiRepliesCount > 0) {
+                $cacheKey = "user_{$channel->user_id}_ai_replies_" . now()->format('Y-m');
+                Cache::decrement($cacheKey);
+            }
             Log::error('ProcessAutoReply: send reply exception', [
                 'error' => $e->getMessage(),
                 'platform' => $channel->type,
             ]);
+            return false;
         }
     }
 
@@ -678,7 +823,6 @@ class ProcessAutoReply implements ShouldQueue
         $url = "https://graph.facebook.com/v19.0/me/messages?access_token={$accessToken}";
 
         $response = Http::timeout(10)
-            ->withOptions(['verify' => false])
             ->post($url, [
                 'recipient' => ['id' => $recipientId],
                 'message' => ['text' => $message],
@@ -801,6 +945,51 @@ class ProcessAutoReply implements ShouldQueue
         } catch (\Exception $e) {
             Log::error('ProcessAutoReply: WhatsApp send exception', ['error' => $e->getMessage()]);
             return false;
+        }
+    }
+
+    /**
+     * Notify business owner about AI failure
+     */
+    private function notifyAIFailure($user, $conversation, $error): void
+    {
+        try {
+            Log::info('Notifying business owner about AI failure', [
+                'user_id' => $user->id,
+                'conversation_id' => $conversation->id,
+                'error' => $error
+            ]);
+
+            // Log as critical for monitoring
+            Log::critical('AI Failure Notification', [
+                'user_id' => $user->id,
+                'user_email' => $user->email,
+                'conversation_id' => $conversation->id,
+                'error' => $error,
+                'timestamp' => now()->toISOString(),
+            ]);
+
+            // Send email notification to business owner
+            if ($user->email) {
+                \Illuminate\Support\Facades\Mail::raw(
+                    "AI Assistant Failure Alert\n\n" .
+                    "The AI assistant encountered an error and needs human intervention.\n\n" .
+                    "Conversation ID: {$conversation->id}\n" .
+                    "Error: {$error}\n" .
+                    "Time: " . now()->toDateTimeString() . "\n\n" .
+                    "Please log in to review this conversation.",
+                    function ($message) use ($user) {
+                        $message->to($user->email)
+                            ->subject('⚠️ AI Assistant Failed - Action Required');
+                    }
+                );
+            }
+
+        } catch (\Exception $e) {
+            Log::error('Failed to notify business owner about AI failure', [
+                'error' => $e->getMessage(),
+                'user_id' => $user->id
+            ]);
         }
     }
 }

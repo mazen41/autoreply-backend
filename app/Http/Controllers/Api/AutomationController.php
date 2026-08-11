@@ -3,243 +3,119 @@
 namespace App\Http\Controllers\Api;
 
 use App\Http\Controllers\Controller;
-use App\Models\AutomationWorkflow;
-use App\Models\Conversation;
-use App\Models\Message;
+use App\Models\BusinessHour;
+use App\Models\AutoMessage;
+use App\Models\BusinessProfile;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\Auth;
-use Illuminate\Support\Facades\Log;
-use App\Services\AutomationEngine;
 
 class AutomationController extends Controller
 {
     /**
-     * Get all automation workflows
+     * Get business hours for a business
      */
-    public function index(Request $request)
+    public function getBusinessHours(Request $request, $businessId)
     {
-        $user = Auth::user();
-        
-        $workflows = AutomationWorkflow::where('user_id', $user->id)
-            ->orderBy('created_at', 'desc')
+        $business = BusinessProfile::where('user_id', Auth::id())
+            ->findOrFail($businessId);
+
+        $hours = BusinessHour::where('business_id', $businessId)
+            ->orderBy('day_of_week')
             ->get();
 
-        return response()->json([
-            'workflows' => $workflows,
-            'total' => $workflows->count(),
-            'active' => $workflows->where('active', true)->count(),
-        ]);
+        return response()->json($hours);
     }
 
     /**
-     * Create a new automation workflow
+     * Update business hours
      */
-    public function store(Request $request)
+    public function updateBusinessHours(Request $request, $businessId)
     {
-        $user = Auth::user();
-        
-        $validated = $request->validate([
-            'name' => 'required|string|max:255',
-            'active' => 'boolean',
-            'trigger_config' => 'required|array',
-            'trigger_config.type' => 'required|in:keyword,time,first_contact,tag_added,message_received',
-            'trigger_config.conditions' => 'required|array',
-            'actions_config' => 'required|array',
+        $request->validate([
+            'hours' => 'required|array',
+            'hours.*.day_of_week' => 'required|integer|min:0|max:6',
+            'hours.*.start_time' => 'required|date_format:H:i:s',
+            'hours.*.end_time' => 'required|date_format:H:i:s',
+            'hours.*.is_active' => 'boolean',
         ]);
 
-        $workflow = AutomationWorkflow::create([
-            'user_id' => $user->id,
-            'name' => $validated['name'],
-            'active' => $validated['active'] ?? true,
-            'trigger_config' => $validated['trigger_config'],
-            'actions_config' => $validated['actions_config'],
-        ]);
+        $business = BusinessProfile::where('user_id', Auth::id())
+            ->findOrFail($businessId);
 
-        Log::info('Automation workflow created', [
-            'workflow_id' => $workflow->id,
-            'user_id' => $user->id,
-            'trigger_type' => $validated['trigger_config']['type']
-        ]);
+        // Delete existing hours
+        BusinessHour::where('business_id', $businessId)->delete();
 
-        return response()->json([
-            'message' => 'Workflow created successfully',
-            'workflow' => $workflow
-        ], 201);
-    }
-
-    /**
-     * Update an automation workflow
-     */
-    public function update(Request $request, $id)
-    {
-        $user = Auth::user();
-        $workflow = AutomationWorkflow::where('user_id', $user->id)->find($id);
-
-        if (!$workflow) {
-            return response()->json(['error' => 'Workflow not found'], 404);
+        // Create new hours
+        foreach ($request->hours as $hourData) {
+            BusinessHour::create([
+                'business_id' => $businessId,
+                'day_of_week' => $hourData['day_of_week'],
+                'start_time' => $hourData['start_time'],
+                'end_time' => $hourData['end_time'],
+                'is_active' => $hourData['is_active'] ?? true,
+            ]);
         }
 
-        $validated = $request->validate([
-            'name' => 'string|max:255',
-            'active' => 'boolean',
-            'trigger_config' => 'array',
-            'actions_config' => 'array',
-        ]);
-
-        $workflow->update($validated);
-
-        return response()->json([
-            'message' => 'Workflow updated successfully',
-            'workflow' => $workflow->fresh()
-        ]);
+        return response()->json(['success' => true]);
     }
 
     /**
-     * Delete an automation workflow
+     * Get auto messages
      */
-    public function destroy(Request $request, $id)
+    public function getAutoMessages(Request $request, $businessId)
     {
-        $user = Auth::user();
-        $workflow = AutomationWorkflow::where('user_id', $user->id)->find($id);
+        $business = BusinessProfile::where('user_id', Auth::id())
+            ->findOrFail($businessId);
 
-        if (!$workflow) {
-            return response()->json(['error' => 'Workflow not found'], 404);
-        }
+        $messages = AutoMessage::where('business_id', $businessId)->get();
 
-        $workflow->delete();
-
-        return response()->json(['message' => 'Workflow deleted']);
+        return response()->json($messages);
     }
 
     /**
-     * Test a workflow on a specific conversation
+     * Update auto message
      */
-    public function test(Request $request, $id)
+    public function updateAutoMessage(Request $request, $businessId)
     {
-        $user = Auth::user();
-        $workflow = AutomationWorkflow::where('user_id', $user->id)->find($id);
-
-        if (!$workflow) {
-            return response()->json(['error' => 'Workflow not found'], 404);
-        }
-
-        $validated = $request->validate([
-            'conversation_id' => 'required|exists:conversations,id',
+        $request->validate([
+            'type' => 'required|in:away,holiday,welcome',
+            'message' => 'required|string',
+            'is_enabled' => 'boolean',
+            'timezone' => 'string',
         ]);
 
-        $conversation = Conversation::with('channel')->find($validated['conversation_id']);
-        
-        // Verify ownership
-        if ($conversation->channel->user_id !== $user->id) {
-            return response()->json(['error' => 'Unauthorized'], 403);
-        }
+        $business = BusinessProfile::where('user_id', Auth::id())
+            ->findOrFail($businessId);
 
-        // Run workflow in test mode
-        $engine = new AutomationEngine();
-        $result = $engine->executeWorkflow($workflow, $conversation, true);
-
-        return response()->json([
-            'message' => 'Workflow test completed',
-            'result' => $result
-        ]);
-    }
-
-    /**
-     * Get workflow execution statistics
-     */
-    public function getStats(Request $request, $id)
-    {
-        $user = Auth::user();
-        $workflow = AutomationWorkflow::where('user_id', $user->id)->find($id);
-
-        if (!$workflow) {
-            return response()->json(['error' => 'Workflow not found'], 404);
-        }
-
-        return response()->json([
-            'workflow_id' => $workflow->id,
-            'executions_count' => $workflow->executions_count,
-            'active' => $workflow->active,
-            'created_at' => $workflow->created_at,
-        ]);
-    }
-
-    /**
-     * Get workflow templates
-     */
-    public function getTemplates(Request $request)
-    {
-        $templates = [
+        $autoMessage = AutoMessage::updateOrCreate(
             [
-                'id' => 'welcome_message',
-                'name' => 'Welcome Message',
-                'description' => 'Send a welcome message when a new conversation starts',
-                'trigger_config' => [
-                    'type' => 'first_contact',
-                    'conditions' => []
-                ],
-                'actions_config' => [
-                    [
-                        'type' => 'send_message',
-                        'message' => 'Welcome! How can we help you today?'
-                    ]
-                ]
+                'business_id' => $businessId,
+                'type' => $request->type,
             ],
             [
-                'id' => 'keyword_response',
-                'name' => 'Keyword Auto-Response',
-                'description' => 'Automatically respond to specific keywords',
-                'trigger_config' => [
-                    'type' => 'keyword',
-                    'conditions' => [
-                        'keywords' => ['price', 'cost', 'pricing'],
-                        'match_type' => 'any'
-                    ]
-                ],
-                'actions_config' => [
-                    [
-                        'type' => 'send_message',
-                        'message' => 'Our pricing starts at $X. Would you like more details?'
-                    ]
-                ]
-            ],
-            [
-                'id' => 'business_hours',
-                'name' => 'Business Hours Auto-Reply',
-                'description' => 'Send automated response outside business hours',
-                'trigger_config' => [
-                    'type' => 'message_received',
-                    'conditions' => [
-                        'time_condition' => 'outside_hours'
-                    ]
-                ],
-                'actions_config' => [
-                    [
-                        'type' => 'send_message',
-                        'message' => 'We are currently closed. We will respond during business hours.'
-                    ]
-                ]
-            ],
-            [
-                'id' => 'tag_customer',
-                'name' => 'Auto-Tag Customers',
-                'description' => 'Automatically tag conversations based on keywords',
-                'trigger_config' => [
-                    'type' => 'keyword',
-                    'conditions' => [
-                        'keywords' => ['complaint', 'issue'],
-                        'match_type' => 'any'
-                    ]
-                ],
-                'actions_config' => [
-                    [
-                        'type' => 'add_tag',
-                        'tag' => 'complaint'
-                    ]
-                ]
+                'message' => $request->message,
+                'is_enabled' => $request->is_enabled ?? true,
+                'timezone' => $request->timezone ?? 'UTC',
             ]
-        ];
+        );
 
-        return response()->json(['templates' => $templates]);
+        return response()->json(['success' => true, 'auto_message' => $autoMessage]);
+    }
+
+    /**
+     * Update business timezone
+     */
+    public function updateTimezone(Request $request, $businessId)
+    {
+        $request->validate([
+            'timezone' => 'required|string',
+        ]);
+
+        $business = BusinessProfile::where('user_id', Auth::id())
+            ->findOrFail($businessId);
+
+        $business->update(['timezone' => $request->timezone]);
+
+        return response()->json(['success' => true]);
     }
 }

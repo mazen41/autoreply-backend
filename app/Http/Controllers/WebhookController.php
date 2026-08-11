@@ -3,9 +3,11 @@
 namespace App\Http\Controllers;
 
 use App\Models\Channel;
+use App\Services\BusinessHoursService;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\Http;
 use Illuminate\Support\Facades\Log;
+use Illuminate\Support\Facades\Cache;
 
 class WebhookController extends Controller
 {
@@ -26,6 +28,27 @@ class WebhookController extends Controller
     public function handle(Request $request)
     {
         try {
+            // Verify webhook signature for security
+            $signature = $request->header('X-Hub-Signature-256');
+            $payload = $request->getContent();
+            $appSecret = config('services.meta.app_secret');
+
+            if ($signature && $appSecret) {
+                $expectedSignature = 'sha256=' . hash_hmac('sha256', $payload, $appSecret);
+                
+                if (!hash_equals($expectedSignature, $signature)) {
+                    Log::error('Invalid Meta webhook signature', [
+                        'received' => $signature,
+                        'expected' => $expectedSignature
+                    ]);
+                    return response('Invalid signature', 403);
+                }
+                
+                Log::info('Meta webhook signature verified successfully');
+            } else {
+                Log::warning('Meta webhook received without signature or app secret not configured');
+            }
+
             $body = $request->all();
             Log::info('Meta Webhook received', $body);
 
@@ -170,8 +193,20 @@ class WebhookController extends Controller
             broadcast(new \App\Events\MessageReceived($message, $conversation, $channel->user_id));
         }
 
-        \App\Jobs\ProcessAutoReply::dispatch($message->id);
-        Log::info('ProcessAutoReply job dispatched', ['message_id' => $message->id]);
+        // Implement message debounce to prevent multiple AI replies
+        $debounceKey = "debounce:conversation:{$conversation->id}";
+        $debounceWindow = 10; // 10 seconds debounce window
+        
+        if (Cache::has($debounceKey)) {
+            Log::info('Message debounced - AI reply skipped', [
+                'conversation_id' => $conversation->id,
+                'message_id' => $message->id
+            ]);
+        } else {
+            \App\Jobs\ProcessAutoReply::dispatch($message->id);
+            Cache::put($debounceKey, true, $debounceWindow);
+            Log::info('ProcessAutoReply job dispatched', ['message_id' => $message->id]);
+        }
     }
 
     private function sendReply(Channel $channel, string $recipientId, string $message): void
@@ -184,7 +219,6 @@ class WebhookController extends Controller
 
         try {
             $response = Http::timeout(10)
-                ->withOptions(['verify' => false])
                 ->post($url, [
                     'recipient' => ['id' => $recipientId],
                     'message'   => ['text' => $message],
@@ -257,7 +291,6 @@ Reply:";
 
         try {
             $response = Http::timeout(20)
-                ->withOptions(['verify' => false])
                 ->post(
                     "https://generativelanguage.googleapis.com/v1beta/models/{$model}:generateContent?key={$apiKey}",
                     [
@@ -475,7 +508,19 @@ Reply:";
                 broadcast(new \App\Events\MessageReceived($messageModel, $conversation, $channel->user_id));
             }
 
-            \App\Jobs\ProcessAutoReply::dispatch($messageModel->id);
+            // Implement message debounce for Gmail as well
+            $debounceKey = "debounce:conversation:{$conversation->id}";
+            $debounceWindow = 10; // 10 seconds debounce window
+            
+            if (Cache::has($debounceKey)) {
+                Log::info('Gmail message debounced - AI reply skipped', [
+                    'conversation_id' => $conversation->id,
+                    'message_id' => $messageModel->id
+                ]);
+            } else {
+                \App\Jobs\ProcessAutoReply::dispatch($messageModel->id);
+                Cache::put($debounceKey, true, $debounceWindow);
+            }
 
         } catch (\Exception $e) {
             Log::error('Error processing Gmail message', [

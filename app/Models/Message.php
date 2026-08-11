@@ -28,6 +28,12 @@ class Message extends Model
         'whatsapp_remote_jid',
         'whatsapp_from_me',
         'metadata',
+        'confidence_score',
+        'detected_dialect',
+        'retry_count',
+        'last_retry_at',
+        'delivery_status',
+        'error_details',
     ];
 
     protected $casts = [
@@ -35,6 +41,8 @@ class Message extends Model
         'reactions' => 'array',
         'whatsapp_from_me' => 'boolean',
         'metadata' => 'array',
+        'confidence_score' => 'float',
+        'last_retry_at' => 'datetime',
     ];
 
     public function conversation()

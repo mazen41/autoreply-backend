@@ -12,6 +12,7 @@ class Channel extends Model
         'type',
         'page_id',
         'page_name',
+        'page_access_token',
         'instagram_account_id',
         'store_id',
         'store_name',
@@ -51,6 +52,28 @@ class Channel extends Model
             return decrypt($value);
         } catch (\Exception $e) {
             // If decryption fails, return the value as-is (might be already decrypted)
+            return $value;
+        }
+    }
+
+    public function setPageAccessTokenAttribute($value)
+    {
+        if (empty($value)) {
+            $this->attributes['page_access_token'] = '';
+        } else {
+            $this->attributes['page_access_token'] = encrypt($value);
+        }
+    }
+
+    public function getPageAccessTokenAttribute($value)
+    {
+        if (empty($value)) {
+            return null;
+        }
+
+        try {
+            return decrypt($value);
+        } catch (\Exception $e) {
             return $value;
         }
     }

@@ -3,156 +3,98 @@
 namespace App\Http\Controllers\Api;
 
 use App\Http\Controllers\Controller;
-use App\Models\BusinessProfile;
+use App\Services\OnboardingService;
 use Illuminate\Http\Request;
+use Illuminate\Support\Facades\Auth;
 
 class OnboardingController extends Controller
 {
-    /** Get or create this user's profile (one per user) */
-    private function profile(Request $request): BusinessProfile
+    private $onboardingService;
+
+    public function __construct(OnboardingService $onboardingService)
     {
-        return BusinessProfile::firstOrCreate(['user_id' => $request->user()->id]);
+        $this->onboardingService = $onboardingService;
     }
 
-    /** STEP 1 — business type */
-    public function step1(Request $request)
+    /**
+     * Get onboarding status
+     */
+    public function getStatus(Request $request)
     {
-        $validated = $request->validate([
-            'business_type' => 'required|string|max:50',
-        ]);
+        $status = $this->onboardingService->getOnboardingStatus(Auth::id());
 
-        $this->profile($request)->update($validated);
-
-        return response()->json(['message' => 'Step 1 saved']);
+        return response()->json($status);
     }
 
-    /** STEP 2 — business info + schedule */
-    public function step2(Request $request)
-    {
-        $validated = $request->validate([
-            'business_name' => 'required|string|max:255',
-            'phone'         => 'nullable|string|max:30',
-            'city'          => 'nullable|string|max:100',
-            'country'       => 'nullable|string|max:100',
-            'working_days'  => 'nullable|array',
-            'working_days.*'=> 'string|max:10',
-            'working_from'  => 'nullable|string|max:5',
-            'working_to'    => 'nullable|string|max:5',
-        ]);
-
-        $this->profile($request)->update($validated);
-
-        return response()->json(['message' => 'Step 2 saved']);
-    }
-
-    /** STEP 3 — AI brain (services, FAQs, reply style) */
-    public function step3(Request $request)
-    {
-        $validated = $request->validate([
-            'services'    => 'nullable|string',
-            'faqs'        => 'nullable|array',
-            'faqs.*.q'    => 'nullable|string|max:500',
-            'faqs.*.a'    => 'nullable|string|max:1000',
-            'reply_style' => 'nullable|string|max:50',
-        ]);
-
-        $this->profile($request)->update($validated);
-
-        return response()->json(['message' => 'Step 3 saved']);
-    }
-
-    /** Upload and extract text from PDF/Excel files */
-    public function uploadKnowledgeFile(Request $request)
+    /**
+     * Update onboarding progress
+     */
+    public function updateProgress(Request $request)
     {
         $request->validate([
-            'file' => 'required|file|mimes:pdf,xlsx,xls|max:10240', // Max 10MB
+            'step' => 'required|string',
         ]);
 
-        $file = $request->file('file');
-        $extractedText = '';
+        $progress = $this->onboardingService->updateProgress(Auth::id(), $request->step);
 
-        try {
-            if ($file->getClientOriginalExtension() === 'pdf') {
-                $extractedText = $this->extractPdfText($file);
-            } elseif (in_array($file->getClientOriginalExtension(), ['xlsx', 'xls'])) {
-                $extractedText = $this->extractExcelText($file);
-            } else {
-                return response()->json(['error' => 'Unsupported file type'], 400);
-            }
-
-            if (empty($extractedText)) {
-                return response()->json(['error' => 'Could not extract text from file'], 400);
-            }
-
-            // Store extracted text in knowledge_base
-            $profile = $this->profile($request);
-            $existingKnowledge = $profile->knowledge_base ?? '';
-            $profile->update([
-                'knowledge_base' => $existingKnowledge . "\n\n" . $extractedText,
-            ]);
-
-            return response()->json([
-                'message' => 'File processed successfully',
-                'extracted_length' => strlen($extractedText),
-            ]);
-        } catch (\Exception $e) {
-            \Illuminate\Support\Facades\Log::error('File extraction failed', [
-                'error' => $e->getMessage(),
-                'file' => $file->getClientOriginalName(),
-            ]);
-            return response()->json(['error' => 'Failed to process file: ' . $e->getMessage()], 500);
-        }
+        return response()->json(['success' => true, 'progress' => $progress]);
     }
 
-    private function extractPdfText($file)
+    /**
+     * Complete specific onboarding step
+     */
+    public function completeStep(Request $request)
     {
-        $parser = new \Smalot\PdfParser\Parser();
-        $pdf = $parser->parseFile($file->getPathname());
-        return $pdf->getText();
-    }
+        $request->validate([
+            'step' => 'required|string|in:connect_channel,business_info,enable_ai,test_message,complete',
+            'business_id' => 'nullable|integer|exists:business_profiles,id',
+        ]);
 
-    private function extractExcelText($file)
-    {
-        $spreadsheet = \PhpOffice\PhpSpreadsheet\IOFactory::load($file->getPathname());
-        $text = '';
+        $step = $request->step;
+        $businessId = $request->business_id;
 
-        foreach ($spreadsheet->getAllSheets() as $sheet) {
-            foreach ($sheet->getRowIterator() as $row) {
-                $cellIterator = $row->getCellIterator();
-                $cellIterator->setIterateOnlyExistingCells(false);
-                $rowData = [];
-                foreach ($cellIterator as $cell) {
-                    $rowData[] = $cell->getFormattedValue();
+        switch ($step) {
+            case 'connect_channel':
+                $this->onboardingService->completeConnectChannel(Auth::id());
+                break;
+            case 'business_info':
+                if ($businessId) {
+                    $this->onboardingService->completeBusinessInfo(Auth::id(), $businessId);
                 }
-                $text .= implode(' | ', array_filter($rowData)) . "\n";
-            }
-            $text .= "\n--- Sheet End ---\n\n";
+                break;
+            case 'enable_ai':
+                $this->onboardingService->completeEnableAI(Auth::id());
+                break;
+            case 'test_message':
+                $this->onboardingService->completeTestMessage(Auth::id());
+                break;
+            case 'complete':
+                $this->onboardingService->completeSetup(Auth::id());
+                break;
         }
 
-        return $text;
+        $status = $this->onboardingService->getOnboardingStatus(Auth::id());
+
+        return response()->json(['success' => true, 'status' => $status]);
     }
 
-    /** STEP 4 — connected channel */
-    public function step4(Request $request)
+    /**
+     * Skip onboarding
+     */
+    public function skip(Request $request)
     {
-        $validated = $request->validate([
-            'connected_channel' => 'nullable|string|max:50',
-        ]);
+        $this->onboardingService->skipOnboarding(Auth::id());
 
-        $this->profile($request)->update($validated);
-
-        return response()->json(['message' => 'Step 4 saved']);
+        return response()->json(['success' => true]);
     }
 
-    /** COMPLETE — mark onboarding done, return fresh user */
-    public function complete(Request $request)
+    /**
+     * Initialize onboarding for user
+     */
+    public function initialize(Request $request)
     {
-        $user = $request->user();
-        $user->update(['onboarding_completed' => true]);
+        $progress = $this->onboardingService->initializeOnboarding(Auth::id());
 
-        return response()->json([
-            'message' => 'Onboarding complete',
-            'user'    => $user->fresh(),
-        ]);
+        return response()->json(['success' => true, 'progress' => $progress]);
     }
 }

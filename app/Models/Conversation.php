@@ -53,11 +53,6 @@ class Conversation extends Model
         return $this->hasOne(Message::class)->latestOfMany();
     }
 
-    public function business()
-    {
-        return $this->belongsTo(BusinessProfile::class, 'business_id');
-    }
-
     public function assignedAgent()
     {
         return $this->belongsTo(User::class, 'assigned_agent_id');

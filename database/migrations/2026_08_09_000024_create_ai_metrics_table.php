@@ -13,7 +13,7 @@ return new class extends Migration
     {
         Schema::create('ai_metrics', function (Blueprint $table) {
             $table->id();
-            $table->foreignId('business_id')->constrained()->onDelete('cascade');
+            $table->foreignId('business_id')->constrained('business_profiles')->onDelete('cascade');
             $table->date('date')->unique();
             $table->integer('total_ai_messages')->default(0);
             $table->integer('successful_ai_messages')->default(0);

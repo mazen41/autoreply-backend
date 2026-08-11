@@ -13,7 +13,7 @@ return new class extends Migration
     {
         Schema::create('campaigns', function (Blueprint $table) {
             $table->id();
-            $table->foreignId('business_id')->constrained()->onDelete('cascade');
+            $table->foreignId('business_id')->constrained('business_profiles')->onDelete('cascade');
             $table->foreignId('channel_id')->constrained()->onDelete('cascade');
             $table->string('name');
             $table->text('message');

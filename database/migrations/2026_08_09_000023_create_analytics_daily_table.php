@@ -13,7 +13,7 @@ return new class extends Migration
     {
         Schema::create('analytics_daily', function (Blueprint $table) {
             $table->id();
-            $table->foreignId('business_id')->constrained()->onDelete('cascade');
+            $table->foreignId('business_id')->constrained('business_profiles')->onDelete('cascade');
             $table->date('date')->unique();
             $table->integer('total_conversations')->default(0);
             $table->integer('total_messages')->default(0);

@@ -13,7 +13,7 @@ return new class extends Migration
     {
         Schema::create('webhooks', function (Blueprint $table) {
             $table->id();
-            $table->foreignId('business_id')->constrained()->onDelete('cascade');
+            $table->foreignId('business_id')->constrained('business_profiles')->onDelete('cascade');
             $table->string('url');
             $table->json('events'); // Array of events to subscribe to
             $table->string('secret')->nullable(); // For signature verification

@@ -13,7 +13,7 @@ return new class extends Migration
     {
         Schema::create('sequences', function (Blueprint $table) {
             $table->id();
-            $table->foreignId('business_id')->constrained()->onDelete('cascade');
+            $table->foreignId('business_id')->constrained('business_profiles')->onDelete('cascade');
             $table->string('name');
             $table->enum('trigger_type', ['new_user', 'tag_added', 'no_reply', 'manual'])->default('manual');
             $table->json('trigger_config')->nullable();

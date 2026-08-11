@@ -13,7 +13,7 @@ return new class extends Migration
     {
         Schema::create('business_hours', function (Blueprint $table) {
             $table->id();
-            $table->foreignId('business_id')->constrained()->onDelete('cascade');
+            $table->foreignId('business_id')->constrained('business_profiles')->onDelete('cascade');
             $table->integer('day_of_week'); // 0-6 (Sunday-Saturday)
             $table->time('start_time');
             $table->time('end_time');

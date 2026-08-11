@@ -13,7 +13,7 @@ return new class extends Migration
     {
         Schema::create('auto_messages', function (Blueprint $table) {
             $table->id();
-            $table->foreignId('business_id')->constrained()->onDelete('cascade');
+            $table->foreignId('business_id')->constrained('business_profiles')->onDelete('cascade');
             $table->enum('type', ['away', 'holiday', 'welcome'])->default('away');
             $table->text('message');
             $table->boolean('is_enabled')->default(true);

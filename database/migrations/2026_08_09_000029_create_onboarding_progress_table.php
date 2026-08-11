@@ -14,7 +14,7 @@ return new class extends Migration
         Schema::create('onboarding_progress', function (Blueprint $table) {
             $table->id();
             $table->foreignId('user_id')->constrained()->onDelete('cascade');
-            $table->foreignId('business_id')->nullable()->constrained()->onDelete('set null');
+            $table->foreignId('business_id')->nullable()->constrained('business_profiles')->onDelete('set null');
             $table->string('step')->default('welcome');
             $table->integer('progress_percentage')->default(0);
             $table->json('completed_steps')->nullable();

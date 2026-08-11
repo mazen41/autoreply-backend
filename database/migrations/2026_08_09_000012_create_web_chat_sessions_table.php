@@ -13,7 +13,7 @@ return new class extends Migration
     {
         Schema::create('web_chat_sessions', function (Blueprint $table) {
             $table->id();
-            $table->foreignId('business_id')->constrained()->onDelete('cascade');
+            $table->foreignId('business_id')->constrained('business_profiles')->onDelete('cascade');
             $table->foreignId('user_id')->nullable()->constrained()->onDelete('set null');
             $table->string('session_id')->unique();
             $table->string('visitor_name')->nullable();

@@ -12,10 +12,19 @@ return new class extends Migration
     public function up(): void
     {
         Schema::table('subscriptions', function (Blueprint $table) {
-            $table->timestamp('grace_period_ends_at')->nullable()->after('ends_at');
-            $table->integer('usage_count')->default(0)->after('package_id');
-            $table->integer('usage_limit')->default(0)->after('usage_count');
-            $table->timestamp('last_usage_alert_at')->nullable()->after('grace_period_ends_at');
+            // Check if columns don't exist before adding them
+            if (!Schema::hasColumn('subscriptions', 'grace_period_ends_at')) {
+                $table->timestamp('grace_period_ends_at')->nullable()->after('ends_at');
+            }
+            if (!Schema::hasColumn('subscriptions', 'usage_count')) {
+                $table->integer('usage_count')->default(0)->after('package_id');
+            }
+            if (!Schema::hasColumn('subscriptions', 'usage_limit')) {
+                $table->integer('usage_limit')->default(0)->after('usage_count');
+            }
+            if (!Schema::hasColumn('subscriptions', 'last_usage_alert_at')) {
+                $table->timestamp('last_usage_alert_at')->nullable()->after('grace_period_ends_at');
+            }
         });
     }
 

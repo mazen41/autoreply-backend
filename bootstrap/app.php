@@ -17,10 +17,9 @@ return Application::configure(basePath: dirname(__DIR__))
         ['middleware' => ['auth:sanctum']],
     )
     ->withMiddleware(function (Middleware $middleware): void {
-        // Removed EnsureFrontendRequestsAreStateful — this project uses
-        // stateless Sanctum token auth (Next.js frontend sends Bearer tokens),
-        // not cookie/session-based SPA auth. That middleware was triggering
-        // VerifyCsrfToken on API routes, causing CSRF token mismatch errors.
+        // Configure Sanctum for SPA session-based authentication
+        // This ensures requests from the frontend are treated as stateful
+        $middleware->statefulApi();
 
         $middleware->alias([
             'verified' => \Illuminate\Auth\Middleware\EnsureEmailIsVerified::class,

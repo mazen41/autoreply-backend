@@ -20,7 +20,7 @@ return [
 
     'stateful' => explode(',', env('SANCTUM_STATEFUL_DOMAINS', sprintf(
         '%s%s',
-        'localhost,localhost:3000,127.0.0.1,127.0.0.1:8000,::1,nazbiz.io,www.nazbiz.io,api.nazbiz.io',
+        'localhost,localhost:3000,127.0.0.1,127.0.0.1:8000,::1',
         Sanctum::currentApplicationUrlWithPort(),
         // Sanctum::currentRequestHost(),
     ))),
@@ -37,7 +37,7 @@ return [
     |
     */
 
-    'guard' => ['sanctum'],
+    'guard' => ['web'],
 
     /*
     |--------------------------------------------------------------------------

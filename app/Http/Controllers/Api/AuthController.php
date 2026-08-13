@@ -3,6 +3,7 @@
 namespace App\Http\Controllers\Api;
 
 use App\Http\Controllers\Controller;
+use App\Models\BusinessProfile;
 use App\Models\User;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\Auth;
@@ -66,7 +67,12 @@ class AuthController extends Controller
 
     public function user(Request $request)
     {
-        return response()->json($request->user());
+        $user = $request->user();
+        $businessId = BusinessProfile::where('user_id', $user->id)->value('id');
+
+        return response()->json(array_merge($user->toArray(), [
+            'business_id' => $businessId,
+        ]));
     }
 
     public function updateProfile(Request $request)

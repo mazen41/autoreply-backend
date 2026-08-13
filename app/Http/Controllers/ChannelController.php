@@ -12,7 +12,12 @@ class ChannelController extends Controller
 {
     public function index(Request $request)
     {
-        $channels = Channel::where('user_id', auth()->id())->get()->map(function ($channel) {
+        $user = $request->user();
+
+        $channels = Channel::where('user_id', $user->getAuthIdentifier())
+            ->latest('connected_at')
+            ->get()
+            ->map(function ($channel) {
             return [
                 'id'                   => $channel->id,
                 'type'                 => $channel->type,
@@ -25,7 +30,9 @@ class ChannelController extends Controller
             ];
         });
 
-        return response()->json($channels);
+        return response()->json([
+            'data' => $channels,
+        ]);
     }
 
     public function connectFacebook(Request $request)
@@ -454,7 +461,6 @@ class ChannelController extends Controller
         // which might be different from the one we assumed
     }
 }
-
 
 
 

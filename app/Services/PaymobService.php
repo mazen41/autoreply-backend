@@ -73,7 +73,16 @@ class PaymobService
         ];
 
         if ($redirectUrl) {
-            $payload['redirect_url'] = $redirectUrl;
+            // Paymob's field is "redirection_url" — NOT "redirect_url".
+            // Sending the wrong key means Paymob silently ignores it and
+            // strands the customer on its own generic post_pay results page
+            // instead of sending them back to our callback route, so the
+            // subscription never gets created even on a successful payment.
+            $payload['redirection_url'] = $redirectUrl;
+            // Also register the same URL as a server-to-server webhook so the
+            // transaction is recorded even if the customer closes the tab
+            // before the browser redirect completes.
+            $payload['notification_url'] = config('app.url') . '/api/payments/webhook';
         }
 
         Log::info('Paymob: Creating intention', ['amount' => $amountCents, 'currency' => $this->currency]);

@@ -119,41 +119,52 @@ class PaymentController extends Controller
     // ──────────────────────────────────────────────────────────────────────────
     public function callback(Request $request)
     {
-        Log::info('Paymob: Callback hit', [
-            'query' => $request->query(),
-        ]);
+        $query = $request->query();
+        Log::info('Paymob: Callback hit', ['query' => $query]);
 
-        $success       = $request->query('success');
-        $transactionId = $request->query('id');
+        $transactionId = $query['id']   ?? null;
+        $hmac          = $query['hmac'] ?? null;
+        $success       = $query['success'] ?? null;
 
-        if (!$transactionId) {
-            Log::warning('Paymob callback: missing transaction id');
+        // Verify the redirect is genuinely from Paymob and untampered.
+        // (This endpoint is public — previously it trusted raw query params,
+        // meaning anyone could hit it manually with success=true.)
+        if (!$transactionId || !$hmac || !$this->paymob->verifyRedirectHmac($query, $hmac)) {
+            Log::error('Paymob callback: HMAC verification failed', ['transaction_id' => $transactionId]);
             return redirect(config('services.frontend_url') . '/pricing?payment=failed');
         }
 
         if ($success !== 'true') {
-            Log::warning('Paymob callback: payment not successful', [
-                'success' => $success,
-                'transaction_id' => $transactionId,
-            ]);
+            Log::warning('Paymob callback: payment not successful', ['transaction_id' => $transactionId]);
             return redirect(config('services.frontend_url') . '/pricing?payment=failed');
         }
 
-        // Fetch the transaction from Paymob to confirm it is genuinely paid
-        // (never trust query-string params alone — they're not signed here).
-        $transaction = $this->paymob->getTransaction($transactionId);
-
-        if (!$transaction || !($transaction['success'] ?? false)) {
-            Log::error('Paymob callback: transaction verification failed', [
-                'transaction_id' => $transactionId,
-                'transaction'    => $transaction,
-            ]);
-            return redirect(config('services.frontend_url') . '/pricing?payment=failed');
+        // The redirect query string is now proven genuine, but it does NOT
+        // carry merchant_order_id (our PaymentIntent link) — only the
+        // HMAC-verified webhook does. Give the webhook a short window to
+        // land (it's server-to-server and usually arrives first/around the
+        // same time) and check for the subscription it creates.
+        $subscription = null;
+        for ($i = 0; $i < 8; $i++) {
+            $subscription = Subscription::where('paymob_transaction_id', $transactionId)->first();
+            if ($subscription) {
+                break;
+            }
+            usleep(500_000); // 0.5s
         }
 
-        $result = $this->fulfillFromTransaction($transaction);
+        if ($subscription) {
+            return redirect(config('services.frontend_url') . '/dashboard?payment=success');
+        }
 
-        return redirect(config('services.frontend_url') . ($result ? '/dashboard?payment=success' : '/pricing?payment=failed'));
+        Log::warning('Paymob callback: payment verified but webhook has not fulfilled yet', [
+            'transaction_id' => $transactionId,
+        ]);
+        // Payment is genuinely successful (HMAC-verified) — send the user to
+        // the dashboard rather than "failed"; the webhook will finish
+        // shortly. Adjust the frontend to show a "confirming payment" state
+        // for ?payment=processing if it doesn't already.
+        return redirect(config('services.frontend_url') . '/dashboard?payment=processing');
     }
 
     // ──────────────────────────────────────────────────────────────────────────
@@ -163,10 +174,15 @@ class PaymentController extends Controller
     public function webhook(Request $request)
     {
         $payload = $request->all();
-        $type    = $request->query('type');
-        $hmac    = $request->query('hmac');
+        // Paymob sends `type` as part of the JSON body, not the query
+        // string — reading it via $request->query('type') was always null,
+        // which made every webhook get silently ignored. Check body first,
+        // fall back to query in case a differently-configured integration
+        // sends it there instead.
+        $type = $payload['type'] ?? $request->query('type');
+        $hmac = $request->query('hmac');
 
-        Log::info('Paymob: Webhook received', ['type' => $type]);
+        Log::info('Paymob: Webhook received', ['type' => $type, 'payload' => $payload]);
 
         if ($type !== 'TRANSACTION') {
             return response()->json(['message' => 'Ignored non-transaction webhook']);

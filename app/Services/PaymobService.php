@@ -171,7 +171,57 @@ class PaymobService
     }
 
     /**
+     * Verify the HMAC signature Paymob appends to the browser REDIRECT
+     * (callback) query string after checkout. Same field set/order as the
+     * webhook's HMAC, but Paymob flattens nested keys here (e.g.
+     * "source_data.pan" becomes "source_data_pan", "order.id" becomes
+     * "order") and booleans already arrive as the literal strings
+     * "true"/"false" rather than JSON booleans.
+     *
+     * @param  array  $query     $request->query() from the callback route
+     * @param  string $received  The `hmac` query param
+     * @return bool
+     */
+    public function verifyRedirectHmac(array $query, string $received): bool
+    {
+        $fields = [
+            'amount_cents'           => $query['amount_cents']           ?? '',
+            'created_at'             => $query['created_at']             ?? '',
+            'currency'               => $query['currency']               ?? '',
+            'error_occured'          => $query['error_occured']          ?? '',
+            'has_parent_transaction' => $query['has_parent_transaction'] ?? '',
+            'id'                     => $query['id']                     ?? '',
+            'integration_id'         => $query['integration_id']         ?? '',
+            'is_3d_secure'           => $query['is_3d_secure']           ?? '',
+            'is_auth'                => $query['is_auth']                ?? '',
+            'is_capture'             => $query['is_capture']             ?? '',
+            'is_refunded'            => $query['is_refunded']            ?? '',
+            'is_standalone_payment'  => $query['is_standalone_payment']  ?? '',
+            'is_voided'              => $query['is_voided']              ?? '',
+            'order.id'               => $query['order']                  ?? '',
+            'owner'                  => $query['owner']                  ?? '',
+            'pending'                => $query['pending']                ?? '',
+            'source_data.pan'        => $query['source_data_pan']        ?? '',
+            'source_data.sub_type'   => $query['source_data_sub_type']   ?? '',
+            'source_data.type'       => $query['source_data_type']       ?? '',
+            'success'                => $query['success']                ?? '',
+        ];
+
+        $concatenated = implode('', array_values($fields));
+        $expected     = hash_hmac('sha512', $concatenated, $this->hmacKey);
+
+        return hash_equals($expected, strtolower($received));
+    }
+
+    /**
      * Fetch a transaction by its ID from Paymob's API.
+     *
+     * NOTE: this uses the classic Accept API which needs a short-lived
+     * auth_token obtained via a separate /api/auth/tokens request using the
+     * API KEY (not the secret key) — it is NOT the same auth as the v1
+     * Intention endpoints. Left here for reference/manual debugging only;
+     * do not rely on it in the payment flow. Use verifyRedirectHmac() for
+     * the callback and the HMAC-verified webhook for fulfillment instead.
      *
      * @param  int|string $transactionId
      * @return array|null

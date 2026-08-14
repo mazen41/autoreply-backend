@@ -17,9 +17,14 @@ return Application::configure(basePath: dirname(__DIR__))
         ['middleware' => ['auth:sanctum']],
     )
     ->withMiddleware(function (Middleware $middleware): void {
-        // Configure Sanctum for SPA session-based authentication
-        // This ensures requests from the frontend are treated as stateful
-        $middleware->statefulApi();
+        // NOTE: statefulApi() removed — this app authenticates entirely via
+        // Sanctum personal access tokens (Bearer header), never SPA cookie
+        // sessions. Leaving it on made Laravel treat any request whose Origin
+        // matched a "stateful domain" (e.g. localhost:3000) as a cookie-based
+        // SPA request and enforce CSRF on it, even though the frontend never
+        // fetches/sends a CSRF cookie — causing "CSRF token mismatch" (419)
+        // on POST endpoints like /api/payments/create, silently, since 419s
+        // aren't logged by default.
 
         $middleware->alias([
             'verified' => \Illuminate\Auth\Middleware\EnsureEmailIsVerified::class,

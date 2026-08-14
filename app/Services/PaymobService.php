@@ -12,14 +12,16 @@ class PaymobService
     private string $hmacKey;
     private string $currency;
     private string $apiBase;
+    private ?string $integrationId;
 
     public function __construct()
     {
-        $this->secretKey = config('services.paymob.secret_key');
-        $this->publicKey = config('services.paymob.public_key');
-        $this->hmacKey   = config('services.paymob.hmac_key');
-        $this->currency  = config('services.paymob.currency', 'EGP');
-        $this->apiBase   = config('services.paymob.api_base', 'https://accept.paymob.com');
+        $this->secretKey     = config('services.paymob.secret_key');
+        $this->publicKey     = config('services.paymob.public_key');
+        $this->hmacKey       = config('services.paymob.hmac_key');
+        $this->currency      = config('services.paymob.currency', 'EGP');
+        $this->apiBase       = config('services.paymob.api_base', 'https://accept.paymob.com');
+        $this->integrationId = config('services.paymob.integration_id');
     }
 
     /**
@@ -42,10 +44,17 @@ class PaymobService
         array  $metadata = [],
         string $redirectUrl = ''
     ): array {
+        if (!$this->integrationId) {
+            throw new \RuntimeException(
+                'Paymob integration_id is not configured. Set PAYMOB_CARD_INTEGRATION_ID '
+                . 'in .env to the numeric ID from Merchant Dashboard → Developers → Payment Integrations.'
+            );
+        }
+
         $payload = [
             'amount'          => $amountCents,
             'currency'        => $this->currency,
-            'payment_methods' => ['card'],           // VPC card payments
+            'payment_methods' => [(int) $this->integrationId], // Paymob integration ID(s), not literal "card"
             'items'           => [
                 [
                     'name'        => $metadata['package_name'] ?? 'Subscription',

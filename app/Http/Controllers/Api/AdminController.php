@@ -218,8 +218,9 @@ class AdminController extends Controller
             'pusher_secret' => config('broadcasting.connections.pusher.secret') ? '***' : null,
             'pusher_cluster' => config('broadcasting.connections.pusher.options.cluster'),
             'pusher_host' => config('broadcasting.connections.pusher.options.host'),
-            'moyasar_publishable_key' => config('services.moyasar.publishable_key'),
-            'moyasar_secret_key' => config('services.moyasar.secret_key') ? '***' : null,
+            'paymob_public_key'  => config('services.paymob.public_key'),
+            'paymob_secret_key'  => config('services.paymob.secret_key') ? '***' : null,
+            'paymob_hmac_key'    => config('services.paymob.hmac_key') ? '***' : null,
             'blog_ai_info' => \App\Services\BlogAIService::getProviderInfo(),
         ]);
     }
@@ -241,7 +242,9 @@ class AdminController extends Controller
             'google_client_id' => 'nullable|string', 'google_client_secret' => 'nullable|string',
             'pusher_app_id' => 'nullable|string', 'pusher_app_key' => 'nullable|string', 'pusher_secret' => 'nullable|string',
             'pusher_cluster' => 'nullable|string', 'pusher_host' => 'nullable|string',
-            'moyasar_publishable_key' => 'nullable|string', 'moyasar_secret_key' => 'nullable|string',
+            'paymob_secret_key' => 'nullable|string',
+            'paymob_public_key' => 'nullable|string',
+            'paymob_hmac_key'   => 'nullable|string',
         ]);
 
         $map = [
@@ -254,7 +257,9 @@ class AdminController extends Controller
             'google_client_id' => 'GOOGLE_CLIENT_ID', 'google_client_secret' => 'GOOGLE_CLIENT_SECRET',
             'pusher_app_id' => 'PUSHER_APP_ID', 'pusher_app_key' => 'PUSHER_APP_KEY', 'pusher_secret' => 'PUSHER_SECRET',
             'pusher_cluster' => 'PUSHER_CLUSTER', 'pusher_host' => 'PUSHER_HOST',
-            'moyasar_publishable_key' => 'MOYASAR_PUBLISHABLE_KEY', 'moyasar_secret_key' => 'MOYASAR_SECRET_KEY',
+            'paymob_secret_key' => 'PAYMOB_SECRET_KEY',
+            'paymob_public_key' => 'PAYMOB_PUBLIC_KEY',
+            'paymob_hmac_key'   => 'PAYMOB_HMAC_KEY',
         ];
 
         foreach ($map as $field => $envKey) {

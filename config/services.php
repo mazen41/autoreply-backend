@@ -38,7 +38,7 @@ return [
     'google' => [
         'client_id' => env('GOOGLE_CLIENT_ID'),
         'client_secret' => env('GOOGLE_CLIENT_SECRET'),
-        'redirect' => env('GOOGLE_REDIRECT_URI'),
+        'redirect' => env('GOOGLE_LOGIN_REDIRECT_URI', env('GOOGLE_REDIRECT_URI')),
     ],
 
     'facebook' => [
@@ -60,10 +60,12 @@ return [
         'media_disk' => env('EVOLUTION_MEDIA_DISK', 'public'),
     ],
 
-    'moyasar' => [
-        'publishable_key' => env('MOYASAR_PUBLISHABLE_KEY'),
-        'secret_key' => env('MOYASAR_SECRET_KEY'),
-        'webhook_secret' => env('MOYASAR_WEBHOOK_SECRET'),
+    'paymob' => [
+        'secret_key'  => env('PAYMOB_SECRET_KEY'),
+        'public_key'  => env('PAYMOB_PUBLIC_KEY'),
+        'hmac_key'    => env('PAYMOB_HMAC_KEY'),
+        'currency'    => env('PAYMOB_CURRENCY', 'EGP'),
+        'api_base'    => 'https://accept.paymob.com',
     ],
 
     'ai' => [
@@ -93,4 +95,3 @@ return [
     ],
 
 ];
-

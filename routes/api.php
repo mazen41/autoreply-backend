@@ -354,13 +354,13 @@ Route::prefix('public')->group(function () {
 Route::get('/packages', [PackageController::class, 'index']);
 Route::get('/packages/{id}', [PackageController::class, 'show']);
 
-// Payment callback (public - Moyasar redirects here)
+// Payment callback (public - Paymob redirects here after checkout)
 Route::get('/payments/callback', [PaymentController::class, 'callback']);
 
 // Tools API (public with rate limiting)
 Route::post('/tools/ai-call', [ToolsController::class, 'aiCall']);
 
-// Moyasar webhook (public, exclude CSRF)
+// Paymob webhook (public, exclude CSRF)
 Route::post('/payments/webhook', [PaymentController::class, 'webhook'])->withoutMiddleware([\App\Http\Middleware\VerifyCsrfToken::class]);
 
 // Protected subscription and payment routes

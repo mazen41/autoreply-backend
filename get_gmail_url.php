@@ -7,7 +7,7 @@ $kernel->bootstrap();
 $client = new Google\Client();
 $client->setClientId(env('GOOGLE_CLIENT_ID'));
 $client->setClientSecret(env('GOOGLE_CLIENT_SECRET'));
-$client->setRedirectUri(env('GOOGLE_REDIRECT_URI'));
+$client->setRedirectUri(env('GMAIL_REDIRECT_URI', env('GOOGLE_REDIRECT_URI')));
 $client->addScope(Google\Service\Gmail::GMAIL_READONLY);
 $client->addScope(Google\Service\Gmail::GMAIL_SEND);
 $client->setAccessType('offline');

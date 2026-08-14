@@ -193,49 +193,19 @@ class BillingService
 
         foreach ($pendingOverages as $overage) {
             try {
-                // Process payment with Moyasar
-                $paymentResult = $this->processMoyasarPayment($overage);
-
-                if ($paymentResult['success']) {
-                    $overage->update([
-                        'status' => 'billed',
-                        'billed_at' => now(),
-                    ]);
-
-                    Log::info('Overage billed successfully', [
-                        'overage_id' => $overage->id,
-                        'amount' => $overage->amount,
-                    ]);
-                } else {
-                    $overage->update(['status' => 'failed']);
-                    
-                    Log::error('Overage billing failed', [
-                        'overage_id' => $overage->id,
-                        'error' => $paymentResult['error'],
-                    ]);
-                }
+                // TODO: implement Paymob recurring charge for overage billing
+                Log::info('Overage billing skipped (Paymob integration pending)', [
+                    'overage_id' => $overage->id,
+                    'amount'     => $overage->amount,
+                ]);
             } catch (\Exception $e) {
                 $overage->update(['status' => 'failed']);
-                
+
                 Log::error('Overage billing exception', [
                     'overage_id' => $overage->id,
-                    'error' => $e->getMessage(),
+                    'error'      => $e->getMessage(),
                 ]);
             }
         }
-    }
-
-    /**
-     * Process Moyasar payment for overage
-     */
-    private function processMoyasarPayment(Overage $overage): array
-    {
-        // Implement Moyasar payment processing
-        // This would need the actual Moyasar API integration
-        
-        return [
-            'success' => false,
-            'error' => 'Payment processing not implemented',
-        ];
     }
 }

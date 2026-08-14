@@ -76,7 +76,12 @@ class SocialAuthController extends Controller
 
                 $token = $user->createToken('auth_token')->plainTextToken;
                 $frontendUrl = config('services.frontend_url', 'http://localhost:3000');
-                return redirect()->away("{$frontendUrl}/auth/callback?token={$token}&provider=google&is_new_user=false{$redirectParam}");
+                $query = http_build_query([
+                    'token' => $token,
+                    'provider' => 'google',
+                    'is_new_user' => 'false',
+                ]);
+                return redirect()->away("{$frontendUrl}/auth/callback?{$query}{$redirectParam}");
             } else {
                 // Create new user
                 $user = User::create([
@@ -90,7 +95,12 @@ class SocialAuthController extends Controller
 
                 $token = $user->createToken('auth_token')->plainTextToken;
                 $frontendUrl = config('services.frontend_url', 'http://localhost:3000');
-                return redirect()->away("{$frontendUrl}/auth/callback?token={$token}&provider=google&is_new_user=true{$redirectParam}");
+                $query = http_build_query([
+                    'token' => $token,
+                    'provider' => 'google',
+                    'is_new_user' => 'true',
+                ]);
+                return redirect()->away("{$frontendUrl}/auth/callback?{$query}{$redirectParam}");
             }
         } catch (\Exception $e) {
             Log::error('Google callback error: ' . $e->getMessage());
@@ -163,7 +173,12 @@ class SocialAuthController extends Controller
 
                 $token = $user->createToken('auth_token')->plainTextToken;
                 $frontendUrl = config('services.frontend_url', 'http://localhost:3000');
-                return redirect()->away("{$frontendUrl}/auth/callback?token={$token}&provider=facebook&is_new_user=false{$redirectParam}");
+                $query = http_build_query([
+                    'token' => $token,
+                    'provider' => 'facebook',
+                    'is_new_user' => 'false',
+                ]);
+                return redirect()->away("{$frontendUrl}/auth/callback?{$query}{$redirectParam}");
             } else {
                 // Create new user
                 $user = User::create([
@@ -177,7 +192,12 @@ class SocialAuthController extends Controller
 
                 $token = $user->createToken('auth_token')->plainTextToken;
                 $frontendUrl = config('services.frontend_url', 'http://localhost:3000');
-                return redirect()->away("{$frontendUrl}/auth/callback?token={$token}&provider=facebook&is_new_user=true{$redirectParam}");
+                $query = http_build_query([
+                    'token' => $token,
+                    'provider' => 'facebook',
+                    'is_new_user' => 'true',
+                ]);
+                return redirect()->away("{$frontendUrl}/auth/callback?{$query}{$redirectParam}");
             }
         } catch (\Exception $e) {
             Log::error('Facebook callback error: ' . $e->getMessage());

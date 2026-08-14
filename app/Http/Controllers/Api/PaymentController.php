@@ -32,6 +32,12 @@ class PaymentController extends Controller
         $package = Package::findOrFail($request->package_id);
         $user    = auth()->user();
 
+        // Paymob rejects blank billing_data fields (e.g. "last_name": [""] fails
+        // validation), so split the single `name` field and fall back safely.
+        $nameParts = preg_split('/\s+/', trim($user->name ?? 'Customer'), 2);
+        $firstName = $nameParts[0] !== '' ? $nameParts[0] : 'Customer';
+        $lastName  = $nameParts[1] ?? 'N/A';
+
         // Amount in smallest unit (piastres: 1 EGP = 100 piastres)
         $amount      = $request->billing_cycle === 'yearly'
             ? $package->price_yearly
@@ -45,8 +51,8 @@ class PaymentController extends Controller
             'apartment'      => 'N/A',
             'email'          => $user->email,
             'floor'          => 'N/A',
-            'first_name'     => $user->name ?? 'Customer',
-            'last_name'      => '',
+            'first_name'     => $firstName,
+            'last_name'      => $lastName,
             'street'         => 'N/A',
             'building'       => 'N/A',
             'phone_number'   => $user->phone ?? '+20000000000',

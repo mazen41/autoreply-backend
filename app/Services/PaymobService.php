@@ -32,17 +32,19 @@ class PaymobService
      *   - checkout_url   (string)  — full URL to redirect the user to
      *   - order_id       (string)  — Paymob's order identifier
      *
-     * @param  int    $amountCents  Amount in smallest currency unit (piastres for EGP)
-     * @param  array  $billingData  Shopper billing info
-     * @param  array  $metadata     Arbitrary metadata (package_id, user_id, etc.)
-     * @param  string $redirectUrl  Where to send the user after payment
+     * @param  int    $amountCents      Amount in smallest currency unit (piastres for EGP)
+     * @param  array  $billingData      Shopper billing info
+     * @param  array  $metadata         Display-only info (package_name, description) — NOT reliably echoed back by Paymob, do not use for identifying the order later
+     * @param  string $redirectUrl      Where to send the user after payment
+     * @param  string $specialReference Our own PaymentIntent row ID — Paymob reliably echoes this back as `merchant_order_id` on the transaction, so use THIS (not metadata/extras) to look the order back up
      * @return array
      */
     public function createIntention(
         int    $amountCents,
         array  $billingData,
         array  $metadata = [],
-        string $redirectUrl = ''
+        string $redirectUrl = '',
+        string $specialReference = ''
     ): array {
         if (!$this->integrationId) {
             throw new \RuntimeException(
@@ -69,8 +71,12 @@ class PaymobService
                 'last_name'   => $billingData['last_name']  ?? '',
                 'email'       => $billingData['email']      ?? '',
             ],
-            'metadata'        => $metadata,
+            'extras'          => $metadata,
         ];
+
+        if ($specialReference) {
+            $payload['special_reference'] = $specialReference;
+        }
 
         if ($redirectUrl) {
             // Paymob's field is "redirection_url" — NOT "redirect_url".

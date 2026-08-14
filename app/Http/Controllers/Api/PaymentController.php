@@ -4,7 +4,9 @@ namespace App\Http\Controllers\Api;
 
 use App\Http\Controllers\Controller;
 use App\Models\Package;
+use App\Models\PaymentIntent;
 use App\Models\Subscription;
+use App\Models\User;
 use App\Services\PaymobService;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\Log;
@@ -63,21 +65,33 @@ class PaymentController extends Controller
             'state'          => 'NA',
         ];
 
-        $metadata = [
-            'package_id'    => (string) $package->id,
-            'package_name'  => $package->name,
+        // Local record created BEFORE talking to Paymob at all. We identify
+        // the order back at callback/webhook time by this row's ID (sent as
+        // Paymob's `special_reference`, reliably echoed back as
+        // `merchant_order_id`) instead of trying to parse Paymob's
+        // metadata/extras echo, which is undocumented and was unreliable.
+        $intent = PaymentIntent::create([
+            'user_id'       => $user->id,
+            'package_id'    => $package->id,
             'billing_cycle' => $request->billing_cycle,
-            'user_id'       => (string) $user->id,
-            'description'   => "nazbiz - {$package->name} plan",
+            'status'        => 'pending',
+        ]);
+
+        $displayInfo = [
+            'package_name' => $package->name,
+            'description'  => "nazbiz - {$package->name} plan",
         ];
 
         try {
             $intention = $this->paymob->createIntention(
                 $amountCents,
                 $billingData,
-                $metadata,
-                $redirectUrl
+                $displayInfo,
+                $redirectUrl,
+                (string) $intent->id
             );
+
+            $intent->update(['paymob_order_id' => (string) $intention['order_id']]);
 
             return response()->json([
                 'checkout_url'  => $intention['checkout_url'],
@@ -85,6 +99,8 @@ class PaymentController extends Controller
                 'order_id'      => $intention['order_id'],
             ]);
         } catch (\Exception $e) {
+            $intent->update(['status' => 'failed']);
+
             Log::error('PaymentController: createPayment failed', [
                 'user_id' => $user->id,
                 'error'   => $e->getMessage(),
@@ -109,19 +125,10 @@ class PaymentController extends Controller
 
         $success       = $request->query('success');
         $transactionId = $request->query('id');
-        $orderId       = $request->query('order');
-        $hmac          = $request->query('hmac');
 
-        // Basic validation
         if (!$transactionId) {
             Log::warning('Paymob callback: missing transaction id');
             return redirect(config('services.frontend_url') . '/pricing?payment=failed');
-        }
-
-        // Verify HMAC from query string (Paymob sends it as a query param on redirect)
-        if ($hmac) {
-            // For redirect callbacks, Paymob signs query params differently.
-            // We verify by fetching the transaction directly instead.
         }
 
         if ($success !== 'true') {
@@ -133,6 +140,7 @@ class PaymentController extends Controller
         }
 
         // Fetch the transaction from Paymob to confirm it is genuinely paid
+        // (never trust query-string params alone — they're not signed here).
         $transaction = $this->paymob->getTransaction($transactionId);
 
         if (!$transaction || !($transaction['success'] ?? false)) {
@@ -143,96 +151,9 @@ class PaymentController extends Controller
             return redirect(config('services.frontend_url') . '/pricing?payment=failed');
         }
 
-        // Extract metadata
-        $metadata     = $transaction['order']['merchant_order_id'] ?? null;
-        $orderObj     = $transaction['order'] ?? [];
-        $paymobOrder  = $orderObj['id'] ?? null;
+        $result = $this->fulfillFromTransaction($transaction);
 
-        // Metadata is stored in the order's shipping_data or extras
-        // Paymob stores our metadata in order.merchant_order_id or order.items/shipping_data
-        // Fallback: get from order's data
-        $packageId    = null;
-        $billingCycle = 'monthly';
-        $userId       = null;
-
-        // Try to retrieve from order items or merchant_order_id
-        if (isset($transaction['order']['items'])) {
-            foreach ($transaction['order']['items'] as $item) {
-                // metadata was passed in items description — not ideal, try other paths
-            }
-        }
-
-        // Best approach: use the transaction's payment token metadata
-        // Paymob v1 intention stores metadata in order.metadata
-        $orderMetadata = $orderObj['metadata'] ?? $transaction['metadata'] ?? [];
-        $packageId     = $orderMetadata['package_id']    ?? null;
-        $billingCycle  = $orderMetadata['billing_cycle'] ?? 'monthly';
-        $userId        = $orderMetadata['user_id']       ?? null;
-
-        if (!$packageId || !$userId) {
-            Log::error('Paymob callback: missing metadata', [
-                'transaction_id' => $transactionId,
-                'order_metadata' => $orderMetadata,
-            ]);
-            return redirect(config('services.frontend_url') . '/pricing?payment=failed');
-        }
-
-        $package = Package::find($packageId);
-        $user    = \App\Models\User::find($userId);
-
-        if (!$package || !$user) {
-            Log::error('Paymob callback: package or user not found', [
-                'package_id' => $packageId,
-                'user_id'    => $userId,
-            ]);
-            return redirect(config('services.frontend_url') . '/pricing?payment=failed');
-        }
-
-        // Avoid duplicate subscription creation
-        $existing = Subscription::where('paymob_transaction_id', (string) $transactionId)->first();
-        if ($existing) {
-            Log::info('Paymob callback: duplicate callback, subscription already exists', [
-                'subscription_id' => $existing->id,
-            ]);
-            return redirect(config('services.frontend_url') . '/dashboard?payment=success');
-        }
-
-        // Cancel any existing active subscription
-        $activeSubscription = $user->activeSubscription;
-        if ($activeSubscription) {
-            $activeSubscription->update([
-                'status'       => 'cancelled',
-                'cancelled_at' => now(),
-            ]);
-        }
-
-        // Create new subscription
-        $startDate = now();
-        $endDate   = $billingCycle === 'yearly'
-            ? $startDate->copy()->addYear()
-            : $startDate->copy()->addMonth();
-
-        $amountPaid = ($transaction['amount_cents'] ?? 0) / 100;
-
-        $subscription = Subscription::create([
-            'user_id'              => $user->id,
-            'package_id'           => $package->id,
-            'status'               => 'active',
-            'billing_cycle'        => $billingCycle,
-            'amount_paid'          => $amountPaid,
-            'paymob_order_id'      => (string) $paymobOrder,
-            'paymob_transaction_id'=> (string) $transactionId,
-            'starts_at'            => $startDate,
-            'ends_at'              => $endDate,
-        ]);
-
-        Log::info('Paymob: Subscription created', [
-            'subscription_id' => $subscription->id,
-            'user_id'         => $user->id,
-            'package_id'      => $package->id,
-        ]);
-
-        return redirect(config('services.frontend_url') . '/dashboard?payment=success');
+        return redirect(config('services.frontend_url') . ($result ? '/dashboard?payment=success' : '/pricing?payment=failed'));
     }
 
     // ──────────────────────────────────────────────────────────────────────────
@@ -241,33 +162,26 @@ class PaymentController extends Controller
     // ──────────────────────────────────────────────────────────────────────────
     public function webhook(Request $request)
     {
-        $payload   = $request->all();
-        $type      = $request->query('type');
-        $hmac      = $request->query('hmac');
+        $payload = $request->all();
+        $type    = $request->query('type');
+        $hmac    = $request->query('hmac');
 
         Log::info('Paymob: Webhook received', ['type' => $type]);
 
-        // Only process transaction notifications
         if ($type !== 'TRANSACTION') {
             return response()->json(['message' => 'Ignored non-transaction webhook']);
         }
 
-        // Verify HMAC
         if (!$this->paymob->verifyHmac($payload, (string) $hmac)) {
             Log::error('Paymob: Invalid webhook HMAC', ['received_hmac' => $hmac]);
             return response()->json(['message' => 'Invalid signature'], 401);
         }
 
-        $obj     = $payload['obj'] ?? [];
-        $success = $obj['success'] ?? false;
-        $pending = $obj['pending'] ?? false;
+        $obj = $payload['obj'] ?? [];
 
-        $transactionId = $obj['id']       ?? null;
-        $paymobOrderId = $obj['order']['id'] ?? null;
-
-        if ($success && !$pending) {
-            $this->handlePaymentSuccess($obj);
-        } elseif (!$success && !$pending) {
+        if (($obj['success'] ?? false) && !($obj['pending'] ?? false)) {
+            $this->fulfillFromTransaction($obj);
+        } elseif (!($obj['success'] ?? true) && !($obj['pending'] ?? false)) {
             $this->handlePaymentFailed($obj);
         }
 
@@ -278,44 +192,107 @@ class PaymentController extends Controller
     // Internal helpers
     // ──────────────────────────────────────────────────────────────────────────
 
-    protected function handlePaymentSuccess(array $obj): void
+    /**
+     * Shared fulfillment path used by BOTH the redirect callback and the
+     * webhook, so whichever one fires first (or fires at all) grants the
+     * package exactly once. Looks the order up via our own PaymentIntent
+     * row (matched on Paymob's `merchant_order_id`, which mirrors the
+     * `special_reference` we sent when creating the intention) rather than
+     * trusting Paymob's metadata/extras echo.
+     *
+     * @return bool true if a subscription now exists for this transaction
+     */
+    protected function fulfillFromTransaction(array $transaction): bool
     {
-        $transactionId = (string) ($obj['id'] ?? '');
-        $paymobOrderId = (string) ($obj['order']['id'] ?? '');
+        $transactionId  = (string) ($transaction['id'] ?? '');
+        $orderObj       = $transaction['order'] ?? [];
+        $paymobOrderId  = (string) ($orderObj['id'] ?? '');
+        $merchantOrderId = $orderObj['merchant_order_id'] ?? $transaction['merchant_order_id'] ?? null;
 
-        // Find subscription by paymob_order_id for renewals
-        $subscription = Subscription::where('paymob_order_id', $paymobOrderId)->first();
-
-        if ($subscription) {
-            $subscription->update([
-                'status'               => 'active',
-                'paymob_transaction_id'=> $transactionId,
-                'starts_at'            => now(),
-                'ends_at'              => $subscription->billing_cycle === 'yearly'
-                    ? now()->addYear()
-                    : now()->addMonth(),
+        if (!$transactionId || !$merchantOrderId) {
+            Log::error('Paymob: cannot fulfill — missing transaction id or merchant_order_id', [
+                'transaction_id'    => $transactionId,
+                'merchant_order_id' => $merchantOrderId,
             ]);
+            return false;
+        }
 
-            Log::info('Paymob webhook: subscription renewed', [
-                'subscription_id' => $subscription->id,
-                'transaction_id'  => $transactionId,
+        // Idempotency: already fulfilled by the other path (callback vs webhook)?
+        if (Subscription::where('paymob_transaction_id', $transactionId)->exists()) {
+            Log::info('Paymob: transaction already fulfilled, skipping', ['transaction_id' => $transactionId]);
+            return true;
+        }
+
+        $intent = PaymentIntent::find($merchantOrderId);
+
+        if (!$intent) {
+            Log::error('Paymob: no matching PaymentIntent for merchant_order_id', [
+                'merchant_order_id' => $merchantOrderId,
+                'transaction_id'    => $transactionId,
+            ]);
+            return false;
+        }
+
+        $user    = User::find($intent->user_id);
+        $package = Package::find($intent->package_id);
+
+        if (!$user || !$package) {
+            Log::error('Paymob: package or user not found for PaymentIntent', [
+                'payment_intent_id' => $intent->id,
+                'user_id'           => $intent->user_id,
+                'package_id'        => $intent->package_id,
+            ]);
+            return false;
+        }
+
+        $activeSubscription = $user->activeSubscription;
+        if ($activeSubscription) {
+            $activeSubscription->update([
+                'status'       => 'cancelled',
+                'cancelled_at' => now(),
             ]);
         }
-        // New subscriptions are handled via the callback redirect
+
+        $startDate = now();
+        $endDate   = $intent->billing_cycle === 'yearly'
+            ? $startDate->copy()->addYear()
+            : $startDate->copy()->addMonth();
+
+        $subscription = Subscription::create([
+            'user_id'               => $user->id,
+            'package_id'            => $package->id,
+            'status'                => 'active',
+            'billing_cycle'         => $intent->billing_cycle,
+            'amount_paid'           => ($transaction['amount_cents'] ?? 0) / 100,
+            'paymob_order_id'       => (string) $paymobOrderId,
+            'paymob_transaction_id' => $transactionId,
+            'starts_at'             => $startDate,
+            'ends_at'               => $endDate,
+        ]);
+
+        $intent->update([
+            'status'                 => 'completed',
+            'paymob_order_id'        => (string) $paymobOrderId,
+            'paymob_transaction_id'  => $transactionId,
+        ]);
+
+        Log::info('Paymob: Subscription created', [
+            'subscription_id' => $subscription->id,
+            'user_id'          => $user->id,
+            'package_id'       => $package->id,
+        ]);
+
+        return true;
     }
 
     protected function handlePaymentFailed(array $obj): void
     {
-        $paymobOrderId = (string) ($obj['order']['id'] ?? '');
+        $merchantOrderId = $obj['order']['merchant_order_id'] ?? $obj['merchant_order_id'] ?? null;
 
-        $subscription = Subscription::where('paymob_order_id', $paymobOrderId)->first();
-
-        if ($subscription && $subscription->status !== 'active') {
-            $subscription->update(['status' => 'expired']);
-
-            Log::info('Paymob webhook: subscription expired due to failed payment', [
-                'subscription_id' => $subscription->id,
-            ]);
+        if ($merchantOrderId) {
+            PaymentIntent::where('id', $merchantOrderId)->update(['status' => 'failed']);
         }
+
+        Log::info('Paymob webhook: payment failed', ['merchant_order_id' => $merchantOrderId]);
     }
 }

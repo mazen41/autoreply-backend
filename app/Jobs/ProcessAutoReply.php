@@ -411,19 +411,11 @@ class ProcessAutoReply implements ShouldQueue
                                     ->first();
                                 
                                 if ($wooCommerceChannel && $phoneMatch) {
-                                    $wooCommerceResponse = Http::get("{$wooCommerceChannel->page_id}/wp-json/wc/v3/orders", [
-                                        'consumer_key' => $wooCommerceChannel->access_token,
-                                        'consumer_secret' => $wooCommerceChannel->refresh_token,
-                                        'phone' => $phoneMatch,
-                                        'status' => 'any',
-                                        'orderby' => 'date',
-                                        'order' => 'desc',
-                                        'per_page' => 1,
-                                    ]);
+                                    $wooCommerceService = new \App\Services\WooCommerceService();
+                                    $wooOrder = $wooCommerceService->getOrderByPhone($wooCommerceChannel->metadata, $phoneMatch);
                                     
-                                    if ($wooCommerceResponse->successful() && !empty($wooCommerceResponse->json())) {
-                                        $wooCommerceOrder = $wooCommerceResponse->json()[0];
-                                        $sallaContext = $this->formatWooCommerceOrderForAI($wooCommerceOrder);
+                                    if ($wooOrder) {
+                                        $sallaContext = $wooCommerceService->formatOrderForAI($wooOrder);
                                         Log::info('ProcessAutoReply: WooCommerce order lookup succeeded');
                                     }
                                 }
@@ -1084,24 +1076,6 @@ class ProcessAutoReply implements ShouldQueue
         return "Order #{$orderNumber}\nStatus: {$status}\nTotal: {$total} {$currency}\n" .
                "Products: " . implode(', ', $products) . "\n" .
                "Processed At: {$processedAt}";
-    }
-
-    private function formatWooCommerceOrderForAI(array $order): string
-    {
-        $orderNumber = $order['number'] ?? $order['id'] ?? 'N/A';
-        $status = $order['status'] ?? 'Unknown';
-        $total = $order['total'] ?? '0';
-        $currency = $order['currency'] ?? 'USD';
-        $dateCreated = $order['date_created'] ?? 'Not specified';
-
-        $products = [];
-        foreach ($order['line_items'] ?? [] as $item) {
-            $products[] = ($item['name'] ?? 'Unknown') . ' x' . ($item['quantity'] ?? 1);
-        }
-
-        return "Order #{$orderNumber}\nStatus: {$status}\nTotal: {$total} {$currency}\n" .
-               "Products: " . implode(', ', $products) . "\n" .
-               "Date Created: {$dateCreated}";
     }
 
     /**

@@ -20,16 +20,18 @@ class WooCommerceController extends Controller
         ]);
 
         $storeUrl = rtrim($request->store_url, '/');
+        if (!str_starts_with($storeUrl, 'https://')) {
+            $storeUrl = 'https://' . $storeUrl;
+        }
+        
         $consumerKey = $request->consumer_key;
         $consumerSecret = $request->consumer_secret;
         $userId = auth()->id();
 
         try {
-            // Verify credentials by calling WooCommerce API
-            $response = Http::timeout(10)->get("{$storeUrl}/wp-json/wc/v3/system_status", [
-                'consumer_key' => $consumerKey,
-                'consumer_secret' => $consumerSecret,
-            ]);
+            // Verify credentials by calling WooCommerce API with Basic Auth
+            $response = Http::timeout(10)->withBasicAuth($consumerKey, $consumerSecret)
+                ->get("{$storeUrl}/wp-json/wc/v3/system_status");
 
             if (!$response->successful()) {
                 Log::error('WooCommerce credentials verification failed', [
@@ -38,14 +40,14 @@ class WooCommerceController extends Controller
                     'status' => $response->status(),
                     'body' => $response->json(),
                 ]);
-                return response()->json(['error' => 'Invalid WooCommerce credentials'], 400);
+                return response()->json(['error' => 'Invalid WooCommerce credentials'], 422);
             }
 
             $systemStatus = $response->json();
-            $storeName = $systemStatus['settings']['store_name'] ?? 'WooCommerce Store';
+            $storeName = $systemStatus['settings']['store_name'] ?? $storeUrl;
             $environment = $systemStatus['environment']['version'] ?? 'Unknown';
 
-            // Save channel
+            // Save channel with encrypted credentials in metadata
             $businessProfile = \App\Models\BusinessProfile::where('user_id', $userId)->first();
 
             $channel = Channel::updateOrCreate(
@@ -56,17 +58,20 @@ class WooCommerceController extends Controller
                 ],
                 [
                     'page_name' => $storeName,
-                    'access_token' => $consumerKey,
-                    'refresh_token' => $consumerSecret, // Store secret in refresh_token field
                     'status' => 'connected',
                     'connected_at' => now(),
                     'business_id' => $businessProfile ? $businessProfile->id : null,
                     'metadata' => [
-                        'environment' => $environment,
                         'store_url' => $storeUrl,
+                        'consumer_key' => encrypt($consumerKey),
+                        'consumer_secret' => encrypt($consumerSecret),
+                        'environment' => $environment,
                     ],
                 ]
             );
+
+            // Register webhooks for real-time synchronization
+            $this->registerWebhooks($storeUrl, $consumerKey, $consumerSecret);
 
             Log::info('WooCommerce channel connected', [
                 'user_id' => $userId,
@@ -79,9 +84,8 @@ class WooCommerceController extends Controller
                 'success' => true,
                 'channel' => [
                     'id' => $channel->id,
+                    'name' => $storeName,
                     'type' => 'woocommerce',
-                    'store_name' => $storeName,
-                    'store_url' => $storeUrl,
                     'status' => 'connected',
                 ],
             ]);
@@ -112,47 +116,32 @@ class WooCommerceController extends Controller
         }
 
         try {
-            $storeUrl = $channel->page_id;
-            $consumerKey = $channel->access_token;
-            $consumerSecret = $channel->refresh_token;
+            $metadata = $channel->metadata;
+            $storeUrl = $metadata['store_url'] ?? $channel->page_id;
+            $consumerKey = decrypt($metadata['consumer_key']);
+            $consumerSecret = decrypt($metadata['consumer_secret']);
 
-            // Search for customer by phone
-            $customerResponse = Http::get("{$storeUrl}/wp-json/wc/v3/customers", [
-                'consumer_key' => $consumerKey,
-                'consumer_secret' => $consumerSecret,
-                'phone' => $phone,
-            ]);
-
-            if (!$customerResponse->successful() || empty($customerResponse->json())) {
-                return response()->json(['error' => 'No customer found with this phone'], 404);
-            }
-
-            $customer = $customerResponse->json()[0];
-
-            // Get customer orders
-            $ordersResponse = Http::get("{$storeUrl}/wp-json/wc/v3/orders", [
-                'consumer_key' => $consumerKey,
-                'consumer_secret' => $consumerSecret,
-                'customer' => $customer['id'],
-                'status' => 'any',
-                'orderby' => 'date',
-                'order' => 'desc',
-                'per_page' => 1,
-            ]);
+            // Search for orders by billing phone directly
+            $ordersResponse = Http::withBasicAuth($consumerKey, $consumerSecret)
+                ->get("{$storeUrl}/wp-json/wc/v3/orders", [
+                    'billing_phone' => $phone,
+                    'orderby' => 'date',
+                    'order' => 'desc',
+                    'per_page' => 1,
+                ]);
 
             if (!$ordersResponse->successful() || empty($ordersResponse->json())) {
-                return response()->json(['error' => 'No orders found for this customer'], 404);
+                return response()->json(['order' => null]);
             }
 
             $order = $ordersResponse->json()[0];
 
-            // Format order data for AI (same pattern as Salla)
+            // Format order data for AI
             $formattedOrder = $this->formatOrderForAI($order);
 
             return response()->json([
                 'success' => true,
                 'order' => $formattedOrder,
-                'raw_order' => $order,
             ]);
 
         } catch (\Exception $e) {
@@ -164,21 +153,48 @@ class WooCommerceController extends Controller
         }
     }
 
-    private function formatOrderForAI(array $order): string
+    private function formatOrderForAI(array $order): array
     {
-        $orderNumber = $order['number'] ?? $order['id'] ?? 'N/A';
-        $status = $order['status'] ?? 'Unknown';
-        $total = $order['total'] ?? '0';
-        $currency = $order['currency'] ?? 'USD';
-        $dateCreated = $order['date_created'] ?? 'Not specified';
+        $statusTranslations = [
+            'pending' => 'قيد الانتظار',
+            'processing' => 'قيد المعالجة',
+            'completed' => 'مكتمل',
+            'cancelled' => 'ملغى',
+            'refunded' => 'مسترجع',
+            'failed' => 'فشل',
+        ];
 
-        $products = [];
+        $status = $order['status'] ?? 'Unknown';
+        $displayStatus = $statusTranslations[$status] ?? $status;
+
+        $items = [];
         foreach ($order['line_items'] ?? [] as $item) {
-            $products[] = ($item['name'] ?? 'Unknown') . ' x' . ($item['quantity'] ?? 1);
+            $items[] = [
+                'name' => $item['name'] ?? 'Unknown',
+                'quantity' => $item['quantity'] ?? 1,
+                'price' => ($item['price'] ?? '0') . ' ' . ($order['currency'] ?? 'USD'),
+            ];
         }
 
-        return "Order #{$orderNumber}\nStatus: {$status}\nTotal: {$total} {$currency}\n" .
-               "Products: " . implode(', ', $products) . "\n" .
-               "Date Created: {$dateCreated}";
+        $billing = $order['billing'] ?? [];
+        $shipping = $order['shipping'] ?? [];
+        
+        $shippingAddress = trim(($billing['address_1'] ?? '') . ' ' . 
+                             ($billing['address_2'] ?? '') . ' ' . 
+                             ($billing['city'] ?? '') . ' ' . 
+                             ($billing['state'] ?? '') . ' ' . 
+                             ($billing['postcode'] ?? '') . ' ' . 
+                             ($billing['country'] ?? ''));
+
+        return [
+            'order_id' => $order['number'] ?? $order['id'] ?? 'N/A',
+            'status' => $displayStatus,
+            'total' => ($order['total'] ?? '0') . ' ' . ($order['currency'] ?? 'USD'),
+            'items' => $items,
+            'customer_name' => trim(($billing['first_name'] ?? '') . ' ' . ($billing['last_name'] ?? '')),
+            'shipping_address' => $shippingAddress ?: 'Not specified',
+            'created_at' => $order['date_created'] ?? 'Not specified',
+            'tracking_number' => null,
+        ];
     }
 }

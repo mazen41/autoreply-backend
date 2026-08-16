@@ -98,7 +98,7 @@ Route::get('/channels/connect/shopify',    [ShopifyController::class, 'connect']
 Route::get('/channels/callback/shopify',   [ShopifyController::class, 'callback']);
 
 // Webhook endpoints (public)
-Route::post('/telegram/webhook',           [TelegramController::class, 'webhook']);
+Route::post('/telegram/webhook/{userId}',  [TelegramController::class, 'webhook']);
 Route::post('/tiktok/webhook',             [TikTokController::class, 'webhook']);
 Route::post('/shopify/webhook',            [ShopifyController::class, 'webhook']);
 
@@ -142,6 +142,7 @@ Route::middleware('auth:sanctum')->group(function () {
     // New channel endpoints (protected)
     Route::post('/channels/telegram/connect', [TelegramController::class, 'connect']);
     Route::post('/channels/telegram/set-webhook', [TelegramController::class, 'setWebhook']);
+    Route::post('/channels/telegram/disconnect', [TelegramController::class, 'disconnect']);
     Route::post('/channels/woocommerce/connect', [WooCommerceController::class, 'connect']);
     Route::get('/channels/shopify/orders',    [ShopifyController::class, 'getOrders']);
     Route::get('/channels/woocommerce/orders', [WooCommerceController::class, 'getOrders']);

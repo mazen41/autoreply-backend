@@ -1006,24 +1006,18 @@ class ProcessAutoReply implements ShouldQueue
     private function sendTelegramReply(Channel $channel, string $chatId, string $message): bool
     {
         try {
-            $botToken = $channel->access_token;
-            $url = "https://api.telegram.org/bot{$botToken}/sendMessage";
+            $botToken = decrypt($channel->access_token);
+            $telegramService = new \App\Services\TelegramService();
+            
+            $success = $telegramService->sendMessage($botToken, $chatId, $message);
 
-            $response = Http::timeout(10)
-                ->post($url, [
-                    'chat_id' => $chatId,
-                    'text' => $message,
-                ]);
-
-            if (!$response->successful()) {
+            if (!$success) {
                 Log::error('ProcessAutoReply: Telegram send failed', [
-                    'status' => $response->status(),
-                    'body' => $response->json(),
                     'chat_id' => $chatId,
                 ]);
             }
 
-            return $response->successful();
+            return $success;
 
         } catch (\Exception $e) {
             Log::error('ProcessAutoReply: Telegram send exception', ['error' => $e->getMessage()]);

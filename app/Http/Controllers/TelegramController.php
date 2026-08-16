@@ -13,11 +13,12 @@ class TelegramController extends Controller
 {
     public function connect(Request $request)
     {
-        $request->validate([
-            'bot_token' => 'required|string',
-        ]);
+        $botToken = $request->bot_token ?? env('TELEGRAM_BOT_TOKEN');
+        
+        if (!$botToken) {
+            return response()->json(['error' => 'Bot token is required'], 400);
+        }
 
-        $botToken = $request->bot_token;
         $userId = auth()->id();
 
         // Verify bot token by calling Telegram getMe API

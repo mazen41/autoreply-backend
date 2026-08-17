@@ -47,11 +47,11 @@ class SyncGmailHistory implements ShouldQueue
         try {
             $gmail = new Gmail($client);
             
-            // Fetch last 30 emails (both read and unread, excluding sent by me)
+            // Fetch last 100 emails (both read and unread, excluding sent by me)
             $results = $gmail->users_messages->listUsersMessages('me', [
                 'labelIds'   => ['INBOX'],
                 'q'          => '-from:me',
-                'maxResults' => 30,
+                'maxResults' => 100,
             ]);
 
             $msgs = $results->getMessages() ?? [];

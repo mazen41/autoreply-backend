@@ -37,7 +37,7 @@ class SendCampaignMessage implements ShouldQueue
         public int $campaignLogId,
         public int $priority = 10 // Low priority for campaigns
     ) {
-        $this->onQueue('campaigns'); // Separate queue for campaigns
+        // Uses default queue connection so standard queue workers process it
     }
 
     public function handle(): void

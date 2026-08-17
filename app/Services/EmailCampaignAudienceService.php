@@ -68,8 +68,22 @@ class EmailCampaignAudienceService
     {
         return Conversation::where('business_id', $business->id)
             ->whereHas('channel', fn ($q) => $q->where('type', 'gmail'))
-            ->pluck('sender_id')
-            ->filter(fn ($s) => filter_var($s, FILTER_VALIDATE_EMAIL))
+            ->get(['sender_email', 'sender_id'])
+            ->flatMap(function ($conv) {
+                $candidates = [];
+                // Primary: sender_email column
+                if ($conv->sender_email && filter_var($conv->sender_email, FILTER_VALIDATE_EMAIL)) {
+                    $candidates[] = strtolower(trim($conv->sender_email));
+                }
+                // Fallback: sender_id when it looks like a real email address
+                if (
+                    $conv->sender_id
+                    && filter_var($conv->sender_id, FILTER_VALIDATE_EMAIL)
+                ) {
+                    $candidates[] = strtolower(trim($conv->sender_id));
+                }
+                return $candidates;
+            })
             ->unique()->values()->all();
     }
 

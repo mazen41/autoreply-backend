@@ -327,9 +327,11 @@ class CampaignController extends Controller
     private function authorizeChannel(int $businessId, int $channelId): void
     {
         $ownsChannel = Channel::where('id', $channelId)
-            ->where('business_id', $businessId)
-            ->where('user_id', Auth::id())
-            ->whereIn('type', ['whatsapp', 'instagram', 'facebook', 'telegram', 'gmail'])
+            ->where(function ($q) use ($businessId) {
+                $q->where('business_id', $businessId)
+                  ->orWhere('user_id', Auth::id());
+            })
+            ->whereIn('type', ['whatsapp', 'instagram', 'facebook', 'telegram', 'gmail', 'salla'])
             ->exists();
 
         if (!$ownsChannel) {

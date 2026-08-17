@@ -64,10 +64,84 @@ class EmailCampaignAudienceService
 
     // ── Gmail ────────────────────────────────────────────────────────────────
 
+    /**
+     * Automated/transactional sender patterns to exclude from Gmail campaigns.
+     * These are people you never actually had a conversation with.
+     */
+    private const AUTOMATED_PATTERNS = [
+        // Local-part patterns (before the @)
+        'noreply', 'no-reply', 'donotreply', 'do-not-reply',
+        'mailer-daemon', 'postmaster', 'bounce', 'bounces',
+        'notification', 'notifications', 'alert', 'alerts',
+        'newsletter', 'newsletters', 'news', 'digest',
+        'automated', 'auto', 'automailer', 'system',
+        'daemon', 'robot', 'bot', 'service', 'services',
+        'support-noreply', 'reply-noreply', 'account-noreply',
+        'updates', 'update', 'info-noreply',
+    ];
+
+    /**
+     * Domains that only ever send transactional / marketing email.
+     * Any address @these domains is never a real contact.
+     */
+    private const AUTOMATED_DOMAINS = [
+        // Google
+        'accounts.google.com', 'mail.google.com',
+        'googleplay.com', 'google.com',
+        // Meta
+        'metamail.com', 'facebookmail.com', 'instagram.com',
+        // Commerce
+        'commerce.temuemail.com', 'email.shein.com', 'us.email.shein.com',
+        'news.us.shein.com',
+        // Streaming / subscriptions
+        'spotify.com',
+        // Ride share / delivery
+        'eg.didiglobal.com', 'didiglobal.com',
+        // Sports / media newsletters
+        'email.premierleague.com',
+        // Tech automated
+        'account3.oppo.com',
+        // Generic mailing platforms (add more as you see them)
+        'sendgrid.net', 'mailchimp.com', 'mandrillapp.com',
+        'amazonses.com', 'mailgun.org', 'sendpulse.com',
+        'klaviyo.com', 'constantcontact.com', 'hubspot.com',
+        'salesforce.com', 'marketo.com', 'eloqua.com',
+    ];
+
+    private function isAutomatedEmail(string $email): bool
+    {
+        [$local, $domain] = explode('@', $email, 2);
+
+        // Block by full domain
+        if (in_array($domain, self::AUTOMATED_DOMAINS, true)) {
+            return true;
+        }
+
+        // Block by local-part keywords (noreply, bounce, etc.)
+        foreach (self::AUTOMATED_PATTERNS as $pattern) {
+            if (str_contains($local, $pattern)) {
+                return true;
+            }
+        }
+
+        // Block addresses that are clearly sub-domain mailers:
+        // e.g. anything@mail.something.com, anything@email.something.com
+        // but allow normal sub-domains like @support.company.com
+        $domainParts = explode('.', $domain);
+        if (count($domainParts) >= 3 && in_array($domainParts[0], ['mail', 'email', 'bounce', 'send', 'em', 'e', 'news', 'list', 'lists', 'reply'], true)) {
+            return true;
+        }
+
+        return false;
+    }
+
     private function resolveGmailEmails(BusinessProfile $business): array
     {
         return Conversation::where('business_id', $business->id)
             ->whereHas('channel', fn ($q) => $q->where('type', 'gmail'))
+            // Only conversations where the business replied — meaning a real
+            // two-way exchange happened, not just a newsletter landing in inbox.
+            ->whereHas('messages', fn ($q) => $q->where('direction', 'outbound'))
             ->get(['sender_email', 'sender_id'])
             ->flatMap(function ($conv) {
                 $candidates = [];
@@ -75,7 +149,7 @@ class EmailCampaignAudienceService
                 if ($conv->sender_email && filter_var($conv->sender_email, FILTER_VALIDATE_EMAIL)) {
                     $candidates[] = strtolower(trim($conv->sender_email));
                 }
-                // Fallback: sender_id when it looks like a real email address
+                // Fallback: sender_id when it looks like a real email
                 if (
                     $conv->sender_id
                     && filter_var($conv->sender_id, FILTER_VALIDATE_EMAIL)
@@ -84,6 +158,7 @@ class EmailCampaignAudienceService
                 }
                 return $candidates;
             })
+            ->filter(fn ($email) => !$this->isAutomatedEmail($email))
             ->unique()->values()->all();
     }
 

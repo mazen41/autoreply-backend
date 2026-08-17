@@ -27,6 +27,34 @@ class EmailCampaignController extends Controller
         return BusinessProfile::where('user_id', Auth::id())->firstOrFail();
     }
 
+    /**
+     * Resolve which timezone to interpret a naive "datetime-local" value in.
+     *
+     * The frontend detects the browser's real IANA timezone automatically
+     * (Intl.DateTimeFormat().resolvedOptions().timeZone) and sends it with
+     * every write — this is exact, works for any country (Egypt, Saudi
+     * Arabia, wherever the user actually is), and needs no manual setup.
+     *
+     * If it's present and valid, we use it directly and also persist it onto
+     * the business profile so it stays in sync for other features (business
+     * hours, etc.) and so the schedule/index responses reflect it too.
+     *
+     * Falls back to whatever is already stored on the business, then UTC,
+     * only if the frontend somehow didn't send one.
+     */
+    private function resolveTimezone(BusinessProfile $business, ?string $requestTimezone): string
+    {
+        if ($requestTimezone && in_array($requestTimezone, timezone_identifiers_list(), true)) {
+            if ($business->timezone !== $requestTimezone) {
+                $business->update(['timezone' => $requestTimezone]);
+            }
+
+            return $requestTimezone;
+        }
+
+        return $business->timezone ?: 'UTC';
+    }
+
     public function index(Request $request)
     {
         $business = $this->business();
@@ -58,6 +86,7 @@ class EmailCampaignController extends Controller
             'audience_criteria.recipients' => 'nullable|array',
             'audience_criteria.recipients.*' => 'email|max:255',
             'scheduled_at'     => 'nullable|date',
+            'timezone'         => 'nullable|string',
         ]);
 
         $business = $this->business();
@@ -65,10 +94,10 @@ class EmailCampaignController extends Controller
 
         $scheduledAt = null;
         if (!empty($validated['scheduled_at'])) {
-            $businessTimezone = $business->timezone ?: 'UTC';
+            $timezone = $this->resolveTimezone($business, $validated['timezone'] ?? null);
 
             try {
-                $scheduledAt = Carbon::parse($validated['scheduled_at'], $businessTimezone)->utc();
+                $scheduledAt = Carbon::parse($validated['scheduled_at'], $timezone)->utc();
             } catch (\Exception $e) {
                 return response()->json(['error' => 'Invalid scheduled_at value.'], 422);
             }
@@ -102,6 +131,7 @@ class EmailCampaignController extends Controller
             'audience_criteria.recipients' => 'nullable|array',
             'audience_criteria.recipients.*' => 'email|max:255',
             'scheduled_at'     => 'nullable|date',
+            'timezone'         => 'nullable|string',
         ]);
 
         $business = $this->business();
@@ -115,17 +145,19 @@ class EmailCampaignController extends Controller
             $validated['audience_criteria'] = $this->normalizeAudienceCriteria($validated['audience_criteria'] ?? []);
         }
 
-        // Same naive-datetime-local handling as schedule(): interpret in the
-        // business's timezone and store as UTC.
+        // Interpret the naive datetime-local value in the timezone the
+        // frontend detected from the browser, then store as UTC.
         if (array_key_exists('scheduled_at', $validated) && $validated['scheduled_at']) {
-            $businessTimezone = $business->timezone ?: 'UTC';
+            $timezone = $this->resolveTimezone($business, $validated['timezone'] ?? null);
 
             try {
-                $validated['scheduled_at'] = Carbon::parse($validated['scheduled_at'], $businessTimezone)->utc();
+                $validated['scheduled_at'] = Carbon::parse($validated['scheduled_at'], $timezone)->utc();
             } catch (\Exception $e) {
                 return response()->json(['error' => 'Invalid scheduled_at value.'], 422);
             }
         }
+
+        unset($validated['timezone']);
 
         DB::transaction(function () use ($campaign, $validated) {
             $campaign->update($validated);
@@ -176,6 +208,7 @@ class EmailCampaignController extends Controller
     {
         $validated = $request->validate([
             'scheduled_at' => 'required|date',
+            'timezone'     => 'nullable|string',
         ]);
 
         $business = $this->business();
@@ -187,14 +220,15 @@ class EmailCampaignController extends Controller
             return response()->json(['error' => 'Only draft or scheduled campaigns can be scheduled'], 400);
         }
 
-        // The frontend sends a naive "datetime-local" value with no timezone
-        // info (e.g. "2026-08-20T10:00"). Interpret it in the business's own
-        // timezone, then store it as UTC so the every-minute cron comparison
-        // against now() (UTC) fires at the time the business actually meant.
-        $businessTimezone = $business->timezone ?: 'UTC';
+        // The frontend sends a naive "datetime-local" value (e.g.
+        // "2026-08-20T10:00") along with the browser's real IANA timezone,
+        // auto-detected client-side. Interpret it in that timezone, then
+        // store as UTC so the every-minute cron comparison against now()
+        // (UTC) fires at the time the user actually meant, wherever they are.
+        $timezone = $this->resolveTimezone($business, $validated['timezone'] ?? null);
 
         try {
-            $scheduledAt = Carbon::parse($validated['scheduled_at'], $businessTimezone)->utc();
+            $scheduledAt = Carbon::parse($validated['scheduled_at'], $timezone)->utc();
         } catch (\Exception $e) {
             return response()->json(['error' => 'Invalid scheduled_at value.'], 422);
         }

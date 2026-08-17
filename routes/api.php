@@ -214,6 +214,8 @@ Route::middleware('auth:sanctum')->group(function () {
     Route::post('/email-campaigns/{id}/cancel-schedule', [EmailCampaignController::class, 'cancelSchedule']);
     Route::get('/email-campaigns/{id}/stats',   [EmailCampaignController::class, 'stats']);
     Route::delete('/email-campaigns/{id}',      [EmailCampaignController::class, 'destroy']);
+    Route::get('/email-campaigns/audience/channels',  [EmailCampaignController::class, 'audienceChannels']);
+    Route::post('/email-campaigns/audience/preview',  [EmailCampaignController::class, 'audiencePreview']);
 
     // Sequences
     Route::get('/businesses/{businessId}/sequences',   [SequenceController::class, 'index']);

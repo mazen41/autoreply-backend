@@ -362,21 +362,59 @@ class EmailCampaignController extends Controller
             ?: (ctype_digit($recipientKey) ? EmailCampaignRecipient::find((int) $recipientKey) : null);
     }
 
+    /**
+     * GET /api/email-campaigns/audience/channels
+     * Returns all connected channels available as audience filters.
+     */
+    public function audienceChannels(): \Illuminate\Http\JsonResponse
+    {
+        $business = $this->business();
+        return response()->json([
+            'channels' => $this->audience->availableChannels($business),
+        ]);
+    }
+
+    /**
+     * POST /api/email-campaigns/audience/preview
+     * Returns estimated recipient count for a given criteria (without saving).
+     */
+    public function audiencePreview(\Illuminate\Http\Request $request): \Illuminate\Http\JsonResponse
+    {
+        $request->validate([
+            'audience_criteria'      => 'required|array',
+            'audience_criteria.mode' => 'required|string|in:manual,gmail,contacts',
+        ]);
+
+        $business = $this->business();
+        $criteria = $request->input('audience_criteria');
+
+        $count = $this->audience->previewCount($business, $criteria);
+
+        return response()->json(['count' => $count]);
+    }
+
     private function normalizeAudienceCriteria(array $criteria): array
     {
         $mode = $criteria['mode'] ?? 'manual';
-        $recipients = $criteria['recipients'] ?? [];
 
         if ($mode === 'gmail') {
             return ['mode' => 'gmail', 'recipients' => []];
         }
 
-        $recipients = collect($recipients)
+        if ($mode === 'contacts') {
+            return [
+                'mode'             => 'contacts',
+                'channel_ids'      => array_map('intval', $criteria['channel_ids'] ?? []),
+                'channel_types'    => $criteria['channel_types'] ?? [],
+                'last_active_days' => isset($criteria['last_active_days']) ? (int) $criteria['last_active_days'] : null,
+            ];
+        }
+
+        // manual
+        $recipients = collect($criteria['recipients'] ?? [])
             ->map(fn ($email) => is_string($email) ? strtolower(trim($email)) : '')
             ->filter(fn ($email) => filter_var($email, FILTER_VALIDATE_EMAIL))
-            ->unique()
-            ->values()
-            ->all();
+            ->unique()->values()->all();
 
         if (count($recipients) === 0) {
             throw ValidationException::withMessages([

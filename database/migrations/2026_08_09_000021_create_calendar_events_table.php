@@ -17,8 +17,11 @@ return new class extends Migration
             $table->foreignId('conversation_id')->nullable()->constrained()->onDelete('set null');
             $table->string('title');
             $table->text('description')->nullable();
-            $table->timestamp('start_time');
-            $table->timestamp('end_time');
+            // Explicit nullable(false) defaults avoid MySQL strict-mode "Invalid default
+            // value" errors that occur when a table has two TIMESTAMP columns and MySQL
+            // tries to auto-apply a zero-date default to the second one.
+            $table->dateTime('start_time');
+            $table->dateTime('end_time');
             $table->string('google_event_id')->nullable();
             $table->string('status')->default('confirmed'); // confirmed, cancelled, pending
             $table->json('attendees')->nullable();

@@ -11,6 +11,7 @@ use App\Http\Controllers\Api\FeedbackController;
 use App\Http\Controllers\Api\TeamController;
 use App\Http\Controllers\Api\AutomationController;
 use App\Http\Controllers\Api\CampaignController;
+use App\Http\Controllers\Api\EmailCampaignController;
 use App\Http\Controllers\Api\SequenceController;
 use App\Http\Controllers\Api\WebhookController as ApiWebhookController;
 use App\Http\Controllers\Api\PublicApiController;
@@ -104,6 +105,10 @@ Route::post('/shopify/webhook',            [ShopifyController::class, 'webhook']
 
 // Salla Webhook - public, Salla calls these directly
 Route::post('/salla/webhook', [SallaWebhookController::class, 'handle']);
+
+// Email campaign open-tracking pixel — public, hit by recipients' mail clients
+Route::get('/email-campaigns/track/open/{recipientId}', [EmailCampaignController::class, 'trackOpen']);
+Route::get('/email-campaigns/track/click/{recipientId}', [EmailCampaignController::class, 'trackClick']);
 
 // â”€â”€ Protected routes â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 Route::middleware('auth:sanctum')->group(function () {
@@ -199,6 +204,17 @@ Route::middleware('auth:sanctum')->group(function () {
     Route::post('/businesses/{businessId}/campaigns/{campaignId}/launch', [CampaignController::class, 'launch']);
     Route::get('/businesses/{businessId}/campaigns/{campaignId}/logs', [CampaignController::class, 'logs']);
 
+    // Email Campaigns (business resolved from authenticated user, matches frontend calls to /api/email-campaigns)
+    Route::get('/email-campaigns',              [EmailCampaignController::class, 'index']);
+    Route::post('/email-campaigns',             [EmailCampaignController::class, 'store']);
+    Route::put('/email-campaigns/{id}',         [EmailCampaignController::class, 'update']);
+    Route::patch('/email-campaigns/{id}',       [EmailCampaignController::class, 'update']);
+    Route::post('/email-campaigns/{id}/send',   [EmailCampaignController::class, 'send']);
+    Route::post('/email-campaigns/{id}/schedule', [EmailCampaignController::class, 'schedule']);
+    Route::post('/email-campaigns/{id}/cancel-schedule', [EmailCampaignController::class, 'cancelSchedule']);
+    Route::get('/email-campaigns/{id}/stats',   [EmailCampaignController::class, 'stats']);
+    Route::delete('/email-campaigns/{id}',      [EmailCampaignController::class, 'destroy']);
+
     // Sequences
     Route::get('/businesses/{businessId}/sequences',   [SequenceController::class, 'index']);
     Route::post('/businesses/{businessId}/sequences',  [SequenceController::class, 'store']);
@@ -215,6 +231,7 @@ Route::middleware('auth:sanctum')->group(function () {
     Route::post('/businesses/{businessId}/webhooks/{webhookId}/test', [ApiWebhookController::class, 'test']);
 
     // Analytics
+    Route::get('/businesses/{businessId}/analytics/dashboard', [AnalyticsController::class, 'getDashboard']);
     Route::get('/businesses/{businessId}/analytics/csat', [AnalyticsController::class, 'getCsatScore']);
     Route::get('/businesses/{businessId}/analytics/daily', [AnalyticsController::class, 'getDailyAnalytics']);
     Route::get('/businesses/{businessId}/analytics/ai-metrics', [AnalyticsController::class, 'getAiMetrics']);

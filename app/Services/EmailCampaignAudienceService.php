@@ -139,17 +139,12 @@ class EmailCampaignAudienceService
     {
         return Conversation::where('business_id', $business->id)
             ->whereHas('channel', fn ($q) => $q->where('type', 'gmail'))
-            // Only conversations where the business replied — meaning a real
-            // two-way exchange happened, not just a newsletter landing in inbox.
-            ->whereHas('messages', fn ($q) => $q->where('direction', 'outbound'))
             ->get(['sender_email', 'sender_id'])
             ->flatMap(function ($conv) {
                 $candidates = [];
-                // Primary: sender_email column
                 if ($conv->sender_email && filter_var($conv->sender_email, FILTER_VALIDATE_EMAIL)) {
                     $candidates[] = strtolower(trim($conv->sender_email));
                 }
-                // Fallback: sender_id when it looks like a real email
                 if (
                     $conv->sender_id
                     && filter_var($conv->sender_id, FILTER_VALIDATE_EMAIL)

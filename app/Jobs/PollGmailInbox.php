@@ -27,6 +27,20 @@ class PollGmailInbox implements ShouldQueue
             ->where('status', 'connected')
             ->get();
 
+        // Backfill business_id on any channel that's missing it
+        foreach ($channels as $channel) {
+            if (!$channel->business_id) {
+                $business = \App\Models\BusinessProfile::where('user_id', $channel->user_id)->first();
+                if ($business) {
+                    $channel->update(['business_id' => $business->id]);
+                    $channel->business_id = $business->id;
+                }
+            }
+        }
+
+        // Only poll channels that have a resolvable business
+        $channels = $channels->filter(fn($c) => !empty($c->business_id));
+
         Log::info('Gmail poll: checking ' . $channels->count() . ' channel(s)');
 
         foreach ($channels as $channel) {
@@ -110,7 +124,12 @@ class PollGmailInbox implements ShouldQueue
                 'subject'         => $subject,
             ]
         );
-        $conversation->update(['last_message_at' => now()]);
+        // Always sync sender_email — it's only set on first create above,
+        // so existing conversations from before this fix have it null.
+        $conversation->update([
+            'last_message_at' => now(),
+            'sender_email'    => $senderEmail,
+        ]);
 
         $message = Message::create([
             'conversation_id'  => $conversation->id,

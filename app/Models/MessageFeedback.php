@@ -6,6 +6,8 @@ use Illuminate\Database\Eloquent\Model;
 
 class MessageFeedback extends Model
 {
+    protected $table = 'message_feedbacks';
+
     protected $fillable = [
         'message_id',
         'user_id',

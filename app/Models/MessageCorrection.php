@@ -6,6 +6,8 @@ use Illuminate\Database\Eloquent\Model;
 
 class MessageCorrection extends Model
 {
+    protected $table = 'message_corrections';
+
     protected $fillable = [
         'original_message_id',
         'ai_draft',

@@ -202,6 +202,7 @@ Route::middleware('auth:sanctum')->group(function () {
     Route::put('/businesses/{businessId}/campaigns/{campaignId}', [CampaignController::class, 'update']);
     Route::delete('/businesses/{businessId}/campaigns/{campaignId}', [CampaignController::class, 'destroy']);
     Route::post('/businesses/{businessId}/campaigns/{campaignId}/launch', [CampaignController::class, 'launch']);
+    Route::post('/businesses/{businessId}/campaigns/{campaignId}/cancel-schedule', [CampaignController::class, 'cancelSchedule']);
     Route::get('/businesses/{businessId}/campaigns/{campaignId}/logs', [CampaignController::class, 'logs']);
 
     // Email Campaigns (business resolved from authenticated user, matches frontend calls to /api/email-campaigns)

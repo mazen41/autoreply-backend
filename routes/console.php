@@ -18,6 +18,7 @@ Schedule::command('backup:database')->dailyAt('02:00')->name('database-backup')-
 // New automation cron jobs
 Schedule::command('analytics:daily')->dailyAt('01:00')->name('daily-analytics')->withoutOverlapping();
 Schedule::command('email-campaigns:send-due')->everyMinute()->name('send-due-email-campaigns')->withoutOverlapping();
+Schedule::command('campaigns:send-due')->everyMinute()->name('send-due-campaigns')->withoutOverlapping();
 Schedule::command('usage:check')->dailyAt('01:30')->name('check-usage-limits')->withoutOverlapping();
 Schedule::command('system:health-check')->hourly()->name('system-health-check')->withoutOverlapping();
 

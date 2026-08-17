@@ -8,6 +8,7 @@ use App\Models\BusinessProfile;
 use App\Models\EmailCampaign;
 use App\Models\EmailCampaignRecipient;
 use App\Services\EmailCampaignAudienceService;
+use Carbon\Carbon;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\Auth;
 use Illuminate\Support\Facades\DB;
@@ -38,7 +39,12 @@ class EmailCampaignController extends Controller
             $query->where('status', $request->query('status'));
         }
 
-        return response()->json(['data' => $query->get()]);
+        return response()->json([
+            'data' => $query->get(),
+            // So the frontend can display/edit scheduled_at in the business's
+            // own timezone instead of the browser's local timezone.
+            'business_timezone' => $business->timezone ?: 'UTC',
+        ]);
     }
 
     public function store(Request $request)
@@ -57,6 +63,17 @@ class EmailCampaignController extends Controller
         $business = $this->business();
         $audienceCriteria = $this->normalizeAudienceCriteria($validated['audience_criteria'] ?? []);
 
+        $scheduledAt = null;
+        if (!empty($validated['scheduled_at'])) {
+            $businessTimezone = $business->timezone ?: 'UTC';
+
+            try {
+                $scheduledAt = Carbon::parse($validated['scheduled_at'], $businessTimezone)->utc();
+            } catch (\Exception $e) {
+                return response()->json(['error' => 'Invalid scheduled_at value.'], 422);
+            }
+        }
+
         $campaign = EmailCampaign::create([
             'business_id'       => $business->id,
             'name'              => $validated['name'],
@@ -64,7 +81,7 @@ class EmailCampaignController extends Controller
             'content'           => $validated['content'],
             'audience_criteria' => $audienceCriteria,
             'status'            => 'draft',
-            'scheduled_at'      => $validated['scheduled_at'] ?? null,
+            'scheduled_at'      => $scheduledAt,
         ]);
 
         return response()->json(['success' => true, 'campaign' => $campaign], 201);
@@ -96,6 +113,18 @@ class EmailCampaignController extends Controller
 
         if (array_key_exists('audience_criteria', $validated)) {
             $validated['audience_criteria'] = $this->normalizeAudienceCriteria($validated['audience_criteria'] ?? []);
+        }
+
+        // Same naive-datetime-local handling as schedule(): interpret in the
+        // business's timezone and store as UTC.
+        if (array_key_exists('scheduled_at', $validated) && $validated['scheduled_at']) {
+            $businessTimezone = $business->timezone ?: 'UTC';
+
+            try {
+                $validated['scheduled_at'] = Carbon::parse($validated['scheduled_at'], $businessTimezone)->utc();
+            } catch (\Exception $e) {
+                return response()->json(['error' => 'Invalid scheduled_at value.'], 422);
+            }
         }
 
         DB::transaction(function () use ($campaign, $validated) {
@@ -146,19 +175,37 @@ class EmailCampaignController extends Controller
     public function schedule(Request $request, $campaignId)
     {
         $validated = $request->validate([
-            'scheduled_at' => 'required|date|after:now',
+            'scheduled_at' => 'required|date',
         ]);
 
         $business = $this->business();
         $campaign = EmailCampaign::where('business_id', $business->id)->findOrFail($campaignId);
 
-        if ($campaign->status !== 'draft') {
-            return response()->json(['error' => 'Only draft campaigns can be scheduled'], 400);
+        // Allow scheduling a draft, and re-scheduling (changing the time on)
+        // a campaign that is already scheduled.
+        if (!in_array($campaign->status, ['draft', 'scheduled'])) {
+            return response()->json(['error' => 'Only draft or scheduled campaigns can be scheduled'], 400);
+        }
+
+        // The frontend sends a naive "datetime-local" value with no timezone
+        // info (e.g. "2026-08-20T10:00"). Interpret it in the business's own
+        // timezone, then store it as UTC so the every-minute cron comparison
+        // against now() (UTC) fires at the time the business actually meant.
+        $businessTimezone = $business->timezone ?: 'UTC';
+
+        try {
+            $scheduledAt = Carbon::parse($validated['scheduled_at'], $businessTimezone)->utc();
+        } catch (\Exception $e) {
+            return response()->json(['error' => 'Invalid scheduled_at value.'], 422);
+        }
+
+        if ($scheduledAt->lte(Carbon::now('UTC'))) {
+            return response()->json(['error' => 'Scheduled time must be in the future.'], 422);
         }
 
         $campaign->update([
             'status'       => 'scheduled',
-            'scheduled_at' => $validated['scheduled_at'],
+            'scheduled_at' => $scheduledAt,
         ]);
 
         $this->audience->buildRecipients($campaign, true);

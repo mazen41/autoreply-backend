@@ -222,11 +222,8 @@ class CampaignController extends Controller
 
         $campaign->refresh();
 
-        // Build audience based on filters
-        $query = Conversation::where('business_id', $businessId)
-            ->whereHas('channel', function ($q) use ($campaign) {
-                $q->where('id', $campaign->channel_id);
-            });
+        // Build audience based on filters: match conversation channel_id directly
+        $query = Conversation::where('channel_id', $campaign->channel_id);
 
         // Apply filters if provided
         if ($campaign->filters) {

@@ -124,7 +124,7 @@ class SendCampaignMessage implements ShouldQueue
 
         // Send message based on channel type
         $this->gmailSubject = $campaign->name ?: 'Message';
-        $success = $this->sendMessageToChannel($channel, $conversation, $message);
+        $success = $this->sendMessageToChannel($channel, $conversation, $message, $campaignLog);
 
         if ($success) {
             $message->update(['send_status' => 'sent']);
@@ -199,7 +199,7 @@ class SendCampaignMessage implements ShouldQueue
         }
     }
 
-    private function sendMessageToChannel(Channel $channel, Conversation $conversation, Message $message): bool
+    private function sendMessageToChannel(Channel $channel, Conversation $conversation, Message $message, CampaignLog $campaignLog): bool
     {
         try {
             $channelType = $channel->type;
@@ -211,7 +211,7 @@ class SendCampaignMessage implements ShouldQueue
                     return $this->sendMetaMessage($channel, $senderId, $message->content);
 
                 case 'whatsapp':
-                    return $this->sendWhatsAppMessage($channel, $senderId, $message->content);
+                    return $this->sendWhatsAppMessage($channel, $senderId, $message->content, $campaignLog);
 
                 case 'telegram':
                     return $this->sendTelegramMessage($channel, $senderId, $message->content);
@@ -258,25 +258,35 @@ class SendCampaignMessage implements ShouldQueue
      * campaigns share the retry/logging/config behaviour with every other
      * outbound WhatsApp path instead of duplicating a second HTTP client.
      */
-    private function sendWhatsAppMessage(Channel $channel, string $recipientId, string $content): bool
+    private function sendWhatsAppMessage(Channel $channel, string $recipientId, string $content, CampaignLog $campaignLog): bool
     {
         try {
             // instance_name is stored in page_id for WhatsApp channels
             $instanceName = $channel->page_id;
             if (!$instanceName) {
-                Log::error('SendCampaignMessage: WhatsApp channel missing instance name', ['channel_id' => $channel->id]);
+                $err = 'WhatsApp channel missing instance name (page_id)';
+                Log::error('SendCampaignMessage: ' . $err, ['channel_id' => $channel->id]);
+                $campaignLog->update(['error_message' => $err]);
                 return false;
             }
 
             $whatsappService = new EvolutionApiService();
             $response = $whatsappService->sendTextMessage($instanceName, $recipientId, $content);
 
-            return isset($response['key']['id']);
+            if (isset($response['key']['id'])) {
+                return true;
+            }
+
+            $errMsg = 'Evolution API error: ' . json_encode($response);
+            $campaignLog->update(['error_message' => substr($errMsg, 0, 500)]);
+            return false;
         } catch (\Exception $e) {
-            Log::error('SendCampaignMessage: WhatsApp send exception', [
+            $errMsg = 'WhatsApp send exception: ' . $e->getMessage();
+            Log::error('SendCampaignMessage: ' . $errMsg, [
                 'error' => $e->getMessage(),
                 'channel_id' => $channel->id,
             ]);
+            $campaignLog->update(['error_message' => substr($errMsg, 0, 500)]);
             return false;
         }
     }

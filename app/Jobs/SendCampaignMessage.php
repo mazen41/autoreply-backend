@@ -88,21 +88,15 @@ class SendCampaignMessage implements ShouldQueue
             return;
         }
 
-        // Rate limiting check per channel (atomic increment avoids the
-        // read-then-write race that let concurrent workers all pass the
-        // check at once and blow past the per-minute cap).
+        // Rate limiting check per channel (max 30 messages per minute per channel)
         $rateLimitKey = "campaign_rate_limit:{$channel->id}";
-        if (Cache::get($rateLimitKey, 0) >= 10) { // Max 10 messages per minute per channel
-            $this->release(15); // Retry shortly, within the same minute window
+        if (Cache::get($rateLimitKey, 0) >= 30) {
+            $this->release(5); // Soft retry in 5s
             return;
         }
-        // Cache::add() seeds the 60s window key atomically only if it does
-        // not already exist; Cache::increment() then bumps it atomically.
-        // Together this avoids the read-then-write race where two workers
-        // both read "9" and both proceed, blowing past the cap of 10.
         Cache::add($rateLimitKey, 0, 60);
-        if (Cache::increment($rateLimitKey) > 10) {
-            $this->release(15);
+        if (Cache::increment($rateLimitKey) > 30) {
+            $this->release(5);
             return;
         }
 

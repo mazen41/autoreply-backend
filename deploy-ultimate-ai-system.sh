@@ -31,7 +31,7 @@ echo "✅ Caches cleared"
 # Restart queue worker
 echo "🔄 Restarting queue worker..."
 pkill -f "autoreply/artisan queue:work"
-nohup php artisan queue:work --sleep=3 --tries=3 --max-time=3600 > /dev/null 2>&1 &
+nohup php artisan queue:work --queue=default,campaigns,proactive,emails --sleep=1 --tries=3 --max-time=3600 > /dev/null 2>&1 &
 echo "✅ Queue worker restarted"
 
 # Restart PHP-FPM

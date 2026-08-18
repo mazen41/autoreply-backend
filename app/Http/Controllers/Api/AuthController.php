@@ -107,6 +107,9 @@ class AuthController extends Controller
             'password' => Hash::make($validated['new_password']),
         ]);
 
+        return response()->json(['message' => 'Password changed successfully']);
+    }
+
     public function forgotPassword(Request $request)
     {
         $request->validate(['email' => 'required|email']);

@@ -53,6 +53,9 @@ class ChannelController extends Controller
             'pages_show_list',
             'instagram_basic',
             'instagram_manage_messages',
+            'pages_read_engagement',
+            'pages_manage_metadata',
+            'business_management',
             'public_profile',
         ]);
 
@@ -135,7 +138,7 @@ class ChannelController extends Controller
             'token_preview' => substr($userAccessToken, 0, 20) . '...',
         ]);
 
-        // Step 2: Get pages this user manages
+        // Step 2: Get pages this user manages (classic personal-admin Pages)
         \Log::info('Fetching user pages...');
         $pagesResponse = Http::get('https://graph.facebook.com/v19.0/me/accounts', [
             'access_token' => $userAccessToken,
@@ -148,6 +151,41 @@ class ChannelController extends Controller
         ]);
 
         $pages = $pagesResponse->json()['data'] ?? [];
+
+        // Fallback: Pages that only exist as Business Portfolio assets don't show up
+        // under /me/accounts. Look them up via the user's Businesses instead.
+        if (empty($pages)) {
+            \Log::info('No pages via /me/accounts, trying Business Portfolio fallback...');
+
+            $businessesResponse = Http::get('https://graph.facebook.com/v19.0/me/businesses', [
+                'access_token' => $userAccessToken,
+                'fields'       => 'id,name',
+            ]);
+
+            \Log::info('Businesses response', [
+                'status' => $businessesResponse->status(),
+                'body'   => $businessesResponse->json(),
+            ]);
+
+            $businesses = $businessesResponse->json()['data'] ?? [];
+
+            foreach ($businesses as $business) {
+                $ownedPagesResponse = Http::get("https://graph.facebook.com/v19.0/{$business['id']}/owned_pages", [
+                    'access_token' => $userAccessToken,
+                    'fields'       => 'id,name,access_token,instagram_business_account',
+                ]);
+
+                \Log::info('Owned pages response', [
+                    'business_id' => $business['id'],
+                    'business_name' => $business['name'] ?? null,
+                    'status'      => $ownedPagesResponse->status(),
+                    'body'        => $ownedPagesResponse->json(),
+                ]);
+
+                $ownedPages = $ownedPagesResponse->json()['data'] ?? [];
+                $pages = array_merge($pages, $ownedPages);
+            }
+        }
 
         \Log::info('Pages found', [
             'count' => count($pages),

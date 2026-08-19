@@ -6,6 +6,7 @@ use App\Services\AICapabilitiesService;
 use App\Models\Channel;
 use App\Models\Conversation;
 use App\Models\Message;
+use App\Services\KnowledgeChunker;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\Log;
 
@@ -68,12 +69,38 @@ class N8nIntegrationController extends Controller
                 $business = \App\Models\BusinessProfile::where('id', $businessId)->first();
             }
 
+            // Build knowledge base with chunking and relevance
+            $knowledgeBase = '';
+            if ($business && $message) {
+                foreach ($business->knowledgeFiles()->get() as $file) {
+                    $fullText = $file->extracted_text;
+
+                    // Chunk the file content to preserve sentence boundaries
+                    if (strlen($fullText) > 2000) {
+                        $chunks = KnowledgeChunker::chunkText($fullText, 2000, 200);
+
+                        // Get relevant chunks based on the user's message
+                        $relevantChunks = KnowledgeChunker::getRelevantChunks(
+                            $chunks,
+                            $message,
+                            3
+                        );
+
+                        $knowledgeBase .= "\n\n--- File: {$file->filename} (Relevant Chunks) ---\n";
+                        $knowledgeBase .= KnowledgeChunker::formatChunksForPrompt($relevantChunks, $file->filename);
+                    } else {
+                        $knowledgeBase .= "\n\n--- File: {$file->filename} ---\n";
+                        $knowledgeBase .= $fullText;
+                    }
+                }
+            }
+
             // Build context for AI
             $context = [
                 'business_name' => $business?->business_name ?? 'our business',
                 'platform' => $platform,
                 'language' => $language,
-                'knowledge_base' => $business?->knowledgeFiles->pluck('extracted_text')->implode("\n\n") ?? '',
+                'knowledge_base' => $knowledgeBase ?? '',
                 'memory' => $memory
             ];
 
@@ -211,7 +238,7 @@ class N8nIntegrationController extends Controller
 
             return response()->json([
                 'success' => false,
-                'error'   => $e->getMessage(),
+                'error'   => $e->getMessage()
             ], 500);
         }
     }

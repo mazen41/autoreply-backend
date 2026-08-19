@@ -196,9 +196,6 @@ class ProcessAutoReply implements ShouldQueue
         }
 
         $detectedLanguage = $this->detectLanguage($message->content);
-        
-        // Build system prompt from business profile
-        $systemPrompt = $this->buildSystemPrompt($channel, $message->content, $detectedLanguage);
 
         // Get last 10 messages for context
         $contextMessages = Message::where('conversation_id', $message->conversation_id)
@@ -537,7 +534,31 @@ class ProcessAutoReply implements ShouldQueue
             'business_name'  => $channel->business?->business_name ?? 'our business',
             'platform'       => $channel->type,
             'language'       => $detectedLanguage,
-            'knowledge_base' => $channel->business?->knowledgeFiles->pluck('extracted_text')->implode("\n\n") ?? '',
+            'knowledge_base' => function() use ($business, $message) {
+                $knowledgeText = '';
+                foreach ($business->knowledgeFiles()->get() as $file) {
+                    $fullText = $file->extracted_text;
+
+                    // Chunk the file content to preserve sentence boundaries
+                    if (strlen($fullText) > 2000) {
+                        $chunks = KnowledgeChunker::chunkText($fullText, 2000, 200);
+
+                        // Get relevant chunks based on the user's message
+                        $relevantChunks = KnowledgeChunker::getRelevantChunks(
+                            $chunks,
+                            $message->content,
+                            3
+                        );
+
+                        $knowledgeText .= "\n\n--- File: {$file->filename} (Relevant Chunks) ---\n";
+                        $knowledgeText .= KnowledgeChunker::formatChunksForPrompt($relevantChunks, $file->filename);
+                    } else {
+                        $knowledgeText .= "\n\n--- File: {$file->filename} ---\n";
+                        $knowledgeText .= $fullText;
+                    }
+                }
+                return $knowledgeText;
+            }() ?? '',
             'order_data'     => $orderContext,
             'products'       => $productsContext ?? null,
         ];
@@ -717,100 +738,7 @@ class ProcessAutoReply implements ShouldQueue
         return $data;
     }
 
-    private function buildSystemPrompt(Channel $channel, string $currentMessage = '', string $language = 'english'): string
-    {
-        $business = $channel->business;
-
-        // Fallback: If channel is missing business_id, try to find the user's business profile
-        if (!$business && $channel->user_id) {
-            $business = \App\Models\BusinessProfile::where('user_id', $channel->user_id)->first();
-        }
-
-        // Hard language instruction at the very top — Gemini respects this when placed first
-        $langInstruction = $language === 'arabic'
-            ? "CRITICAL: You MUST reply in Arabic only. Do not use English under any circumstances.\n\n"
-            : "CRITICAL: You MUST reply in English only. Do not use Arabic under any circumstances.\n\n";
-
-        if (!$business) {
-            return $langInstruction . "You are an AI customer support assistant. Answer questions truthfully. If you do not know the answer, politely state that you don't know and offer to connect them with a human agent.";
-        }
-
-        $workingDays = is_array($business->working_days) ? implode(', ', $business->working_days) : ($business->working_days ?? 'N/A');
-        $workingHours = "{$workingDays} from {$business->working_from} to {$business->working_to}";
-
-        $faqsText = '';
-        if (!empty($business->faqs)) {
-            $faqs = is_array($business->faqs) ? $business->faqs : json_decode($business->faqs, true);
-            if (is_array($faqs)) {
-                foreach ($faqs as $faq) {
-                    $q = $faq['question'] ?? $faq['q'] ?? '';
-                    $a = $faq['answer'] ?? $faq['a'] ?? '';
-                    if ($q && $a) $faqsText .= "Q: {$q}\nA: {$a}\n";
-                }
-            }
-        }
-
-        // Build knowledge base from individual files with proper chunking
-        $knowledgeText = '';
-        foreach ($business->knowledgeFiles()->get() as $file) {
-            $fullText = $file->extracted_text;
-            
-            // Chunk the file content to preserve sentence boundaries
-            if (strlen($fullText) > 2000) {
-                $chunks = KnowledgeChunker::chunkText($fullText, 2000, 200);
-                
-                // Get relevant chunks based on the user's message
-                $relevantChunks = KnowledgeChunker::getRelevantChunks(
-                    $chunks,
-                    $currentMessage,
-                    3
-                );
-                
-                $knowledgeText .= "\n\n--- File: {$file->filename} (Relevant Chunks) ---\n";
-                $knowledgeText .= KnowledgeChunker::formatChunksForPrompt($relevantChunks, $file->filename);
-            } else {
-                $knowledgeText .= "\n\n--- File: {$file->filename} ---\n";
-                $knowledgeText .= $fullText;
-            }
-        }
-
-        $prompt = $langInstruction;
-        $prompt .= "You are the AI assistant for {$business->business_name}, a {$business->business_type} business.\n";
-        $prompt .= "Your job is to answer customer questions accurately using ONLY the information provided below.\n\n";
-
-        $prompt .= "### BUSINESS INFORMATION ###\n";
-        $prompt .= "- Business Name: {$business->business_name}\n";
-        $prompt .= "- Business Type: {$business->business_type}\n";
-        $prompt .= "- Location: {$business->city}, {$business->country}\n";
-        $prompt .= "- Contact Phone: {$business->phone}\n";
-        $prompt .= "- Working Hours: {$workingHours}\n";
-        $prompt .= "- Services/Products: {$business->services}\n";
-        
-        if ($faqsText) {
-            $prompt .= "\n### FREQUENTLY ASKED QUESTIONS ###\n{$faqsText}\n";
-        }
-
-        // Add knowledge base from uploaded files
-        if (!empty($knowledgeText)) {
-            $prompt .= "\n### KNOWLEDGE BASE & DOCUMENTATION ###\n{$knowledgeText}\n";
-        }
-
-        // Add custom AI instructions
-        if (!empty($business->ai_instructions)) {
-            $prompt .= "\n### CUSTOM INSTRUCTIONS ###\n{$business->ai_instructions}\n";
-        }
-
-        $prompt .= "\n### CRITICAL RULES ###\n";
-        $prompt .= "1. NEVER say vague filler like 'I am here to assist you with any questions' as a substitute for a real answer.\n";
-        $prompt .= "2. If you do not know the answer based on the provided information, DO NOT guess or make things up. Honestly say you don't have that information and offer to have a human follow up.\n";
-        $prompt .= "3. Actively use the conversation history context provided. Do not repeat or contradict yourself.\n";
-        $prompt .= "4. Keep replies concise and under 3 sentences where possible — never write long paragraphs.\n";
-        $prompt .= "5. Reply in the same language the customer used (Arabic or English).\n";
-        $prompt .= "6. Reply style should be: " . ($business->reply_style ?? 'friendly and professional') . ".\n";
-
-        return $prompt;
-    }
-
+    
     private function sendReply(Channel $channel, Conversation $conversation, Message $replyMessage): bool
     {
         $senderId = $conversation->sender_id;

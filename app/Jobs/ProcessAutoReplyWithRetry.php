@@ -103,7 +103,7 @@ class ProcessAutoReplyWithRetry implements ShouldQueue
 
         try {
             // Build system prompt from business profile
-            $systemPrompt = $this->buildSystemPrompt($channel);
+            $systemPrompt = $this->buildSystemPrompt($channel, $message->content);
 
             // Get last 10 messages for context
             $contextMessages = Message::where('conversation_id', $message->conversation_id)
@@ -154,7 +154,7 @@ class ProcessAutoReplyWithRetry implements ShouldQueue
                 'error' => $e->getMessage(),
                 'trace' => $e->getTraceAsString()
             ]);
-            
+
             // Mark message as failed if this is the last attempt
             if ($this->attempts() >= $this->tries) {
                 $message->update(['send_status' => 'failed']);
@@ -163,12 +163,12 @@ class ProcessAutoReplyWithRetry implements ShouldQueue
                     'attempts' => $this->attempts()
                 ]);
             }
-            
+
             throw $e; // Re-throw to trigger retry mechanism
         }
     }
 
-    private function buildSystemPrompt(Channel $channel): string
+    private function buildSystemPrompt(Channel $channel, ?string $message = null): string
     {
         $business = $channel->business;
 
@@ -200,18 +200,18 @@ class ProcessAutoReplyWithRetry implements ShouldQueue
         $knowledgeText = '';
         foreach ($business->knowledgeFiles()->get() as $file) {
             $fullText = $file->extracted_text;
-            
+
             // Chunk the file content to preserve sentence boundaries
             if (strlen($fullText) > 2000) {
                 $chunks = KnowledgeChunker::chunkText($fullText, 2000, 200);
-                
+
                 // Get relevant chunks based on the user's message
                 $relevantChunks = KnowledgeChunker::getRelevantChunks(
-                    $chunks, 
-                    '', // Will be improved with actual query context
+                    $chunks,
+                    $message ?? '', // Use actual message content for relevance
                     3
                 );
-                
+
                 $knowledgeText .= "\n\n--- File: {$file->filename} (Relevant Chunks) ---\n";
                 $knowledgeText .= KnowledgeChunker::formatChunksForPrompt($relevantChunks, $file->filename);
             } else {
@@ -230,7 +230,7 @@ class ProcessAutoReplyWithRetry implements ShouldQueue
         $prompt .= "- Contact Phone: {$business->phone}\n";
         $prompt .= "- Working Hours: {$workingHours}\n";
         $prompt .= "- Services/Products: {$business->services}\n";
-        
+
         if ($faqsText) {
             $prompt .= "\n### FREQUENTLY ASKED QUESTIONS ###\n{$faqsText}\n";
         }
@@ -297,16 +297,16 @@ class ProcessAutoReplyWithRetry implements ShouldQueue
         }
 
         $content = strtolower($lastMessage['content'] ?? '');
-        
+
         // Simple keyword-based fallback responses
         if (str_contains($content, 'price') || str_contains($content, 'cost') || str_contains($content, 'سعر')) {
             return "For pricing information, please contact our support team. They'll be happy to provide you with our current packages and offers.";
         }
-        
+
         if (str_contains($content, 'hour') || str_contains($content, 'time') || str_contains($content, 'ساعة') || str_contains($content, 'وقت')) {
             return "Our working hours vary by location. Please contact us directly for our current schedule.";
         }
-        
+
         if (str_contains($content, 'help') || str_contains($content, 'assist') || str_contains($content, 'مساعدة')) {
             return "I'm here to help! Please let me know what you need assistance with, and I'll do my best to help you or connect you with the right person.";
         }
@@ -351,7 +351,7 @@ class ProcessAutoReplyWithRetry implements ShouldQueue
         if ($response->successful()) {
             Log::info('WhatsApp reply sent successfully', ['recipient' => $recipientId]);
         } else {
-            throw new \Exception('WhatsApp API failed: ' . $response->body());
+            throw new \Exception('WhatsAPI failed: ' . $response->body());
         }
     }
 

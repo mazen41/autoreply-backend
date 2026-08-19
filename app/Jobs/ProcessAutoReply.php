@@ -534,7 +534,7 @@ class ProcessAutoReply implements ShouldQueue
             'business_name'  => $channel->business?->business_name ?? 'our business',
             'platform'       => $channel->type,
             'language'       => $detectedLanguage,
-            'knowledge_base' => function() use ($business, $message) {
+            'knowledge_base' => (function() use ($business, $message) {
                 $knowledgeText = '';
                 foreach ($business->knowledgeFiles()->get() as $file) {
                     $fullText = $file->extracted_text;
@@ -558,7 +558,7 @@ class ProcessAutoReply implements ShouldQueue
                     }
                 }
                 return $knowledgeText;
-            }() ?? '',
+            })() ?? '',
             'order_data'     => $orderContext,
             'products'       => $productsContext ?? null,
         ];

@@ -197,6 +197,8 @@ Route::middleware('auth:sanctum')->group(function () {
     Route::get('/businesses/{businessId}/auto-messages', [AutomationController::class, 'getAutoMessages']);
     Route::put('/businesses/{businessId}/auto-messages', [AutomationController::class, 'updateAutoMessage']);
     Route::put('/businesses/{businessId}/timezone',    [AutomationController::class, 'updateTimezone']);
+    Route::get('/automation/comment-settings/{businessId}',  [AutomationController::class, 'getCommentSettings']);
+    Route::post('/automation/comment-settings/{businessId}', [AutomationController::class, 'updateCommentSettings']);
 
     // Campaigns
     Route::get('/businesses/{businessId}/campaigns',   [CampaignController::class, 'index']);

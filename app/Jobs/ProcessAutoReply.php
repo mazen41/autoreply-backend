@@ -530,10 +530,75 @@ class ProcessAutoReply implements ShouldQueue
             Log::info('ProcessAutoReply: order context built for AI', ['order_context' => $orderContext]);
         }
 
+        // Build business profile context separate from uploaded knowledge
+        $businessProfileContext = '';
+        if ($business) {
+            // Business name
+            $businessProfileContext .= "BUSINESS PROFILE\n";
+            $businessProfileContext .= "================\n";
+            $businessProfileContext .= "Business Name: {$business->business_name ?? 'our business'}\n";
+
+            // Business type
+            if (!empty($business->business_type)) {
+                $businessProfileContext .= "Business Type: {$business->business_type}\n";
+            }
+
+            // Business description/knowledge_base from business profile
+            if (!empty($business->knowledge_base)) {
+                $businessProfileContext .= "Description: {$business->knowledge_base}\n";
+            }
+
+            // Services
+            if (!empty($business->services)) {
+                if (is_string($business->services)) {
+                    $services = $business->services;
+                } elseif (is_array($business->services)) {
+                    $services = implode("\n- ", $business->services);
+                    $services = "- " . $services;
+                } else {
+                    $services = (string) $business->services;
+                }
+                $businessProfileContext .= "Services:\n{$services}\n";
+            }
+
+            // FAQs
+            if (!empty($business->faqs)) {
+                if (is_string($business->faqs)) {
+                    $faqs = $business->faqs;
+                } elseif (is_array($business->faqs)) {
+                    $faqItems = [];
+                    foreach ($business->faqs as $faq) {
+                        if (is_array($faq) && isset($faq['question'], $faq['answer'])) {
+                            $faqItems[] = "Q: {$faq['question']}\nA: {$faq['answer']}";
+                        } elseif (is_string($faq)) {
+                            $faqItems[] = $faq;
+                        }
+                    }
+                    $faqs = implode("\n\n", $faqItems);
+                } else {
+                    $faqs = (string) $business->faqs;
+                }
+                $businessProfileContext .= "FAQs:\n{$faqs}\n";
+            }
+
+            // AI instructions
+            if (!empty($business->ai_instructions)) {
+                $businessProfileContext .= "AI Instructions: {$business->ai_instructions}\n";
+            }
+
+            // Reply style
+            if (!empty($business->reply_style)) {
+                $businessProfileContext .= "Reply Style: {$business->reply_style}\n";
+            }
+
+            $businessProfileContext .= "\n";
+        }
+
         $context = [
             'business_name'  => $channel->business?->business_name ?? 'our business',
             'platform'       => $channel->type,
             'language'       => $detectedLanguage,
+            'business_profile' => $businessProfileContext,
             'knowledge_base' => (function() use ($business, $message) {
                 $knowledgeText = '';
                 foreach ($business->knowledgeFiles()->get() as $file) {
@@ -602,47 +667,100 @@ class ProcessAutoReply implements ShouldQueue
             return;
         }
 
-        // Step 5: Simple Decision Logic (3 lines)
+        // Step 5: Intelligent Escalation Decision
+        //
+        // Priority order:
+        //   1. AI explicitly flagged needs_escalation=true with a clear reason
+        //      (customer_requested_human, complaint, sensitive_issue, business_rule)
+        //   2. AI confidence is below threshold AND information_missing
+        //   3. Otherwise: AUTO_REPLY (even for questions with low confidence if
+        //      a reply was generated — let the AI reply rather than escalating)
+        //
+        // We do NOT escalate simply because intent=="question" or confidence is
+        // moderate. The business profile and knowledge base are now in context;
+        // if the AI generated a reply it has something useful to say.
+
         $confidenceThreshold = $channel->business?->ai_confidence_threshold ?? 70;
-        $aiConfidence = $aiResult['confidence'] * 100;
+        $aiConfidence        = $aiResult['confidence'] * 100;
+        $escalationReason    = $aiResult['escalation_reason'] ?? 'none';
+        $intent              = $aiResult['intent']           ?? 'question';
+        $needsEscalation     = $aiResult['needs_escalation'] ?? false;
 
-        // Do not escalate for questions with sufficient confidence, regardless of AI's needs_escalation suggestion
-if (!($aiResult['intent'] === 'question' && $aiConfidence >= $confidenceThreshold)) {
-    // Check the original escalation conditions for non-questions or low-confidence questions
-    if ($aiResult['needs_escalation'] || $aiConfidence < $confidenceThreshold) {
-        // Escalate
-        Log::info('ProcessAutoReply: Escalating based on AI decision', [
-            'conversation_id' => $conversation->id,
-            'ai_intent' => $aiResult['intent'],
-            'ai_needs_escalation' => $aiResult['needs_escalation'],
-            'ai_confidence' => $aiConfidence,
-            'threshold' => $confidenceThreshold
-        ]);
+        // Reasons that should ALWAYS trigger escalation
+        $hardEscalationReasons = [
+            'customer_requested_human',
+            'complaint',
+            'sensitive_issue',
+            'business_rule',
+        ];
 
-        $conversation->update([
-            'requires_human' => true,
-            'escalated_at' => now(),
-            'escalation_reason' => "ai_decision: intent={$aiResult['intent']}, confidence={$aiConfidence}%"
-        ]);
+        // Decide whether to escalate
+        $shouldEscalate   = false;
+        $decisionReason   = 'auto_reply_default';
 
-        $escalationMessage = "Sure 👍 I'm connecting you with a human agent now. Please wait a moment.";
-        $replyMessage = Message::create([
-            'conversation_id' => $message->conversation_id,
-            'content' => $escalationMessage,
-            'direction' => 'outbound',
-            'status' => 'auto',
-            'is_ai' => false,
-            'source' => 'escalation',
-            'send_status' => 'pending',
-        ]);
-
-        if ($channel->user_id) {
-            broadcast(new \App\Events\MessageReceived($replyMessage, $conversation, $channel->user_id));
+        if ($needsEscalation && in_array($escalationReason, $hardEscalationReasons)) {
+            // Hard escalation: AI has a concrete reason to hand off
+            $shouldEscalate = true;
+            $decisionReason = "ai_hard_escalation: {$escalationReason}";
+        } elseif ($needsEscalation && $escalationReason === 'information_missing' && $aiConfidence < $confidenceThreshold) {
+            // Information is genuinely missing AND confidence is low → escalate
+            $shouldEscalate = true;
+            $decisionReason = "information_missing_low_confidence: {$aiConfidence}% < {$confidenceThreshold}%";
+        } elseif ($needsEscalation && $escalationReason === 'low_confidence' && $aiConfidence < ($confidenceThreshold - 20)) {
+            // Very low confidence (well below threshold) → escalate
+            $shouldEscalate = true;
+            $decisionReason = "very_low_confidence: {$aiConfidence}%";
+        } elseif (!$needsEscalation) {
+            // AI says no escalation needed → auto-reply regardless of confidence
+            $shouldEscalate = false;
+            $decisionReason = 'ai_no_escalation_needed';
+        } else {
+            // AI flagged needs_escalation but reason is 'none' or 'low_confidence'
+            // while confidence is still above threshold → trust the AI reply
+            $shouldEscalate = false;
+            $decisionReason = 'ai_escalation_overridden_sufficient_confidence';
         }
-        $this->sendReply($channel, $conversation, $replyMessage);
-        return;
-    }
-}
+
+        // Log full AI decision for diagnostics
+        Log::info('ProcessAutoReply: AI decision', [
+            'conversation_id'  => $conversation->id,
+            'intent'           => $intent,
+            'confidence'       => round($aiConfidence, 1),
+            'threshold'        => $confidenceThreshold,
+            'needs_escalation' => $needsEscalation,
+            'escalation_reason' => $escalationReason,
+        ]);
+
+        Log::info('ProcessAutoReply: final decision', [
+            'conversation_id' => $conversation->id,
+            'decision'        => $shouldEscalate ? 'ESCALATE' : 'AUTO_REPLY',
+            'decision_reason' => $decisionReason,
+        ]);
+
+        if ($shouldEscalate) {
+            $conversation->update([
+                'requires_human'   => true,
+                'escalated_at'     => now(),
+                'escalation_reason' => "{$decisionReason} (intent={$intent}, confidence={$aiConfidence}%)",
+            ]);
+
+            $escalationMessage = "Sure 👍 I'm connecting you with a team member now. Please wait a moment.";
+            $replyMessage = Message::create([
+                'conversation_id' => $message->conversation_id,
+                'content'         => $escalationMessage,
+                'direction'       => 'outbound',
+                'status'          => 'auto',
+                'is_ai'           => false,
+                'source'          => 'escalation',
+                'send_status'     => 'pending',
+            ]);
+
+            if ($channel->user_id) {
+                broadcast(new \App\Events\MessageReceived($replyMessage, $conversation, $channel->user_id));
+            }
+            $this->sendReply($channel, $conversation, $replyMessage);
+            return;
+        }
 
         // Step 6: Send AI Response
         $aiResponse = $aiResult['reply'];

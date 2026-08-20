@@ -31,6 +31,7 @@ class BusinessProfile extends Model
         'ai_model',
         'google_access_token',
         'google_refresh_token',
+        'knowledge_base',
     ];
 
     protected $casts = [

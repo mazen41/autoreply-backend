@@ -74,16 +74,33 @@ You ONLY use data provided to you below. You NEVER call APIs, fetch data, or inv
 
 ROLE;
 
-        // ── Business knowledge base ───────────────────────────────────────────
+        // ── Business Profile Information ───────────────────────────────────────
+        $hasBusinessProfile = !empty($context['business_profile']);
+        if ($hasBusinessProfile) {
+            $p .= "\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n";
+            $p .= "BUSINESS PROFILE INFORMATION\n";
+            $p .= "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n";
+            $p .= $context['business_profile'] . "\n\n";
+            $p .= "USAGE RULES:\n";
+            $p .= "• Use this information to answer general questions about the business.\n";
+            $p .= "• This defines what the business is, what it does, its services, policies, tone, etc.\n";
+            $p .= "• If the answer exists here → use it directly.\n";
+            $p .= "• If partially available → combine with reasoning.\n\n";
+        }
+
+        // ── Uploaded Knowledge Base ───────────────────────────────────────────
+        $hasKnowledgeBase = !empty($context['knowledge_base']);
         if ($hasKnowledgeBase) {
             $p .= "\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n";
-            $p .= "BUSINESS KNOWLEDGE BASE\n";
+            $p .= "UPLOADED KNOWLEDGE BASE\n";
             $p .= "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n";
             $p .= $context['knowledge_base'] . "\n\n";
             $p .= "USAGE RULES:\n";
+            $p .= "• Use this information for detailed information from uploaded documents.\n";
+            $p .= "• These are additional detailed documents/files provided by the business.\n";
             $p .= "• If the answer exists here → use it directly.\n";
             $p .= "• If partially available → combine with reasoning.\n";
-            $p .= "• If not available → do NOT guess. Ask for details or escalate.\n\n";
+            $p .= "• If not available in either source → do NOT guess. Ask for details or escalate.\n\n";
         }
 
         // ── Order data (pre-fetched by ProcessAutoReply) ──────────────────────
@@ -98,9 +115,10 @@ ROLE;
         $p .= "INTENT 2 — GENERAL QUESTIONS\n";
         $p .= "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n";
         $p .= "Trigger: any question about the business, services, pricing, location, hours, etc.\n";
-        $p .= "• Use the knowledge base above to answer.\n";
-        $p .= "• If partially answered → combine knowledge + reasoning, then offer to follow up.\n";
-        $p .= "• If not found → reply: \"I couldn't find the exact information. Let me forward this to our team and they'll get back to you shortly 😊\" → needs_escalation = true\n\n";
+        $p .= "• First check the Business Profile Information above for answers about what the business does, its services, etc.\n";
+        $p .= "• Then check the Uploaded Knowledge Base for detailed information from documents.\n";
+        $p .= "• If partially answered → combine information from both sources + reasoning, then offer to follow up.\n";
+        $p .= "• If not found in either source → reply: \"I couldn't find the exact information. Let me forward this to our team and they'll get back to you shortly 😊\" → needs_escalation = true\n\n";
 
         // ── ORDER STATUS ──────────────────────────────────────────────────────
         $p .= "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n";
@@ -192,11 +210,11 @@ ROLE;
         $p .= "• Customer explicitly asks for a human / agent / موظف / شخص / خدمة عملاء\n";
         $p .= "• Customer is clearly angry, abusive, or deeply dissatisfied\n";
         $p .= "• A technical/system failure has occurred\n";
-        $p .= "• The issue genuinely cannot be resolved with the data available\n\n";
+        $p .= "• The issue genuinely cannot be resolved with the data available from BOTH business profile AND uploaded knowledge\n\n";
         $p .= "DO NOT escalate for:\n";
         $p .= "• Order status questions — you handle those with the data provided\n";
         $p .= "• Product browsing or placing orders — you handle those with the data provided\n";
-        $p .= "• Any question that has an answer in the knowledge base\n\n";
+        $p .= "• Any question that has an answer in EITHER the business profile OR the uploaded knowledge\n\n";
         $p .= "Escalation reply: \"Sure 👍 I'm connecting you with a team member now. Please wait a moment.\"\n";
         $p .= "intent = escalation, needs_escalation = true\n\n";
 
@@ -218,12 +236,21 @@ ROLE;
   "reply": "your message to the customer",
   "intent": "greeting | question | order_status | place_order | escalation",
   "needs_escalation": true or false,
-  "confidence": 0.0 to 1.0
+  "confidence": 0.0 to 1.0,
+  "escalation_reason": "customer_requested_human | information_missing | complaint | sensitive_issue | business_rule | low_confidence | none"
 }
 
 Rules:
 • "reply" must NEVER be empty.
 • "confidence" must reflect how certain you are (1.0 = fully covered by data, 0.5 = partial, 0.3 = guessing).
+• "escalation_reason" must explain why escalation is recommended:
+    - "customer_requested_human": Customer explicitly asked for human agent
+    - "information_missing": Answer not found in business profile or uploaded knowledge
+    - "complaint": Customer expressing dissatisfaction or complaint
+    - "sensitive_issue": Issue requires human sensitivity (legal, medical, etc.)
+    - "business_rule": Escalation required by configured business rules
+    - "low_confidence": AI confidence below threshold despite available information
+    - "none": No escalation needed
 • Output ONLY the JSON object. No preamble, no explanation, no markdown fences.
 JSON;
 
@@ -232,20 +259,33 @@ JSON;
 
     /**
      * Hard Escalation Override (Pre-AI Check)
+     *
+     * Only triggers on EXPLICIT requests for a human agent.
+     * Generic words like "support" alone do NOT force escalation — a customer
+     * asking "what kind of support do you offer?" is a normal question, not a
+     * handoff request. We require a phrase that unambiguously means the customer
+     * wants a human to take over the conversation.
      */
     public static function checkHardEscalation(string $message): array
     {
         $messageLower = strtolower(trim($message));
-        $escalationKeywords = [
-            'human', 'agent', 'support', 'person', 'representative',
-            'موظف', 'انسان', 'شخص', 'دعم', 'خدمة عملاء', 'كلم انسان'
+
+        // Multi-word phrases checked first (most specific)
+        $hardPhrases = [
+            'speak to a human', 'talk to a human', 'talk to a person',
+            'speak to a person', 'connect me to a human', 'connect me to an agent',
+            'transfer me to an agent', 'transfer to human', 'get me an agent',
+            'i want to speak to someone', 'i need to speak to someone',
+            'i want a human', 'i need a human',
+            'خدمة عملاء', 'كلم انسان', 'ابي موظف', 'ابغا موظف', 'عايز موظف',
+            'تواصل مع موظف', 'اتكلم مع شخص', 'وصلني لموظف',
         ];
 
-        foreach ($escalationKeywords as $keyword) {
-            if (str_contains($messageLower, $keyword)) {
+        foreach ($hardPhrases as $phrase) {
+            if (str_contains($messageLower, $phrase)) {
                 return [
                     'force_escalation' => true,
-                    'matched_keyword' => $keyword,
+                    'matched_keyword' => $phrase,
                     'reason' => 'hard_keyword_override'
                 ];
             }
@@ -524,6 +564,7 @@ JSON;
                 'intent'           => $aiResult['intent'],
                 'needs_escalation' => $aiResult['needs_escalation'] ?? false,
                 'confidence'       => $aiResult['confidence'] ?? 0.7,
+                'escalation_reason' => $aiResult['escalation_reason'] ?? 'none',
                 'validation'       => $validation,
             ];
 

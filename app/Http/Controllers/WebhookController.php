@@ -54,10 +54,29 @@ class WebhookController extends Controller
 
             $object = $body['object'] ?? '';
 
-            if ($object === 'page') {
-                $this->handleFacebook($body);
-            } elseif ($object === 'instagram') {
+            if ($object === 'instagram') {
                 $this->handleInstagram($body);
+            } elseif ($object === 'page') {
+                // Meta sends Instagram DMs as object=page when using Messenger API for Instagram.
+                // Check if any entry ID matches a connected Instagram account — if so, route to Instagram handler.
+                $igAccountIds = \App\Models\Channel::where('type', 'instagram')
+                    ->where('status', 'connected')
+                    ->pluck('instagram_account_id')
+                    ->toArray();
+
+                $hasInstagramEntry = false;
+                foreach ($body['entry'] ?? [] as $entry) {
+                    if (in_array($entry['id'], $igAccountIds, true)) {
+                        $hasInstagramEntry = true;
+                        break;
+                    }
+                }
+
+                if ($hasInstagramEntry) {
+                    $this->handleInstagram($body);
+                } else {
+                    $this->handleFacebook($body);
+                }
             }
 
             return response('EVENT_RECEIVED', 200);
@@ -176,6 +195,24 @@ class WebhookController extends Controller
                     ->latest('connected_at')
                     ->first();
 
+                // Fallback: when Meta sends as object=page, entry['id'] is page_id not ig account id.
+                // Try to find via the linked Facebook channel's page_id -> same business -> instagram channel.
+                if (!$channel) {
+                    $fbChannel = Channel::where('page_id', $igAccountId)
+                        ->where('type', 'facebook')
+                        ->where('status', 'connected')
+                        ->latest('connected_at')
+                        ->first();
+
+                    if ($fbChannel) {
+                        $channel = Channel::where('type', 'instagram')
+                            ->where('status', 'connected')
+                            ->where('business_id', $fbChannel->business_id)
+                            ->latest('connected_at')
+                            ->first();
+                    }
+                }
+
                 // No fallback - require proper Instagram channel mapping â€” it has the same page token
                 // which also works for Instagram replies
                 if (!$channel) {
@@ -283,8 +320,9 @@ class WebhookController extends Controller
 
     private function sendReply(Channel $channel, string $recipientId, string $message): void
     {
-        // Decrypt the access token
-        $accessToken = decrypt($channel->access_token);
+        // The Channel model's accessor already decrypts access_token — do NOT
+        // call decrypt() again or it will throw "The payload is invalid."
+        $accessToken = $channel->access_token;
         
         // /me/messages works for both Facebook and Instagram when using the Page Access Token
         $url = "https://graph.facebook.com/v19.0/me/messages?access_token={$accessToken}";

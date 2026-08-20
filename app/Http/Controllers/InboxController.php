@@ -321,8 +321,9 @@ class InboxController extends Controller
      */
     private function sendFacebookReply(Request $request, Conversation $conversation, Channel $channel)
     {
-        // Decrypt the access token
-        $accessToken = decrypt($channel->access_token);
+        // The Channel model's accessor already decrypts access_token — do NOT
+        // call decrypt() again or it will throw "The payload is invalid."
+        $accessToken = $channel->access_token;
 
         $fbResponse = Http::timeout(10)
             ->post(

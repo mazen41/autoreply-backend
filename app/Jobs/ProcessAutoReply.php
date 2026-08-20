@@ -283,7 +283,7 @@ class ProcessAutoReply implements ShouldQueue
         // Add product awareness to AI context
         if ($business) {
             $productService = new ProductAwarenessService();
-            $productsContext = $productService->buildProductContext($business->id);
+            $productsContext = $productService->buildProductContextArray($business->id);
         }
 
         // Keywords that indicate customer is asking about an EXISTING order

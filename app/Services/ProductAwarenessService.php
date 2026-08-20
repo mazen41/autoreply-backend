@@ -156,4 +156,28 @@ class ProductAwarenessService
 
         return $context;
     }
+
+    /**
+     * Build AI context as a structured array (name, price, currency, available, url).
+     * This is the shape AICapabilitiesService::getUltimateSystemPrompt() expects
+     * for $context['products'] — use this instead of buildProductContext() when
+     * passing products into ProcessAutoReply's AI context, since that method
+     * does a foreach() over $context['products'] and expects an array, not a
+     * pre-formatted string.
+     */
+    public function buildProductContextArray(int $businessId): array
+    {
+        $products = $this->getProductsForContext($businessId, ['limit' => 10]);
+
+        return array_map(function ($product) {
+            return [
+                'id'        => $product['id'] ?? null,
+                'name'      => $product['name'] ?? 'Unknown',
+                'price'     => $product['price'] ?? '?',
+                'currency'  => $product['currency'] ?? 'SAR',
+                'available' => $product['available'] ?? true,
+                'url'       => $product['url'] ?? null,
+            ];
+        }, $products);
+    }
 }

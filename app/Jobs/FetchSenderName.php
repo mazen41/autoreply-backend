@@ -47,8 +47,9 @@ class FetchSenderName implements ShouldQueue
         }
 
         try {
-            // Decrypt the access token
-            $accessToken = decrypt($channel->access_token);
+            // The Channel model's accessor already decrypts access_token — do NOT
+            // call decrypt() again or it will throw "The payload is invalid."
+            $accessToken = $channel->access_token;
             
             $response = Http::timeout(8)
                 ->get("https://graph.facebook.com/v19.0/{$this->senderId}", [

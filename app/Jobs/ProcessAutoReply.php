@@ -606,39 +606,43 @@ class ProcessAutoReply implements ShouldQueue
         $confidenceThreshold = $channel->business?->ai_confidence_threshold ?? 70;
         $aiConfidence = $aiResult['confidence'] * 100;
 
-        if ($aiResult['needs_escalation'] || $aiConfidence < $confidenceThreshold) {
-            // Escalate
-            Log::info('ProcessAutoReply: Escalating based on AI decision', [
-                'conversation_id' => $conversation->id,
-                'ai_intent' => $aiResult['intent'],
-                'ai_needs_escalation' => $aiResult['needs_escalation'],
-                'ai_confidence' => $aiConfidence,
-                'threshold' => $confidenceThreshold
-            ]);
+        // Do not escalate for questions with sufficient confidence, regardless of AI's needs_escalation suggestion
+if (!($aiResult['intent'] === 'question' && $aiConfidence >= $confidenceThreshold)) {
+    // Check the original escalation conditions for non-questions or low-confidence questions
+    if ($aiResult['needs_escalation'] || $aiConfidence < $confidenceThreshold) {
+        // Escalate
+        Log::info('ProcessAutoReply: Escalating based on AI decision', [
+            'conversation_id' => $conversation->id,
+            'ai_intent' => $aiResult['intent'],
+            'ai_needs_escalation' => $aiResult['needs_escalation'],
+            'ai_confidence' => $aiConfidence,
+            'threshold' => $confidenceThreshold
+        ]);
 
-            $conversation->update([
-                'requires_human' => true,
-                'escalated_at' => now(),
-                'escalation_reason' => "ai_decision: intent={$aiResult['intent']}, confidence={$aiConfidence}%"
-            ]);
+        $conversation->update([
+            'requires_human' => true,
+            'escalated_at' => now(),
+            'escalation_reason' => "ai_decision: intent={$aiResult['intent']}, confidence={$aiConfidence}%"
+        ]);
 
-            $escalationMessage = "Sure 👍 I'm connecting you with a human agent now. Please wait a moment.";
-            $replyMessage = Message::create([
-                'conversation_id' => $message->conversation_id,
-                'content' => $escalationMessage,
-                'direction' => 'outbound',
-                'status' => 'auto',
-                'is_ai' => false,
-                'source' => 'escalation',
-                'send_status' => 'pending',
-            ]);
+        $escalationMessage = "Sure 👍 I'm connecting you with a human agent now. Please wait a moment.";
+        $replyMessage = Message::create([
+            'conversation_id' => $message->conversation_id,
+            'content' => $escalationMessage,
+            'direction' => 'outbound',
+            'status' => 'auto',
+            'is_ai' => false,
+            'source' => 'escalation',
+            'send_status' => 'pending',
+        ]);
 
-            if ($channel->user_id) {
-                broadcast(new \App\Events\MessageReceived($replyMessage, $conversation, $channel->user_id));
-            }
-            $this->sendReply($channel, $conversation, $replyMessage);
-            return;
+        if ($channel->user_id) {
+            broadcast(new \App\Events\MessageReceived($replyMessage, $conversation, $channel->user_id));
         }
+        $this->sendReply($channel, $conversation, $replyMessage);
+        return;
+    }
+}
 
         // Step 6: Send AI Response
         $aiResponse = $aiResult['reply'];

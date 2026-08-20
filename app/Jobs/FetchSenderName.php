@@ -53,7 +53,7 @@ class FetchSenderName implements ShouldQueue
             
             $response = Http::timeout(8)
                 ->get("https://graph.facebook.com/v19.0/{$this->senderId}", [
-                    'fields'       => 'first_name,last_name,name',
+                    'fields'       => 'name',
                     'access_token' => $accessToken,
                 ]);
 
@@ -67,12 +67,12 @@ class FetchSenderName implements ShouldQueue
             }
 
             $data = $response->json();
-            $name = $data['name'] ?? trim(($data['first_name'] ?? '') . ' ' . ($data['last_name'] ?? ''));
+            $name = $data['name'] ?? '';
 
             if ($name !== '') {
                 $conversation->sender_name = $name;
                 $conversation->save();
-                
+
                 Log::info('FetchSenderName: successfully updated sender name', [
                     'conversation_id' => $this->conversationId,
                     'sender_name' => $name,

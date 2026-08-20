@@ -536,7 +536,8 @@ class ProcessAutoReply implements ShouldQueue
             // Business name
             $businessProfileContext .= "BUSINESS PROFILE\n";
             $businessProfileContext .= "================\n";
-            $businessProfileContext .= "Business Name: {$business->business_name ?? 'our business'}\n";
+            $businessName = $business->business_name ?? 'our business';
+            $businessProfileContext .= "Business Name: {$businessName}\n";
 
             // Business type
             if (!empty($business->business_type)) {

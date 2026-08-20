@@ -59,14 +59,15 @@ class WebhookController extends Controller
             } elseif ($object === 'page') {
                 // Meta sends Instagram DMs as object=page when using Messenger API for Instagram.
                 // Check if any entry ID matches a connected Instagram account — if so, route to Instagram handler.
-                $igAccountIds = \App\Models\Channel::where('type', 'instagram')
+                $igIds = \App\Models\Channel::where('type', 'instagram')
                     ->where('status', 'connected')
-                    ->pluck('instagram_account_id')
+                    ->get(['instagram_account_id', 'page_id'])
+                    ->flatMap(fn($c) => array_filter([$c->instagram_account_id, $c->page_id]))
                     ->toArray();
 
                 $hasInstagramEntry = false;
                 foreach ($body['entry'] ?? [] as $entry) {
-                    if (in_array($entry['id'], $igAccountIds, true)) {
+                    if (in_array($entry['id'], $igIds, true)) {
                         $hasInstagramEntry = true;
                         break;
                     }
@@ -158,23 +159,15 @@ class WebhookController extends Controller
     private function handleInstagram(array $body): void
     {
         foreach ($body['entry'] as $entry) {
-            $igAccountId = $entry['id'];
+            $entryId = $entry['id']; // Page ID when object=page, IG account ID when object=instagram
 
-            if (str_starts_with($igAccountId, 'TEST_')) continue;
+            if (str_starts_with($entryId, 'TEST_')) continue;
 
-            // Log full entry so we can debug the exact structure
-            Log::info('Instagram entry', ['id' => $igAccountId, 'keys' => array_keys($entry)]);
+            Log::info('Instagram entry', ['id' => $entryId, 'keys' => array_keys($entry)]);
 
-            // Instagram sends DMs under 'messaging' key
-            $events = $entry['messaging'] ?? [];
-
-            foreach ($events as $event) {
-                // Skip echoes (bot's own messages coming back)
+            foreach ($entry['messaging'] ?? [] as $event) {
                 if (isset($event['message']['is_echo'])) continue;
-
-                // Skip edits
                 if (isset($event['message_edit'])) continue;
-
                 if (!isset($event['message']['text'])) continue;
 
                 $senderId    = $event['sender']['id'];
@@ -183,22 +176,30 @@ class WebhookController extends Controller
                 if (str_starts_with($senderId, 'TEST_')) continue;
 
                 Log::info('Instagram DM received', [
-                    'ig_account_id' => $igAccountId,
-                    'sender'        => $senderId,
-                    'message'       => $messageText,
+                    'entry_id' => $entryId,
+                    'sender'   => $senderId,
+                    'message'  => $messageText,
                 ]);
 
-                // Find Instagram channel by instagram_account_id
-                $channel = Channel::where('instagram_account_id', $igAccountId)
+                // Strategy 1: entry ID is the Instagram account ID (object=instagram)
+                $channel = Channel::where('instagram_account_id', $entryId)
                     ->where('type', 'instagram')
                     ->where('status', 'connected')
                     ->latest('connected_at')
                     ->first();
 
-                // Fallback: when Meta sends as object=page, entry['id'] is page_id not ig account id.
-                // Try to find via the linked Facebook channel's page_id -> same business -> instagram channel.
+                // Strategy 2: entry ID matches page_id stored on instagram channel
                 if (!$channel) {
-                    $fbChannel = Channel::where('page_id', $igAccountId)
+                    $channel = Channel::where('page_id', $entryId)
+                        ->where('type', 'instagram')
+                        ->where('status', 'connected')
+                        ->latest('connected_at')
+                        ->first();
+                }
+
+                // Strategy 3: find facebook channel by page_id, then get instagram for same user
+                if (!$channel) {
+                    $fbChannel = Channel::where('page_id', $entryId)
                         ->where('type', 'facebook')
                         ->where('status', 'connected')
                         ->latest('connected_at')
@@ -207,20 +208,23 @@ class WebhookController extends Controller
                     if ($fbChannel) {
                         $channel = Channel::where('type', 'instagram')
                             ->where('status', 'connected')
-                            ->where('business_id', $fbChannel->business_id)
+                            ->where('user_id', $fbChannel->user_id)
                             ->latest('connected_at')
                             ->first();
+
+                        // Cache the page_id on instagram channel for future lookups
+                        if ($channel && empty($channel->page_id)) {
+                            $channel->update(['page_id' => $entryId]);
+                        }
                     }
                 }
 
-                // No fallback - require proper Instagram channel mapping â€” it has the same page token
-                // which also works for Instagram replies
                 if (!$channel) {
-                    Log::error('No Instagram channel found for instagram_account_id', [
-                        'ig_account_id' => $igAccountId,
-                        'available_channels' => Channel::where('type', 'instagram')
+                    Log::error('No Instagram channel found', [
+                        'entry_id'  => $entryId,
+                        'available' => Channel::where('type', 'instagram')
                             ->where('status', 'connected')
-                            ->get(['id', 'instagram_account_id', 'page_name'])
+                            ->get(['id', 'instagram_account_id', 'page_id', 'page_name'])
                             ->toArray(),
                     ]);
                     continue;
@@ -229,39 +233,45 @@ class WebhookController extends Controller
                 $this->processMessage($channel, $senderId, $messageText);
             }
 
-            // Handle Instagram comments on posts
+            // Handle Instagram comments
             foreach ($entry['changes'] ?? [] as $change) {
                 if ($change['field'] !== 'comments') continue;
 
-                $comment = $change['value'];
+                $comment     = $change['value'];
                 $commentText = $comment['text'] ?? '';
-                $commentId = $comment['comment_id'] ?? '';
-                $senderId = $comment['from']['id'] ?? '';
-                $parentId = $comment['parent_id'] ?? ''; // For replies to comments
-                $mediaId = $comment['media']['id'] ?? ''; // The post/reel the comment is on
+                $commentId   = $comment['comment_id'] ?? '';
+                $senderId    = $comment['from']['id'] ?? '';
 
-                // Skip if no text or if it's from our own account (to prevent loops)
                 if (empty($commentText) || empty($senderId)) continue;
+                if ($senderId === $entryId) continue;
 
-                // Get the Instagram account ID from the entry
-                $igAccountIdFromEntry = $entry['id'];
-
-                // Skip if comment is from our own account (prevent self-reply loops)
-                if ($senderId === $igAccountIdFromEntry) continue;
-
-                $channel = Channel::where('instagram_account_id', $igAccountIdFromEntry)
-                    ->where('type', 'instagram')
-                    ->where('status', 'connected')
-                    ->latest('connected_at')
-                    ->first();
+                $channel = Channel::where('instagram_account_id', $entryId)
+                    ->where('type', 'instagram')->where('status', 'connected')
+                    ->latest('connected_at')->first();
 
                 if (!$channel) {
-                    Log::warning('No Instagram channel found for instagram_account_id: ' . $igAccountIdFromEntry);
+                    $channel = Channel::where('page_id', $entryId)
+                        ->where('type', 'instagram')->where('status', 'connected')
+                        ->latest('connected_at')->first();
+                }
+
+                if (!$channel) {
+                    $fbChannel = Channel::where('page_id', $entryId)
+                        ->where('type', 'facebook')->where('status', 'connected')
+                        ->latest('connected_at')->first();
+                    if ($fbChannel) {
+                        $channel = Channel::where('type', 'instagram')
+                            ->where('status', 'connected')
+                            ->where('user_id', $fbChannel->user_id)
+                            ->latest('connected_at')->first();
+                    }
+                }
+
+                if (!$channel) {
+                    Log::warning('No Instagram channel found for comment', ['entry_id' => $entryId]);
                     continue;
                 }
 
-                // For comments, we need to determine if this is a top-level comment or a reply
-                // For now, we'll treat all comments similarly, but we could enhance this later
                 $this->processComment($channel, $senderId, $commentText, $commentId);
             }
         }

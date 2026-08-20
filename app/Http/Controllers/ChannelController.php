@@ -264,13 +264,27 @@ class ChannelController extends Controller
                     ]
                 );
                 \Log::info('Instagram channel saved', ['account_id' => $igAccountId]);
+
+                // Store page_id on instagram channel for webhook routing
+                Channel::where('user_id', $userId)
+                    ->where('type', 'instagram')
+                    ->where('instagram_account_id', $igAccountId)
+                    ->update(['page_id' => $pageId]);
             }
 
-            // Step 5: Subscribe page to webhook
+            // Step 5: Subscribe page to webhook — include Instagram fields
             Http::post("https://graph.facebook.com/v19.0/{$pageId}/subscribed_apps", [
-                'subscribed_fields' => 'messages,messaging_postbacks,message_echoes',
+                'subscribed_fields' => 'messages,messaging_postbacks,message_echoes,instagram_manage_messages,feed,comments',
                 'access_token'      => $longLivedToken,
             ]);
+
+            // Also store page_id on the Instagram channel so webhook routing works
+            if ($igAccountId) {
+                Channel::where('user_id', $userId)
+                    ->where('type', 'instagram')
+                    ->where('instagram_account_id', $igAccountId)
+                    ->update(['page_id' => $pageId]);
+            }
         }
 
         \Log::info('=== FACEBOOK CALLBACK SUCCESS ===');

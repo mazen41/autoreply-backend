@@ -30,6 +30,8 @@ class Message extends Model
         'metadata',
         'confidence_score',
         'detected_dialect',
+        'intent',
+        'detected_language',
         'retry_count',
         'last_retry_at',
         'delivery_status',

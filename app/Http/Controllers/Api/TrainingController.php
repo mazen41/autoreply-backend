@@ -5,6 +5,7 @@ namespace App\Http\Controllers\Api;
 use App\Http\Controllers\Controller;
 use App\Models\MessageCorrection;
 use App\Models\BusinessProfile;
+use App\Services\TrainingStatsService;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\Auth;
 use Illuminate\Support\Facades\Log;
@@ -220,35 +221,25 @@ class TrainingController extends Controller
     }
 
     /**
-     * Get training statistics
+     * Get real AI performance stats from messages + conversations.
+     *
+     * These numbers change as the AI handles real conversations. Supports a
+     * validated date-range `preset` and an optional `business_id` (the user may
+     * only request stats for a business they own). All aggregation happens in
+     * the database via TrainingStatsService.
      */
     public function getStats(Request $request)
     {
-        $user = Auth::user();
-        
-        $totalCorrections = MessageCorrection::whereHas('originalMessage.conversation.channel', function ($query) use ($user) {
-            $query->where('user_id', $user->id);
-        })->count();
-
-        $approvedCorrections = MessageCorrection::whereHas('originalMessage.conversation.channel', function ($query) use ($user) {
-            $query->where('user_id', $user->id);
-        })->where('approved', true)->count();
-
-        $pendingCorrections = $totalCorrections - $approvedCorrections;
-
-        $learningTypes = MessageCorrection::whereHas('originalMessage.conversation.channel', function ($query) use ($user) {
-            $query->where('user_id', $user->id);
-        })
-        ->selectRaw('learning_type, COUNT(*) as count')
-        ->groupBy('learning_type')
-        ->pluck('count', 'learning_type')
-        ->toArray();
-
-        return response()->json([
-            'total_corrections' => $totalCorrections,
-            'approved_corrections' => $approvedCorrections,
-            'pending_review' => $pendingCorrections,
-            'learning_types' => $learningTypes,
+        $validated = $request->validate([
+            'preset'      => 'sometimes|string|in:today,last_7_days,this_month,last_30_days,all_time',
+            'business_id' => 'sometimes|nullable|integer',
         ]);
+
+        $preset = $validated['preset'] ?? 'last_30_days';
+        $businessId = $validated['business_id'] ?? null;
+
+        $stats = app(TrainingStatsService::class)->statistics($preset, $businessId);
+
+        return response()->json($stats);
     }
 }

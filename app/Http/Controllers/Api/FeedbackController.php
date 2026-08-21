@@ -57,46 +57,61 @@ class FeedbackController extends Controller
     }
 
     /**
-     * Get feedback statistics for training dashboard
+     * Get feedback statistics for training dashboard.
+     *
+     * Scoped to the authenticated user's channels (and optionally narrowed to a
+     * business the user owns). Confidence averages exclude NULL and out-of-range
+     * values so a bad row cannot corrupt the reported average.
      */
     public function statistics(Request $request)
     {
         $businessId = $request->query('business_id');
-        
-        $query = MessageFeedback::whereHas('message.conversation.channel', function ($q) {
-                $q->where('user_id', Auth::id());
-            });
 
         if ($businessId) {
-            $query->whereHas('message.conversation', function ($q) use ($businessId) {
-                $q->where('business_id', $businessId);
-            });
+            \App\Models\BusinessProfile::where('user_id', Auth::id())
+                ->where('id', $businessId)
+                ->firstOrFail();
         }
 
-        $totalFeedback = $query->count();
+        $scope = function ($q) use ($businessId) {
+            $q->whereHas('message.conversation.channel', function ($q2) use ($businessId) {
+                $q2->where('user_id', Auth::id());
+                if ($businessId) {
+                    $q2->where('business_id', $businessId);
+                }
+            });
+        };
+
+        $query = MessageFeedback::query();
+        $scope($query);
+
+        $totalFeedback = (clone $query)->count();
         $positiveCount = (clone $query)->positive()->count();
         $negativeCount = (clone $query)->negative()->count();
 
         // Issue breakdown
         $issueBreakdown = (clone $query)->negative()
+            ->whereNotNull('issue_type')
             ->selectRaw('issue_type, COUNT(*) as count')
             ->groupBy('issue_type')
-            ->get()
             ->pluck('count', 'issue_type')
             ->toArray();
 
-        // Dialect breakdown
+        // Dialect breakdown (real values only — never NULL)
         $dialectBreakdown = (clone $query)
+            ->whereNotNull('detected_dialect')
             ->selectRaw('detected_dialect, COUNT(*) as count')
             ->groupBy('detected_dialect')
-            ->get()
             ->pluck('count', 'detected_dialect')
             ->toArray();
 
-        // Confidence score analysis
-        $avgConfidence = (clone $query)->avg('confidence_score');
-        $positiveAvgConfidence = (clone $query)->positive()->avg('confidence_score');
-        $negativeAvgConfidence = (clone $query)->negative()->avg('confidence_score');
+        // Confidence: NULL is excluded (AVG ignores it) and out-of-range scores
+        // are normalized so they cannot skew the result. Values are 0–1 here.
+        $confSelect = 'AVG(CASE WHEN confidence_score BETWEEN 0 AND 1 THEN confidence_score
+                                WHEN confidence_score > 1 AND confidence_score <= 100 THEN confidence_score / 100 END)';
+        $avgConfidence = (clone $query)->selectRaw($confSelect)->value($confSelect);
+        $positiveAvg = (clone $query)->positive()->selectRaw($confSelect)->value($confSelect);
+        $negativeAvg = (clone $query)->negative()->selectRaw($confSelect)->value($confSelect);
 
         return response()->json([
             'total_feedback' => $totalFeedback,
@@ -105,9 +120,9 @@ class FeedbackController extends Controller
             'positive_rate' => $totalFeedback > 0 ? round(($positiveCount / $totalFeedback) * 100, 2) : 0,
             'issue_breakdown' => $issueBreakdown,
             'dialect_breakdown' => $dialectBreakdown,
-            'avg_confidence' => round($avgConfidence ?? 0, 2),
-            'positive_avg_confidence' => round($positiveAvgConfidence ?? 0, 2),
-            'negative_avg_confidence' => round($negativeAvgConfidence ?? 0, 2),
+            'avg_confidence' => $avgConfidence !== null ? round((float) $avgConfidence, 4) : null,
+            'positive_avg_confidence' => $positiveAvg !== null ? round((float) $positiveAvg, 4) : null,
+            'negative_avg_confidence' => $negativeAvg !== null ? round((float) $negativeAvg, 4) : null,
         ]);
     }
 

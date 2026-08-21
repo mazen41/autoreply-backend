@@ -777,7 +777,10 @@ class ProcessAutoReply implements ShouldQueue
         // Detect Arabic dialect for training purposes
         $detectedDialect = ArabicDialectService::detectDialect($message->content);
 
-        // Save AI response as outbound message with confidence and dialect info
+        // Persist intent + language + normalized confidence so the training
+        // dashboard can compute real per-message statistics. Normalization
+        // keeps confidence on the app's canonical 0–1 scale regardless of what
+        // the AI model returns (some providers return 0–100).
         $replyMessage = Message::create([
             'conversation_id' => $message->conversation_id,
             'content' => $aiResponse,
@@ -786,8 +789,10 @@ class ProcessAutoReply implements ShouldQueue
             'is_ai' => true,
             'source' => 'ai',
             'send_status' => 'pending',
-            'confidence_score' => $aiResult['confidence'] ?? null,
-            'detected_dialect' => $detectedDialect,
+            'confidence_score' => self::normalizeConfidenceScore($aiResult['confidence'] ?? null),
+            'detected_dialect' => in_array($detectedDialect, ['egyptian', 'gulf', 'msa', 'mixed']) ? $detectedDialect : null,
+            'intent' => $intent,
+            'detected_language' => $detectedLanguage,
         ]);
 
         Log::info('ProcessAutoReply: AI reply saved', ['message_id' => $replyMessage->id]);
@@ -827,6 +832,36 @@ class ProcessAutoReply implements ShouldQueue
             // Notify about the send failure
             $this->notifyAIFailure($channel->user, $conversation, 'Message send failure');
         }
+    }
+
+    /**
+     * Normalize an AI confidence value to the app's canonical 0–1 scale.
+     *
+     * The AI JSON contract uses 0–1, but some providers/models occasionally
+     * return 0–100 or a string. Normalizing here (and defensively again when
+     * aggregating) prevents a stray out-of-range value from corrupting the
+     * training-dashboard average. NULL stays NULL.
+     */
+    private static function normalizeConfidenceScore($value): ?float
+    {
+        if ($value === null) {
+            return null;
+        }
+        if (!is_numeric($value)) {
+            return null;
+        }
+
+        $v = (float) $value;
+        if (!is_finite($v)) {
+            return null;
+        }
+
+        // Provider returned 0–100 (e.g. 85.5).
+        if ($v > 1 && $v <= 100) {
+            $v = $v / 100;
+        }
+
+        return max(0.0, min(1.0, $v));
     }
 
     /**

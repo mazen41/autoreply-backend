@@ -212,28 +212,6 @@ class ProcessAutoReply implements ShouldQueue
             ])
             ->toArray();
 
-        // Detect if handoff is needed
-        $handoffDetection = AICapabilitiesService::detectHandoff($message->content, $contextMessages);
-        if ($handoffDetection['should_escalate']) {
-            Log::info('ProcessAutoReply: Conversation escalated to human', [
-                'conversation_id' => $conversation->id,
-                'reasons' => $handoffDetection['reasons'],
-                'confidence' => $handoffDetection['confidence']
-            ]);
-
-            // Flag conversation for human review
-            $conversation->update([
-                'requires_human' => true,
-                'escalated_at' => now(),
-                'escalation_reason' => implode(', ', $handoffDetection['reasons']),
-                'escalation_notified' => false
-            ]);
-
-            // Notify business owner about escalation
-            // This would trigger a notification system
-            return;
-        }
-
         // Check business hours routing — guard against null business
         $businessHoursCheck = $channel->business
             ? AICapabilitiesService::checkBusinessHours($channel->business)
@@ -673,22 +651,19 @@ class ProcessAutoReply implements ShouldQueue
 
         // Step 5: Intelligent Escalation Decision
         //
-        // Priority order:
-        //   1. AI explicitly flagged needs_escalation=true with a clear reason
-        //      (customer_requested_human, complaint, sensitive_issue, business_rule)
-        //   2. AI confidence is below threshold AND information_missing
-        //   3. Otherwise: AUTO_REPLY (even for questions with low confidence if
-        //      a reply was generated — let the AI reply rather than escalating)
+        // ONLY escalate for:
+        //   1. Customer explicitly requested human (customer_requested_human)
+        //   2. Customer is making a serious complaint/problem (complaint, sensitive_issue)
+        //   3. Business rule requires escalation (business_rule)
         //
-        // We do NOT escalate simply because intent=="question" or confidence is
-        // moderate. The business profile and knowledge base are now in context;
-        // if the AI generated a reply it has something useful to say.
+        // DO NOT escalate for:
+        //   - general questions (even if AI doesn't know the answer)
+        //   - information_missing (AI should just say it doesn't know and ask if user wants human)
+        //   - low_confidence (AI should still reply, just be honest about uncertainty)
 
-        $confidenceThreshold = $channel->business?->ai_confidence_threshold ?? 70;
-        $aiConfidence        = $aiResult['confidence'] * 100;
         $escalationReason    = $aiResult['escalation_reason'] ?? 'none';
-        $intent              = $aiResult['intent']           ?? 'question';
         $needsEscalation     = $aiResult['needs_escalation'] ?? false;
+        $intent              = $aiResult['intent'] ?? 'unknown';
 
         // Reasons that should ALWAYS trigger escalation
         $hardEscalationReasons = [
@@ -706,31 +681,17 @@ class ProcessAutoReply implements ShouldQueue
             // Hard escalation: AI has a concrete reason to hand off
             $shouldEscalate = true;
             $decisionReason = "ai_hard_escalation: {$escalationReason}";
-        } elseif ($needsEscalation && $escalationReason === 'information_missing' && $aiConfidence < $confidenceThreshold) {
-            // Information is genuinely missing AND confidence is low → escalate
-            $shouldEscalate = true;
-            $decisionReason = "information_missing_low_confidence: {$aiConfidence}% < {$confidenceThreshold}%";
-        } elseif ($needsEscalation && $escalationReason === 'low_confidence' && $aiConfidence < ($confidenceThreshold - 20)) {
-            // Very low confidence (well below threshold) → escalate
-            $shouldEscalate = true;
-            $decisionReason = "very_low_confidence: {$aiConfidence}%";
-        } elseif (!$needsEscalation) {
-            // AI says no escalation needed → auto-reply regardless of confidence
-            $shouldEscalate = false;
-            $decisionReason = 'ai_no_escalation_needed';
         } else {
-            // AI flagged needs_escalation but reason is 'none' or 'low_confidence'
-            // while confidence is still above threshold → trust the AI reply
+            // Never escalate for other reasons - trust the AI's reply
             $shouldEscalate = false;
-            $decisionReason = 'ai_escalation_overridden_sufficient_confidence';
+            $decisionReason = 'auto_reply_trust_ai_response';
         }
 
         // Log full AI decision for diagnostics
         Log::info('ProcessAutoReply: AI decision', [
             'conversation_id'  => $conversation->id,
             'intent'           => $intent,
-            'confidence'       => round($aiConfidence, 1),
-            'threshold'        => $confidenceThreshold,
+            'confidence'       => round(($aiResult['confidence'] ?? 0) * 100, 1),
             'needs_escalation' => $needsEscalation,
             'escalation_reason' => $escalationReason,
         ]);
@@ -745,7 +706,7 @@ class ProcessAutoReply implements ShouldQueue
             $conversation->update([
                 'requires_human'   => true,
                 'escalated_at'     => now(),
-                'escalation_reason' => "{$decisionReason} (intent={$intent}, confidence={$aiConfidence}%)",
+                'escalation_reason' => "{$decisionReason} (intent={$intent})",
             ]);
 
             $escalationMessage = "Sure 👍 I'm connecting you with a team member now. Please wait a moment.";
@@ -761,6 +722,14 @@ class ProcessAutoReply implements ShouldQueue
 
             if ($channel->user_id) {
                 broadcast(new \App\Events\MessageReceived($replyMessage, $conversation, $channel->user_id));
+
+                // Send email notification about escalation
+                $notificationService = new \App\Services\NotificationService();
+                $notificationService->escalation(
+                    $channel->user_id,
+                    $decisionReason,
+                    $conversation->id
+                );
             }
             $this->sendReply($channel, $conversation, $replyMessage);
             return;

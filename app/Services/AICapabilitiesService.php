@@ -118,7 +118,7 @@ ROLE;
         $p .= "• First check the Business Profile Information above for answers about what the business does, its services, etc.\n";
         $p .= "• Then check the Uploaded Knowledge Base for detailed information from documents.\n";
         $p .= "• If partially answered → combine information from both sources + reasoning, then offer to follow up.\n";
-        $p .= "• If not found in either source → reply: \"I couldn't find the exact information. Let me forward this to our team and they'll get back to you shortly 😊\" → needs_escalation = true\n\n";
+        $p .= "• If not found in either source → reply honestly: \"I don't have information about that. Would you like me to connect you with a human agent who can help?\" → needs_escalation = false (let customer decide)\n\n";
 
         // ── ORDER STATUS ──────────────────────────────────────────────────────
         $p .= "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n";
@@ -209,12 +209,16 @@ ROLE;
         $p .= "Escalate ONLY when:\n";
         $p .= "• Customer explicitly asks for a human / agent / موظف / شخص / خدمة عملاء\n";
         $p .= "• Customer is clearly angry, abusive, or deeply dissatisfied\n";
-        $p .= "• A technical/system failure has occurred\n";
-        $p .= "• The issue genuinely cannot be resolved with the data available from BOTH business profile AND uploaded knowledge\n\n";
+        $p .= "• Customer is making a serious problem/complaint that requires human intervention\n\n";
         $p .= "DO NOT escalate for:\n";
+        $p .= "• Questions about features you don't know about (e.g., \"will you add TikTok?\")\n";
         $p .= "• Order status questions — you handle those with the data provided\n";
         $p .= "• Product browsing or placing orders — you handle those with the data provided\n";
-        $p .= "• Any question that has an answer in EITHER the business profile OR the uploaded knowledge\n\n";
+        $p .= "• Any question where you simply don't have information\n\n";
+        $p .= "When you don't have information:\n";
+        $p .= "• Reply honestly: \"I don't have information about that. Let me know if you'd like me to connect you with a human agent who can help.\"\n";
+        $p .= "• Do NOT automatically escalate. Let the customer decide.\n";
+        $p .= "• If customer says yes to human connection → needs_escalation = true, escalation_reason = customer_requested_human\n\n";
         $p .= "Escalation reply: \"Sure 👍 I'm connecting you with a team member now. Please wait a moment.\"\n";
         $p .= "intent = escalation, needs_escalation = true\n\n";
 
@@ -237,7 +241,7 @@ ROLE;
   "intent": "greeting | question | order_status | place_order | escalation",
   "needs_escalation": true or false,
   "confidence": 0.0 to 1.0,
-  "escalation_reason": "customer_requested_human | information_missing | complaint | sensitive_issue | business_rule | low_confidence | none"
+  "escalation_reason": "customer_requested_human | complaint | sensitive_issue | business_rule | none"
 }
 
 Rules:
@@ -245,11 +249,9 @@ Rules:
 • "confidence" must reflect how certain you are (1.0 = fully covered by data, 0.5 = partial, 0.3 = guessing).
 • "escalation_reason" must explain why escalation is recommended:
     - "customer_requested_human": Customer explicitly asked for human agent
-    - "information_missing": Answer not found in business profile or uploaded knowledge
     - "complaint": Customer expressing dissatisfaction or complaint
     - "sensitive_issue": Issue requires human sensitivity (legal, medical, etc.)
     - "business_rule": Escalation required by configured business rules
-    - "low_confidence": AI confidence below threshold despite available information
     - "none": No escalation needed
 • Output ONLY the JSON object. No preamble, no explanation, no markdown fences.
 JSON;
@@ -834,19 +836,12 @@ JSON;
 
     public static function detectHandoff(string $message, array $conversationHistory): array
     {
-        $hardEscalation = self::checkHardEscalation($message);
-
-        if ($hardEscalation['force_escalation']) {
-            return [
-                'should_escalate' => true,
-                'confidence' => 100,
-                'reasons' => [$hardEscalation['reason']]
-            ];
-        }
-
+        // This function is no longer used for escalation decisions
+        // Escalation is now handled entirely by the AI response in ProcessAutoReply
+        // Keeping this for backwards compatibility but it will never escalate
         return [
             'should_escalate' => false,
-            'confidence' => 30,
+            'confidence' => 0,
             'reasons' => []
         ];
     }

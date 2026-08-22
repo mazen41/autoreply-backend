@@ -4,6 +4,7 @@ namespace App\Services;
 
 use App\Models\Notification;
 use Illuminate\Support\Facades\Log;
+use Illuminate\Support\Facades\Mail;
 
 class NotificationService
 {
@@ -143,6 +144,63 @@ class NotificationService
             ['conversation_id' => $conversationId, 'reason' => $reason],
             "/dashboard/inbox?conversation={$conversationId}"
         );
+
+        // Send email notification
+        $this->sendEscalationEmail($userId, $reason, $conversationId);
+    }
+
+    /**
+     * Send escalation email notification
+     */
+    private function sendEscalationEmail(int $userId, string $reason, int $conversationId): void
+    {
+        try {
+            $user = \App\Models\User::find($userId);
+            if (!$user || !$user->email) {
+                Log::warning('Cannot send escalation email: user or email not found', ['user_id' => $userId]);
+                return;
+            }
+
+            $conversation = \App\Models\Conversation::find($conversationId);
+            $senderName = $conversation?->sender_name ?? 'Unknown';
+            $lastMessage = $conversation?->latestMessage?->content ?? 'No message content';
+
+            Mail::raw(
+                $this->buildEscalationEmailBody($reason, $conversationId, $senderName, $lastMessage),
+                function ($message) use ($user, $conversationId) {
+                    $message->to($user->email)
+                        ->subject('Conversation Escalated - Action Required')
+                        ->from(config('mail.from.address'), config('mail.from.name'));
+                }
+            );
+
+            Log::info('Escalation email sent', [
+                'user_id' => $userId,
+                'email' => $user->email,
+                'conversation_id' => $conversationId,
+            ]);
+        } catch (\Exception $e) {
+            Log::error('Failed to send escalation email', [
+                'user_id' => $userId,
+                'error' => $e->getMessage(),
+            ]);
+        }
+    }
+
+    /**
+     * Build escalation email body
+     */
+    private function buildEscalationEmailBody(string $reason, int $conversationId, string $senderName, string $lastMessage): string
+    {
+        $inboxUrl = config('app.url') . "/dashboard/inbox?conversation={$conversationId}";
+
+        return "A conversation has been escalated and requires your attention.\n\n" .
+               "Conversation ID: {$conversationId}\n" .
+               "Customer: {$senderName}\n" .
+               "Reason: {$reason}\n" .
+               "Last Message: {$lastMessage}\n\n" .
+               "Please review and respond at: {$inboxUrl}\n\n" .
+               "This is an automated notification from your AI customer service system.";
     }
 
     /**

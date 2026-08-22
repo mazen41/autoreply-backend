@@ -111,6 +111,7 @@ Route::post('/salla/webhook', [SallaWebhookController::class, 'handle']);
 // Email campaign open-tracking pixel — public, hit by recipients' mail clients
 Route::get('/email-campaigns/track/open/{recipientId}', [EmailCampaignController::class, 'trackOpen']);
 Route::get('/email-campaigns/track/click/{recipientId}', [EmailCampaignController::class, 'trackClick']);
+Route::get('/messages/{messageId}/media', [InboxController::class, 'media']);
 
 // â”€â”€ Protected routes â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 Route::middleware('auth:sanctum')->group(function () {
@@ -172,6 +173,7 @@ Route::middleware('auth:sanctum')->group(function () {
     Route::post('/inbox/{conversationId}/reply',        [InboxController::class, 'reply']);
     Route::post('/inbox/{conversationId}/media',        [InboxController::class, 'mediaReply']);
     Route::patch('/inbox/{conversationId}/toggle-ai',   [InboxController::class, 'toggleAi']);
+    Route::patch('/inbox/{conversationId}/status',      [InboxController::class, 'updateStatus']);
     Route::post('/messages/{messageId}/react',          [InboxController::class, 'reactToMessage']);
     
     // Tag management

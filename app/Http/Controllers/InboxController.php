@@ -11,6 +11,7 @@ use Illuminate\Support\Facades\Http;
 use Illuminate\Support\Facades\Log;
 use Illuminate\Support\Facades\Storage;
 use Illuminate\Support\Str;
+use Laravel\Sanctum\PersonalAccessToken;
 use Google\Client as GoogleClient;
 use Google\Service\Gmail;
 
@@ -263,6 +264,56 @@ class InboxController extends Controller
             Log::error('WhatsApp media reply failed', ['error' => $e->getMessage(), 'channel_id' => $channel->id]);
             return response()->json(['error' => 'Failed to send WhatsApp media: ' . $e->getMessage()], 500);
         }
+    }
+
+    /**
+     * Stream an attachment for preview or download after verifying ownership.
+     */
+    public function media(Request $request, $messageId)
+    {
+        $user = auth('sanctum')->user();
+
+        if (!$user && $request->query('token')) {
+            $accessToken = PersonalAccessToken::findToken((string) $request->query('token'));
+            $user = $accessToken?->tokenable;
+        }
+
+        if (!$user) {
+            return response()->json(['error' => 'Unauthenticated'], 401);
+        }
+
+        $message = Message::whereHas('conversation.channel', function ($q) use ($user) {
+                $q->where('user_id', $user->id);
+            })
+            ->findOrFail($messageId);
+
+        if (!$message->media_url) {
+            return response()->json(['error' => 'Attachment not found'], 404);
+        }
+
+        $disk = config('services.evolution.media_disk', 'public');
+        $path = $this->storagePathFromMediaUrl($message->media_url);
+
+        if (!$path || !Storage::disk($disk)->exists($path)) {
+            Log::warning('Message media missing from storage', [
+                'message_id' => $message->id,
+                'disk' => $disk,
+                'media_url' => $message->media_url,
+                'resolved_path' => $path,
+            ]);
+
+            return response()->json(['error' => 'File unavailable'], 404);
+        }
+
+        $filename = $message->file_name ?: basename($path);
+        $mimeType = $message->mime_type ?: Storage::disk($disk)->mimeType($path) ?: 'application/octet-stream';
+        $disposition = $request->query('disposition') === 'inline' ? 'inline' : 'attachment';
+
+        return Storage::disk($disk)->response($path, $filename, [
+            'Content-Type' => $mimeType,
+            'Content-Disposition' => $disposition . '; filename="' . addslashes($filename) . '"',
+            'X-Content-Type-Options' => 'nosniff',
+        ]);
     }
 
     /**
@@ -583,6 +634,45 @@ class InboxController extends Controller
         }
 
         return 'document';
+    }
+
+    private function storagePathFromMediaUrl(string $mediaUrl): ?string
+    {
+        if (!preg_match('#^https?://#i', $mediaUrl)) {
+            return ltrim($mediaUrl, '/');
+        }
+
+        $path = parse_url($mediaUrl, PHP_URL_PATH);
+        if (!$path) {
+            return null;
+        }
+
+        $storagePrefix = '/storage/';
+        $position = strpos($path, $storagePrefix);
+        if ($position !== false) {
+            return urldecode(substr($path, $position + strlen($storagePrefix)));
+        }
+
+        return ltrim(urldecode($path), '/');
+    }
+
+    public function updateStatus(Request $request, $conversationId)
+    {
+        $request->validate([
+            'status' => 'required|in:open,closed,pending',
+        ]);
+
+        $conversation = Conversation::whereHas('channel', function ($q) {
+                $q->where('user_id', auth()->id());
+            })
+            ->findOrFail($conversationId);
+
+        $conversation->update(['status' => $request->status]);
+
+        return response()->json([
+            'success' => true,
+            'conversation' => $conversation->fresh('channel:id,type,page_name', 'latestMessage'),
+        ]);
     }
 
     /**

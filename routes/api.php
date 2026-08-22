@@ -137,6 +137,8 @@ Route::middleware('auth:sanctum')->group(function () {
         Route::post('/instructions', [KnowledgeController::class, 'updateInstructions']);
         Route::post('/profile', [KnowledgeController::class, 'updateProfile']);
         Route::post('/test', [KnowledgeController::class, 'testResponse']);
+        Route::post('/reindex', [KnowledgeController::class, 'reindex']);
+        Route::post('/search', [KnowledgeController::class, 'search']);
     });
 
     // Channels â€” listing and disconnect

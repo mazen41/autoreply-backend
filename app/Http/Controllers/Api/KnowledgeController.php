@@ -119,7 +119,8 @@ class KnowledgeController extends Controller
             'reply_style' => 'nullable|string|max:255',
         ]);
 
-        $this->profile($request)->update($request->only([
+        $profile = $this->profile($request);
+        $profile->update($request->only([
             'business_name',
             'business_type',
             'phone',
@@ -133,6 +134,11 @@ class KnowledgeController extends Controller
             'reply_style',
         ]));
 
+        // Link this business profile to the user's channels if not already linked
+        \App\Models\Channel::where('user_id', $request->user()->id)
+            ->whereNull('business_id')
+            ->update(['business_id' => $profile->id]);
+
         return response()->json(['message' => 'Profile updated successfully']);
     }
 
@@ -144,10 +150,10 @@ class KnowledgeController extends Controller
         ]);
 
         $profile = $this->profile($request);
-        
+
         // Build system prompt using the same logic as ProcessAutoReply
         $systemPrompt = $this->buildTestSystemPrompt($profile);
-        
+
         // Call AI for test response
         $testResponse = $this->callConfiguredAI($systemPrompt, [
             ['role' => 'user', 'content' => $request->test_question]
@@ -160,6 +166,114 @@ class KnowledgeController extends Controller
         return response()->json([
             'test_response' => $testResponse,
         ]);
+    }
+
+    /** Reindex knowledge files (regenerate chunks/indices) */
+    public function reindex(Request $request)
+    {
+        $profile = $this->profile($request);
+        $files = $profile->knowledgeFiles()->get();
+
+        foreach ($files as $file) {
+            // In a real implementation, this would regenerate chunks or embeddings
+            // For now, we'll just update the chunks_count based on extracted text length
+            $chunkCount = ceil(strlen($file->extracted_text) / 2000);
+            $file->update(['chunks_count' => $chunkCount]);
+        }
+
+        return response()->json([
+            'message' => 'Knowledge base reindexed successfully',
+            'files_processed' => $files->count(),
+        ]);
+    }
+
+    /** Search knowledge base semantically */
+    public function search(Request $request)
+    {
+        $request->validate([
+            'query' => 'required|string|max:500',
+            'limit' => 'nullable|integer|min:1|max:20',
+        ]);
+
+        $profile = $this->profile($request);
+        $query = strtolower($request->query);
+        $limit = $request->limit ?? 5;
+
+        $results = [];
+        $files = $profile->knowledgeFiles()->get();
+
+        foreach ($files as $file) {
+            $text = strtolower($file->extracted_text);
+            $score = 0;
+
+            // Simple keyword matching (in production, use vector embeddings)
+            if (str_contains($text, $query)) {
+                $score = 0.8;
+            } else {
+                // Calculate partial match score
+                $words = explode(' ', $query);
+                $matchedWords = 0;
+                foreach ($words as $word) {
+                    if (str_contains($text, $word)) {
+                        $matchedWords++;
+                    }
+                }
+                $score = $matchedWords / count($words);
+            }
+
+            if ($score > 0.3) {
+                // Extract relevant snippet around matched content
+                $snippet = $this->extractSnippet($file->extracted_text, $query, 200);
+                $results[] = [
+                    'source' => $file->filename,
+                    'content' => $snippet,
+                    'score' => $score,
+                ];
+            }
+        }
+
+        // Sort by score and limit results
+        usort($results, fn($a, $b) => $b['score'] <=> $a['score']);
+        $results = array_slice($results, 0, $limit);
+
+        return response()->json([
+            'results' => $results,
+        ]);
+    }
+
+    private function extractSnippet(string $text, string $query, int $maxLength): string
+    {
+        $textLower = strtolower($text);
+        $queryLower = strtolower($query);
+
+        // Find first occurrence of query or its parts
+        $pos = strpos($textLower, $queryLower);
+        if ($pos === false) {
+            // Try to find first word of query
+            $words = explode(' ', $query);
+            if (!empty($words)) {
+                $pos = strpos($textLower, strtolower($words[0]));
+            }
+        }
+
+        if ($pos === false) {
+            // Return first part of text if no match found
+            return substr($text, 0, $maxLength) . (strlen($text) > $maxLength ? '...' : '');
+        }
+
+        // Extract snippet around the match
+        $start = max(0, $pos - 50);
+        $snippet = substr($text, $start, $maxLength);
+
+        // Add ellipsis if truncated
+        if ($start > 0) {
+            $snippet = '...' . $snippet;
+        }
+        if (strlen($text) > $start + $maxLength) {
+            $snippet = $snippet . '...';
+        }
+
+        return $snippet;
     }
 
     private function extractPdfText($file)

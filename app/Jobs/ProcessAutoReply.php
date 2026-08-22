@@ -601,6 +601,9 @@ class ProcessAutoReply implements ShouldQueue
             'language'       => $detectedLanguage,
             'business_profile' => $businessProfileContext,
             'knowledge_base' => (function() use ($business, $message) {
+                if (!$business) {
+                    return '';
+                }
                 $knowledgeText = '';
                 foreach ($business->knowledgeFiles()->get() as $file) {
                     $fullText = $file->extracted_text;

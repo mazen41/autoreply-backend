@@ -17,6 +17,14 @@ class PaymentIntent extends Model
         'status',
         'paymob_order_id',
         'paymob_transaction_id',
+        'myfatoorah_invoice_id',
+        'myfatoorah_payment_id',
+        'payment_gateway',
+        'gateway_response',
+    ];
+
+    protected $casts = [
+        'gateway_response' => 'array',
     ];
 
     public function user(): BelongsTo

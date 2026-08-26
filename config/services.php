@@ -60,6 +60,12 @@ return [
         'media_disk' => env('EVOLUTION_MEDIA_DISK', 'public'),
     ],
 
+    'myfatoorah' => [
+        'api_key'        => env('MYFATOORAH_API_KEY'),
+        'base_url'       => env('MYFATOORAH_BASE_URL', 'https://api.myfatoorah.com'),
+        'webhook_secret' => env('MYFATOORAH_WEBHOOK_SECRET'),
+    ],
+
     'paymob' => [
         'secret_key'     => env('PAYMOB_SECRET_KEY'),
         'public_key'     => env('PAYMOB_PUBLIC_KEY'),

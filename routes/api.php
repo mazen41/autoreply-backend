@@ -30,6 +30,8 @@ use App\Http\Controllers\Api\ProactiveController;
 use App\Http\Controllers\Api\ToolsController;
 use App\Http\Controllers\Api\SallaWebhookController;
 use App\Http\Controllers\Api\PusherAuthController;
+use App\Http\Controllers\Api\MyFatoorahController;
+use App\Http\Controllers\Api\MyFatoorahWebhookController;
 use App\Http\Controllers\WebhookController as MetaWebhookController;
 use App\Http\Controllers\ChannelController;
 use App\Http\Controllers\GmailController;
@@ -58,7 +60,7 @@ $rateLimitMiddleware = function ($request, $next) {
     return $next($request);
 };
 
-// â”€â”€ Public auth routes â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+// ── Public auth routes ────────────────────────────────────────────────────────
 Route::prefix('auth')->group(function () {
     Route::post('/register', [AuthController::class, 'register']);
     Route::post('/login',    [AuthController::class, 'login']);
@@ -83,11 +85,11 @@ Route::middleware('auth:sanctum')->prefix('broadcasting')->group(function () {
     Route::post('/auth', [PusherAuthController::class, 'authenticate']);
 });
 
-// â”€â”€ Meta Webhook â€” public, Meta calls these directly â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+// ── Meta Webhook – public, Meta calls these directly ─────────────────────────
 Route::get('/webhook/meta',  [MetaWebhookController::class, 'verify']);
 Route::post('/webhook/meta', [MetaWebhookController::class, 'handle']);
 
-// â”€â”€ Public OAuth channels callbacks â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+// ── Public OAuth channels callbacks ──────────────────────────────────────────
 Route::get('/channels/connect/facebook',  [ChannelController::class, 'connectFacebook']);
 Route::get('/channels/callback/facebook', [ChannelController::class, 'callbackFacebook']);
 Route::get('/channels/callback/gmail',    [GmailController::class, 'callback']);
@@ -108,12 +110,16 @@ Route::post('/shopify/webhook',            [ShopifyController::class, 'webhook']
 // Salla Webhook - public, Salla calls these directly
 Route::post('/salla/webhook', [SallaWebhookController::class, 'handle']);
 
+// ── MyFatoorah Webhook (public – MyFatoorah POSTs here) ──────────────────────
+Route::post('/webhooks/myfatoorah', [MyFatoorahWebhookController::class, 'handle'])
+    ->name('webhooks.myfatoorah');
+
 // Email campaign open-tracking pixel — public, hit by recipients' mail clients
 Route::get('/email-campaigns/track/open/{recipientId}', [EmailCampaignController::class, 'trackOpen']);
 Route::get('/email-campaigns/track/click/{recipientId}', [EmailCampaignController::class, 'trackClick']);
 Route::get('/messages/{messageId}/media', [InboxController::class, 'media']);
 
-// â”€â”€ Protected routes â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+// ── Protected routes ──────────────────────────────────────────────────────────
 Route::middleware('auth:sanctum')->group(function () {
     Route::post('/auth/logout', [AuthController::class, 'logout']);
     Route::get('/auth/user',    [AuthController::class, 'user']);
@@ -142,7 +148,7 @@ Route::middleware('auth:sanctum')->group(function () {
         Route::post('/search', [KnowledgeController::class, 'search']);
     });
 
-    // Channels â€” listing and disconnect
+    // Channels – listing and disconnect
     Route::get('/channels/connect/gmail',     [GmailController::class, 'connect']);
     Route::get('/channels/gmail/fetch',         [GmailController::class, 'fetchEmails']);
     Route::get('/channels',                   [ChannelController::class, 'index']);
@@ -213,7 +219,7 @@ Route::middleware('auth:sanctum')->group(function () {
     Route::post('/businesses/{businessId}/campaigns/{campaignId}/cancel-schedule', [CampaignController::class, 'cancelSchedule']);
     Route::get('/businesses/{businessId}/campaigns/{campaignId}/logs', [CampaignController::class, 'logs']);
 
-    // Email Campaigns (business resolved from authenticated user, matches frontend calls to /api/email-campaigns)
+    // Email Campaigns
     Route::get('/email-campaigns',              [EmailCampaignController::class, 'index']);
     Route::post('/email-campaigns',             [EmailCampaignController::class, 'store']);
     Route::put('/email-campaigns/{id}',         [EmailCampaignController::class, 'update']);
@@ -274,7 +280,7 @@ Route::middleware('auth:sanctum')->group(function () {
     Route::post('/onboarding/skip', [OnboardingController::class, 'skip']);
     Route::post('/onboarding/initialize', [OnboardingController::class, 'initialize']);
 
-    // Web Chat (public endpoints for widget)
+    // Web Chat
     Route::prefix('web-chat')->group(function () {
         Route::post('/sessions', [WebChatController::class, 'createSession']);
         Route::post('/messages', [WebChatController::class, 'sendMessage']);
@@ -342,6 +348,14 @@ Route::middleware('auth:sanctum')->group(function () {
 
     // Top-level dashboard stats
     Route::get('/stats', [ReportsController::class, 'dashboardStats']);
+
+    // ── MyFatoorah Payment (authenticated) ───────────────────────────────────
+    Route::post('/payment/myfatoorah/initiate', [MyFatoorahController::class, 'initiate'])
+        ->name('payment.myfatoorah.initiate');
+    Route::get('/payment/callback', [MyFatoorahController::class, 'callback'])
+        ->name('payment.callback');
+    Route::get('/payment/error', [MyFatoorahController::class, 'error'])
+        ->name('payment.error');
 });
 
 // Gmail Webhook - public, Google Pub/Sub calls this

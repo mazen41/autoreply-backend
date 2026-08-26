@@ -14,8 +14,8 @@ class MyFatoorahService
 
     public function __construct()
     {
-        $this->apiKey   = config('services.myfatoorah.api_key');
-        $this->baseUrl  = rtrim(config('services.myfatoorah.base_url', 'https://api.myfatoorah.com'), '/');
+        $this->apiKey  = config('services.myfatoorah.api_key');
+        $this->baseUrl = rtrim(config('services.myfatoorah.base_url', 'https://api.myfatoorah.com'), '/');
 
         $this->defaultHeaders = [
             'Authorization' => 'Bearer ' . $this->apiKey,
@@ -25,28 +25,28 @@ class MyFatoorahService
     }
 
     // ─── InitiatePayment ───────────────────────────────────────────────────────
-    /**
-     * Calls MyFatoorah's /v2/InitiatePayment endpoint to discover the
-     * available payment methods for a given invoice amount & currency.
-     *
-     * @param  float  $invoiceAmount  e.g. 99.00
-     * @param  string $currencyIso    e.g. "SAR"
-     * @return array  ['PaymentMethods' => [...], ...]
-     * @throws Exception
-     */
     public function initiatePayment(float $invoiceAmount, string $currencyIso = 'SAR'): array
     {
+        $payload = [
+            'InvoiceAmount' => $invoiceAmount,
+            'CurrencyIso'   => $currencyIso,
+        ];
+
+        Log::info('[MyFatoorah] InitiatePayment request', [
+            'url'     => "{$this->baseUrl}/v2/InitiatePayment",
+            'payload' => $payload,
+            'key_prefix' => substr($this->apiKey, 0, 10) . '...',
+        ]);
+
         $response = Http::withHeaders($this->defaultHeaders)
-            ->post("{$this->baseUrl}/v2/InitiatePayment", [
-                'InvoiceAmount' => $invoiceAmount,
-                'CurrencyIso'   => $currencyIso,
-            ]);
+            ->post("{$this->baseUrl}/v2/InitiatePayment", $payload);
+
+        Log::info('[MyFatoorah] InitiatePayment response', [
+            'status' => $response->status(),
+            'body'   => $response->body(),
+        ]);
 
         if ($response->failed()) {
-            Log::error('[MyFatoorah] InitiatePayment failed', [
-                'status' => $response->status(),
-                'body'   => $response->body(),
-            ]);
             throw new Exception('MyFatoorah InitiatePayment failed: ' . $response->body());
         }
 
@@ -60,41 +60,22 @@ class MyFatoorahService
     }
 
     // ─── ExecutePayment ────────────────────────────────────────────────────────
-    /**
-     * Calls /v2/ExecutePayment to create an invoice and get the redirect URL
-     * for the MyFatoorah hosted payment page.
-     *
-     * @param  array $payload  {
-     *   PaymentMethodId  int    (from InitiatePayment; 0 = let customer choose)
-     *   InvoiceValue     float
-     *   CustomerName     string
-     *   CustomerEmail    string
-     *   CustomerMobile   string (optional)
-     *   DisplayCurrencyIso string e.g. "SAR"
-     *   MobileCountryCode  string e.g. "+966"
-     *   Language         string "EN"|"AR"
-     *   CallBackUrl      string
-     *   ErrorUrl         string
-     *   UserDefinedField string (optional – your internal reference)
-     * }
-     * @return array  ['InvoiceId' => ..., 'IsDirectPayment' => ..., 'PaymentURL' => ...]
-     * @throws Exception
-     */
     public function executePayment(array $payload): array
     {
-        // Ensure redirect URLs always point to nazbiz.io
         $payload['CallBackUrl'] = $payload['CallBackUrl'] ?? 'https://nazbiz.io/payment/callback';
         $payload['ErrorUrl']    = $payload['ErrorUrl']    ?? 'https://nazbiz.io/payment/error';
+
+        Log::info('[MyFatoorah] ExecutePayment request', ['payload' => $payload]);
 
         $response = Http::withHeaders($this->defaultHeaders)
             ->post("{$this->baseUrl}/v2/ExecutePayment", $payload);
 
+        Log::info('[MyFatoorah] ExecutePayment response', [
+            'status' => $response->status(),
+            'body'   => $response->body(),
+        ]);
+
         if ($response->failed()) {
-            Log::error('[MyFatoorah] ExecutePayment failed', [
-                'status'  => $response->status(),
-                'body'    => $response->body(),
-                'payload' => $payload,
-            ]);
             throw new Exception('MyFatoorah ExecutePayment failed: ' . $response->body());
         }
 
@@ -108,14 +89,6 @@ class MyFatoorahService
     }
 
     // ─── GetPaymentStatus ──────────────────────────────────────────────────────
-    /**
-     * Calls /v2/GetPaymentStatus to verify a payment after redirect or webhook.
-     *
-     * @param  string $key       The PaymentId returned in the callback query string
-     * @param  string $keyType   "PaymentId" (default) | "InvoiceId" | "InvoiceValue"
-     * @return array  Full invoice/transaction data from MyFatoorah
-     * @throws Exception
-     */
     public function getPaymentStatus(string $key, string $keyType = 'PaymentId'): array
     {
         $response = Http::withHeaders($this->defaultHeaders)
@@ -126,10 +99,8 @@ class MyFatoorahService
 
         if ($response->failed()) {
             Log::error('[MyFatoorah] GetPaymentStatus failed', [
-                'status'  => $response->status(),
-                'body'    => $response->body(),
-                'key'     => $key,
-                'keyType' => $keyType,
+                'status' => $response->status(),
+                'body'   => $response->body(),
             ]);
             throw new Exception('MyFatoorah GetPaymentStatus failed: ' . $response->body());
         }
@@ -144,13 +115,6 @@ class MyFatoorahService
     }
 
     // ─── Webhook Signature Verification ───────────────────────────────────────
-    /**
-     * Verifies the HMAC-SHA256 signature sent in the MyFatoorah-Signature header.
-     *
-     * @param  string $rawBody    Raw request body (file_get_contents('php://input'))
-     * @param  string $signature  Value of MyFatoorah-Signature header
-     * @return bool
-     */
     public function verifyWebhookSignature(string $rawBody, string $signature): bool
     {
         $secret = config('services.myfatoorah.webhook_secret');
@@ -161,7 +125,6 @@ class MyFatoorahService
         }
 
         $expected = hash_hmac('sha256', $rawBody, $secret);
-
         return hash_equals($expected, $signature);
     }
 }

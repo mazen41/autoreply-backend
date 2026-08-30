@@ -19,10 +19,10 @@ class SallaWebhookTest extends TestCase
         $payload = json_encode(['event' => 'order.created', 'data' => []]);
         $invalidSignature = 'invalid_signature';
 
-        $response = $this->post('/api/salla/webhook', $payload, [
+        $response = $this->call('POST', '/api/salla/webhook', [], [], [], $this->transformHeadersToServerVars([
             'X-Salla-Signature' => $invalidSignature,
             'Content-Type' => 'application/json',
-        ]);
+        ]), $payload);
 
         $response->assertStatus(401);
         Queue::assertNotPushed(SallaWebhookJob::class);
@@ -34,14 +34,17 @@ class SallaWebhookTest extends TestCase
         
         // Set webhook secret for testing
         config(['services.salla.webhook_secret' => 'test_secret']);
+        putenv('SALLA_WEBHOOK_SECRET=test_secret');
+        $_ENV['SALLA_WEBHOOK_SECRET'] = 'test_secret';
+        $_SERVER['SALLA_WEBHOOK_SECRET'] = 'test_secret';
 
         $payload = json_encode(['event' => 'order.created', 'data' => ['id' => 123]]);
         $signature = hash_hmac('sha256', $payload, 'test_secret');
 
-        $response = $this->post('/api/salla/webhook', $payload, [
+        $response = $this->call('POST', '/api/salla/webhook', [], [], [], $this->transformHeadersToServerVars([
             'X-Salla-Signature' => $signature,
             'Content-Type' => 'application/json',
-        ]);
+        ]), $payload);
 
         $response->assertStatus(200);
         Queue::assertPushed(SallaWebhookJob::class);
@@ -51,6 +54,9 @@ class SallaWebhookTest extends TestCase
     {
         Queue::fake();
         config(['services.salla.webhook_secret' => 'test_secret']);
+        putenv('SALLA_WEBHOOK_SECRET=test_secret');
+        $_ENV['SALLA_WEBHOOK_SECRET'] = 'test_secret';
+        $_SERVER['SALLA_WEBHOOK_SECRET'] = 'test_secret';
 
         $events = [
             'order.created',
@@ -64,10 +70,10 @@ class SallaWebhookTest extends TestCase
             $payload = json_encode(['event' => $event, 'data' => ['id' => rand(1, 1000)]]);
             $signature = hash_hmac('sha256', $payload, 'test_secret');
 
-            $this->post('/api/salla/webhook', $payload, [
+            $this->call('POST', '/api/salla/webhook', [], [], [], $this->transformHeadersToServerVars([
                 'X-Salla-Signature' => $signature,
                 'Content-Type' => 'application/json',
-            ]);
+            ]), $payload);
 
             Queue::assertPushed(SallaWebhookJob::class);
         }
@@ -77,6 +83,9 @@ class SallaWebhookTest extends TestCase
     {
         Queue::fake();
         config(['services.salla.webhook_secret' => 'test_secret']);
+        putenv('SALLA_WEBHOOK_SECRET=test_secret');
+        $_ENV['SALLA_WEBHOOK_SECRET'] = 'test_secret';
+        $_SERVER['SALLA_WEBHOOK_SECRET'] = 'test_secret';
 
         $events = [
             'customer.created',
@@ -87,10 +96,10 @@ class SallaWebhookTest extends TestCase
             $payload = json_encode(['event' => $event, 'data' => ['id' => rand(1, 1000)]]);
             $signature = hash_hmac('sha256', $payload, 'test_secret');
 
-            $this->post('/api/salla/webhook', $payload, [
+            $this->call('POST', '/api/salla/webhook', [], [], [], $this->transformHeadersToServerVars([
                 'X-Salla-Signature' => $signature,
                 'Content-Type' => 'application/json',
-            ]);
+            ]), $payload);
 
             Queue::assertPushed(SallaWebhookJob::class);
         }

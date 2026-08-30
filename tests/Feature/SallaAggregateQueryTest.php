@@ -52,7 +52,11 @@ class SallaAggregateQueryTest extends TestCase
     {
         $this->makeFreePackage();
 
-        $user = User::factory()->create();
+        $user = User::forceCreate([
+            'name' => 'Test User',
+            'email' => 'test' . rand() . '@example.com',
+            'password' => bcrypt('password'),
+        ]);
 
         $business = BusinessProfile::create([
             'user_id' => $user->id,
@@ -69,6 +73,7 @@ class SallaAggregateQueryTest extends TestCase
             'type' => 'whatsapp',
             'page_id' => 'instance-1',
             'status' => 'connected',
+            'access_token' => 'test_token_' . \Illuminate\Support\Str::random(10),
             'ai_enabled' => true,
         ]);
 

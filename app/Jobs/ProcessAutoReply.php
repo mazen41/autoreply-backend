@@ -1010,6 +1010,40 @@ class ProcessAutoReply implements ShouldQueue
         // Step 6: Send AI Response
         $aiResponse = $aiResult['reply'];
 
+        // ── IMAGE SEND VERIFICATION (fixes: bot claiming "here are the photos"
+        // while sending zero actual media) ────────────────────────────────────
+        // The AI decides needs_images and writes "here are the photos" language
+        // into $aiResponse BEFORE any image has actually been sent. We now
+        // attempt the real sends first and only let that claim reach the
+        // customer if at least one image genuinely went through.
+        $images = [];
+        if (!empty($aiResult['needs_images']) && !empty($productsAggregateContext['items'])) {
+            $images = array_values(array_filter(array_column($productsAggregateContext['items'], 'image_url')));
+            // Cap at 5 images to avoid spam
+            $images = array_slice($images, 0, 5);
+        }
+
+        $imagesActuallySent = 0;
+        if (!empty($images)) {
+            $imagesActuallySent = $this->sendImagesToCustomer($channel, $conversation->sender_id, $images);
+            Log::info('ProcessAutoReply: image send attempt result', [
+                'conversation_id' => $conversation->id,
+                'attempted'       => count($images),
+                'sent'            => $imagesActuallySent,
+            ]);
+        }
+
+        if (!empty($aiResult['needs_images']) && $imagesActuallySent === 0) {
+            Log::warning('ProcessAutoReply: AI intended to claim images were sent but zero actually sent -- overriding reply text to stay honest', [
+                'conversation_id'  => $conversation->id,
+                'candidate_images' => count($images),
+                'original_reply'   => substr($aiResponse, 0, 200),
+            ]);
+            $aiResponse = $detectedLanguage === 'arabic'
+                ? "عذرًا، لا أستطيع إرسال صور المنتج الآن. سأقوم بتوصيلك بأحد أفراد الفريق ليرسلها لك مباشرة 🙏"
+                : "I'm sorry, I'm not able to send product photos right now. Let me connect you with a team member who can send them directly 🙏";
+        }
+
         // Auto-tag conversation based on AI-detected intent
         if ($aiResult['intent'] !== 'unknown') {
             \App\Models\ConversationTag::firstOrCreate(
@@ -1048,16 +1082,9 @@ class ProcessAutoReply implements ShouldQueue
             broadcast(new \App\Events\MessageReceived($replyMessage, $message->conversation, $channel->user_id));
         }
 
-        // Collect images if requested
-        $images = [];
-        if (!empty($aiResult['needs_images']) && !empty($productsAggregateContext['items'])) {
-            $images = array_values(array_filter(array_column($productsAggregateContext['items'], 'image_url')));
-            // Cap at 5 images to avoid spam
-            $images = array_slice($images, 0, 5);
-        }
-
-        // Send reply through platform (with images if any)
-        $sendSuccess = $this->sendReply($channel, $message->conversation, $replyMessage, $images);
+        // Images (if any) were already sent above, before the text was composed,
+        // so sendReply now only needs to deliver the (possibly overridden) text.
+        $sendSuccess = $this->sendReply($channel, $message->conversation, $replyMessage);
         
         // If send failed, provide fallback response to user
         if (!$sendSuccess) {
@@ -1149,6 +1176,73 @@ class ProcessAutoReply implements ShouldQueue
     }
 
     
+    /**
+     * Sends product images directly to the customer via the channel's native
+     * media API, BEFORE the text reply is composed. Returns how many of the
+     * given URLs were actually confirmed sent. Each image is attempted
+     * independently (try/catch per item) so one bad URL doesn't block the rest.
+     *
+     * This return value is what gates whether the AI's "here are the photos"
+     * language is allowed to reach the customer -- see handle().
+     */
+    private function sendImagesToCustomer(Channel $channel, string $recipientId, array $imageUrls): int
+    {
+        $sentCount = 0;
+
+        foreach ($imageUrls as $imageUrl) {
+            if (empty($imageUrl)) {
+                continue;
+            }
+
+            try {
+                if ($channel->type === 'whatsapp') {
+                    $whatsappService = new EvolutionApiService();
+                    // EvolutionApiService::makeRequest() throws on any non-2xx
+                    // response after retries -- reaching the line below without
+                    // an exception means Evolution accepted the send.
+                    $whatsappService->sendMediaMessage($channel->page_id, $recipientId, $imageUrl, '', 'image');
+                    $sentCount++;
+                } elseif (in_array($channel->type, ['facebook', 'instagram'], true)) {
+                    $accessToken = $channel->access_token;
+                    $response = Http::timeout(10)->post(
+                        "https://graph.facebook.com/v19.0/me/messages?access_token={$accessToken}",
+                        [
+                            'recipient' => ['id' => $recipientId],
+                            'message' => [
+                                'attachment' => [
+                                    'type' => 'image',
+                                    'payload' => ['url' => $imageUrl, 'is_reusable' => true],
+                                ],
+                            ],
+                        ]
+                    );
+                    if ($response->successful()) {
+                        $sentCount++;
+                    } else {
+                        Log::error('ProcessAutoReply: image send failed (Facebook/Instagram)', [
+                            'channel_type' => $channel->type,
+                            'image_url'    => $imageUrl,
+                            'status'       => $response->status(),
+                            'body'         => $response->body(),
+                        ]);
+                    }
+                } else {
+                    Log::info('ProcessAutoReply: image sending not supported for this channel type', [
+                        'channel_type' => $channel->type,
+                    ]);
+                }
+            } catch (\Exception $e) {
+                Log::error('ProcessAutoReply: image send exception', [
+                    'channel_type' => $channel->type,
+                    'image_url'    => $imageUrl,
+                    'error'        => $e->getMessage(),
+                ]);
+            }
+        }
+
+        return $sentCount;
+    }
+
     private function sendReply(Channel $channel, Conversation $conversation, Message $replyMessage, array $images = []): bool
     {
         $senderId = $conversation->sender_id;

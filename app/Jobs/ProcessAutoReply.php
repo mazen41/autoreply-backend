@@ -79,7 +79,23 @@ class ProcessAutoReply implements ShouldQueue
             return;
         }
 
-        // Check business hours and send away message if closed
+        // Resolve business profile — Conversation has no direct business_id FK,
+        // so we load it exclusively from the channel. If it's null the channel
+        // was never linked to a business profile (data-integrity gap) — bail
+        // gracefully without retrying (retrying won't fix a missing FK).
+        $business = $channel->business;
+        if (!$business) {
+            Log::error('ProcessAutoReply: channel has no linked business profile — aborting (no retry)', [
+                'message_id'      => $this->messageId,
+                'channel_id'      => $channel->id,
+                'channel_type'    => $channel->type,
+                'conversation_id' => $conversation->id,
+            ]);
+            $this->fail(new \RuntimeException("Channel {$channel->id} has no business profile — permanent failure"));
+            return;
+        }
+
+        // Legacy alias kept for downstream code that still uses $conversation->business
         $business = $conversation->business ?? $channel->business;
         if ($business) {
             $businessHoursService = new BusinessHoursService();
@@ -287,6 +303,41 @@ class ProcessAutoReply implements ShouldQueue
             if (str_contains($msgLower, $kw)) { $isPlaceOrder = true; break; }
         }
 
+        // Bug 6 fix: detect bare order-number follow-up replies like "#276817444" or "276817444".
+        // If the customer's message is *just* an order number (digits, possibly prefixed with #),
+        // AND a recent AI message asked for the order number, treat this as an order-status request.
+        if (!$isOrderStatus) {
+            $trimmedMsg = trim($message->content);
+            if (preg_match('/^#?(\d{5,12})$/', $trimmedMsg, $bareMatch)) {
+                // Looks like a standalone order number. Check if last AI reply asked for it.
+                $recentAiMsg = Message::where('conversation_id', $conversation->id)
+                    ->where('is_ai', true)
+                    ->where('direction', 'outbound')
+                    ->orderBy('created_at', 'desc')
+                    ->value('content');
+
+                $orderRequestPhrases = ['order number', 'رقم الطلب', 'رقم طلبك', 'order no', 'your order'];
+                $aiAskedForOrderNumber = false;
+                if ($recentAiMsg) {
+                    $recentAiLower = mb_strtolower($recentAiMsg);
+                    foreach ($orderRequestPhrases as $phrase) {
+                        if (str_contains($recentAiLower, $phrase)) {
+                            $aiAskedForOrderNumber = true;
+                            break;
+                        }
+                    }
+                }
+
+                if ($aiAskedForOrderNumber) {
+                    $isOrderStatus = true;
+                    Log::info('ProcessAutoReply: detected bare order number follow-up', [
+                        'conversation_id' => $conversation->id,
+                        'order_number'    => $bareMatch[1],
+                    ]);
+                }
+            }
+        }
+
         // Find Salla channel for this user
         $sallaChannel = Channel::where('user_id', $user->id)
             ->where('type', 'salla')
@@ -299,17 +350,36 @@ class ProcessAutoReply implements ShouldQueue
             if ($isOrderStatus) {
                 $rawPhone = preg_replace('/[^0-9]/', '', $conversation->sender_id ?? '');
 
-                // WhatsApp: auto-lookup by sender phone
+                // WhatsApp: try direct order-number lookup first (if message is a bare order number),
+                // then fall back to phone-based lookup.
                 if ($channel->type === 'whatsapp' && $rawPhone) {
                     try {
                         $sallaService = new SallaService();
-                        $order = $sallaService->getLatestOrderByPhone($sallaChannel->access_token, $rawPhone);
-                        if ($order) {
-                            $sallaContext = $sallaService->formatOrderForAI($order);
-                            Log::info('ProcessAutoReply: Salla order found for WhatsApp sender', [
-                                'phone'    => $rawPhone,
-                                'order_id' => $order['id'] ?? null,
-                            ]);
+
+                        // If message is a bare order number, look up directly
+                        $trimmedMsg = trim($message->content);
+                        if (preg_match('/^#?(\d{5,12})$/', $trimmedMsg, $bareOrderMatch)) {
+                            $raw   = $sallaService->getOrderForChannel($sallaChannel, $bareOrderMatch[1]);
+                            $order = $raw['data'] ?? $raw ?? null;
+                            if ($order) {
+                                $sallaContext = $sallaService->formatOrderForAI($order);
+                                Log::info('ProcessAutoReply: Salla order found by order number (WhatsApp follow-up)', [
+                                    'order_number' => $bareOrderMatch[1],
+                                    'order_id'     => $order['id'] ?? null,
+                                ]);
+                            }
+                        }
+
+                        // Fall back to phone lookup if order-number lookup didn't yield results
+                        if (!$sallaContext) {
+                            $order = $sallaService->getLatestOrderByPhoneForChannel($sallaChannel, $rawPhone);
+                            if ($order) {
+                                $sallaContext = $sallaService->formatOrderForAI($order);
+                                Log::info('ProcessAutoReply: Salla order found for WhatsApp sender', [
+                                    'phone'    => $rawPhone,
+                                    'order_id' => $order['id'] ?? null,
+                                ]);
+                            }
                         }
                         // If no order found, sallaContext stays null → AI will ask for order number
                     } catch (\Exception $e) {

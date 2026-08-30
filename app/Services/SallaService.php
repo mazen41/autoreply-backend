@@ -138,6 +138,7 @@ class SallaService
 
     /**
      * Make an authenticated REST call to the Salla Admin API v2.
+     * Token-agnostic version (raw access token string, no refresh logic).
      */
     protected function apiCall(string $method, string $endpoint, array $data = [], string $accessToken = ''): array
     {
@@ -167,6 +168,62 @@ class SallaService
         }
 
         return $response->json();
+    }
+
+    /**
+     * Bug 4 fix: Channel-aware API call that automatically refreshes token on 401.
+     * On successful refresh, updates the Channel model with new tokens.
+     * If refresh also fails, marks channel status = 'token_expired' so the dashboard shows it.
+     */
+    protected function apiCallForChannel(Channel $channel, string $method, string $endpoint, array $data = []): array
+    {
+        $accessToken = $channel->access_token;
+        $url         = $this->apiBaseUrl . $endpoint;
+
+        try {
+            return $this->apiCall($method, $endpoint, $data, $accessToken);
+        } catch (\Exception $e) {
+            // If token expired, try to refresh once
+            if (str_contains($e->getMessage(), 'Access token expired') || str_contains($e->getMessage(), '401')) {
+                $refreshToken = $channel->refresh_token;
+
+                if (!$refreshToken) {
+                    Log::error('Salla: token expired but no refresh_token stored — marking channel as token_expired', [
+                        'channel_id' => $channel->id,
+                    ]);
+                    $channel->update(['status' => 'token_expired']);
+                    throw new \Exception("Salla token expired and no refresh token available for channel {$channel->id}");
+                }
+
+                try {
+                    Log::info('Salla: attempting token refresh', ['channel_id' => $channel->id]);
+                    $newTokens = $this->refreshAccessToken($refreshToken);
+
+                    // Update the channel with new tokens
+                    $channel->access_token  = $newTokens['access_token'];
+                    $channel->refresh_token = $newTokens['refresh_token'] ?? $refreshToken;
+                    if (!empty($newTokens['expires_in'])) {
+                        $channel->token_expires_at = now()->addSeconds($newTokens['expires_in']);
+                    }
+                    $channel->save();
+
+                    Log::info('Salla: token refreshed successfully', ['channel_id' => $channel->id]);
+
+                    // Retry the original request once with the new token
+                    return $this->apiCall($method, $endpoint, $data, $channel->access_token);
+
+                } catch (\Exception $refreshEx) {
+                    Log::error('Salla: token refresh failed — marking channel as token_expired', [
+                        'channel_id' => $channel->id,
+                        'error'      => $refreshEx->getMessage(),
+                    ]);
+                    $channel->update(['status' => 'token_expired']);
+                    throw new \Exception("Salla token refresh failed for channel {$channel->id}: " . $refreshEx->getMessage());
+                }
+            }
+
+            throw $e;
+        }
     }
 
     /**
@@ -275,6 +332,9 @@ class SallaService
 
         $acceptedVariants = array_unique([$cleanPhone, $local, $saudi966, $intl, $last9]);
 
+        // Bug 5 fix: known Salla sandbox/placeholder phones — ignore them
+        $placeholderPhones = ['555555555', '0555555555', '966555555555'];
+
         $customer = null;
 
         // Try each variant until we find a customer whose stored phone actually matches
@@ -283,8 +343,17 @@ class SallaService
             $candidates = $result['data'] ?? [];
 
             foreach ($candidates as $candidate) {
-                $storedRaw = preg_replace('/[^0-9]/', '', $candidate['mobile'] ?? '');
+                $storedRaw   = preg_replace('/[^0-9]/', '', $candidate['mobile'] ?? '');
                 $storedLast9 = substr($storedRaw, -9);
+
+                // Bug 5 fix: skip known placeholder/test records
+                if (in_array($storedRaw, $placeholderPhones) || in_array($storedLast9, ['555555555'])) {
+                    Log::info('Salla: skipping placeholder/test phone customer', [
+                        'returned_phone' => $candidate['mobile'] ?? 'N/A',
+                        'customer_id'    => $candidate['id'] ?? 'N/A',
+                    ]);
+                    continue;
+                }
 
                 if ($storedLast9 === $last9) {
                     $customer = $candidate;
@@ -296,10 +365,14 @@ class SallaService
                     break 2; // found a verified match — stop searching
                 }
 
+                // Bug 5 fix: log the full raw record so mismatches are debuggable
                 Log::warning('Salla: customer phone mismatch — skipping', [
-                    'searched'       => $searchPhone,
-                    'returned_phone' => $candidate['mobile'] ?? 'N/A',
-                    'customer_id'    => $candidate['id'] ?? 'N/A',
+                    'searched'        => $searchPhone,
+                    'returned_phone'  => $candidate['mobile'] ?? 'N/A',
+                    'returned_last9'  => $storedLast9,
+                    'expected_last9'  => $last9,
+                    'customer_id'     => $candidate['id'] ?? 'N/A',
+                    'customer_record' => json_encode(array_intersect_key($candidate, array_flip(['id', 'mobile', 'first_name', 'last_name', 'email']))),
                 ]);
             }
         }
@@ -331,6 +404,68 @@ class SallaService
         }
 
         return $order;
+    }
+
+    /**
+     * Bug 4+6: Channel-aware version of getLatestOrderByPhone — uses auto-refresh.
+     */
+    public function getLatestOrderByPhoneForChannel(Channel $channel, string $phone): ?array
+    {
+        // We need to use the channel's token for the customers API call.
+        // Temporarily override apiCall to use channel-aware version.
+        // Strategy: make direct HTTP calls using the channel's refreshable token.
+        $cleanPhone = preg_replace('/[^0-9]/', '', $phone);
+        $last9      = substr($cleanPhone, -9);
+        $local      = '0' . $last9;
+
+        $placeholderPhones = ['555555555', '0555555555', '966555555555'];
+        $customer = null;
+
+        foreach ([$cleanPhone, $local] as $searchPhone) {
+            $result    = $this->apiCallForChannel($channel, 'GET', '/customers', ['mobile' => $searchPhone]);
+            $candidates = $result['data'] ?? [];
+
+            foreach ($candidates as $candidate) {
+                $storedRaw   = preg_replace('/[^0-9]/', '', $candidate['mobile'] ?? '');
+                $storedLast9 = substr($storedRaw, -9);
+
+                if (in_array($storedRaw, $placeholderPhones) || in_array($storedLast9, ['555555555'])) {
+                    continue;
+                }
+
+                if ($storedLast9 === $last9) {
+                    $customer = $candidate;
+                    break 2;
+                }
+
+                Log::warning('Salla: customer phone mismatch (channel-aware) — skipping', [
+                    'searched'        => $searchPhone,
+                    'returned_phone'  => $candidate['mobile'] ?? 'N/A',
+                    'returned_last9'  => $storedLast9,
+                    'expected_last9'  => $last9,
+                    'customer_record' => json_encode(array_intersect_key($candidate, array_flip(['id', 'mobile', 'first_name', 'last_name']))),
+                ]);
+            }
+        }
+
+        if (!$customer) {
+            return null;
+        }
+
+        $orders = $this->apiCallForChannel($channel, 'GET', '/orders', [
+            'customer_id' => $customer['id'],
+            'per_page'    => 1,
+        ]);
+
+        return $orders['data'][0] ?? null;
+    }
+
+    /**
+     * Bug 6: Get order by reference number using channel-aware (auto-refresh) token.
+     */
+    public function getOrderForChannel(Channel $channel, string $orderId): array
+    {
+        return $this->apiCallForChannel($channel, 'GET', "/orders/{$orderId}");
     }
 
     public function formatOrderForAI(array $order): string

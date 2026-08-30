@@ -16,8 +16,8 @@ class FetchSenderName implements ShouldQueue
 {
     use Dispatchable, InteractsWithQueue, Queueable, SerializesModels;
 
-    public $tries = 3;
-    public $backoff = [5, 10, 30]; // Progressive backoff
+    public $tries = 2; // Bug 8: reduced from 3 to 2
+    public $backoff = [5, 10]; // Progressive backoff
 
     public function __construct(
         public int $conversationId,
@@ -31,6 +31,12 @@ class FetchSenderName implements ShouldQueue
         $channel = Channel::find($this->channelId);
         if (!$channel) {
             Log::warning('FetchSenderName: channel not found', ['channel_id' => $this->channelId]);
+            return;
+        }
+
+        // Bug 8: WhatsApp sender IDs are phone numbers, not Facebook PSIDs.
+        // Calling Graph API with a phone number always returns 400/404.
+        if ($channel->type === 'whatsapp') {
             return;
         }
 
@@ -63,6 +69,12 @@ class FetchSenderName implements ShouldQueue
                     'status'    => $response->status(),
                     'body'      => $response->json(),
                 ]);
+                
+                // If it's a 400/404, it's a permanent failure (e.g. user blocked app, invalid PSID).
+                // Throw an exception for 5xx to trigger Laravel's normal retry mechanism.
+                if ($response->serverError()) {
+                    throw new \Exception('Graph API returned server error: ' . $response->status());
+                }
                 return;
             }
 
@@ -85,8 +97,9 @@ class FetchSenderName implements ShouldQueue
                 'conversation_id' => $this->conversationId,
             ]);
             
-            // Mark this job as failed for retry
-            $this->release(30);
+            // Bug 8: Removed $this->release(30) to prevent double-retry loops.
+            // If we actually want to retry, we re-throw the exception to let Laravel handle it.
+            throw $e;
         }
     }
 

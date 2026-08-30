@@ -13,9 +13,17 @@ class EmbeddingsService
 
     public function __construct()
     {
-        $this->apiKey = config('services.gemini.key') ?? env('GEMINI_API_KEY', '');
-        $this->baseUrl = 'https://generativelanguage.googleapis.com/v1beta';
-        $this->model = 'text-embedding-004';
+        // config('services.gemini.api_key') is the canonical key (see config/services.php)
+        $this->apiKey = config('services.gemini.api_key') ?? env('GEMINI_API_KEY', '');
+
+        // Use the GA endpoint (v1), NOT the deprecated v1beta.
+        // Error "text-embedding-004 is not found for API version v1beta" confirms v1beta is wrong.
+        $this->baseUrl = 'https://generativelanguage.googleapis.com/v1';
+        $this->model   = 'text-embedding-004';
+
+        if (empty($this->apiKey)) {
+            Log::error('EmbeddingsService: GEMINI_API_KEY is not configured — all embedding calls will fail');
+        }
     }
 
     /**

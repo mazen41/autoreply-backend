@@ -536,12 +536,25 @@ JSON;
             }
 
             // Strategy 4: Gemini returned plain text with no JSON at all —
-            // wrap it as a valid reply so the customer gets an answer
-            // instead of the generic fallback message.
+            // wrap it as a valid reply ONLY if it is genuine prose.
+            // If it still looks like raw JSON (starts with { or [), do NOT send it
+            // to the customer — escalate instead.
             if (!$aiResult && !empty(trim($response))) {
                 $plainText = trim(preg_replace('/^```[a-z]*\s*/i', '', trim($response)));
                 $plainText = trim(preg_replace('/\s*```$/i', '', $plainText));
+
                 if (strlen($plainText) > 5) {
+                    // Check if this looks like raw JSON structure that failed parsing
+                    $looksLikeJson = str_starts_with($plainText, '{') || str_starts_with($plainText, '[');
+
+                    if ($looksLikeJson) {
+                        // Raw JSON leaked — escalate, never send JSON structure to customer
+                        Log::error('AI returned raw JSON that could not be parsed — escalating to human instead of sending garbage', [
+                            'raw_response' => substr($response, 0, 300),
+                        ]);
+                        return self::getFallbackResponse();
+                    }
+
                     Log::warning('AI returned plain text instead of JSON — wrapping as reply', [
                         'raw_response' => substr($response, 0, 300),
                     ]);
@@ -562,6 +575,19 @@ JSON;
                 return self::getFallbackResponse();
             }
 
+            // Final sanitization: strip any stray markdown fences from the reply text
+            // before it reaches the customer (guards against partial fence strips above).
+            $aiResult['reply'] = trim(preg_replace('/^```[a-z]*\s*/i', '', $aiResult['reply']));
+            $aiResult['reply'] = trim(preg_replace('/\s*```\s*$/i', '', $aiResult['reply']));
+
+            // Also detect if the reply field itself is raw JSON (another leak vector)
+            if (str_starts_with(ltrim($aiResult['reply']), '{') || str_starts_with(ltrim($aiResult['reply']), '[')) {
+                Log::error('AI reply field contains raw JSON structure — escalating', [
+                    'reply_preview' => substr($aiResult['reply'], 0, 200),
+                ]);
+                return self::getFallbackResponse();
+            }
+
             // Validate the reply TEXT (not the JSON wrapper)
             $validation = self::validateResponse($aiResult['reply'], $aiResult['intent']);
 
@@ -575,13 +601,13 @@ JSON;
             }
 
             return [
-                'success'          => true,
-                'reply'            => $aiResult['reply'],
-                'intent'           => $aiResult['intent'],
-                'needs_escalation' => $aiResult['needs_escalation'] ?? false,
-                'confidence'       => $aiResult['confidence'] ?? 0.7,
+                'success'           => true,
+                'reply'             => $aiResult['reply'],
+                'intent'            => $aiResult['intent'],
+                'needs_escalation'  => $aiResult['needs_escalation'] ?? false,
+                'confidence'        => $aiResult['confidence'] ?? 0.7,
                 'escalation_reason' => $aiResult['escalation_reason'] ?? 'none',
-                'validation'       => $validation,
+                'validation'        => $validation,
             ];
 
         } catch (\Exception $e) {

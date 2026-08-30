@@ -286,40 +286,113 @@ class ProcessAutoReply implements ShouldQueue
             'وين','فين','متى','when','status','حالة','مشتريات',
             'بضاعتي','بتاعي','اين طلبي','where is my','track',
         ];
-        // Keywords that indicate customer wants to PLACE a new order / buy
+        // Keywords that indicate customer wants to PLACE a new order / buy a SPECIFIC item.
+        // ⚠️  Do NOT add general product-browse phrases here ("show me products", "what do you
+        // sell", "المنتجات") — those belong to the aggregate detection block above and
+        // adding them here causes "fetch the products" to be misclassified as place_order,
+        // which triggers an unwarranted escalation.
         $placeOrderKeywords = [
             'place an order','i want to order','i want to buy','purchase','i\'d like to order',
-            'عايز اطلب','ابي اشتري','ابغا اشتري','اشتري','اطلب',
-            'show me products','what do you sell','المنتجات','منتجاتكم',
+            'i\'d like to buy','i\'ll take','i will take','add to cart',
+            'عايز اطلب','ابي اشتري','ابغا اشتري','اشتري','اطلب منكم',
         ];
 
-        // Bug (Priority 1) fix: aggregate/list queries — "how many products", "list your
-        // orders", etc. — were falling through to the generic INTENT-2 (question) path,
-        // which only checks business_profile/knowledge_base and never calls Salla, so the
-        // AI either hallucinated (contamination from unrelated knowledge chunks) or replied
-        // "I don't have access". These keywords are matched BEFORE the order-status /
-        // place-order keywords so a phrase like "how many orders exist" (which also contains
-        // the generic word "order") is routed to the aggregate flow, not order-status lookup.
-        $productAggregateKeywords = [
-            'how many products', 'how many items', 'products exist', 'products are there',
-            'products do you have', 'what products do you have', 'list your products',
-            'list products', 'list of products', 'show your products', 'show all products',
-            'كم منتج', 'كم عدد المنتجات', 'عدد المنتجات', 'قائمة المنتجات', 'كل المنتجات',
-        ];
-        $orderAggregateKeywords = [
-            'how many orders', 'orders exist', 'orders are there', 'show me my orders',
-            'show me orders', 'list orders', 'list my orders', 'list all orders',
-            'all my orders', 'how many orders do you have', 'how many orders are there',
-            'كم طلب', 'عدد الطلبات', 'كم عدد الطلبات', 'قائمة الطلبات', 'كل الطلبات',
-        ];
+        // ── AGGREGATE INTENT DETECTION ────────────────────────────────────────
+        // Strategy: regex patterns are far more robust than keyword lists for real-world
+        // phrasing variation. These patterns are designed to be broad but precise —
+        // they match the INTENT (browse/count products or orders) not specific words.
+        //
+        // Patterns explained:
+        //   \bproduct\w* — matches "product", "products", "products?"
+        //   \border\w*   — matches "order", "orders"
+        //   The word-boundary anchors (\b) prevent "unordered" matching "order".
+        //
+        // English product browse/count patterns
+        $productAggregatePattern = '/(' .
+            'how many (products?|items?|things?|stuff)' .
+            '|what (products?|items?|things?).*(have|sell|got|offer|carry|available)' .
+            '|(products?|items?).*(you have|you sell|you got|you offer|in your store|on salla|available)' .
+            '|(show|list|fetch|get|give|display|send).*(me |us |your |all )?(the )?(products?|items?|catalogue|catalog|inventory|what you.*(have|sell|got))' .
+            '|(products?|items?).*(show|list|fetch|get|see|view|browse|check)' .
+            '|your (products?|items?|inventory|catalogue|catalog)' .
+            '|what do you sell' .
+            '|what.*(sell|have|offer|carry)' .
+            '|do you have (any )?(products?|items?|stuff|things?)' .
+            ')/iu';
 
-        $isProductAggregate = false;
-        $isOrderAggregate    = false;
-        foreach ($productAggregateKeywords as $kw) {
-            if (str_contains($msgLower, $kw)) { $isProductAggregate = true; break; }
-        }
-        foreach ($orderAggregateKeywords as $kw) {
-            if (str_contains($msgLower, $kw)) { $isOrderAggregate = true; break; }
+        // Arabic product browse/count patterns
+        $productAggregatePatternAr = '/(' .
+            'كم (منتج|عدد المنتجات|صنف|منتجات)' .
+            '|عدد المنتجات|قائمة المنتجات|كل المنتجات' .
+            '|(اعرض|وريني|اريني|أرني|شوفني|أعرض|ارسل|ابعث).*(المنتجات?|المنتج|البضايع|اللي عندك)' .
+            '|ما (عندكم|لديكم|عندك|لديك|هي المنتجات)' .
+            '|ايش (عندكم?|لديكم?|تبيعون?|تبيعوا)' .
+            '|إيش (عندكم?|لديكم?|تبيعون?|تبيعوا)' .
+            '|شو (عندكم?|لديكم?|تبيعون?|بتبيعوا)' .
+            '|المنتجات' .
+        ')/iu';
+
+        // English order list/count patterns
+        $orderAggregatePattern = '/(' .
+            'how many orders?' .
+            '|orders?.*(exist|are there|do you have|in.*(store|system|salla))' .
+            '|(show|list|fetch|get|display|give me).*(me |us |my |all )?(the )?orders?' .
+            '|all (my |the )?orders?' .
+            '|my orders?' .
+            ')/iu';
+
+        // Arabic order list/count patterns
+        $orderAggregatePatternAr = '/(' .
+            'كم (طلب|طلبات?|عدد الطلبات)' .
+            '|عدد الطلبات|قائمة الطلبات|كل الطلبات' .
+            '|(اعرض|وريني|اريني|أرني|شوفني).*(طلباتي?|الطلبات?)' .
+            '|طلباتي' .
+        ')/iu';
+
+        $isProductAggregate = (bool) preg_match($productAggregatePattern, $message->content)
+            || (bool) preg_match($productAggregatePatternAr, $message->content);
+
+        $isOrderAggregate = (bool) preg_match($orderAggregatePattern, $message->content)
+            || (bool) preg_match($orderAggregatePatternAr, $message->content);
+
+        // ── FOLLOW-UP CONTEXT DETECTION ───────────────────────────────────────
+        // If the customer's previous AI reply asked them to rephrase a product question
+        // (i.e. the AI couldn't detect the intent), and their follow-up contains
+        // affirmative/fetch words, treat it as a product aggregate request.
+        // This covers: "yeah fetch them", "yes please", "go ahead show me", etc.
+        if (!$isProductAggregate && !$isOrderAggregate) {
+            $affirmativeFollowUp = preg_match(
+                '/(yeah|yes|yep|sure|ok|okay|go ahead|please|fetch|show|bring|send|get|see|view|exactly|right|correct)/i',
+                $message->content
+            );
+
+            if ($affirmativeFollowUp) {
+                // Check last AI message for context clues
+                $lastAiContent = Message::where('conversation_id', $conversation->id)
+                    ->where('is_ai', true)
+                    ->where('direction', 'outbound')
+                    ->orderBy('created_at', 'desc')
+                    ->value('content');
+
+                if ($lastAiContent) {
+                    $lastAiLower = mb_strtolower($lastAiContent);
+                    // Last AI message talked about products but asked for a rephrase
+                    if ((str_contains($lastAiLower, 'product') || str_contains($lastAiLower, 'منتج') || str_contains($lastAiLower, 'item'))
+                        && (str_contains($lastAiLower, 'rephrase') || str_contains($lastAiLower, 'could you') || str_contains($lastAiLower, 'please') || str_contains($lastAiLower, 'how many'))) {
+                        $isProductAggregate = true;
+                        Log::info('ProcessAutoReply: detected product-aggregate follow-up after AI asked for rephrase', [
+                            'conversation_id' => $conversation->id,
+                            'user_message'    => $message->content,
+                            'last_ai_message' => substr($lastAiContent, 0, 100),
+                        ]);
+                    }
+                    // Last AI message talked about orders
+                    if ((str_contains($lastAiLower, 'order') || str_contains($lastAiLower, 'طلب'))
+                        && (str_contains($lastAiLower, 'rephrase') || str_contains($lastAiLower, 'could you') || str_contains($lastAiLower, 'how many'))) {
+                        $isOrderAggregate = true;
+                    }
+                }
+            }
         }
 
         $isOrderStatus = false;

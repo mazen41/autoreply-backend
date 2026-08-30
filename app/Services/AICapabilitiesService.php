@@ -224,10 +224,27 @@ ROLE;
 
         // ── PLACE AN ORDER ────────────────────────────────────────────────────
         $p .= "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n";
-        $p .= "INTENT 4 — PLACE AN ORDER (Product Browsing + Checkout)\n";
+        $p .= "INTENT 4 — PLACE AN ORDER (Checkout / Purchase a specific product)\n";
         $p .= "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n";
-        $p .= "Trigger: \"I want to order\", \"buy\", \"purchase\", \"show me products\", \"what do you sell\",\n";
-        $p .= "         \"عايز اطلب\", \"ابي اشتري\", \"ابغا اشتري\", \"المنتجات\"\n\n";
+        $p .= "Trigger: customer wants to BUY a SPECIFIC product → \"I want to order X\", \"buy this\", \"purchase\",\n";
+        $p .= "         \"عايز اطلب\", \"ابي اشتري\", \"ابغا اشتري\"\n\n";
+        $p .= "⚠️  CRITICAL DISAMBIGUATION — read before classifying:\n";
+        $p .= "    INTENT 4 (place_order) = customer wants to PURCHASE/BUY a specific item.\n";
+        $p .= "    INTENT 0 (question/browse) = customer wants to BROWSE, SEE, or LIST what products exist.\n\n";
+        $p .= "    INTENT 0 examples (DO NOT classify these as place_order):\n";
+        $p .= "      • \"What products do you have?\"  → browse, NOT order\n";
+        $p .= "      • \"Show me the products\"        → browse, NOT order\n";
+        $p .= "      • \"Fetch them please\"           → browse (follow-up to a product question), NOT order\n";
+        $p .= "      • \"Yeah I wanna see the products, fetch them\" → browse, NOT order\n";
+        $p .= "      • \"What do you sell?\"           → browse, NOT order\n";
+        $p .= "      • \"List your items\"             → browse, NOT order\n";
+        $p .= "      • \"يش عندكم\" / \"وريني المنتجات\" → browse, NOT order\n\n";
+        $p .= "    INTENT 4 examples (these ARE place_order):\n";
+        $p .= "      • \"I want to order the blue shirt\"   → place_order\n";
+        $p .= "      • \"Buy product #3\"                   → place_order\n";
+        $p .= "      • \"I'll take 2 of those\"             → place_order\n";
+        $p .= "      • \"ابي اشتري الحزام الجلد\"            → place_order\n\n";
+        $p .= "If you are not 100% sure the customer wants to BUY a SPECIFIC item, treat it as INTENT 0 (browse).\n\n";
 
         if ($hasProducts) {
             $productList = '';

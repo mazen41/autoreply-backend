@@ -809,6 +809,19 @@ class EvolutionApiService
     protected function ensureWhatsAppChannel(WhatsAppInstance $instance): void
     {
         try {
+            // Look up the user's business profile so we can link it to the channel.
+            // This was previously hardcoded as null, causing ProcessAutoReply to abort
+            // with "channel has no linked business profile".
+            $businessProfile = \App\Models\BusinessProfile::where('user_id', $instance->user_id)->first();
+            $businessId = $businessProfile?->id;
+
+            if (!$businessId) {
+                Log::warning("ensureWhatsAppChannel: no BusinessProfile found for user — channel will have business_id=null", [
+                    'user_id'       => $instance->user_id,
+                    'instance_name' => $instance->instance_name,
+                ]);
+            }
+
             $channel = Channel::where('user_id', $instance->user_id)
                 ->where('type', 'whatsapp')
                 ->where('page_id', $instance->instance_name)
@@ -816,32 +829,45 @@ class EvolutionApiService
 
             if (!$channel) {
                 $channel = Channel::create([
-                    'user_id' => $instance->user_id,
-                    'business_id' => null,
-                    'type' => 'whatsapp',
-                    'page_id' => $instance->instance_name,
-                    'page_name' => $instance->profile_name ?? $instance->instance_name,
-                    'access_token' => '', // Empty for WhatsApp, instance_name stored in page_id
-                    'status' => 'connected',
+                    'user_id'      => $instance->user_id,
+                    'business_id'  => $businessId,   // fixed: was hardcoded null
+                    'type'         => 'whatsapp',
+                    'page_id'      => $instance->instance_name,
+                    'page_name'    => $instance->profile_name ?? $instance->instance_name,
+                    'access_token' => '', // WhatsApp uses instance_name in page_id, not an OAuth token
+                    'status'       => 'connected',
                     'connected_at' => now(),
-                    'ai_enabled' => false,
+                    'ai_enabled'   => true,  // fixed: was false, meaning AI never ran after connect
                 ]);
 
                 Log::info("Created WhatsApp channel for instance", [
                     'instance_name' => $instance->instance_name,
-                    'channel_id' => $channel->id,
+                    'channel_id'    => $channel->id,
+                    'business_id'   => $businessId,
                 ]);
             } else {
-                // Update existing channel status
-                $channel->update([
-                    'status' => 'connected',
+                // Update existing channel status. Also backfill business_id if it was
+                // left null by a previous connect (the bug we're fixing here).
+                $updateData = [
+                    'status'       => 'connected',
                     'connected_at' => now(),
-                    'page_name' => $instance->profile_name ?? $instance->instance_name,
-                ]);
+                    'page_name'    => $instance->profile_name ?? $instance->instance_name,
+                ];
+
+                if ($businessId && !$channel->business_id) {
+                    $updateData['business_id'] = $businessId;
+                    Log::info("Backfilling business_id on existing WhatsApp channel", [
+                        'channel_id'  => $channel->id,
+                        'business_id' => $businessId,
+                    ]);
+                }
+
+                $channel->update($updateData);
 
                 Log::info("Updated WhatsApp channel status", [
                     'instance_name' => $instance->instance_name,
-                    'channel_id' => $channel->id,
+                    'channel_id'    => $channel->id,
+                    'business_id'   => $channel->fresh()->business_id,
                 ]);
             }
         } catch (\Exception $e) {

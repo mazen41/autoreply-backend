@@ -12,6 +12,8 @@ class BusinessKnowledgeFile extends Model
         'filename',
         'file_type',
         'extracted_text',
+        'status',
+        'error_message',
     ];
 
     protected $casts = [

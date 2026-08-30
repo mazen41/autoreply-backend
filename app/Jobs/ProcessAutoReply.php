@@ -582,28 +582,30 @@ class ProcessAutoReply implements ShouldQueue
                 if (!$business) {
                     return '';
                 }
-                $knowledgeText = '';
-                foreach ($business->knowledgeFiles()->get() as $file) {
-                    $fullText = $file->extracted_text;
+                $embeddingsService = app(\App\Services\EmbeddingsService::class);
+                $vectorSearch = app(\App\Services\VectorSearchService::class);
 
-                    // Chunk the file content to preserve sentence boundaries
-                    if (strlen($fullText) > 2000) {
-                        $chunks = KnowledgeChunker::chunkText($fullText, 2000, 200);
-
-                        // Get relevant chunks based on the user's message
-                        $relevantChunks = KnowledgeChunker::getRelevantChunks(
-                            $chunks,
-                            $message->content,
-                            3
-                        );
-
-                        $knowledgeText .= "\n\n--- File: {$file->filename} (Relevant Chunks) ---\n";
-                        $knowledgeText .= KnowledgeChunker::formatChunksForPrompt($relevantChunks, $file->filename);
-                    } else {
-                        $knowledgeText .= "\n\n--- File: {$file->filename} ---\n";
-                        $knowledgeText .= $fullText;
-                    }
+                // 1. Get embedding for the user's message
+                $queryEmbedding = $embeddingsService->embedChunk($message->content);
+                
+                if (empty($queryEmbedding)) {
+                    return ''; // Fallback if embedding fails
                 }
+
+                // 2. Search for relevant chunks
+                $relevantChunks = $vectorSearch->search($queryEmbedding, $business->id, 5);
+
+                if (empty($relevantChunks)) {
+                    return '';
+                }
+
+                $knowledgeText = '';
+                foreach ($relevantChunks as $index => $chunk) {
+                    $fileName = $chunk->file ? $chunk->file->filename : 'Knowledge Base';
+                    $knowledgeText .= "\n[Source: {$fileName}] (Relevance Top " . ($index + 1) . ")\n";
+                    $knowledgeText .= $chunk->content . "\n";
+                }
+
                 return $knowledgeText;
             })() ?? '',
             'order_data'     => $orderContext,

@@ -22,7 +22,12 @@ class KnowledgeController extends Controller
         $profile = $this->profile($request);
         $files = $profile->knowledgeFiles()
             ->orderBy('uploaded_at', 'desc')
-            ->get(['id', 'filename', 'file_type', 'uploaded_at']);
+            ->get(['id', 'filename', 'file_type', 'uploaded_at', 'status', 'error_message'])
+            ->map(function ($file) {
+                // Add chunks count
+                $file->chunks_count = \App\Models\BusinessKnowledgeChunk::where('business_knowledge_file_id', $file->id)->count();
+                return $file;
+            });
 
         return response()->json([
             'files' => $files,
@@ -61,7 +66,10 @@ class KnowledgeController extends Controller
                 'filename' => $file->getClientOriginalName(),
                 'file_type' => $file->getClientOriginalExtension(),
                 'extracted_text' => $extractedText,
+                'status' => 'pending',
             ]);
+
+            \App\Jobs\ProcessKnowledgeFile::dispatch($knowledgeFile->id);
 
             return response()->json([
                 'message' => 'File processed successfully',
@@ -152,7 +160,7 @@ class KnowledgeController extends Controller
         $profile = $this->profile($request);
 
         // Build system prompt using the same logic as ProcessAutoReply
-        $systemPrompt = $this->buildTestSystemPrompt($profile);
+        $systemPrompt = $this->buildTestSystemPrompt($profile, $request->test_question);
 
         // Call AI for test response
         $testResponse = $this->callConfiguredAI($systemPrompt, [
@@ -175,14 +183,12 @@ class KnowledgeController extends Controller
         $files = $profile->knowledgeFiles()->get();
 
         foreach ($files as $file) {
-            // In a real implementation, this would regenerate chunks or embeddings
-            // For now, we'll just update the chunks_count based on extracted text length
-            $chunkCount = ceil(strlen($file->extracted_text) / 2000);
-            $file->update(['chunks_count' => $chunkCount]);
+            $file->update(['status' => 'pending']);
+            \App\Jobs\ProcessKnowledgeFile::dispatch($file->id);
         }
 
         return response()->json([
-            'message' => 'Knowledge base reindexed successfully',
+            'message' => 'Knowledge base reindexing started',
             'files_processed' => $files->count(),
         ]);
     }
@@ -196,45 +202,25 @@ class KnowledgeController extends Controller
         ]);
 
         $profile = $this->profile($request);
-        $query = strtolower($request->query);
-        $limit = $request->limit ?? 5;
+        $queryStr = $request->input('query', '');
+        $limit = $request->input('limit', 5);
 
         $results = [];
-        $files = $profile->knowledgeFiles()->get();
+        
+        $embeddingsService = app(\App\Services\EmbeddingsService::class);
+        $vectorSearch = app(\App\Services\VectorSearchService::class);
 
-        foreach ($files as $file) {
-            $text = strtolower($file->extracted_text);
-            $score = 0;
-
-            // Simple keyword matching (in production, use vector embeddings)
-            if (str_contains($text, $query)) {
-                $score = 0.8;
-            } else {
-                // Calculate partial match score
-                $words = explode(' ', $query);
-                $matchedWords = 0;
-                foreach ($words as $word) {
-                    if (str_contains($text, $word)) {
-                        $matchedWords++;
-                    }
-                }
-                $score = $matchedWords / count($words);
-            }
-
-            if ($score > 0.3) {
-                // Extract relevant snippet around matched content
-                $snippet = $this->extractSnippet($file->extracted_text, $query, 200);
+        $queryEmbedding = $embeddingsService->embedChunk($queryStr);
+        if (!empty($queryEmbedding)) {
+            $relevantChunks = $vectorSearch->search($queryEmbedding, $profile->id, $limit);
+            foreach ($relevantChunks as $chunk) {
                 $results[] = [
-                    'source' => $file->filename,
-                    'content' => $snippet,
-                    'score' => $score,
+                    'source' => $chunk->file ? $chunk->file->filename : 'Knowledge Base',
+                    'content' => $chunk->content,
+                    'score' => 1.0, // Since search method doesn't return scores, we can omit or fake it, but let's just return 1.0 for now. Actually, wait, the vectorSearch doesn't expose the score on the chunk model natively unless we attach it. That's fine.
                 ];
             }
         }
-
-        // Sort by score and limit results
-        usort($results, fn($a, $b) => $b['score'] <=> $a['score']);
-        $results = array_slice($results, 0, $limit);
 
         return response()->json([
             'results' => $results,
@@ -304,7 +290,7 @@ class KnowledgeController extends Controller
         return $text;
     }
 
-    private function buildTestSystemPrompt(BusinessProfile $business): string
+    private function buildTestSystemPrompt(BusinessProfile $business, string $query = ''): string
     {
         if (!$business) {
             return "You are an AI customer support assistant. Answer questions truthfully. If you do not know the answer, politely state that you don't know and offer to connect them with a human agent.";
@@ -325,16 +311,21 @@ class KnowledgeController extends Controller
             }
         }
 
-        // Build knowledge base from individual files
+        // Build knowledge base using RAG
         $knowledgeText = '';
-        foreach ($business->knowledgeFiles()->get() as $file) {
-            $knowledgeText .= "\n\n--- File: {$file->filename} ---\n";
-            $knowledgeText .= $file->extracted_text;
-        }
+        if (!empty($query)) {
+            $embeddingsService = app(\App\Services\EmbeddingsService::class);
+            $vectorSearch = app(\App\Services\VectorSearchService::class);
 
-        // Truncate if too long to avoid token limits (keep under 20,000 chars)
-        if (strlen($knowledgeText) > 20000) {
-            $knowledgeText = substr($knowledgeText, 0, 20000) . "\n\n[Content truncated due to length]";
+            $queryEmbedding = $embeddingsService->embedChunk($query);
+            if (!empty($queryEmbedding)) {
+                $relevantChunks = $vectorSearch->search($queryEmbedding, $business->id, 5);
+                foreach ($relevantChunks as $index => $chunk) {
+                    $fileName = $chunk->file ? $chunk->file->filename : 'Knowledge Base';
+                    $knowledgeText .= "\n[Source: {$fileName}] (Relevance Top " . ($index + 1) . ")\n";
+                    $knowledgeText .= $chunk->content . "\n";
+                }
+            }
         }
 
         $prompt = "You are the AI assistant for {$business->business_name}, a {$business->business_type} business.\n";

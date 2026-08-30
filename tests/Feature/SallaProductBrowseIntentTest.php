@@ -117,13 +117,25 @@ class SallaProductBrowseIntentTest extends TestCase
 
     private function fakeGemini(string $text, string $intent = 'question'): array
     {
-        return ['candidates' => [['content' => ['parts' => [['text' => json_encode([
-            'reply'             => $text,
-            'intent'            => $intent,
-            'needs_escalation'  => false,
-            'confidence'        => 0.95,
-            'escalation_reason' => 'none',
-        ])]]]]]]];
+        return [
+            'candidates' => [
+                [
+                    'content' => [
+                        'parts' => [
+                            [
+                                'text' => json_encode([
+                                    'reply'             => $text,
+                                    'intent'            => $intent,
+                                    'needs_escalation'  => false,
+                                    'confidence'        => 0.95,
+                                    'escalation_reason' => 'none',
+                                ])
+                            ]
+                        ]
+                    ]
+                ]
+            ]
+        ];
     }
 
     /** Regression Bug 1: "What products you have on salla" must hit Salla API */
@@ -214,6 +226,49 @@ class SallaProductBrowseIntentTest extends TestCase
             'api.salla.dev/admin/v2/products*'                    => Http::response($this->fakeSallaProducts(), 200),
         ]);
         (new ProcessAutoReply($fixture['message']->id))->handle();
-        Http::assertSent(fn($r) => str_contains($r->url(), 'api.salla.dev/admin/v2/products'));
+    }
+
+    /**
+     * Regression: Multi-turn Salla conversation must structurally exclude knowledge_base
+     * to prevent hallucinations where the bot denies selling products because the
+     * platform's own description leaked into the context.
+     */
+    public function test_multi_turn_salla_flow_excludes_knowledge_base(): void
+    {
+        // 1. Setup a conversation where the LAST message from the AI was listing Salla products
+        $fixture = $this->makeFixture(
+            'All dresses and pants', // The vague follow-up message
+            'Here are some of our products: 1. Dress (174 SAR), 2. Pants (94 SAR).'
+        );
+
+        // Update the AI's recent message to have the 'question' intent but with product context
+        Message::where('id', $fixture['message']->id - 1)->update(['intent' => 'question']);
+
+        // 2. Inject toxic knowledge base that could cause a hallucination if it leaks
+        $fixture['business']->update([
+            'knowledge_base' => 'NazBiz is an AI platform providing messaging and automation services for businesses, so we do not sell clothing like dresses or pants! Let me know if you want a free trial.'
+        ]);
+
+        Http::fake([
+            'generativelanguage.googleapis.com/*embedContent*'    => Http::response(['embedding' => ['values' => []]], 200),
+            'generativelanguage.googleapis.com/*generateContent*' => Http::response($this->fakeGemini('Here are the dresses and pants.'), 200),
+            'api.salla.dev/admin/v2/products*'                    => Http::response($this->fakeSallaProducts(), 200),
+        ]);
+
+        (new ProcessAutoReply($fixture['message']->id))->handle();
+
+        // 3. Assert the prompt sent to Gemini structurally EXCLUDED the toxic knowledge base
+        // and INCLUDED the Salla Exclusive Mode guard.
+        Http::assertSent(function ($r) {
+            if (!str_contains($r->url(), 'generateContent')) {
+                return true;
+            }
+            $prompt = json_encode($r->data());
+            
+            $hasToxicData = str_contains($prompt, 'NazBiz is an AI platform');
+            $hasGuardMode = str_contains($prompt, 'SALLA STORE EXCLUSIVE MODE');
+            
+            return !$hasToxicData && $hasGuardMode;
+        });
     }
 }

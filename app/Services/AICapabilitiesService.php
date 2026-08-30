@@ -75,9 +75,17 @@ You ONLY use data provided to you below. You NEVER call APIs, fetch data, or inv
 
 ROLE;
 
+        // ── Salla Exclusive Mode ─────────────────────────────────────────────
+        if (!empty($context['salla_exclusive_mode'])) {
+            $p .= "\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n";
+            $p .= "SALLA STORE EXCLUSIVE MODE\n";
+            $p .= "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n";
+            $p .= "⚠️ CRITICAL STRUCTURAL RULE: The customer is actively discussing products, checkout, or orders. You are ONLY allowed to discuss this merchant's live Salla store data right now. Do not reference any other generic business description, software platform, services, or plans. Answer using ONLY the Salla products, orders, and cart data provided below.\n\n";
+        }
+
         // ── Business Profile Information ───────────────────────────────────────
         $hasBusinessProfile = !empty($context['business_profile']);
-        if ($hasBusinessProfile) {
+        if ($hasBusinessProfile && empty($context['salla_exclusive_mode'])) {
             $p .= "\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n";
             $p .= "BUSINESS PROFILE INFORMATION\n";
             $p .= "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n";
@@ -92,7 +100,7 @@ ROLE;
 
         // ── Uploaded Knowledge Base ───────────────────────────────────────────
         $hasKnowledgeBase = !empty($context['knowledge_base']);
-        if ($hasKnowledgeBase) {
+        if ($hasKnowledgeBase && empty($context['salla_exclusive_mode'])) {
             $p .= "\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n";
             $p .= "UPLOADED KNOWLEDGE BASE\n";
             $p .= "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n";

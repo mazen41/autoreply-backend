@@ -461,6 +461,37 @@ class ProcessAutoReply implements ShouldQueue
             ->where('status', 'connected')
             ->first();
 
+        // ── SALLA EXCLUSIVE MODE DETECTION ────────────────────────────────────
+        // Check if the conversation is actively in a Salla-related flow (products/orders/checkout).
+        // This structurally prevents the AI from hallucinating platform/unrelated text into store chats.
+        $isSallaFlow = false;
+        
+        if ($sallaChannel) {
+            // 1. Direct intent detection on this turn
+            if ($isProductAggregate || $isOrderAggregate || $isOrderStatus || $isPlaceOrder || ($imageRequest ?? false)) {
+                $isSallaFlow = true;
+            } else {
+                // 2. Contextual detection: Was the recent conversation about Salla?
+                $recentAiMessage = Message::where('conversation_id', $conversation->id)
+                    ->where('is_ai', true)
+                    ->where('direction', 'outbound')
+                    ->orderBy('created_at', 'desc')
+                    ->first();
+
+                if ($recentAiMessage) {
+                    if (in_array($recentAiMessage->intent, ['order_status', 'place_order'])) {
+                        $isSallaFlow = true;
+                    } else {
+                        // For generic 'question' intent, check if the content looks Salla-related
+                        $recentLower = mb_strtolower($recentAiMessage->content);
+                        if (preg_match('/(sar|ريال|product|منتج|items?|order|طلب|cart|سلة)/i', $recentLower)) {
+                            $isSallaFlow = true;
+                        }
+                    }
+                }
+            }
+        }
+
         $productsAggregateContext = null;
         $ordersAggregateContext   = null;
 
@@ -801,9 +832,10 @@ class ProcessAutoReply implements ShouldQueue
             'business_name'  => $channel->business?->business_name ?? 'our business',
             'platform'       => $channel->type,
             'language'       => $detectedLanguage,
-            'business_profile' => $businessProfileContext,
-            'knowledge_base' => (function() use ($business, $message) {
-                if (!$business) {
+            'salla_exclusive_mode' => $isSallaFlow,
+            'business_profile' => $isSallaFlow ? '' : $businessProfileContext,
+            'knowledge_base' => (function() use ($business, $message, $isSallaFlow) {
+                if (!$business || $isSallaFlow) {
                     return '';
                 }
                 $embeddingsService = app(\App\Services\EmbeddingsService::class);

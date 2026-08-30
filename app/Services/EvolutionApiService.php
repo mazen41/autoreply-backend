@@ -291,10 +291,11 @@ class EvolutionApiService
                 // — previously only the status code was kept, which hid the
                 // real reason for every 400/422 failure.
                 Log::error('Evolution API returned non-success response', [
-                    'url' => $url,
+                    'url'    => $url,
                     'status' => $response->status(),
-                    'body' => $response->body(),
-                    'sent_payload' => $data,
+                    'body'   => $response->body(),
+                    // NOTE: payload intentionally NOT logged here to avoid
+                    // exposing media URLs, phone numbers, or message content.
                 ]);
 
                 throw new Exception("HTTP request failed with status: {$response->status()} — body: {$response->body()}");
@@ -330,9 +331,9 @@ class EvolutionApiService
             $eventType = $rawEventType ? strtoupper(str_replace('.', '_', $rawEventType)) : null;
 
             Log::info('Evolution webhook event normalized', [
-                'raw_event' => $rawEventType,
+                'raw_event'        => $rawEventType,
                 'normalized_event' => $eventType,
-                'instance' => $event['instance'] ?? null,
+                'instance'         => $event['instance'] ?? null,
             ]);
 
             switch ($eventType) {
@@ -350,6 +351,16 @@ class EvolutionApiService
                     break;
                 case 'STATUS_INSTANCE':
                     $this->handleStatusInstance($event);
+                    break;
+                case 'SEND_MESSAGE':
+                    // Evolution fires SEND_MESSAGE as an echo for every outbound
+                    // message we send. It is NOT a new customer message. Silently
+                    // acknowledge it — processing it would create duplicate records
+                    // and could trigger AI self-reply loops.
+                    Log::debug('Evolution SEND_MESSAGE echo received and intentionally ignored', [
+                        'instance'   => $event['instance'] ?? null,
+                        'message_id' => $event['data']['key']['id'] ?? null,
+                    ]);
                     break;
                 default:
                     Log::info("Unhandled webhook event type: {$eventType} (raw: {$rawEventType})");
@@ -430,7 +441,8 @@ class EvolutionApiService
             return;
         }
 
-        // Save to WhatsApp messages table (legacy)
+        // Store only safe metadata — never the full event (contains media
+        // payload, base64 data, phone numbers, and message content).
         $whatsappMessage = WhatsAppMessage::create([
             'whatsapp_instance_id' => $instance->id,
             'user_id' => $instance->user_id,
@@ -442,11 +454,20 @@ class EvolutionApiService
             'to_phone' => $instance->phone_number,
             'body' => $body,
             'message_type' => $messageType,
-            'media' => $media,
+            'media' => $media ? [
+                'type'     => $media['type'] ?? null,
+                'mimetype' => $media['mimetype'] ?? null,
+                'file_size' => $media['file_size'] ?? null,
+                'duration'  => $media['duration'] ?? null,
+                'url'       => $media['url'] ?? null,
+                // Never store base64 data or encrypted media URLs in metadata
+            ] : null,
             'metadata' => [
-                'event' => $event,
-                'message_key' => $message,
-                'pushName' => $fromName,
+                'message_id'  => $message['id'] ?? null,
+                'remote_jid'  => $message['remoteJid'] ?? null,
+                'from_me'     => $fromMe,
+                'message_type' => $messageType,
+                // raw event/message_key deliberately omitted
             ],
             'status' => 'pending',
             'sent_at' => now(),

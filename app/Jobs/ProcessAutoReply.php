@@ -292,8 +292,9 @@ class ProcessAutoReply implements ShouldQueue
         // adding them here causes "fetch the products" to be misclassified as place_order,
         // which triggers an unwarranted escalation.
         $placeOrderKeywords = [
-            'place an order','i want to order','i want to buy','purchase','i\'d like to order',
-            'i\'d like to buy','i\'ll take','i will take','add to cart',
+            'place an order','place the order','i want to order','i want to buy','purchase','i\'d like to order',
+            'i\'d like to buy','i\'ll take','i will take','add to cart','i wanna order','i wanna buy',
+            'i wanna place','okay now i wanna','now i wanna',
             'عايز اطلب','ابي اشتري','ابغا اشتري','اشتري','اطلب منكم',
         ];
 
@@ -1435,23 +1436,36 @@ class ProcessAutoReply implements ShouldQueue
             $response = $whatsappService->sendTextMessage($instanceName, $recipientId, $message);
 
             if (isset($response['key']['id'])) {
-                // Also save to WhatsApp messages table for legacy compatibility
-                \App\Models\WhatsAppMessage::create([
-                    'whatsapp_instance_id' => \App\Models\WhatsAppInstance::where('instance_name', $instanceName)->first()?->id,
-                    'user_id' => $channel->user_id,
-                    'message_id' => $response['key']['id'] ?? null,
-                    'remote_message_id' => $response['key']['id'] ?? null,
-                    'direction' => 'outgoing',
-                    'from_phone' => null,
-                    'from_name' => null,
-                    'to_phone' => $recipientId,
-                    'body' => $message,
-                    'message_type' => 'text',
-                    'media' => null,
-                    'metadata' => ['evolution_response' => $response],
-                    'status' => 'sent',
-                    'sent_at' => now(),
-                ]);
+                // Persist to whatsapp_messages (legacy table) only when an
+                // instance row exists. In test environments or during the brief
+                // window between Channel creation and WhatsAppInstance creation,
+                // the instance may not exist yet — skipping the insert is correct
+                // because the message was already saved in unified inbox.
+                $instance = \App\Models\WhatsAppInstance::where('instance_name', $instanceName)->first();
+
+                if ($instance) {
+                    \App\Models\WhatsAppMessage::create([
+                        'whatsapp_instance_id' => $instance->id,
+                        'user_id'              => $channel->user_id,
+                        'message_id'           => $response['key']['id'] ?? null,
+                        'remote_message_id'    => $response['key']['id'] ?? null,
+                        'direction'            => 'outgoing',
+                        'from_phone'           => null,
+                        'from_name'            => null,
+                        'to_phone'             => $recipientId,
+                        'body'                 => $message,
+                        'message_type'         => 'text',
+                        'media'                => null,
+                        'metadata'             => ['evolution_message_id' => $response['key']['id'] ?? null],
+                        'status'               => 'sent',
+                        'sent_at'              => now(),
+                    ]);
+                } else {
+                    Log::warning('ProcessAutoReply: WhatsAppInstance not found for legacy message record — skipping (unified inbox record already saved)', [
+                        'instance_name' => $instanceName,
+                        'channel_id'    => $channel->id,
+                    ]);
+                }
 
                 return true;
             }
@@ -1545,13 +1559,12 @@ class ProcessAutoReply implements ShouldQueue
                 'error' => $error
             ]);
 
-            // Log as critical for monitoring
+            // Log as critical for monitoring — omit PII (email, phone)
             Log::critical('AI Failure Notification', [
-                'user_id' => $user->id,
-                'user_email' => $user->email,
+                'user_id'         => $user->id,
                 'conversation_id' => $conversation->id,
-                'error' => $error,
-                'timestamp' => now()->toISOString(),
+                'error'           => $error,
+                'timestamp'       => now()->toISOString(),
             ]);
 
             // Send email notification to business owner

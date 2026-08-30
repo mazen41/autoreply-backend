@@ -359,7 +359,14 @@ class WhatsAppController extends Controller
     {
         try {
             $event = $request->all();
-            Log::info('Evolution webhook received', ['event' => $event]);
+
+            // Log only safe metadata — never the full payload (may contain
+            // base64 image data, media URLs, or credential material).
+            Log::info('Evolution webhook received', [
+                'event_type' => $event['event'] ?? 'unknown',
+                'instance'   => $event['instance'] ?? 'unknown',
+                'data_keys'  => array_keys($event['data'] ?? []),
+            ]);
 
             $this->evolutionService->processWebhookEvent($event);
 

@@ -688,6 +688,7 @@ JSON;
                 'reply'             => $aiResult['reply'],
                 'intent'            => $aiResult['intent'],
                 'needs_escalation'  => $aiResult['needs_escalation'] ?? false,
+                'needs_images'      => $aiResult['needs_images'] ?? false,
                 'confidence'        => $aiResult['confidence'] ?? 0.7,
                 'escalation_reason' => $aiResult['escalation_reason'] ?? 'none',
                 'validation'        => $validation,

@@ -504,12 +504,16 @@ class SallaService
             'per_page'       => $pagination['per_page'] ?? null,
             'current_page'   => $pagination['current_page'] ?? null,
             'items'          => array_map(function ($p) {
+                // Salla V2 returns a primary image string in `main_image` and an array of objects in `images`
+                $imageUrl = $p['main_image'] ?? $p['images'][0]['url'] ?? null;
+                
                 return [
                     'id'       => $p['id']   ?? null,
                     'name'     => $p['name'] ?? 'Unknown',
                     'price'    => $p['price']['amount']       ?? $p['price'] ?? null,
                     'currency' => $p['price']['currency_code'] ?? 'SAR',
                     'quantity' => $p['quantity'] ?? null,
+                    'image_url'=> $imageUrl,
                 ];
             }, array_slice($products, 0, 10)),
         ];

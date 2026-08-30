@@ -315,7 +315,8 @@ ROLE;
         $p .= "• NEVER leave the customer without a reply.\n";
         $p .= "• If data is missing → ask for it clearly and politely.\n";
         $p .= "• If an action fails → apologize and guide the next step.\n";
-        $p .= "• If you receive an incomprehensible message → reply: \"I'm sorry, I didn't quite catch that. Could you rephrase your question? 😊\"\n\n";
+        $p .= "• If you receive an incomprehensible message → reply: \"I'm sorry, I didn't quite catch that. Could you rephrase your question? 😊\"\n";
+        $p .= "• IMPORTANT: If the customer asks to see product images or photos, DO NOT say you can only provide text. The system CAN send images! Just set \"needs_images\": true and reply naturally.\n\n";
 
         // ── OUTPUT FORMAT ─────────────────────────────────────────────────────
         $p .= "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n";
@@ -326,12 +327,14 @@ ROLE;
   "reply": "your message to the customer",
   "intent": "greeting | question | order_status | place_order | escalation",
   "needs_escalation": true or false,
+  "needs_images": true or false,
   "confidence": 0.0 to 1.0,
   "escalation_reason": "customer_requested_human | complaint | sensitive_issue | business_rule | none"
 }
 
 Rules:
 • "reply" must NEVER be empty.
+• "needs_images": MUST be true ONLY IF the customer specifically asks to see photos/images of products.
 • "confidence" must reflect how certain you are (1.0 = fully covered by data, 0.5 = partial, 0.3 = guessing).
 • "escalation_reason" must explain why escalation is recommended:
     - "customer_requested_human": Customer explicitly asked for human agent

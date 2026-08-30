@@ -356,17 +356,17 @@ class ProcessAutoReply implements ShouldQueue
             || (bool) preg_match($orderAggregatePatternAr, $message->content);
 
         // ── FOLLOW-UP CONTEXT DETECTION ───────────────────────────────────────
-        // If the customer's previous AI reply asked them to rephrase a product question
-        // (i.e. the AI couldn't detect the intent), and their follow-up contains
-        // affirmative/fetch words, treat it as a product aggregate request.
-        // This covers: "yeah fetch them", "yes please", "go ahead show me", etc.
         if (!$isProductAggregate && !$isOrderAggregate) {
             $affirmativeFollowUp = preg_match(
                 '/(yeah|yes|yep|sure|ok|okay|go ahead|please|fetch|show|bring|send|get|see|view|exactly|right|correct)/i',
                 $message->content
             );
+            $imageRequest = preg_match(
+                '/(images?|photos?|pictures?|pics?|صور|صورة|صوره)/i',
+                $message->content
+            );
 
-            if ($affirmativeFollowUp) {
+            if ($affirmativeFollowUp || $imageRequest) {
                 // Check last AI message for context clues
                 $lastAiContent = Message::where('conversation_id', $conversation->id)
                     ->where('is_ai', true)
@@ -376,9 +376,16 @@ class ProcessAutoReply implements ShouldQueue
 
                 if ($lastAiContent) {
                     $lastAiLower = mb_strtolower($lastAiContent);
-                    // Last AI message talked about products but asked for a rephrase
-                    if ((str_contains($lastAiLower, 'product') || str_contains($lastAiLower, 'منتج') || str_contains($lastAiLower, 'item'))
-                        && (str_contains($lastAiLower, 'rephrase') || str_contains($lastAiLower, 'could you') || str_contains($lastAiLower, 'please') || str_contains($lastAiLower, 'how many'))) {
+                    // Last AI message talked about products
+                    $aiMentionedProducts = (str_contains($lastAiLower, 'product') || str_contains($lastAiLower, 'منتج') || str_contains($lastAiLower, 'item'));
+                    $aiAskedRephrase = (str_contains($lastAiLower, 'rephrase') || str_contains($lastAiLower, 'could you') || str_contains($lastAiLower, 'please') || str_contains($lastAiLower, 'how many'));
+
+                    if ($imageRequest && $aiMentionedProducts) {
+                        $isProductAggregate = true;
+                        Log::info('ProcessAutoReply: detected product image request follow-up', [
+                            'conversation_id' => $conversation->id,
+                        ]);
+                    } elseif ($affirmativeFollowUp && $aiMentionedProducts && $aiAskedRephrase) {
                         $isProductAggregate = true;
                         Log::info('ProcessAutoReply: detected product-aggregate follow-up after AI asked for rephrase', [
                             'conversation_id' => $conversation->id,
@@ -386,9 +393,10 @@ class ProcessAutoReply implements ShouldQueue
                             'last_ai_message' => substr($lastAiContent, 0, 100),
                         ]);
                     }
+
                     // Last AI message talked about orders
                     if ((str_contains($lastAiLower, 'order') || str_contains($lastAiLower, 'طلب'))
-                        && (str_contains($lastAiLower, 'rephrase') || str_contains($lastAiLower, 'could you') || str_contains($lastAiLower, 'how many'))) {
+                        && $aiAskedRephrase && $affirmativeFollowUp) {
                         $isOrderAggregate = true;
                     }
                 }
@@ -1008,8 +1016,16 @@ class ProcessAutoReply implements ShouldQueue
             broadcast(new \App\Events\MessageReceived($replyMessage, $message->conversation, $channel->user_id));
         }
 
-        // Send reply through platform
-        $sendSuccess = $this->sendReply($channel, $message->conversation, $replyMessage);
+        // Collect images if requested
+        $images = [];
+        if (!empty($aiResult['needs_images']) && !empty($productsAggregateContext['items'])) {
+            $images = array_values(array_filter(array_column($productsAggregateContext['items'], 'image_url')));
+            // Cap at 5 images to avoid spam
+            $images = array_slice($images, 0, 5);
+        }
+
+        // Send reply through platform (with images if any)
+        $sendSuccess = $this->sendReply($channel, $message->conversation, $replyMessage, $images);
         
         // If send failed, provide fallback response to user
         if (!$sendSuccess) {
@@ -1101,7 +1117,7 @@ class ProcessAutoReply implements ShouldQueue
     }
 
     
-    private function sendReply(Channel $channel, Conversation $conversation, Message $replyMessage): bool
+    private function sendReply(Channel $channel, Conversation $conversation, Message $replyMessage, array $images = []): bool
     {
         $senderId = $conversation->sender_id;
         $content = $replyMessage->content;
@@ -1110,13 +1126,13 @@ class ProcessAutoReply implements ShouldQueue
             $success = false;
 
             if ($channel->type === 'facebook') {
-                $success = $this->sendFacebookReply($channel, $senderId, $content);
+                $success = $this->sendFacebookReply($channel, $senderId, $content, $images);
             } elseif ($channel->type === 'instagram') {
-                $success = $this->sendInstagramReply($channel, $senderId, $content);
+                $success = $this->sendInstagramReply($channel, $senderId, $content, $images);
             } elseif ($channel->type === 'gmail') {
                 $success = $this->sendGmailReply($channel, $conversation, $content);
             } elseif ($channel->type === 'whatsapp') {
-                $success = $this->sendWhatsAppReply($channel, $senderId, $content);
+                $success = $this->sendWhatsAppReply($channel, $senderId, $content, $images);
             } elseif ($channel->type === 'telegram') {
                 $success = $this->sendTelegramReply($channel, $senderId, $content);
             } elseif ($channel->type === 'tiktok') {
@@ -1160,15 +1176,32 @@ class ProcessAutoReply implements ShouldQueue
         }
     }
 
-    private function sendFacebookReply(Channel $channel, string $recipientId, string $message): bool
+    private function sendFacebookReply(Channel $channel, string $recipientId, string $message, array $images = []): bool
     {
         // The Channel model's accessor already decrypts access_token — do NOT
         // call decrypt() again or the token will be double-decrypted and corrupted.
         $accessToken = $channel->access_token;
-        $url = "https://graph.facebook.com/v19.0/me/messages?access_token={$accessToken}";
+        $baseUrl = "https://graph.facebook.com/v19.0/me/messages?access_token={$accessToken}";
 
+        // Send images first
+        foreach ($images as $imageUrl) {
+            Http::timeout(10)->post($baseUrl, [
+                'recipient' => ['id' => $recipientId],
+                'message' => [
+                    'attachment' => [
+                        'type' => 'image',
+                        'payload' => [
+                            'url' => $imageUrl,
+                            'is_reusable' => true
+                        ]
+                    ]
+                ],
+            ]);
+        }
+
+        // Send text message
         $response = Http::timeout(10)
-            ->post($url, [
+            ->post($baseUrl, [
                 'recipient' => ['id' => $recipientId],
                 'message' => ['text' => $message],
             ]);
@@ -1198,10 +1231,10 @@ class ProcessAutoReply implements ShouldQueue
         return 'english';
     }
 
-    private function sendInstagramReply(Channel $channel, string $recipientId, string $message): bool
+    private function sendInstagramReply(Channel $channel, string $recipientId, string $message, array $images = []): bool
     {
         // Instagram uses the same API as Facebook with the page access token
-        return $this->sendFacebookReply($channel, $recipientId, $message);
+        return $this->sendFacebookReply($channel, $recipientId, $message, $images);
     }
 
     private function sendGmailReply(Channel $channel, Conversation $conversation, string $body): bool
@@ -1240,13 +1273,13 @@ class ProcessAutoReply implements ShouldQueue
 
             $encoded = rtrim(strtr(base64_encode($raw), '+/', '-_'), '=');
 
-            $message = new GmailMessage();
-            $message->setRaw($encoded);
+            $messageObj = new GmailMessage();
+            $messageObj->setRaw($encoded);
             if ($threadId) {
-                $message->setThreadId($threadId);
+                $messageObj->setThreadId($threadId);
             }
 
-            $gmail->users_messages->send('me', $message);
+            $gmail->users_messages->send('me', $messageObj);
             return true;
 
         } catch (\Exception $e) {
@@ -1255,12 +1288,24 @@ class ProcessAutoReply implements ShouldQueue
         }
     }
 
-    private function sendWhatsAppReply(Channel $channel, string $recipientId, string $message): bool
+    private function sendWhatsAppReply(Channel $channel, string $recipientId, string $message, array $images = []): bool
     {
         try {
             $whatsappService = new EvolutionApiService();
             $instanceName = $channel->page_id; // We store instance_name in page_id for WhatsApp
 
+            // Send images first
+            foreach ($images as $imageUrl) {
+                $whatsappService->sendMediaMessage(
+                    $instanceName,
+                    $recipientId,
+                    $imageUrl,
+                    '', // No caption, send standalone image
+                    'image'
+                );
+            }
+
+            // Send the actual text message
             $response = $whatsappService->sendTextMessage($instanceName, $recipientId, $message);
 
             if (isset($response['key']['id'])) {

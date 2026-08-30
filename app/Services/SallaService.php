@@ -468,6 +468,78 @@ class SallaService
         return $this->apiCallForChannel($channel, 'GET', "/orders/{$orderId}");
     }
 
+    /**
+     * Priority 1 fix: channel-aware (auto-refresh) product LIST endpoint, for
+     * aggregate/count queries ("how many products", "list your products").
+     * Correct endpoint: GET /admin/v2/products — never a single-resource lookup.
+     */
+    public function getProductsForChannel(Channel $channel, array $params = []): array
+    {
+        return $this->apiCallForChannel($channel, 'GET', '/products', $params);
+    }
+
+    /**
+     * Priority 1 fix: channel-aware (auto-refresh) order LIST endpoint, for
+     * aggregate/count queries ("how many orders", "show me my orders").
+     * Correct endpoint: GET /admin/v2/orders — never a single-resource lookup.
+     */
+    public function getOrdersForChannel(Channel $channel, array $params = []): array
+    {
+        return $this->apiCallForChannel($channel, 'GET', '/orders', $params);
+    }
+
+    /**
+     * Normalise a raw GET /products list response into a small, AI-safe structure:
+     * total count (from pagination metadata, falling back to the returned page size),
+     * the returned count, and up to 10 items for display.
+     */
+    public function formatProductsListForAI(array $productsResponse): array
+    {
+        $products   = $productsResponse['data'] ?? [];
+        $pagination = $productsResponse['pagination'] ?? [];
+
+        return [
+            'total_count'    => $pagination['total'] ?? count($products),
+            'returned_count' => count($products),
+            'per_page'       => $pagination['per_page'] ?? null,
+            'current_page'   => $pagination['current_page'] ?? null,
+            'items'          => array_map(function ($p) {
+                return [
+                    'id'       => $p['id']   ?? null,
+                    'name'     => $p['name'] ?? 'Unknown',
+                    'price'    => $p['price']['amount']       ?? $p['price'] ?? null,
+                    'currency' => $p['price']['currency_code'] ?? 'SAR',
+                    'quantity' => $p['quantity'] ?? null,
+                ];
+            }, array_slice($products, 0, 10)),
+        ];
+    }
+
+    /**
+     * Normalise a raw GET /orders list response into a small, AI-safe structure.
+     */
+    public function formatOrdersListForAI(array $ordersResponse): array
+    {
+        $orders     = $ordersResponse['data'] ?? [];
+        $pagination = $ordersResponse['pagination'] ?? [];
+
+        return [
+            'total_count'    => $pagination['total'] ?? count($orders),
+            'returned_count' => count($orders),
+            'per_page'       => $pagination['per_page'] ?? null,
+            'current_page'   => $pagination['current_page'] ?? null,
+            'items'          => array_map(function ($o) {
+                return [
+                    'id'           => $o['id'] ?? null,
+                    'reference_id' => $o['reference_id'] ?? ($o['id'] ?? null),
+                    'status'       => $o['status']['name'] ?? $o['status'] ?? 'Unknown',
+                    'total'        => $o['total']['amount']       ?? null,
+                    'currency'     => $o['total']['currency']     ?? 'SAR',
+                ];
+            }, array_slice($orders, 0, 10)),
+        ];
+    }
+
     public function formatOrderForAI(array $order): string
     {
         $orderNumber      = $order['reference_id'] ?? $order['id'] ?? 'N/A';

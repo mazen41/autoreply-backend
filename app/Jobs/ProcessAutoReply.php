@@ -293,6 +293,35 @@ class ProcessAutoReply implements ShouldQueue
             'show me products','what do you sell','المنتجات','منتجاتكم',
         ];
 
+        // Bug (Priority 1) fix: aggregate/list queries — "how many products", "list your
+        // orders", etc. — were falling through to the generic INTENT-2 (question) path,
+        // which only checks business_profile/knowledge_base and never calls Salla, so the
+        // AI either hallucinated (contamination from unrelated knowledge chunks) or replied
+        // "I don't have access". These keywords are matched BEFORE the order-status /
+        // place-order keywords so a phrase like "how many orders exist" (which also contains
+        // the generic word "order") is routed to the aggregate flow, not order-status lookup.
+        $productAggregateKeywords = [
+            'how many products', 'how many items', 'products exist', 'products are there',
+            'products do you have', 'what products do you have', 'list your products',
+            'list products', 'list of products', 'show your products', 'show all products',
+            'كم منتج', 'كم عدد المنتجات', 'عدد المنتجات', 'قائمة المنتجات', 'كل المنتجات',
+        ];
+        $orderAggregateKeywords = [
+            'how many orders', 'orders exist', 'orders are there', 'show me my orders',
+            'show me orders', 'list orders', 'list my orders', 'list all orders',
+            'all my orders', 'how many orders do you have', 'how many orders are there',
+            'كم طلب', 'عدد الطلبات', 'كم عدد الطلبات', 'قائمة الطلبات', 'كل الطلبات',
+        ];
+
+        $isProductAggregate = false;
+        $isOrderAggregate    = false;
+        foreach ($productAggregateKeywords as $kw) {
+            if (str_contains($msgLower, $kw)) { $isProductAggregate = true; break; }
+        }
+        foreach ($orderAggregateKeywords as $kw) {
+            if (str_contains($msgLower, $kw)) { $isOrderAggregate = true; break; }
+        }
+
         $isOrderStatus = false;
         $isPlaceOrder  = false;
 
@@ -301,6 +330,13 @@ class ProcessAutoReply implements ShouldQueue
         }
         foreach ($placeOrderKeywords as $kw) {
             if (str_contains($msgLower, $kw)) { $isPlaceOrder = true; break; }
+        }
+
+        // Aggregate intent is more specific than the generic order-status / place-order
+        // keyword buckets (which share words like "order" and "products") — it always wins.
+        if ($isProductAggregate || $isOrderAggregate) {
+            $isOrderStatus = false;
+            $isPlaceOrder  = false;
         }
 
         // Bug 6 fix: detect bare order-number follow-up replies like "#276817444" or "276817444".
@@ -344,7 +380,44 @@ class ProcessAutoReply implements ShouldQueue
             ->where('status', 'connected')
             ->first();
 
+        $productsAggregateContext = null;
+        $ordersAggregateContext   = null;
+
         if ($sallaChannel) {
+
+            // ── STORE AGGREGATE FLOW (Priority 1 fix) ────────────────────────
+            // Aggregate/list queries must hit the real Salla list endpoints
+            // (GET /products, GET /orders) — never the single-resource endpoints,
+            // and never silently fall back to "no access". If the call fails we still
+            // pass a structured error into the AI context so it can be honest about it
+            // instead of hallucinating a generic "I don't have access" line.
+            if ($isProductAggregate) {
+                try {
+                    $sallaService = new SallaService();
+                    $raw = $sallaService->getProductsForChannel($sallaChannel, ['per_page' => 10]);
+                    $productsAggregateContext = $sallaService->formatProductsListForAI($raw);
+                    Log::info('ProcessAutoReply: Salla products aggregate fetched', [
+                        'total_count' => $productsAggregateContext['total_count'] ?? null,
+                    ]);
+                } catch (\Exception $e) {
+                    Log::error('ProcessAutoReply: Salla products aggregate fetch failed', ['error' => $e->getMessage()]);
+                    $productsAggregateContext = ['error' => $e->getMessage()];
+                }
+            }
+
+            if ($isOrderAggregate) {
+                try {
+                    $sallaService = new SallaService();
+                    $raw = $sallaService->getOrdersForChannel($sallaChannel, ['per_page' => 10]);
+                    $ordersAggregateContext = $sallaService->formatOrdersListForAI($raw);
+                    Log::info('ProcessAutoReply: Salla orders aggregate fetched', [
+                        'total_count' => $ordersAggregateContext['total_count'] ?? null,
+                    ]);
+                } catch (\Exception $e) {
+                    Log::error('ProcessAutoReply: Salla orders aggregate fetch failed', ['error' => $e->getMessage()]);
+                    $ordersAggregateContext = ['error' => $e->getMessage()];
+                }
+            }
 
             // ── ORDER STATUS FLOW ────────────────────────────────────────────
             if ($isOrderStatus) {
@@ -691,6 +764,9 @@ class ProcessAutoReply implements ShouldQueue
             })(),
             'order_data'     => $orderContext,
             'products'       => $productsContext ?? null,
+            'salla_products_aggregate' => $productsAggregateContext,
+            'salla_orders_aggregate'   => $ordersAggregateContext,
+            'salla_connected'          => (bool) $sallaChannel,
         ];
 
         // Step 4: Single AI Call with JSON Output

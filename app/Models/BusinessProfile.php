@@ -124,4 +124,9 @@ class BusinessProfile extends Model
     {
         return $this->hasMany(Conversation::class, 'business_id');
     }
+
+    public function channels()
+    {
+        return $this->hasMany(Channel::class, 'business_id');
+    }
 }

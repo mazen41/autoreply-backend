@@ -608,6 +608,17 @@ class ProcessAutoReply implements ShouldQueue
 
                 return $knowledgeText;
             })() ?? '',
+            'connected_channels' => (function() use ($business) {
+                if (!$business) return '';
+                $channels = $business->channels()->where('status', 'connected')->pluck('type')->unique()->toArray();
+                if (empty($channels)) return '';
+                
+                $formatted = array_map(function($c) {
+                    return ucfirst($c); // e.g. "Instagram", "Whatsapp", "Salla", "Shopify"
+                }, $channels);
+                
+                return implode(', ', $formatted);
+            })(),
             'order_data'     => $orderContext,
             'products'       => $productsContext ?? null,
         ];

@@ -343,6 +343,14 @@ class KnowledgeController extends Controller
             $prompt .= "\n### FREQUENTLY ASKED QUESTIONS ###\n{$faqsText}\n";
         }
 
+        $channels = $business->channels()->where('status', 'connected')->pluck('type')->unique()->toArray();
+        if (!empty($channels)) {
+            $formattedChannels = implode(', ', array_map('ucfirst', $channels));
+            $prompt .= "\n### CONNECTED CHANNELS ###\n";
+            $prompt .= "We are currently active on: {$formattedChannels}\n";
+            $prompt .= "(Use this if the user asks if we have an app, website, or are on a specific platform like Salla or Instagram).\n";
+        }
+
         // Add knowledge base from uploaded files
         if (!empty($knowledgeText)) {
             $prompt .= "\n### KNOWLEDGE BASE & DOCUMENTATION ###\n{$knowledgeText}\n";

@@ -103,6 +103,20 @@ ROLE;
             $p .= "• If not available in either source → do NOT guess. Ask for details or escalate.\n\n";
         }
 
+        // ── Connected Channels ───────────────────────────────────────────
+        $hasConnectedChannels = !empty($context['connected_channels']);
+        if ($hasConnectedChannels) {
+            $p .= "\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n";
+            $p .= "CONNECTED CHANNELS (WHERE WE ARE ACTIVE)\n";
+            $p .= "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n";
+            $p .= "The business is currently active on the following platforms/channels:\n";
+            $p .= $context['connected_channels'] . "\n\n";
+            $p .= "USAGE RULES:\n";
+            $p .= "• If the customer asks if you have a website, app, or account on a specific platform, check this list.\n";
+            $p .= "• E.g. 'Do you have Salla?', 'Are you on Instagram?', 'Do you have a website?'.\n";
+            $p .= "• Only confirm presence on these platforms. If a platform is not listed, politely state you are not on it.\n\n";
+        }
+
         // ── Order data (pre-fetched by ProcessAutoReply) ──────────────────────
         $p .= "\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n";
         $p .= "INTENT 1 — GREETING\n";

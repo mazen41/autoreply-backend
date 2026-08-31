@@ -761,28 +761,54 @@ class ProcessAutoReply implements ShouldQueue
                         'product_id'      => $referencedProduct['salla_product_id'],
                     ]);
                 } else {
-                    try {
-                        $sallaService = new SallaService();
-                        $productsRaw  = $sallaService->getProducts($sallaChannel->access_token, ['per_page' => 10]);
-                        $products     = $productsRaw['data'] ?? [];
-
-                        // Normalise product list for AI context
-                        $productsContext = array_map(function ($p) {
+                    // Reuse the aggregate data already fetched this turn if available
+                    // (avoids a redundant API round-trip and works even if isProductAggregate
+                    // wasn't set, e.g. the customer typed "I want to order" without going
+                    // through the browse flow first).
+                    if (!empty($productsAggregateContext['items'])) {
+                        $productsContext = array_map(function ($item) {
                             return [
-                                'id'        => $p['id']                    ?? null,
-                                'name'      => $p['name']                  ?? 'Unknown',
-                                'price'     => $p['price']['amount']       ?? $p['price'] ?? '?',
-                                'currency'  => $p['price']['currency_code'] ?? 'SAR',
-                                'available' => ($p['quantity'] ?? 1) > 0,
-                                'url'       => $p['urls']['customer']      ?? null,
+                                'id'        => $item['id']        ?? null,
+                                'name'      => $item['name']      ?? 'Unknown',
+                                'price'     => $item['price']     ?? '?',
+                                'currency'  => $item['currency']  ?? 'SAR',
+                                'available' => ($item['quantity'] ?? 1) > 0,
+                                'url'       => null,
                             ];
-                        }, $products);
+                        }, $productsAggregateContext['items']);
 
-                        Log::info('ProcessAutoReply: Salla products loaded for place_order', [
-                            'count' => count($productsContext),
+                        Log::info('ProcessAutoReply: place_order reusing already-fetched aggregate products', [
+                            'conversation_id' => $conversation->id,
+                            'count'           => count($productsContext),
                         ]);
-                    } catch (\Exception $e) {
-                        Log::warning('ProcessAutoReply: Salla products fetch failed', ['error' => $e->getMessage()]);
+                    } else {
+                        // No aggregate data yet — fetch fresh using the channel-aware
+                        // method (handles token expiry + auto-refresh automatically).
+                        // The old getProducts($token) path had no refresh logic and would
+                        // silently fail on an expired token, leaving productsContext empty
+                        // which caused the AI to escalate with "business_rule".
+                        try {
+                            $sallaService = new SallaService();
+                            $raw          = $sallaService->getProductsForChannel($sallaChannel, ['per_page' => 10]);
+                            $formatted    = $sallaService->formatProductsListForAI($raw);
+
+                            $productsContext = array_map(function ($item) {
+                                return [
+                                    'id'        => $item['id']        ?? null,
+                                    'name'      => $item['name']      ?? 'Unknown',
+                                    'price'     => $item['price']     ?? '?',
+                                    'currency'  => $item['currency']  ?? 'SAR',
+                                    'available' => ($item['quantity'] ?? 1) > 0,
+                                    'url'       => null,
+                                ];
+                            }, $formatted['items'] ?? []);
+
+                            Log::info('ProcessAutoReply: Salla products loaded for place_order', [
+                                'count' => count($productsContext),
+                            ]);
+                        } catch (\Exception $e) {
+                            Log::warning('ProcessAutoReply: Salla products fetch failed for place_order', ['error' => $e->getMessage()]);
+                        }
                     }
                 }
             }

@@ -316,9 +316,14 @@ ROLE;
             $p .= "Step 6: On confirmation → reply: \"Your order has been placed! 🎉 Our team will contact you shortly to arrange delivery.\"\n\n";
             $p .= "intent = place_order\n\n";
         } else {
-            $p .= "❌ No product catalogue is currently loaded.\n";
-            $p .= "Reply: \"I'd love to help you place an order! Let me connect you with our team who can assist you directly 😊\"\n";
-            $p .= "needs_escalation = true, intent = place_order\n\n";
+            // No product catalogue was pre-loaded for this turn.
+            // DO NOT escalate — the backend should always load products for
+            // place_order turns. If we still ended up here, reply politely
+            // and let the customer re-state their order (the next message
+            // will be processed fresh and will load the catalogue).
+            $p .= "⚠️ Product catalogue not available right now.\n";
+            $p .= "Reply: \"I'm sorry, I'm having a brief issue loading our product catalogue. Could you let me know which product you'd like to order and I'll get it sorted for you right away? 😊\"\n";
+            $p .= "needs_escalation = false, intent = place_order\n\n";
         }
 
         // ── CART STATE (optional, injected when multi-turn ordering is tracked) ─

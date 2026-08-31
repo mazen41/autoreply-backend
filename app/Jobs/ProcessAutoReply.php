@@ -267,6 +267,51 @@ class ProcessAutoReply implements ShouldQueue
             'focus' => 'support'
         ];
         
+        // ── CRITICAL ISSUE — REPLY-TO-PRODUCT CONTEXT / PRODUCT SELECTION ──────
+        // If this incoming message is a WhatsApp reply to a specific product
+        // image we previously sent, resolve the EXACT product deterministically
+        // from the persisted message→product mapping. This must happen BEFORE
+        // any keyword/AI intent classification and must NEVER be left to AI
+        // inference — see ProductMessageMap / EvolutionApiService::extractQuotedMessageId().
+        //
+        // Priority order for product identification (per spec):
+        //   1. Replied-to product message (this block)
+        //   2. Explicit product ID/SKU supplied by user (left to existing AI/product context)
+        //   3. Explicit product name (left to existing AI/product context)
+        //   4. Conversation context
+        //   5. AI inference (last resort only)
+        $referencedProduct = null;
+        $quotedMessageId = $message->metadata['quoted_message_id'] ?? null;
+
+        if ($quotedMessageId) {
+            $productMap = \App\Models\ProductMessageMap::where('conversation_id', $message->conversation_id)
+                ->where('whatsapp_message_id', $quotedMessageId)
+                ->latest('id')
+                ->first();
+
+            if ($productMap) {
+                $referencedProduct = [
+                    'salla_product_id' => $productMap->salla_product_id,
+                    'sku'              => $productMap->sku,
+                    'name'             => $productMap->product_name,
+                    'price'            => $productMap->product_price,
+                    'currency'         => $productMap->currency ?? 'SAR',
+                    'image'            => $productMap->image_url,
+                ];
+
+                Log::info('ProcessAutoReply: resolved referenced product from replied-to message', [
+                    'conversation_id'   => $message->conversation_id,
+                    'quoted_message_id' => $quotedMessageId,
+                    'product_id'        => $referencedProduct['salla_product_id'],
+                ]);
+            } else {
+                Log::info('ProcessAutoReply: message replies to a quoted message but no product mapping was found for it', [
+                    'conversation_id'   => $message->conversation_id,
+                    'quoted_message_id' => $quotedMessageId,
+                ]);
+            }
+        }
+
         // ── SMART SALLA FLOW ──────────────────────────────────────────────────
         // Detect intent from message BEFORE calling AI, so we can pre-load the
         // right Salla data (order data OR product list) into the AI context.
@@ -419,6 +464,27 @@ class ProcessAutoReply implements ShouldQueue
         if ($isProductAggregate || $isOrderAggregate) {
             $isOrderStatus = false;
             $isPlaceOrder  = false;
+        }
+
+        // ── REPLY-TO-PRODUCT "THIS ONE" INTENT ──────────────────────────────
+        // When a specific product was deterministically resolved from a
+        // replied-to image (see block above), phrases like "I want this one",
+        // "order this", "give me this one" unambiguously mean BUY that exact
+        // product — never a generic browse/aggregate request, and never
+        // something the AI should re-classify by guessing. Only fires when a
+        // product was actually resolved, so it can't misfire on ordinary text.
+        if ($referencedProduct) {
+            $thisProductOrderPattern = '/\b(i want this( one)?|i wanna (order|buy) this|order this( one)?|buy this( one)?|this one|give me this( one)?|i\'?ll take this|i will take this|add this to (my )?(order|cart))\b/iu';
+            if (preg_match($thisProductOrderPattern, $msgLower)) {
+                $isPlaceOrder      = true;
+                $isProductAggregate = false;
+                $isOrderAggregate   = false;
+                $isOrderStatus      = false;
+                Log::info('ProcessAutoReply: "this one" reply-to-product phrasing detected — forcing place_order intent', [
+                    'conversation_id' => $conversation->id,
+                    'product_id'      => $referencedProduct['salla_product_id'],
+                ]);
+            }
         }
 
         // Bug 6 fix: detect bare order-number follow-up replies like "#276817444" or "276817444".
@@ -660,28 +726,50 @@ class ProcessAutoReply implements ShouldQueue
 
             // ── PLACE ORDER FLOW ─────────────────────────────────────────────
             if ($isPlaceOrder) {
-                try {
-                    $sallaService = new SallaService();
-                    $productsRaw  = $sallaService->getProducts($sallaChannel->access_token, ['per_page' => 10]);
-                    $products     = $productsRaw['data'] ?? [];
+                if ($referencedProduct) {
+                    // CRITICAL ISSUE — REPLY-TO-PRODUCT CONTEXT: the customer
+                    // replied to a specific product image, so the product is
+                    // already known deterministically. NEVER re-fetch a generic
+                    // product list here and let the AI guess/re-search — that
+                    // is exactly the bug this fix closes. Feed the AI a
+                    // single-item list containing only the referenced product.
+                    $productsContext = [[
+                        'id'        => $referencedProduct['salla_product_id'],
+                        'name'      => $referencedProduct['name'] ?? 'Unknown',
+                        'price'     => $referencedProduct['price'] ?? '?',
+                        'currency'  => $referencedProduct['currency'] ?? 'SAR',
+                        'available' => true,
+                        'url'       => null,
+                    ]];
 
-                    // Normalise product list for AI context
-                    $productsContext = array_map(function ($p) {
-                        return [
-                            'id'        => $p['id']                    ?? null,
-                            'name'      => $p['name']                  ?? 'Unknown',
-                            'price'     => $p['price']['amount']       ?? $p['price'] ?? '?',
-                            'currency'  => $p['price']['currency_code'] ?? 'SAR',
-                            'available' => ($p['quantity'] ?? 1) > 0,
-                            'url'       => $p['urls']['customer']      ?? null,
-                        ];
-                    }, $products);
-
-                    Log::info('ProcessAutoReply: Salla products loaded for place_order', [
-                        'count' => count($productsContext),
+                    Log::info('ProcessAutoReply: place_order using deterministically-resolved referenced product (skipping product re-fetch)', [
+                        'conversation_id' => $conversation->id,
+                        'product_id'      => $referencedProduct['salla_product_id'],
                     ]);
-                } catch (\Exception $e) {
-                    Log::warning('ProcessAutoReply: Salla products fetch failed', ['error' => $e->getMessage()]);
+                } else {
+                    try {
+                        $sallaService = new SallaService();
+                        $productsRaw  = $sallaService->getProducts($sallaChannel->access_token, ['per_page' => 10]);
+                        $products     = $productsRaw['data'] ?? [];
+
+                        // Normalise product list for AI context
+                        $productsContext = array_map(function ($p) {
+                            return [
+                                'id'        => $p['id']                    ?? null,
+                                'name'      => $p['name']                  ?? 'Unknown',
+                                'price'     => $p['price']['amount']       ?? $p['price'] ?? '?',
+                                'currency'  => $p['price']['currency_code'] ?? 'SAR',
+                                'available' => ($p['quantity'] ?? 1) > 0,
+                                'url'       => $p['urls']['customer']      ?? null,
+                            ];
+                        }, $products);
+
+                        Log::info('ProcessAutoReply: Salla products loaded for place_order', [
+                            'count' => count($productsContext),
+                        ]);
+                    } catch (\Exception $e) {
+                        Log::warning('ProcessAutoReply: Salla products fetch failed', ['error' => $e->getMessage()]);
+                    }
                 }
             }
         }
@@ -881,6 +969,11 @@ class ProcessAutoReply implements ShouldQueue
             'salla_products_aggregate' => $productsAggregateContext,
             'salla_orders_aggregate'   => $ordersAggregateContext,
             'salla_connected'          => (bool) $sallaChannel,
+            // CRITICAL ISSUE — REPLY-TO-PRODUCT CONTEXT: the product the
+            // customer deterministically referenced by replying to its image,
+            // if any. See getUltimateSystemPrompt() — when present, the AI
+            // must never ask "which product" again.
+            'referenced_product'       => $referencedProduct,
         ];
 
         // Step 4: Single AI Call with JSON Output
@@ -1017,19 +1110,26 @@ class ProcessAutoReply implements ShouldQueue
         // into $aiResponse BEFORE any image has actually been sent. We now
         // attempt the real sends first and only let that claim reach the
         // customer if at least one image genuinely went through.
-        $images = [];
+        // CRITICAL ISSUE — REPLY-TO-PRODUCT CONTEXT: send full product items
+        // (not just bare URLs) so each successfully-sent image can be persisted
+        // as a ProductMessageMap row — the deterministic evidence a later reply
+        // ("I want this one") resolves back to the exact product.
+        $productImageItems = [];
         if (!empty($aiResult['needs_images']) && !empty($productsAggregateContext['items'])) {
-            $images = array_values(array_filter(array_column($productsAggregateContext['items'], 'image_url')));
+            $productImageItems = array_values(array_filter(
+                $productsAggregateContext['items'],
+                fn($item) => !empty($item['image_url'])
+            ));
             // Cap at 5 images to avoid spam
-            $images = array_slice($images, 0, 5);
+            $productImageItems = array_slice($productImageItems, 0, 5);
         }
 
         $imagesActuallySent = 0;
-        if (!empty($images)) {
-            $imagesActuallySent = $this->sendImagesToCustomer($channel, $conversation->sender_id, $images);
+        if (!empty($productImageItems)) {
+            $imagesActuallySent = $this->sendImagesToCustomer($channel, $conversation, $productImageItems);
             Log::info('ProcessAutoReply: image send attempt result', [
                 'conversation_id' => $conversation->id,
-                'attempted'       => count($images),
+                'attempted'       => count($productImageItems),
                 'sent'            => $imagesActuallySent,
             ]);
         }
@@ -1037,7 +1137,7 @@ class ProcessAutoReply implements ShouldQueue
         if (!empty($aiResult['needs_images']) && $imagesActuallySent === 0) {
             Log::warning('ProcessAutoReply: AI intended to claim images were sent but zero actually sent -- overriding reply text to stay honest', [
                 'conversation_id'  => $conversation->id,
-                'candidate_images' => count($images),
+                'candidate_images' => count($productImageItems),
                 'original_reply'   => substr($aiResponse, 0, 200),
             ]);
             $aiResponse = $detectedLanguage === 'arabic'
@@ -1180,20 +1280,33 @@ class ProcessAutoReply implements ShouldQueue
     /**
      * Sends product images directly to the customer via the channel's native
      * media API, BEFORE the text reply is composed. Returns how many of the
-     * given URLs were actually confirmed sent. Each image is attempted
-     * independently (try/catch per item) so one bad URL doesn't block the rest.
+     * given product items were actually confirmed sent. Each image is
+     * attempted independently (try/catch per item) so one bad URL doesn't
+     * block the rest.
      *
      * This return value is what gates whether the AI's "here are the photos"
      * language is allowed to reach the customer -- see handle().
+     *
+     * CRITICAL ISSUE — REPLY-TO-PRODUCT CONTEXT: every successfully-sent
+     * image is persisted as a ProductMessageMap row (outgoing message id →
+     * Salla product), so that when the customer later replies directly to
+     * one of these images, the exact product can be resolved deterministically
+     * instead of the AI guessing from text/position/name similarity.
+     *
+     * @param array $productItems Each item: ['id','name','price','currency','quantity','image_url','sku'?]
      */
-    private function sendImagesToCustomer(Channel $channel, string $recipientId, array $imageUrls): int
+    private function sendImagesToCustomer(Channel $channel, Conversation $conversation, array $productItems): int
     {
         $sentCount = 0;
+        $recipientId = $conversation->sender_id;
 
-        foreach ($imageUrls as $imageUrl) {
+        foreach ($productItems as $item) {
+            $imageUrl = $item['image_url'] ?? null;
             if (empty($imageUrl)) {
                 continue;
             }
+
+            $sentMessageId = null;
 
             try {
                 if ($channel->type === 'whatsapp') {
@@ -1201,7 +1314,8 @@ class ProcessAutoReply implements ShouldQueue
                     // EvolutionApiService::makeRequest() throws on any non-2xx
                     // response after retries -- reaching the line below without
                     // an exception means Evolution accepted the send.
-                    $whatsappService->sendMediaMessage($channel->page_id, $recipientId, $imageUrl, '', 'image');
+                    $response = $whatsappService->sendMediaMessage($channel->page_id, $recipientId, $imageUrl, '', 'image');
+                    $sentMessageId = $response['key']['id'] ?? null;
                     $sentCount++;
                 } elseif (in_array($channel->type, ['facebook', 'instagram'], true)) {
                     $accessToken = $channel->access_token;
@@ -1219,6 +1333,7 @@ class ProcessAutoReply implements ShouldQueue
                     );
                     if ($response->successful()) {
                         $sentCount++;
+                        $sentMessageId = $response->json()['message_id'] ?? null;
                     } else {
                         Log::error('ProcessAutoReply: image send failed (Facebook/Instagram)', [
                             'channel_type' => $channel->type,
@@ -1238,6 +1353,35 @@ class ProcessAutoReply implements ShouldQueue
                     'image_url'    => $imageUrl,
                     'error'        => $e->getMessage(),
                 ]);
+            }
+
+            // Persist the deterministic message→product mapping ONLY when we
+            // actually have the outgoing message id — without it a later reply
+            // can never be traced back to this specific image.
+            if ($sentMessageId) {
+                try {
+                    \App\Models\ProductMessageMap::updateOrCreate(
+                        [
+                            'conversation_id'      => $conversation->id,
+                            'whatsapp_message_id'  => $sentMessageId,
+                        ],
+                        [
+                            'channel_id'       => $channel->id,
+                            'salla_product_id' => isset($item['id']) ? (string) $item['id'] : null,
+                            'sku'              => $item['sku'] ?? null,
+                            'product_name'     => $item['name'] ?? null,
+                            'product_price'    => isset($item['price']) ? (string) $item['price'] : null,
+                            'currency'         => $item['currency'] ?? null,
+                            'image_url'        => $imageUrl,
+                        ]
+                    );
+                } catch (\Exception $e) {
+                    Log::error('ProcessAutoReply: failed to persist product message map', [
+                        'conversation_id' => $conversation->id,
+                        'message_id'      => $sentMessageId,
+                        'error'           => $e->getMessage(),
+                    ]);
+                }
             }
         }
 

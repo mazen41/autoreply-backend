@@ -45,6 +45,7 @@ class AICapabilitiesService
         $hasOrderData     = !empty($context['order_data']);
         $hasProducts      = !empty($context['products']);
         $hasCartState     = !empty($context['cart']);
+        $hasReferencedProduct = !empty($context['referenced_product']);
 
         // ── Language instruction (placed first so the model sees it before anything else)
         $langRule = $language === 'arabic'
@@ -230,6 +231,34 @@ ROLE;
             $p .= "intent = order_status, needs_escalation = false\n\n";
         }
 
+        // ── DETERMINISTIC PRODUCT REFERENCE (reply-to-product-image) ───────────
+        // CRITICAL ISSUE — REPLY-TO-PRODUCT CONTEXT / PRODUCT SELECTION: when
+        // present, this was resolved by the backend from the WhatsApp message
+        // the customer directly replied to — it is NOT a guess and must never
+        // be second-guessed, re-asked, or overridden by the AI.
+        if ($hasReferencedProduct) {
+            $rp = $context['referenced_product'];
+            $p .= "\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n";
+            $p .= "⚠️ DETERMINISTIC PRODUCT REFERENCE (customer replied to a specific product photo)\n";
+            $p .= "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n";
+            $p .= "The customer's message is a WhatsApp reply directly to one specific product photo\n";
+            $p .= "sent earlier in this conversation. This was resolved by the backend from the exact\n";
+            $p .= "message they replied to — it is certain, not a guess.\n\n";
+            $p .= "Whenever the customer says things like \"this one\", \"this\", \"order this\",\n";
+            $p .= "\"how much is this\", \"add this to my order\", or \"show me more details\", they mean\n";
+            $p .= "EXACTLY this product — never a different one, and never ask them to identify the\n";
+            $p .= "product again or re-list the catalogue:\n\n";
+            $p .= "• Product: " . ($rp['name'] ?? 'Unknown') . "\n";
+            $p .= "• Price: " . ($rp['price'] ?? '?') . " " . ($rp['currency'] ?? 'SAR') . "\n";
+            if (!empty($rp['sku'])) {
+                $p .= "• SKU: {$rp['sku']}\n";
+            }
+            $p .= "\nIf the customer wants to buy it, skip straight to collecting order details — do NOT\n";
+            $p .= "ask \"which product are you interested in?\" (see ORDER COLLECTION FLOW Step 1 below).\n";
+            $p .= "If they're just asking a question about it (price, details), answer using only the\n";
+            $p .= "data above.\n\n";
+        }
+
         // ── PLACE AN ORDER ────────────────────────────────────────────────────
         $p .= "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n";
         $p .= "INTENT 4 — PLACE AN ORDER (Checkout / Purchase a specific product)\n";
@@ -268,7 +297,12 @@ ROLE;
 
             $p .= "✅ AVAILABLE PRODUCTS:\n{$productList}\n";
             $p .= "ORDER COLLECTION FLOW — follow these steps strictly:\n";
-            $p .= "Step 1: Present the product list above. Ask: \"Which product are you interested in?\"\n";
+            if ($hasReferencedProduct) {
+                $p .= "Step 1: The product is ALREADY confirmed (see DETERMINISTIC PRODUCT REFERENCE above).\n";
+                $p .= "        Do NOT ask which product — skip directly to Step 2.\n";
+            } else {
+                $p .= "Step 1: Present the product list above. Ask: \"Which product are you interested in?\"\n";
+            }
             $p .= "Step 2: Confirm the chosen product. Ask any needed follow-ups (size, color, quantity).\n";
             $p .= "Step 3: Collect ALL of the following — ask for missing fields one at a time:\n";
             $p .= "        • Full Name\n";

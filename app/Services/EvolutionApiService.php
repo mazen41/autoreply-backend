@@ -436,6 +436,16 @@ class EvolutionApiService
         $messageType = $this->detectMessageType($messageContent);
         $media = $this->extractAndStoreMedia($messageContent, $event, $instanceName, $message);
 
+        // CRITICAL ISSUE — REPLY-TO-PRODUCT CONTEXT: if this incoming message
+        // is a WhatsApp reply/quote, Baileys/Evolution carries the ID of the
+        // message being replied to under contextInfo.stanzaId, nested inside
+        // whichever message-type key the reply used (almost always
+        // extendedTextMessage, since a plain "conversation" message cannot
+        // carry contextInfo). Extract it here so it survives normalization —
+        // this is the deterministic evidence ProcessAutoReply uses to resolve
+        // "this one" back to the exact product the customer replied to.
+        $quotedMessageId = $this->extractQuotedMessageId($messageContent);
+
         if ($this->isReactionMessage($messageContent)) {
             $this->handleMessageReaction($event);
             return;
@@ -467,6 +477,7 @@ class EvolutionApiService
                 'remote_jid'  => $message['remoteJid'] ?? null,
                 'from_me'     => $fromMe,
                 'message_type' => $messageType,
+                'quoted_message_id' => $quotedMessageId,
                 // raw event/message_key deliberately omitted
             ],
             'status' => 'pending',
@@ -474,7 +485,7 @@ class EvolutionApiService
         ]);
 
         // Also save to unified inbox system
-        $this->saveToUnifiedInbox($instance, $fromPhone, $fromName, $body, $messageType, $media, $message, $fromMe);
+        $this->saveToUnifiedInbox($instance, $fromPhone, $fromName, $body, $messageType, $media, $message, $fromMe, $quotedMessageId);
 
         Log::info("Message saved from {$fromPhone} for instance {$instanceName} (fromMe: " . ($fromMe ? 'true' : 'false') . ")");
     }
@@ -482,7 +493,7 @@ class EvolutionApiService
     /**
      * Save WhatsApp message to unified inbox (Conversation/Message)
      */
-    protected function saveToUnifiedInbox(WhatsAppInstance $instance, ?string $fromPhone, ?string $fromName, ?string $body, string $messageType, ?array $media = null, array $messageKey = [], bool $fromMe = false): void
+    protected function saveToUnifiedInbox(WhatsAppInstance $instance, ?string $fromPhone, ?string $fromName, ?string $body, string $messageType, ?array $media = null, array $messageKey = [], bool $fromMe = false, ?string $quotedMessageId = null): void
     {
         try {
             // Deduplicate: the same WhatsApp message ID can arrive on multiple
@@ -602,6 +613,12 @@ class EvolutionApiService
                 'metadata' => [
                     'whatsapp_key' => $messageKey,
                     'media' => $media,
+                    // CRITICAL ISSUE — REPLY-TO-PRODUCT CONTEXT: the id of the
+                    // message this one replies to (Evolution contextInfo.stanzaId),
+                    // or null when this message isn't a reply. ProcessAutoReply
+                    // uses this to deterministically resolve which product a
+                    // reply like "I want this one" refers to.
+                    'quoted_message_id' => $quotedMessageId,
                 ],
             ]);
 
@@ -922,6 +939,48 @@ class EvolutionApiService
         $instance->save();
 
         Log::info("Instance status updated for {$instanceName}: {$status}");
+    }
+
+    /**
+     * CRITICAL ISSUE — REPLY-TO-PRODUCT CONTEXT: extract the id of the message
+     * being replied to (WhatsApp "quoted"/"reply" reference), if any.
+     *
+     * Baileys/Evolution nests contextInfo INSIDE whichever message-type key
+     * carries the reply — almost always extendedTextMessage, since a bare
+     * "conversation" message type has no room for contextInfo. Some
+     * normalizations also surface it one level up as messageContent.contextInfo
+     * directly, so we check both. We deliberately do NOT assume a single field
+     * name/location: this must survive whichever shape Evolution sends, per
+     * the "trace the real payload" requirement — do not guess field names.
+     *
+     * Returns the stanzaId (the replied-to message's own WhatsApp message id)
+     * or null when this message is not a reply.
+     */
+    protected function extractQuotedMessageId(array $messageContent): ?string
+    {
+        // Direct/top-level contextInfo (some Evolution versions flatten it here).
+        if (isset($messageContent['contextInfo']['stanzaId'])) {
+            return $messageContent['contextInfo']['stanzaId'];
+        }
+
+        // Nested inside a specific message-type key — the normal case.
+        $typeKeys = [
+            'extendedTextMessage',
+            'imageMessage',
+            'videoMessage',
+            'audioMessage',
+            'documentMessage',
+            'stickerMessage',
+            'conversation',
+        ];
+
+        foreach ($typeKeys as $key) {
+            if (isset($messageContent[$key]['contextInfo']['stanzaId'])) {
+                return $messageContent[$key]['contextInfo']['stanzaId'];
+            }
+        }
+
+        return null;
     }
 
     /**

@@ -437,14 +437,17 @@ class EvolutionApiService
         $media = $this->extractAndStoreMedia($messageContent, $event, $instanceName, $message);
 
         // CRITICAL ISSUE — REPLY-TO-PRODUCT CONTEXT: if this incoming message
-        // is a WhatsApp reply/quote, Baileys/Evolution carries the ID of the
-        // message being replied to under contextInfo.stanzaId, nested inside
-        // whichever message-type key the reply used (almost always
-        // extendedTextMessage, since a plain "conversation" message cannot
-        // carry contextInfo). Extract it here so it survives normalization —
-        // this is the deterministic evidence ProcessAutoReply uses to resolve
-        // "this one" back to the exact product the customer replied to.
-        $quotedMessageId = $this->extractQuotedMessageId($messageContent);
+        // is a WhatsApp reply/quote, Evolution carries the ID of the message
+        // being replied to under contextInfo.stanzaId. CONFIRMED FROM REAL
+        // PRODUCTION PAYLOADS (2026-08-31 logs): this Evolution version puts
+        // contextInfo as a SIBLING of `message` at the top level of `data`
+        // (data.contextInfo.stanzaId) — NOT nested inside data.message.*, as
+        // Baileys' raw format would suggest. extractQuotedMessageId() checks
+        // that real location first and falls back to the nested locations for
+        // safety across Evolution versions. Extract it here so it survives
+        // normalization — this is the deterministic evidence ProcessAutoReply
+        // uses to resolve "this one" back to the exact product replied to.
+        $quotedMessageId = $this->extractQuotedMessageId($event['data'] ?? [], $messageContent);
 
         if ($this->isReactionMessage($messageContent)) {
             $this->handleMessageReaction($event);
@@ -945,25 +948,37 @@ class EvolutionApiService
      * CRITICAL ISSUE — REPLY-TO-PRODUCT CONTEXT: extract the id of the message
      * being replied to (WhatsApp "quoted"/"reply" reference), if any.
      *
-     * Baileys/Evolution nests contextInfo INSIDE whichever message-type key
-     * carries the reply — almost always extendedTextMessage, since a bare
-     * "conversation" message type has no room for contextInfo. Some
-     * normalizations also surface it one level up as messageContent.contextInfo
-     * directly, so we check both. We deliberately do NOT assume a single field
-     * name/location: this must survive whichever shape Evolution sends, per
-     * the "trace the real payload" requirement — do not guess field names.
+     * CONFIRMED FROM REAL PRODUCTION WEBHOOK PAYLOADS (2026-08-31): this
+     * Evolution instance puts contextInfo as a SIBLING of `message` at the
+     * top level of the webhook's `data` object — i.e. data.contextInfo.stanzaId
+     * — for both MESSAGES_UPSERT and the SEND_MESSAGE echo. It is NOT nested
+     * inside data.message.extendedTextMessage.contextInfo as Baileys' raw
+     * (non-normalized) format would suggest. That nested shape is kept as a
+     * fallback only, in case a different Evolution/Baileys version reverts to
+     * it — we deliberately do NOT assume a single field name/location, per
+     * the "trace the real payload" requirement.
+     *
+     * @param array $data           The full webhook event's `data` object (event['data']).
+     * @param array $messageContent data.message — kept as a fallback lookup location.
      *
      * Returns the stanzaId (the replied-to message's own WhatsApp message id)
      * or null when this message is not a reply.
      */
-    protected function extractQuotedMessageId(array $messageContent): ?string
+    protected function extractQuotedMessageId(array $data, array $messageContent = []): ?string
     {
-        // Direct/top-level contextInfo (some Evolution versions flatten it here).
+        // REAL location, confirmed against production payloads: sibling of
+        // `message` at the top level of `data`.
+        if (isset($data['contextInfo']['stanzaId'])) {
+            return $data['contextInfo']['stanzaId'];
+        }
+
+        // Fallback: some normalizations flatten contextInfo directly onto
+        // the message-content object itself.
         if (isset($messageContent['contextInfo']['stanzaId'])) {
             return $messageContent['contextInfo']['stanzaId'];
         }
 
-        // Nested inside a specific message-type key — the normal case.
+        // Fallback: nested inside a specific message-type key (raw Baileys shape).
         $typeKeys = [
             'extendedTextMessage',
             'imageMessage',

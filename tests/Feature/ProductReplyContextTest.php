@@ -309,8 +309,11 @@ class ProductReplyContextTest extends TestCase
     /**
      * CRITICAL WEBHOOK INVESTIGATION: the replied-to message id
      * (contextInfo.stanzaId) must be extracted from an incoming Evolution
-     * MESSAGES_UPSERT payload and survive into the unified inbox Message's
-     * metadata, regardless of which message-type key carries contextInfo.
+     * MESSAGES_UPSERT payload. CONFIRMED FROM REAL PRODUCTION LOGS
+     * (2026-08-31): this Evolution instance puts contextInfo as a SIBLING of
+     * `message` at the top level of `data` — data.contextInfo.stanzaId — not
+     * nested inside data.message.extendedTextMessage.contextInfo. This test
+     * uses that real, confirmed shape.
      */
     public function test_webhook_extracts_quoted_message_id_into_unified_inbox_message(): void
     {
@@ -358,11 +361,13 @@ class ProductReplyContextTest extends TestCase
                 'message' => [
                     'extendedTextMessage' => [
                         'text' => 'I wanna place order for this one',
-                        'contextInfo' => [
-                            'stanzaId' => 'MEDIA_MSG_3',
-                            'participant' => '966500000000@s.whatsapp.net',
-                        ],
                     ],
+                ],
+                // REAL shape: contextInfo is a SIBLING of `message`, not nested
+                // inside it. See EvolutionApiService::extractQuotedMessageId().
+                'contextInfo' => [
+                    'stanzaId' => 'MEDIA_MSG_3',
+                    'participant' => '966500000000@s.whatsapp.net',
                 ],
             ],
         ]);
@@ -371,6 +376,73 @@ class ProductReplyContextTest extends TestCase
 
         $this->assertNotNull($saved, 'Unified inbox message must be saved');
         $this->assertEquals('MEDIA_MSG_3', $saved->metadata['quoted_message_id'] ?? null);
+    }
+
+    /**
+     * Fallback path: some Evolution/Baileys versions nest contextInfo INSIDE
+     * the message-type key instead of at the top level of `data`. This shape
+     * must still resolve correctly, even though it's not the shape confirmed
+     * in production.
+     */
+    public function test_webhook_extracts_quoted_message_id_from_nested_fallback_shape(): void
+    {
+        Queue::fake();
+        $this->makeFreePackage();
+
+        $user = User::forceCreate([
+            'name' => 'Test',
+            'email' => 'test' . rand() . '@example.com',
+            'password' => bcrypt('password'),
+        ]);
+
+        $business = BusinessProfile::create([
+            'user_id' => $user->id,
+            'business_name' => 'Demo Store',
+        ]);
+
+        $instance = WhatsAppInstance::create([
+            'user_id' => $user->id,
+            'instance_name' => 'instance-webhook-nested-reply-test',
+            'status' => 'connected',
+        ]);
+
+        Channel::create([
+            'user_id' => $user->id,
+            'business_id' => $business->id,
+            'type' => 'whatsapp',
+            'page_id' => $instance->instance_name,
+            'status' => 'connected',
+            'access_token' => '',
+            'ai_enabled' => true,
+        ]);
+
+        $service = new EvolutionApiService();
+        $service->processWebhookEvent([
+            'event' => 'MESSAGES_UPSERT',
+            'instance' => $instance->instance_name,
+            'data' => [
+                'key' => [
+                    'id' => 'REPLY_MSG_2',
+                    'fromMe' => false,
+                    'remoteJid' => '966500000000@s.whatsapp.net',
+                ],
+                'pushName' => 'Customer',
+                'message' => [
+                    'extendedTextMessage' => [
+                        'text' => 'how much is this',
+                        'contextInfo' => [
+                            'stanzaId' => 'MEDIA_MSG_5',
+                            'participant' => '966500000000@s.whatsapp.net',
+                        ],
+                    ],
+                ],
+            ],
+        ]);
+
+        $saved = Message::where('content', 'how much is this')->first();
+
+        $this->assertNotNull($saved, 'Unified inbox message must be saved');
+        $this->assertEquals('MEDIA_MSG_5', $saved->metadata['quoted_message_id'] ?? null);
     }
 
     /**

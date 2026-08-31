@@ -1375,6 +1375,16 @@ class ProcessAutoReply implements ShouldQueue
                             'image_url'        => $imageUrl,
                         ]
                     );
+
+                    // Deliberate INFO-level success log: its absence was what
+                    // made the original bug hard to diagnose from production
+                    // logs alone (image sends looked "successful" with no way
+                    // to tell whether the mapping was actually persisted).
+                    Log::info('ProcessAutoReply: persisted product message map', [
+                        'conversation_id'     => $conversation->id,
+                        'whatsapp_message_id' => $sentMessageId,
+                        'salla_product_id'    => isset($item['id']) ? (string) $item['id'] : null,
+                    ]);
                 } catch (\Exception $e) {
                     Log::error('ProcessAutoReply: failed to persist product message map', [
                         'conversation_id' => $conversation->id,

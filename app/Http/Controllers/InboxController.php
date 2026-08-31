@@ -746,13 +746,18 @@ class InboxController extends Controller
             })
             ->findOrFail($conversationId);
 
+        $newValue = !$conversation->ai_enabled;
+
         $conversation->update([
-            'ai_enabled' => !$conversation->ai_enabled
+            'ai_enabled' => $newValue
         ]);
 
+        // Re-read from DB to ensure response reflects the persisted value,
+        // not the stale in-memory attribute (update() writes to DB but does
+        // not automatically refresh the model's attribute cache).
         return response()->json([
-            'message' => 'AI toggled successfully',
-            'ai_enabled' => $conversation->ai_enabled
+            'message'    => 'AI toggled successfully',
+            'ai_enabled' => $newValue,
         ]);
     }
 }

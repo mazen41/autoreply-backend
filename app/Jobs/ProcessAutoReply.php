@@ -33,7 +33,21 @@ class ProcessAutoReply implements ShouldQueue
 
     public $tries = 3;
     public $backoff = 30;
-    
+
+    // FIX (2026-08-31): no job-level timeout was set, so a hang anywhere in
+    // handle() (most commonly the Gemini chat/embedding HTTP calls, now given
+    // their own explicit timeouts) could run past the queue connection's
+    // retry_after window (90s, see config/queue.php 'database'.'retry_after').
+    // When that happens Laravel assumes the worker died and makes the SAME
+    // job available again — NOT a clean retry via $tries/$backoff, but a
+    // duplicate/possibly-concurrent execution. Production logs showed exactly
+    // this: "ProcessAutoReply job started" for the same message id 2-3 times,
+    // ~90s apart, before one attempt finally completed. Setting an explicit
+    // timeout comfortably below 90s means a hang now fails the job cleanly
+    // and lets $tries/$backoff handle the retry as intended, instead of the
+    // queue's reservation-expiry silently duplicating it.
+    public $timeout = 75;
+
     public int $aiRepliesCount = 0;
 
     public function __construct(public int $messageId)

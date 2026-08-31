@@ -54,7 +54,10 @@ class EmbeddingsService
     public function embedChunk(string $text): ?array
     {
         try {
-            $response = Http::withHeaders([
+            // FIX (2026-08-31): same missing-timeout issue as AICapabilitiesService's
+            // Gemini chat call — a hang here blocks ProcessAutoReply's knowledge-base
+            // lookup well past the queue's 90s retry_after, causing duplicate job runs.
+            $response = Http::timeout(15)->connectTimeout(10)->withHeaders([
                 'Content-Type' => 'application/json',
             ])->post("{$this->baseUrl}/models/{$this->model}:embedContent?key={$this->apiKey}", [
                 'model' => "models/{$this->model}",
@@ -111,7 +114,8 @@ class EmbeddingsService
                 ];
             }
 
-            $response = Http::withHeaders([
+            // FIX (2026-08-31): same missing-timeout issue — see embedChunk() above.
+            $response = Http::timeout(20)->connectTimeout(10)->withHeaders([
                 'Content-Type' => 'application/json',
             ])->post("{$this->baseUrl}/models/{$this->model}:batchEmbedContents?key={$this->apiKey}", [
                 'requests' => $requests

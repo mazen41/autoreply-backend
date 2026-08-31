@@ -841,7 +841,16 @@ JSON;
             ];
         }
 
-        $response = Http::withHeaders([
+        // FIX (2026-08-31): no timeout was set here, so a slow/hanging Gemini
+        // request could block well past the queue's retry_after window
+        // (90s — see config/queue.php), causing Laravel to assume the worker
+        // died and silently re-dispatch the SAME job. Production logs showed
+        // ProcessAutoReply running 2-3x for one message, ~90s apart, with the
+        // customer waiting 3+ minutes for a reply. An explicit timeout here
+        // lets this fail fast with a real exception, which the existing
+        // callAIChatWithRetry() retry-with-backoff logic already handles
+        // correctly — that logic never even triggers on a plain hang.
+        $response = Http::timeout(25)->connectTimeout(10)->withHeaders([
             'Content-Type' => 'application/json',
         ])->post(
             "https://generativelanguage.googleapis.com/v1beta/models/{$model}:generateContent?key={$apiKey}",

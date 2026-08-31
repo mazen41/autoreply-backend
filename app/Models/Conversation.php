@@ -22,6 +22,7 @@ class Conversation extends Model
         'last_message_at',
         'assigned_agent_id',
         'assigned_at',
+        'checkout_state',
     ];
 
     protected $casts = [
@@ -31,6 +32,7 @@ class Conversation extends Model
         'ai_enabled'           => 'boolean',
         'requires_human'       => 'boolean',
         'escalation_notified'  => 'boolean',
+        'checkout_state'       => 'array',
     ];
 
     public function channel()

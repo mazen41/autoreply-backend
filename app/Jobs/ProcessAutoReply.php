@@ -290,10 +290,9 @@ class ProcessAutoReply implements ShouldQueue
         //
         // Priority order for product identification (per spec):
         //   1. Replied-to product message (this block)
-        //   2. Explicit product ID/SKU supplied by user (left to existing AI/product context)
-        //   3. Explicit product name (left to existing AI/product context)
-        //   4. Conversation context
-        //   5. AI inference (last resort only)
+        //   2. Active checkout_state on the conversation (persisted across turns)
+        //   3. Explicit product ID/SKU supplied by user (left to existing AI/product context)
+        //   4. AI inference (last resort only)
         $referencedProduct = null;
         $quotedMessageId = $message->metadata['quoted_message_id'] ?? null;
 
@@ -324,6 +323,35 @@ class ProcessAutoReply implements ShouldQueue
                     'quoted_message_id' => $quotedMessageId,
                 ]);
             }
+        }
+
+        // ── CHECKOUT STATE RECOVERY ─────────────────────────────────────────
+        // If the customer is mid-way through an order collection flow (they have
+        // already identified a product and the bot is collecting name/phone/address),
+        // their follow-up messages (providing those details) will NOT have a
+        // quoted_message_id — so referencedProduct would be null above, causing
+        // the place_order branch to re-fetch products, time out on an expired
+        // token, and show a "product catalogue not available" apology.
+        //
+        // Fix: persist a checkout_state JSON on the conversation every time a
+        // product is confirmed during place_order, then load it back here so the
+        // product identity is never lost between turns.
+        $checkoutState = $conversation->checkout_state ?? null;
+
+        if (!$referencedProduct && !empty($checkoutState['salla_product_id'])) {
+            $referencedProduct = [
+                'salla_product_id' => $checkoutState['salla_product_id'],
+                'sku'              => $checkoutState['sku']              ?? null,
+                'name'             => $checkoutState['product_name']     ?? 'Unknown',
+                'price'            => $checkoutState['product_price']    ?? '?',
+                'currency'         => $checkoutState['product_currency'] ?? 'SAR',
+                'image'            => null,
+            ];
+            Log::info('ProcessAutoReply: restored referenced product from checkout_state (mid-order turn)', [
+                'conversation_id' => $conversation->id,
+                'product_id'      => $referencedProduct['salla_product_id'],
+                'checkout_fields' => array_keys(array_filter($checkoutState)),
+            ]);
         }
 
         // ── SMART SALLA FLOW ──────────────────────────────────────────────────
@@ -1014,6 +1042,9 @@ class ProcessAutoReply implements ShouldQueue
             // if any. See getUltimateSystemPrompt() — when present, the AI
             // must never ask "which product" again.
             'referenced_product'       => $referencedProduct,
+            // Active partial order state (persisted across turns so the AI
+            // knows which fields have already been collected and won't re-ask).
+            'cart'                     => !empty($checkoutState) ? $checkoutState : null,
         ];
 
         // Step 4: Single AI Call with JSON Output
@@ -1215,6 +1246,67 @@ class ProcessAutoReply implements ShouldQueue
         ]);
 
         Log::info('ProcessAutoReply: AI reply saved', ['message_id' => $replyMessage->id]);
+
+        // ── CHECKOUT STATE PERSISTENCE ───────────────────────────────────────
+        // Keep the partial order state alive across turns so the product identity
+        // and any already-collected customer fields (name/phone/address) survive
+        // when downstream calls fail or the customer sends multiple reply messages.
+        //
+        // Rules:
+        //  • On place_order turns: initialize or merge state (product + collected fields)
+        //  • When the AI reply confirms the order was placed: clear state
+        //  • All other intents: leave state untouched (may be a Salla-flow continuation)
+        if ($intent === 'place_order' && $referencedProduct) {
+            $aiReplyLower   = mb_strtolower($aiResponse);
+            $orderConfirmed = str_contains($aiReplyLower, 'order has been placed')
+                || str_contains($aiReplyLower, 'تم تأكيد طلبك')
+                || str_contains($aiReplyLower, 'تم الطلب');
+
+            if ($orderConfirmed) {
+                // Order successfully placed — clear state
+                $conversation->update(['checkout_state' => null]);
+                Log::info('ProcessAutoReply: cleared checkout_state after order confirmed', [
+                    'conversation_id' => $conversation->id,
+                ]);
+            } else {
+                // Merge the known product identity with any newly-provided customer fields
+                // extracted directly from the customer's message text.
+                $incoming = $message->content;
+
+                // Simple heuristic: extract phone if message contains a digit sequence
+                $newPhone = null;
+                if (preg_match('/(?:\+?[0-9]{8,15})/', preg_replace('/\s+/', '', $incoming), $pm)) {
+                    $newPhone = $pm[0];
+                }
+
+                $newState = array_merge(
+                    is_array($checkoutState) ? $checkoutState : [],
+                    array_filter([
+                        'salla_product_id' => $referencedProduct['salla_product_id'] ?? ($checkoutState['salla_product_id'] ?? null),
+                        'sku'              => $referencedProduct['sku']              ?? ($checkoutState['sku']              ?? null),
+                        'product_name'     => $referencedProduct['name']             ?? ($checkoutState['product_name']     ?? null),
+                        'product_price'    => $referencedProduct['price']            ?? ($checkoutState['product_price']    ?? null),
+                        'product_currency' => $referencedProduct['currency']         ?? ($checkoutState['product_currency'] ?? 'SAR'),
+                        // Phone extracted from this message (non-null only if found)
+                        'customer_phone'   => $newPhone ?? ($checkoutState['customer_phone'] ?? null),
+                        // Preserve started_at timestamp from first turn
+                        'started_at'       => $checkoutState['started_at'] ?? now()->toISOString(),
+                    ], fn($v) => $v !== null)
+                );
+
+                $conversation->update(['checkout_state' => $newState]);
+                Log::info('ProcessAutoReply: updated checkout_state for place_order turn', [
+                    'conversation_id' => $conversation->id,
+                    'product_id'      => $newState['salla_product_id'] ?? null,
+                    'has_phone'       => !empty($newState['customer_phone']),
+                ]);
+            }
+        } elseif ($checkoutState && in_array($intent, ['greeting', 'escalation', 'order_status'])) {
+            // Clear stale checkout state if the conversation moved to a clearly different flow
+            $conversation->update(['checkout_state' => null]);
+        }
+        // ── END CHECKOUT STATE PERSISTENCE ───────────────────────────────────
+
 
         // Increment the monthly counter now that the message is confirmed saved
         cache()->increment($cacheKey);

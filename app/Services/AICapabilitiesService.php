@@ -1017,4 +1017,41 @@ JSON;
             'reasons' => []
         ];
     }
+
+    /**
+     * Test connectivity and credentials for the configured AI provider.
+     * Used by SystemHealthMonitoringService.
+     */
+    public static function testConnection(): array
+    {
+        try {
+            $provider = self::getAIProvider();
+            $apiKey = self::getAIAPIKey();
+
+            if (empty($apiKey)) {
+                return ['success' => false, 'error' => 'AI API Key is missing.'];
+            }
+
+            if ($provider === 'gemini') {
+                // Lightweight call to verify credentials without generating content
+                $response = \Illuminate\Support\Facades\Http::timeout(10)->get("https://generativelanguage.googleapis.com/v1beta/models?key={$apiKey}");
+                
+                if ($response->successful()) {
+                    return ['success' => true];
+                }
+                
+                return ['success' => false, 'error' => "Gemini API test failed: HTTP {$response->status()} " . $response->body()];
+            } elseif ($provider === 'openai') {
+                $response = \Illuminate\Support\Facades\Http::withToken($apiKey)->timeout(10)->get('https://api.openai.com/v1/models');
+                if ($response->successful()) {
+                    return ['success' => true];
+                }
+                return ['success' => false, 'error' => "OpenAI API test failed: HTTP {$response->status()} " . $response->body()];
+            }
+
+            return ['success' => false, 'error' => "Unsupported AI provider: {$provider}"];
+        } catch (\Exception $e) {
+            return ['success' => false, 'error' => 'Connection test exception: ' . $e->getMessage()];
+        }
+    }
 }

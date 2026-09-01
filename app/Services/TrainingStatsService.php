@@ -73,19 +73,17 @@ class TrainingStatsService
             ->count();
 
         // ── Escalations ────────────────────────────────────────────────────────
-        $escalatedInRange = (clone $this->conversationsQuery(null, null))
+        $escalatedInRange = (clone $this->conversationsQuery($start, $end))
             ->where('requires_human', true)
-            ->when($start, fn ($q) => $q->whereBetween('escalated_at', [$start, $end]))
             ->count();
 
         $escalatedToday  = $this->escalatedSince(Carbon::now()->startOfDay());
         $escalatedWeek   = $this->escalatedSince(Carbon::now()->startOfWeek());
         $escalatedMonth  = $this->escalatedSince(Carbon::now()->startOfMonth());
 
-        $escalationReasons = (clone $this->conversationsQuery(null, null))
+        $escalationReasons = (clone $this->conversationsQuery($start, $end))
             ->where('requires_human', true)
             ->whereNotNull('escalation_reason')
-            ->when($start, fn ($q) => $q->whereBetween('escalated_at', [$start, $end]))
             ->selectRaw('escalation_reason, COUNT(*) AS count')
             ->groupBy('escalation_reason')
             ->pluck('count', 'escalation_reason')
@@ -188,7 +186,7 @@ class TrainingStatsService
     {
         return $this->conversationsQuery(null, null)
             ->where('requires_human', true)
-            ->when($since, fn ($q) => $q->where('escalated_at', '>=', $since))
+            ->when($since, fn ($q) => $q->where('created_at', '>=', $since))
             ->count();
     }
 

@@ -202,9 +202,12 @@ class TrainingController extends Controller
             'file_type' => 'text/plain',
             'file_size' => strlen($correction->human_correction),
             'extracted_text' => "Question: {$correction->originalMessage->content}\n\nAnswer: {$correction->human_correction}",
+            'status' => 'pending', // Important for the job to pick it up or display correctly
         ]);
 
-        Log::info('Added correction to knowledge base', [
+        \App\Jobs\ProcessKnowledgeFile::dispatch($knowledgeFile->id);
+
+        Log::info('Added correction to knowledge base and dispatched for embedding', [
             'knowledge_file_id' => $knowledgeFile->id,
             'business_id' => $business->id
         ]);

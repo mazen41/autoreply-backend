@@ -143,13 +143,17 @@ class SequenceTriggerService
                 $triggerConfig = $sequence->trigger_config ?? [];
                 $hoursWithoutReply = $triggerConfig['hours'] ?? 24;
 
-                // Check if conversation has been inactive for the specified hours
-                $lastMessageTime = $conversation->messages()
-                    ->where('direction', 'inbound')
+                // Check if the last message was from business (outbound)
+                // and sent more than the configured hours ago (customer hasn't replied)
+                $threshold = now()->subHours($hoursWithoutReply);
+                
+                $lastMessage = $conversation->messages()
                     ->latest()
-                    ->first()?->created_at;
+                    ->first();
 
-                if ($lastMessageTime && $lastMessageTime->lt(now()->subHours($hoursWithoutReply))) {
+                if ($lastMessage && 
+                    $lastMessage->direction === 'outbound' && 
+                    $lastMessage->created_at->lte($threshold)) {
                     $this->enrollIfEligible($sequence, $conversation);
                 }
             } catch (\Exception $e) {

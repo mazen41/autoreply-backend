@@ -6,6 +6,7 @@ use App\Models\Conversation;
 use App\Models\Sequence;
 use App\Services\SequenceTriggerService;
 use Illuminate\Console\Command;
+use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Log;
 
 class CheckNoReplySequences extends Command
@@ -52,13 +53,22 @@ class CheckNoReplySequences extends Command
                 $triggerConfig = $sequence->trigger_config ?? [];
                 $hoursWithoutReply = $triggerConfig['hours'] ?? 24;
 
-                // Get conversations that haven't had inbound messages in the configured timeframe
+                // Get conversations where the last message was from business (outbound)
+                // and sent more than the configured hours ago (customer hasn't replied)
                 $threshold = now()->subHours($hoursWithoutReply);
 
                 $conversations = Conversation::where('business_id', $sequence->business_id)
-                    ->whereHas('messages', function ($query) use ($threshold) {
-                        $query->where('direction', 'inbound')
-                            ->where('created_at', '<=', $threshold);
+                    ->whereExists(function ($query) use ($threshold) {
+                        $query->select(DB::raw(1))
+                            ->from('messages')
+                            ->whereColumn('messages.conversation_id', 'conversations.id')
+                            ->where('direction', 'outbound')
+                            ->where('created_at', '<=', $threshold)
+                            ->where('id', function ($subQuery) {
+                                $subQuery->select(DB::raw('MAX(id)'))
+                                    ->from('messages')
+                                    ->whereColumn('messages.conversation_id', 'conversations.id');
+                            });
                     })
                     ->whereDoesntHave('sequenceEnrollments', function ($query) use ($sequence) {
                         $query->where('sequence_id', $sequence->id)

@@ -84,8 +84,14 @@ class BusinessHoursService
      */
     protected function extractBusinessHoursFromProfile(\App\Models\BusinessProfile $business): array
     {
-        // Parse working_days JSON if available
-        $workingDays = json_decode($business->working_days ?? '[]', true);
+        // Parse working_days - handle both JSON string and array
+        $workingDays = $business->working_days;
+        if (is_string($workingDays)) {
+            $workingDays = json_decode($workingDays, true);
+        }
+        if (!is_array($workingDays)) {
+            $workingDays = [];
+        }
         
         // Create business hours array format
         $businessHours = [];

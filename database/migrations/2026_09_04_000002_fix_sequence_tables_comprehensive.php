@@ -45,14 +45,26 @@ return new class extends Migration
         }
         // Case 4: sequence_enrollments already exists (do nothing)
         
-        // Now ensure the table has all required columns
+        // Now ensure the tables have all required columns
         if (Schema::hasTable('sequence_enrollments')) {
             Schema::table('sequence_enrollments', function (Blueprint $table) {
                 if (!Schema::hasColumn('sequence_enrollments', 'timezone')) {
-                    $table->string('timezone')->default('UTC')->after('settings');
+                    $table->string('timezone')->default('UTC')->nullable();
                 }
                 if (!Schema::hasColumn('sequence_enrollments', 'business_hours')) {
-                    $table->json('business_hours')->nullable()->after('timezone');
+                    $table->json('business_hours')->nullable();
+                }
+            });
+        }
+
+        // Add timezone and business_hours to sequences table if they don't exist
+        if (Schema::hasTable('sequences')) {
+            Schema::table('sequences', function (Blueprint $table) {
+                if (!Schema::hasColumn('sequences', 'timezone')) {
+                    $table->string('timezone')->default('UTC')->nullable();
+                }
+                if (!Schema::hasColumn('sequences', 'business_hours')) {
+                    $table->json('business_hours')->nullable();
                 }
             });
         }
@@ -75,6 +87,18 @@ return new class extends Migration
                     $table->dropColumn('timezone');
                 }
                 if (Schema::hasColumn('sequence_enrollments', 'business_hours')) {
+                    $table->dropColumn('business_hours');
+                }
+            });
+        }
+
+        // Remove columns from sequences table
+        if (Schema::hasTable('sequences')) {
+            Schema::table('sequences', function (Blueprint $table) {
+                if (Schema::hasColumn('sequences', 'timezone')) {
+                    $table->dropColumn('timezone');
+                }
+                if (Schema::hasColumn('sequences', 'business_hours')) {
                     $table->dropColumn('business_hours');
                 }
             });

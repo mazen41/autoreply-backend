@@ -14,7 +14,7 @@ use Illuminate\Database\QueryException;
 
 class SequenceEnrollmentService
 {
-    public function enrollConversation(Sequence $sequence, Conversation $conversation, int $startStep = 0): SequenceEnrollment
+    public function enrollConversation(Sequence $sequence, Conversation $conversation, int $startStep = 1): SequenceEnrollment
     {
         // Check for duplicate active enrollment
         $existingEnrollment = SequenceEnrollment::forSequence($sequence->id)
@@ -62,7 +62,7 @@ class SequenceEnrollmentService
         }
     }
 
-    public function enrollConversationWithoutDuplicateCheck(Sequence $sequence, Conversation $conversation, int $startStep = 0): SequenceEnrollment
+    public function enrollConversationWithoutDuplicateCheck(Sequence $sequence, Conversation $conversation, int $startStep = 1): SequenceEnrollment
     {
         try {
             return DB::transaction(function () use ($sequence, $conversation, $startStep) {

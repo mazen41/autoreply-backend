@@ -716,13 +716,34 @@ class EvolutionApiService
         $updates = array_is_list($data) ? $data : [$data];
 
         foreach ($updates as $item) {
-            $messageKey = $item['key']    ?? [];
-            $update     = $item['update'] ?? [];
+            // Evolution v2 sends MESSAGES_UPDATE in TWO different shapes
+            // depending on version/config:
+            //
+            // Shape A (nested — documented format):
+            //   { key: { id, fromMe, remoteJid }, update: { status } }
+            //
+            // Shape B (flat — CONFIRMED from production 2026-09-04 logs):
+            //   { keyId, remoteJid, fromMe, status, instanceId, messageId }
+            //
+            // data_keys observed: ["keyId","remoteJid","fromMe","status","instanceId","messageId"]
+            // Our handler was reading Shape A only — all fields were null on Shape B.
+            // Fixed: detect shape and read from whichever location has the data.
 
-            $remoteMessageId = $messageKey['id']        ?? null;
-            $fromMe          = $messageKey['fromMe']    ?? false;
-            $remoteJid       = $messageKey['remoteJid'] ?? null;
-            $status          = $update['status']        ?? null;
+            if (isset($item['keyId'])) {
+                // Shape B — flat (production confirmed)
+                $remoteMessageId = $item['keyId']     ?? null;
+                $fromMe          = $item['fromMe']    ?? false;
+                $remoteJid       = $item['remoteJid'] ?? null;
+                $status          = $item['status']    ?? null;
+            } else {
+                // Shape A — nested
+                $messageKey      = $item['key']    ?? [];
+                $update          = $item['update'] ?? [];
+                $remoteMessageId = $messageKey['id']        ?? null;
+                $fromMe          = $messageKey['fromMe']    ?? false;
+                $remoteJid       = $messageKey['remoteJid'] ?? null;
+                $status          = $update['status']        ?? null;
+            }
 
             // Diagnostic log — no sensitive content, only delivery metadata.
             Log::info('ProcessAutoReply: MESSAGES_UPDATE status', [

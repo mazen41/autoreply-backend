@@ -9,19 +9,17 @@ return new class extends Migration
 {
     /**
      * Enforces "at most one ACTIVE enrollment per (sequence_id, conversation_id)"
-     * at the database level, closing the race-condition gap where the
-     * application-level check-then-insert in SequenceEnrollmentService could
-     * theoretically be beaten by a truly concurrent write.
+     * at the database level using a stored generated column + unique index.
      *
-     * MySQL has no native partial/filtered unique index, so we use a stored
-     * generated column that evaluates to conversation_id only when
-     * status = 'active', and NULL otherwise. MySQL unique indexes treat NULL
-     * as distinct from other NULLs, so any number of non-active rows
-     * (completed/stopped/failed) can coexist for the same sequence+conversation,
-     * but only one row with status='active' can exist at a time.
+     * Rewritten to be fully idempotent and to avoid the FK-drop/re-add
+     * dance that failed in production (sequence_enrollments has no FK on
+     * conversation_id — only a plain index — so we never need to touch FKs).
      */
     public function up(): void
     {
+        // Step 1 — add the generated column if it doesn't exist yet.
+        // The column already exists in production (added by a previous failed
+        // migration attempt), so the hasColumn guard makes this safe to re-run.
         if (!Schema::hasColumn('sequence_enrollments', 'conversation_id_if_active')) {
             DB::statement("
                 ALTER TABLE sequence_enrollments
@@ -32,12 +30,15 @@ return new class extends Migration
             ");
         }
 
-        // Before adding the unique index, defensively clean up any pre-existing
-        // duplicate active enrollments that may already exist in production data
-        // (keep the oldest one, stop the rest with a clear reason so nothing is
-        // silently deleted).
+        // Step 2 — clean up any duplicate active enrollments before adding
+        // the unique index (idempotent: no duplicates → no rows updated).
         $duplicates = DB::table('sequence_enrollments')
-            ->select('sequence_id', 'conversation_id', DB::raw('COUNT(*) as cnt'), DB::raw('MIN(id) as keep_id'))
+            ->select(
+                'sequence_id',
+                'conversation_id',
+                DB::raw('COUNT(*) as cnt'),
+                DB::raw('MIN(id) as keep_id')
+            )
             ->where('status', 'active')
             ->groupBy('sequence_id', 'conversation_id')
             ->having('cnt', '>', 1)
@@ -50,25 +51,44 @@ return new class extends Migration
                 ->where('status', 'active')
                 ->where('id', '!=', $dup->keep_id)
                 ->update([
-                    'status' => 'stopped',
+                    'status'     => 'stopped',
                     'stopped_at' => now(),
                     'updated_at' => now(),
                 ]);
         }
 
-        Schema::table('sequence_enrollments', function (Blueprint $table) {
-            $table->unique(
-                ['sequence_id', 'conversation_id_if_active'],
-                'seq_enroll_unique_active'
-            );
-        });
+        // Step 3 — add the unique index only if it doesn't exist yet.
+        $indexExists = DB::select("
+            SELECT INDEX_NAME
+            FROM information_schema.STATISTICS
+            WHERE TABLE_SCHEMA = DATABASE()
+              AND TABLE_NAME   = 'sequence_enrollments'
+              AND INDEX_NAME   = 'seq_enroll_unique_active'
+            LIMIT 1
+        ");
+
+        if (empty($indexExists)) {
+            DB::statement("
+                ALTER TABLE sequence_enrollments
+                ADD UNIQUE KEY seq_enroll_unique_active (sequence_id, conversation_id_if_active)
+            ");
+        }
     }
 
     public function down(): void
     {
-        Schema::table('sequence_enrollments', function (Blueprint $table) {
-            $table->dropUnique('seq_enroll_unique_active');
-        });
+        $indexExists = DB::select("
+            SELECT INDEX_NAME
+            FROM information_schema.STATISTICS
+            WHERE TABLE_SCHEMA = DATABASE()
+              AND TABLE_NAME   = 'sequence_enrollments'
+              AND INDEX_NAME   = 'seq_enroll_unique_active'
+            LIMIT 1
+        ");
+
+        if (!empty($indexExists)) {
+            DB::statement("ALTER TABLE sequence_enrollments DROP INDEX seq_enroll_unique_active");
+        }
 
         if (Schema::hasColumn('sequence_enrollments', 'conversation_id_if_active')) {
             Schema::table('sequence_enrollments', function (Blueprint $table) {

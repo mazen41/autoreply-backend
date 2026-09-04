@@ -163,9 +163,13 @@ class SequenceService
 
         // Validate trigger configuration if not manual
         if ($sequence->trigger_type !== 'manual') {
-            $triggerConfig = $sequence->trigger_config ?? [];
-            if (empty($triggerConfig)) {
-                throw new \Exception('Sequence trigger configuration is required for non-manual triggers');
+            // Some trigger types don't require specific configuration
+            $triggersRequiringConfig = ['tag_added', 'no_reply', 'order_created'];
+            if (in_array($sequence->trigger_type, $triggersRequiringConfig)) {
+                $triggerConfig = $sequence->trigger_config ?? [];
+                if (empty($triggerConfig)) {
+                    throw new \Exception('Sequence trigger configuration is required for non-manual triggers');
+                }
             }
         }
 

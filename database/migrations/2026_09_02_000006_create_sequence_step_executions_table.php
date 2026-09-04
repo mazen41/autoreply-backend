@@ -13,6 +13,7 @@ return new class extends Migration
     {
         // Ensure sequence_enrollments table exists first
         if (!Schema::hasTable('sequence_enrollments')) {
+            // Try to rename from sequence_users if it exists
             if (Schema::hasTable('sequence_users')) {
                 Schema::rename('sequence_users', 'sequence_enrollments');
             } else {
@@ -40,7 +41,7 @@ return new class extends Migration
         Schema::create('sequence_step_executions', function (Blueprint $table) {
             $table->id();
             $table->foreignId('sequence_id')->constrained('sequences')->onDelete('cascade');
-            $table->foreignId('sequence_enrollment_id')->constrained('sequence_enrollments')->onDelete('cascade');
+            $table->foreignId('sequence_enrollment_id')->nullable()->constrained('sequence_enrollments')->onDelete('cascade');
             $table->foreignId('sequence_step_id')->constrained('sequence_steps')->onDelete('cascade');
             $table->enum('status', ['pending', 'processing', 'executed', 'failed', 'skipped'])->default('pending');
             $table->timestamp('executed_at')->nullable();
@@ -62,5 +63,10 @@ return new class extends Migration
     public function down(): void
     {
         Schema::dropIfExists('sequence_step_executions');
+        
+        // Rollback table rename if needed
+        if (Schema::hasTable('sequence_enrollments') && !Schema::hasTable('sequence_users')) {
+            Schema::rename('sequence_enrollments', 'sequence_users');
+        }
     }
 };

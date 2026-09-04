@@ -38,23 +38,36 @@ return new class extends Migration
             }
         }
 
-        Schema::create('sequence_step_executions', function (Blueprint $table) {
-            $table->id();
-            $table->foreignId('sequence_id')->constrained('sequences')->onDelete('cascade');
-            $table->foreignId('sequence_enrollment_id')->nullable()->constrained('sequence_enrollments')->onDelete('cascade');
-            $table->foreignId('sequence_step_id')->constrained('sequence_steps')->onDelete('cascade');
-            $table->enum('status', ['pending', 'processing', 'executed', 'failed', 'skipped'])->default('pending');
-            $table->timestamp('executed_at')->nullable();
-            $table->timestamp('scheduled_at')->nullable();
-            $table->foreignId('message_id')->nullable()->constrained()->onDelete('set null');
-            $table->text('error')->nullable();
-            $table->json('metadata')->nullable();
-            $table->timestamps();
-            
-            $table->index(['sequence_enrollment_id', 'status']);
-            $table->index('scheduled_at');
-            $table->index('executed_at');
-        });
+        // Create sequence_step_executions table only if it doesn't exist
+        if (!Schema::hasTable('sequence_step_executions')) {
+            Schema::create('sequence_step_executions', function (Blueprint $table) {
+                $table->id();
+                $table->foreignId('sequence_id')->constrained('sequences')->onDelete('cascade');
+                $table->foreignId('sequence_enrollment_id')->nullable()->constrained('sequence_enrollments')->onDelete('cascade');
+                $table->foreignId('sequence_step_id')->constrained('sequence_steps')->onDelete('cascade');
+                $table->enum('status', ['pending', 'processing', 'executed', 'failed', 'skipped'])->default('pending');
+                $table->timestamp('executed_at')->nullable();
+                $table->timestamp('scheduled_at')->nullable();
+                $table->foreignId('message_id')->nullable()->constrained()->onDelete('set null');
+                $table->text('error')->nullable();
+                $table->json('metadata')->nullable();
+                $table->timestamps();
+                
+                $table->index(['sequence_enrollment_id', 'status']);
+                $table->index('scheduled_at');
+                $table->index('executed_at');
+            });
+        } else {
+            // Table already exists, just add missing columns/indexes if needed
+            Schema::table('sequence_step_executions', function (Blueprint $table) {
+                if (!Schema::hasColumn('sequence_step_executions', 'processing')) {
+                    $table->enum('status', ['pending', 'processing', 'executed', 'failed', 'skipped'])->default('pending')->change();
+                }
+                if (!Schema::hasColumn('sequence_step_executions', 'sequence_enrollment_id')) {
+                    $table->foreignId('sequence_enrollment_id')->nullable()->constrained('sequence_enrollments')->onDelete('cascade');
+                }
+            });
+        }
     }
 
     /**

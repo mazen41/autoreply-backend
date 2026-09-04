@@ -11,7 +11,10 @@ return new class extends Migration
      */
     public function up(): void
     {
-        Schema::rename('sequence_users', 'sequence_enrollments');
+        // Only rename if sequence_users exists and sequence_enrollments doesn't exist
+        if (Schema::hasTable('sequence_users') && !Schema::hasTable('sequence_enrollments')) {
+            Schema::rename('sequence_users', 'sequence_enrollments');
+        }
     }
 
     /**

@@ -3,6 +3,7 @@
 use Illuminate\Database\Migrations\Migration;
 use Illuminate\Database\Schema\Blueprint;
 use Illuminate\Support\Facades\Schema;
+use Illuminate\Support\Facades\DB;
 
 return new class extends Migration
 {
@@ -43,7 +44,8 @@ return new class extends Migration
                 $table->index('next_execution_at');
             });
         }
-        // Case 4: sequence_enrollments already exists (do nothing)
+        // Mark the rename migration as completed to skip it
+        DB::table('migrations')->where('migration', '2026_09_02_000007_rename_sequence_users_to_enrollments')->update(['batch' => DB::raw('batch + 1')]);
         
         // Now ensure the tables have all required columns
         if (Schema::hasTable('sequence_enrollments')) {

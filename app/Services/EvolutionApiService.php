@@ -123,7 +123,25 @@ class EvolutionApiService
             ],
         ];
 
-        return $this->makeRequest('POST', $url, $payload);
+        // Diagnostic: log exactly what we send to Evolution (no message content,
+        // only routing metadata) so we can verify recipient + instance in logs.
+        Log::info('EvolutionApiService: sendTextMessage', [
+            'instance' => $instanceName,
+            'recipient' => $cleanNumber,
+            'endpoint' => $url,
+        ]);
+
+        $response = $this->makeRequest('POST', $url, $payload);
+
+        // Log the Evolution response key so we can correlate with MESSAGES_UPDATE.
+        Log::info('EvolutionApiService: sendTextMessage response', [
+            'instance'    => $instanceName,
+            'recipient'   => $cleanNumber,
+            'response_key_id' => $response['key']['id'] ?? null,
+            'status'          => $response['status'] ?? null,
+        ]);
+
+        return $response;
     }
 
     /**
@@ -664,46 +682,102 @@ class EvolutionApiService
     }
 
     /**
-     * Handle message status update
+     * Handle message status update from Evolution webhook.
+     *
+     * ROOT CAUSE OF DELIVERY FAILURE (confirmed 2026-09-04):
+     *
+     * 1. Evolution v2 sends MESSAGES_UPDATE with data as an ARRAY of update
+     *    objects: [{key:{id,fromMe,remoteJid}, update:{status:'...'}}]
+     *    The old handler read $event['data']['key'] directly — which is null
+     *    on an array payload — so ALL status updates were silently dropped.
+     *    Fixed: handle both array and single-object data shapes.
+     *
+     * 2. Even when the status WAS read, only WhatsAppMessage.status was
+     *    updated. The unified inbox Message.send_status was never touched,
+     *    so ERROR status was invisible to the rest of the system and
+     *    sendReply() always returned true ("sent successfully") even when
+     *    WhatsApp actually failed delivery.
+     *    Fixed: also update Message.send_status from the Evolution status.
+     *
+     * 3. No diagnostic logging existed for the actual status value received.
+     *    Fixed: log key_id + status + fromMe + remoteJid at info level.
      */
     protected function handleMessageUpdate(array $event): void
     {
         $instanceName = $event['instance'] ?? null;
-        $messageKey = $event['data']['key'] ?? [];
-        $update = $event['data']['update'] ?? [];
+        $data = $event['data'] ?? [];
 
         if (!$instanceName) {
             return;
         }
 
-        $remoteMessageId = $messageKey['id'] ?? null;
-        if (!$remoteMessageId) {
-            return;
-        }
+        // Evolution v2 sends data as a LIST of update objects.
+        // Normalise: wrap single object in array so we always iterate.
+        $updates = array_is_list($data) ? $data : [$data];
 
-        $message = WhatsAppMessage::where('remote_message_id', $remoteMessageId)->first();
-        if (!$message) {
-            return;
-        }
+        foreach ($updates as $item) {
+            $messageKey = $item['key']    ?? [];
+            $update     = $item['update'] ?? [];
 
-        $status = $update['status'] ?? null;
-        if ($status) {
-            $message->status = match ($status) {
-                'ERROR' => 'failed',
-                'PENDING' => 'pending',
-                'SERVER_ACK' => 'sent',
-                'DELIVERY_ACK' => 'delivered',
-                'READ' => 'read',
-                default => $message->status,
-            };
+            $remoteMessageId = $messageKey['id']        ?? null;
+            $fromMe          = $messageKey['fromMe']    ?? false;
+            $remoteJid       = $messageKey['remoteJid'] ?? null;
+            $status          = $update['status']        ?? null;
 
-            if ($status === 'DELIVERY_ACK') {
-                $message->delivered_at = now();
-            } elseif ($status === 'READ') {
-                $message->read_at = now();
+            // Diagnostic log — no sensitive content, only delivery metadata.
+            Log::info('ProcessAutoReply: MESSAGES_UPDATE status', [
+                'instance'          => $instanceName,
+                'key_id'            => $remoteMessageId,
+                'from_me'           => $fromMe,
+                'remote_jid'        => $remoteJid,
+                'status'            => $status,
+            ]);
+
+            if (!$remoteMessageId || !$status) {
+                continue;
             }
 
-            $message->save();
+            $mappedStatus = match ($status) {
+                'ERROR'        => 'failed',
+                'PENDING'      => 'pending',
+                'SERVER_ACK'   => 'sent',
+                'DELIVERY_ACK' => 'delivered',
+                'READ'         => 'read',
+                default        => null,
+            };
+
+            if (!$mappedStatus) {
+                continue;
+            }
+
+            // ── Update legacy WhatsAppMessage row ──────────────────────────
+            $waMessage = WhatsAppMessage::where('remote_message_id', $remoteMessageId)->first();
+            if ($waMessage) {
+                $waMessage->status = $mappedStatus;
+                if ($status === 'DELIVERY_ACK') { $waMessage->delivered_at = now(); }
+                if ($status === 'READ')          { $waMessage->read_at      = now(); }
+                $waMessage->save();
+            }
+
+            // ── Update unified inbox Message row ───────────────────────────
+            // This is the critical missing piece: ProcessAutoReply reads
+            // Message.send_status to decide whether delivery succeeded.
+            // Without this update, ERROR always looked like 'sent'.
+            $inboxMessage = Message::where('whatsapp_message_id', $remoteMessageId)->first();
+            if ($inboxMessage) {
+                $inboxMessage->send_status = $mappedStatus;
+                $inboxMessage->save();
+
+                if ($status === 'ERROR') {
+                    Log::error('ProcessAutoReply: WhatsApp delivery FAILED (Evolution reported ERROR)', [
+                        'instance'          => $instanceName,
+                        'key_id'            => $remoteMessageId,
+                        'remote_jid'        => $remoteJid,
+                        'unified_message_id' => $inboxMessage->id,
+                        'conversation_id'   => $inboxMessage->conversation_id,
+                    ]);
+                }
+            }
         }
     }
 

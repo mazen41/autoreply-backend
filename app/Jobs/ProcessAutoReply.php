@@ -1916,11 +1916,10 @@ class ProcessAutoReply implements ShouldQueue
             $response = $whatsappService->sendTextMessage($instanceName, $recipientId, $message);
 
             if (isset($response['key']['id'])) {
-                // Persist to whatsapp_messages (legacy table) only when an
-                // instance row exists. In test environments or during the brief
-                // window between Channel creation and WhatsAppInstance creation,
-                // the instance may not exist yet — skipping the insert is correct
-                // because the message was already saved in unified inbox.
+                // Evolution accepted the send (queued it). TRUE does NOT mean
+                // the phone received it yet — delivery confirmation comes via
+                // MESSAGES_UPDATE webhook (SERVER_ACK → DELIVERY_ACK). This is
+                // the correct definition of sendWhatsAppReply "success".
                 $instance = \App\Models\WhatsAppInstance::where('instance_name', $instanceName)->first();
 
                 if ($instance) {

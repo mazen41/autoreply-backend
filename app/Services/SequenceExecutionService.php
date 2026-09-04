@@ -425,6 +425,16 @@ class SequenceExecutionService
         $timezone = $sequence->timezone ?? 'UTC';
         $businessHours = $sequence->business_hours ?? null;
         
+        Log::info("scheduleNextStepAfterDelay: Delay calculation input", [
+            'enrollment_id' => $enrollment->id,
+            'delay_step_id' => $delayStep->id,
+            'delay_hours' => $delayStep->delay_hours,
+            'delay_unit' => $delayStep->delay_unit,
+            'calculated_delay_seconds' => $delaySeconds,
+            'sequence_timezone' => $timezone,
+            'business_hours' => $businessHours,
+        ]);
+        
         // Calculate next execution time respecting business hours
         $currentTime = now()->setTimezone($timezone);
         $scheduledAt = $this->businessHoursService->calculateNextExecutionTime(
@@ -433,6 +443,12 @@ class SequenceExecutionService
             $businessHours, 
             $timezone
         );
+        
+        Log::info("scheduleNextStepAfterDelay: Time calculation", [
+            'current_time' => $currentTime,
+            'scheduled_at' => $scheduledAt,
+            'diff_seconds' => $scheduledAt->diffInSeconds($currentTime),
+        ]);
         
         // Queue next step execution
         $execution = SequenceStepExecution::create([
@@ -457,7 +473,26 @@ class SequenceExecutionService
 
         // Dispatch job with calculated delay
         $jobDelay = $scheduledAt->diffInSeconds(now());
-        ExecuteSequenceStep::dispatch($execution->id)->delay($jobDelay);
+        
+        Log::info("scheduleNextStepAfterDelay: Job dispatch calculation", [
+            'execution_id' => $execution->id,
+            'scheduled_at' => $scheduledAt,
+            'now' => now(),
+            'job_delay_seconds' => $jobDelay,
+        ]);
+        
+        if ($jobDelay <= 0) {
+            Log::error("scheduleNextStepAfterDelay: Invalid job delay", [
+                'execution_id' => $execution->id,
+                'job_delay_seconds' => $jobDelay,
+                'scheduled_at' => $scheduledAt,
+                'now' => now(),
+            ]);
+            // Fallback: dispatch immediately if delay is invalid
+            ExecuteSequenceStep::dispatch($execution->id);
+        } else {
+            ExecuteSequenceStep::dispatch($execution->id)->delay($jobDelay);
+        }
         
         Log::info("scheduleNextStepAfterDelay: Dispatched next step job", [
             'execution_id' => $execution->id,

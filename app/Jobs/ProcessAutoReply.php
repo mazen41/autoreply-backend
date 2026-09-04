@@ -13,6 +13,7 @@ use App\Services\SallaService;
 use App\Services\ArabicDialectService;
 use App\Services\BusinessHoursService;
 use App\Services\ProductAwarenessService;
+use App\Services\SequenceTriggerService;
 use Google\Service\Gmail;
 use Google\Service\Gmail\Message as GmailMessage;
 use Illuminate\Bus\Queueable;
@@ -1343,6 +1344,19 @@ class ProcessAutoReply implements ShouldQueue
             
             // Notify about the send failure
             $this->notifyAIFailure($channel->user, $conversation, 'Message send failure');
+        }
+
+        // ── SEQUENCE TRIGGER INTEGRATION ───────────────────────────────────────
+        // After AI reply is sent, check if conversation should be enrolled in any sequences
+        // This is a small integration that doesn't affect the main AI processing logic
+        try {
+            $sequenceTriggerService = new SequenceTriggerService();
+            $sequenceTriggerService->checkAndEnrollForMessageReceived($conversation);
+        } catch (\Exception $e) {
+            Log::error('ProcessAutoReply: Failed to check sequence enrollment', [
+                'conversation_id' => $conversation->id,
+                'error' => $e->getMessage(),
+            ]);
         }
     }
 

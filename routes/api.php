@@ -233,12 +233,20 @@ Route::middleware('auth:sanctum')->group(function () {
     Route::post('/email-campaigns/audience/preview',  [EmailCampaignController::class, 'audiencePreview']);
 
     // Sequences
-    Route::get('/businesses/{businessId}/sequences',   [SequenceController::class, 'index']);
-    Route::post('/businesses/{businessId}/sequences',  [SequenceController::class, 'store']);
-    Route::put('/businesses/{businessId}/sequences/{sequenceId}', [SequenceController::class, 'update']);
-    Route::delete('/businesses/{businessId}/sequences/{sequenceId}', [SequenceController::class, 'destroy']);
-    Route::post('/businesses/{businessId}/sequences/{sequenceId}/enroll', [SequenceController::class, 'enroll']);
-    Route::get('/businesses/{businessId}/sequences/{sequenceId}/enrollments', [SequenceController::class, 'enrollments']);
+    Route::get('/sequences', [SequenceController::class, 'index']);
+    Route::post('/sequences', [SequenceController::class, 'store']);
+    Route::get('/sequences/{id}', [SequenceController::class, 'show']);
+    Route::put('/sequences/{id}', [SequenceController::class, 'update']);
+    Route::delete('/sequences/{id}', [SequenceController::class, 'destroy']);
+    Route::post('/sequences/{id}/activate', [SequenceController::class, 'activate']);
+    Route::post('/sequences/{id}/pause', [SequenceController::class, 'pause']);
+    Route::post('/sequences/{id}/duplicate', [SequenceController::class, 'duplicate']);
+    Route::get('/sequences/{id}/analytics', [SequenceController::class, 'analytics']);
+    Route::get('/sequences/{id}/enrollments', [SequenceController::class, 'enrollments']);
+    Route::post('/sequences/{id}/enroll', [SequenceController::class, 'enroll']);
+    Route::post('/sequences/{id}/unenroll', [SequenceController::class, 'unenroll']);
+    Route::get('/sequences/queue/metrics', [SequenceController::class, 'queueMetrics']);
+    Route::post('/sequences/queue/reset-stuck', [SequenceController::class, 'resetStuckExecutions']);
 
     // Webhooks
     Route::get('/businesses/{businessId}/webhooks',     [ApiWebhookController::class, 'index']);

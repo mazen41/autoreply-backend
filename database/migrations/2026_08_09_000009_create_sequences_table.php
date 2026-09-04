@@ -15,7 +15,7 @@ return new class extends Migration
             $table->id();
             $table->foreignId('business_id')->constrained('business_profiles')->onDelete('cascade');
             $table->string('name');
-            $table->enum('trigger_type', ['new_user', 'tag_added', 'no_reply', 'manual'])->default('manual');
+            $table->enum('trigger_type', ['new_user', 'tag_added', 'no_reply', 'manual', 'order_created'])->default('manual');
             $table->json('trigger_config')->nullable();
             $table->boolean('is_active')->default(true);
             $table->timestamps();

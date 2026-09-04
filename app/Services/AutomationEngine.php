@@ -6,6 +6,8 @@ use App\Models\AutomationWorkflow;
 use App\Models\Conversation;
 use App\Models\Message;
 use App\Models\ConversationTag;
+use App\Models\Sequence;
+use App\Services\SequenceTriggerService;
 use Illuminate\Support\Facades\Http;
 use Illuminate\Support\Facades\Log;
 
@@ -226,6 +228,9 @@ class AutomationEngine
                 case 'pause_ai':
                     $result = $this->executePauseAI($action, $conversation, $testMode);
                     break;
+                case 'start_sequence':
+                    $result = $this->executeStartSequence($action, $conversation, $testMode);
+                    break;
                 default:
                     $result['error'] = "Unknown action type: {$actionType}";
             }
@@ -389,6 +394,66 @@ class AutomationEngine
             'type' => 'pause_ai',
             'success' => true
         ];
+    }
+
+    /**
+     * Execute start sequence action
+     */
+    private function executeStartSequence(array $action, Conversation $conversation, bool $testMode): array
+    {
+        if ($testMode) {
+            return [
+                'type' => 'start_sequence',
+                'success' => true,
+                'sequence_id' => $action['sequence_id'] ?? null
+            ];
+        }
+
+        $sequenceId = $action['sequence_id'] ?? null;
+        if (!$sequenceId) {
+            return [
+                'type' => 'start_sequence',
+                'success' => false,
+                'error' => 'Sequence ID is required'
+            ];
+        }
+
+        $sequence = Sequence::find($sequenceId);
+        if (!$sequence) {
+            return [
+                'type' => 'start_sequence',
+                'success' => false,
+                'error' => 'Sequence not found'
+            ];
+        }
+
+        // Verify business ownership
+        if ($sequence->business_id !== $conversation->business_id) {
+            return [
+                'type' => 'start_sequence',
+                'success' => false,
+                'error' => 'Sequence does not belong to this business'
+            ];
+        }
+
+        // Use SequenceTriggerService to enroll
+        $sequenceTriggerService = new SequenceTriggerService();
+        
+        try {
+            $enrollment = $sequenceTriggerService->enrollInSequence($sequence, $conversation, false);
+            
+            return [
+                'type' => 'start_sequence',
+                'success' => true,
+                'enrollment_id' => $enrollment?->id ?? null
+            ];
+        } catch (\Exception $e) {
+            return [
+                'type' => 'start_sequence',
+                'success' => false,
+                'error' => $e->getMessage()
+            ];
+        }
     }
 
     /**

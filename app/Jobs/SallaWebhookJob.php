@@ -3,7 +3,9 @@
 namespace App\Jobs;
 
 use App\Models\Channel;
+use App\Models\Conversation;
 use App\Services\SallaService;
+use App\Services\SequenceTriggerService;
 use Illuminate\Bus\Queueable;
 use Illuminate\Contracts\Queue\ShouldQueue;
 use Illuminate\Foundation\Bus\Dispatchable;
@@ -111,6 +113,30 @@ class SallaWebhookJob implements ShouldQueue
         $metadata['last_order'] = $data;
         $channel->metadata = $metadata;
         $channel->save();
+
+        // Find or create conversation for the customer
+        $customerPhone = $data['customer']['mobile'] ?? null;
+        if ($customerPhone) {
+            $conversation = Conversation::where('business_id', $channel->business_id)
+                ->where('sender_id', $customerPhone)
+                ->first();
+
+            if (!$conversation) {
+                // Create conversation for the order customer
+                $conversation = Conversation::create([
+                    'business_id' => $channel->business_id,
+                    'channel_id' => $channel->id,
+                    'sender_id' => $customerPhone,
+                    'sender_name' => $data['customer']['name'] ?? null,
+                    'sender_email' => $data['customer']['email'] ?? null,
+                    'status' => 'active',
+                ]);
+            }
+
+            // Trigger sequences with order-based triggers
+            $sequenceTriggerService = new SequenceTriggerService();
+            $sequenceTriggerService->checkAndEnrollForOrderCreated($conversation, $data);
+        }
 
         // Trigger sync job for this order
         // This could be used to sync order details to local database

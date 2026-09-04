@@ -4,168 +4,382 @@ namespace App\Http\Controllers\Api;
 
 use App\Http\Controllers\Controller;
 use App\Models\Sequence;
-use App\Models\SequenceStep;
-use App\Models\SequenceUser;
-use App\Models\Conversation;
-use App\Jobs\ProcessSequenceStep;
+use App\Models\SequenceEnrollment;
+use App\Services\SequenceService;
+use App\Services\SequenceEnrollmentService;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\Auth;
+use Illuminate\Support\Facades\Log;
 
 class SequenceController extends Controller
 {
-    /**
-     * Get all sequences for a business
-     */
-    public function index(Request $request, $businessId)
-    {
-        $sequences = Sequence::where('business_id', $businessId)
-            ->with(['steps'])
-            ->orderBy('created_at', 'desc')
-            ->get();
+    private SequenceService $sequenceService;
+    private SequenceEnrollmentService $enrollmentService;
 
-        return response()->json($sequences);
+    public function __construct(
+        SequenceService $sequenceService,
+        SequenceEnrollmentService $enrollmentService
+    ) {
+        $this->sequenceService = $sequenceService;
+        $this->enrollmentService = $enrollmentService;
     }
 
-    /**
-     * Create a new sequence
-     */
-    public function store(Request $request, $businessId)
+    public function index(Request $request)
     {
-        $request->validate([
+        $user = Auth::user();
+        if (!$user || !$user->business_id) {
+            return response()->json(['error' => 'Business not found'], 404);
+        }
+
+        $filters = [
+            'status' => $request->input('status'),
+            'channel' => $request->input('channel'),
+            'trigger_type' => $request->input('trigger_type'),
+        ];
+
+        $sequences = $this->sequenceService->getSequencesForBusiness($user->business_id, $filters);
+
+        return response()->json([
+            'data' => $sequences,
+        ]);
+    }
+
+    public function store(Request $request)
+    {
+        $user = Auth::user();
+        if (!$user || !$user->business_id) {
+            return response()->json(['error' => 'Business not found'], 404);
+        }
+
+        $validated = $request->validate([
             'name' => 'required|string|max:255',
-            'trigger_type' => 'required|in:new_user,tag_added,no_reply,manual',
+            'description' => 'nullable|string',
+            'trigger_type' => 'nullable|in:new_user,tag_added,no_reply,manual',
             'trigger_config' => 'nullable|array',
-            'steps' => 'required|array',
-            'steps.*.message' => 'required|string',
-            'steps.*.delay_hours' => 'required|integer|min:0',
+            'channel' => 'nullable|in:whatsapp,telegram,email',
+            'settings' => 'nullable|array',
+            'steps' => 'nullable|array',
         ]);
 
-        $sequence = Sequence::create([
-            'business_id' => $businessId,
-            'name' => $request->name,
-            'trigger_type' => $request->trigger_type,
-            'trigger_config' => $request->trigger_config,
-            'is_active' => true,
-        ]);
-
-        // Create steps
-        foreach ($request->steps as $index => $stepData) {
-            SequenceStep::create([
-                'sequence_id' => $sequence->id,
-                'step_order' => $index + 1,
-                'message' => $stepData['message'],
-                'delay_hours' => $stepData['delay_hours'],
-                'is_active' => true,
-            ]);
+        try {
+            $sequence = $this->sequenceService->createSequence($validated, $user->business_id);
+            return response()->json(['data' => $sequence], 201);
+        } catch (\Exception $e) {
+            Log::error('Failed to create sequence', ['error' => $e->getMessage()]);
+            return response()->json(['error' => $e->getMessage()], 500);
         }
-
-        return response()->json(['success' => true, 'sequence' => $sequence->load('steps')]);
     }
 
-    /**
-     * Update a sequence
-     */
-    public function update(Request $request, $businessId, $sequenceId)
+    public function show(Request $request, $id)
     {
-        $request->validate([
-            'name' => 'sometimes|string|max:255',
-            'is_active' => 'sometimes|boolean',
-            'steps' => 'sometimes|array',
-            'steps.*.message' => 'required|string',
-            'steps.*.delay_hours' => 'required|integer|min:0',
+        $user = Auth::user();
+        if (!$user || !$user->business_id) {
+            return response()->json(['error' => 'Business not found'], 404);
+        }
+
+        $sequence = Sequence::forBusiness($user->business_id)->with('steps')->find($id);
+
+        if (!$sequence) {
+            return response()->json(['error' => 'Sequence not found'], 404);
+        }
+
+        return response()->json(['data' => $sequence]);
+    }
+
+    public function update(Request $request, $id)
+    {
+        $user = Auth::user();
+        if (!$user || !$user->business_id) {
+            return response()->json(['error' => 'Business not found'], 404);
+        }
+
+        $sequence = Sequence::forBusiness($user->business_id)->find($id);
+
+        if (!$sequence) {
+            return response()->json(['error' => 'Sequence not found'], 404);
+        }
+
+        $validated = $request->validate([
+            'name' => 'sometimes|required|string|max:255',
+            'description' => 'nullable|string',
+            'trigger_type' => 'nullable|in:new_user,tag_added,no_reply,manual',
+            'trigger_config' => 'nullable|array',
+            'channel' => 'nullable|in:whatsapp,telegram,email',
+            'settings' => 'nullable|array',
+            'steps' => 'nullable|array',
         ]);
 
-        $sequence = Sequence::where('business_id', $businessId)
-            ->findOrFail($sequenceId);
+        try {
+            $sequence = $this->sequenceService->updateSequence($sequence, $validated);
+            return response()->json(['data' => $sequence]);
+        } catch (\Exception $e) {
+            Log::error('Failed to update sequence', ['error' => $e->getMessage()]);
+            return response()->json(['error' => $e->getMessage()], 500);
+        }
+    }
 
-        $sequence->update($request->only(['name', 'is_active']));
+    public function destroy(Request $request, $id)
+    {
+        $user = Auth::user();
+        if (!$user || !$user->business_id) {
+            return response()->json(['error' => 'Business not found'], 404);
+        }
 
-        // Update steps if provided
-        if ($request->has('steps')) {
-            // Delete existing steps
-            $sequence->steps()->delete();
+        $sequence = Sequence::forBusiness($user->business_id)->find($id);
 
-            // Create new steps
-            foreach ($request->steps as $index => $stepData) {
-                SequenceStep::create([
-                    'sequence_id' => $sequence->id,
-                    'step_order' => $index + 1,
-                    'message' => $stepData['message'],
-                    'delay_hours' => $stepData['delay_hours'],
-                    'is_active' => true,
-                ]);
+        if (!$sequence) {
+            return response()->json(['error' => 'Sequence not found'], 404);
+        }
+
+        try {
+            $this->sequenceService->deleteSequence($sequence);
+            return response()->json(['success' => true]);
+        } catch (\Exception $e) {
+            Log::error('Failed to delete sequence', ['error' => $e->getMessage()]);
+            return response()->json(['error' => $e->getMessage()], 500);
+        }
+    }
+
+    public function activate(Request $request, $id)
+    {
+        $user = Auth::user();
+        if (!$user || !$user->business_id) {
+            return response()->json(['error' => 'Business not found'], 404);
+        }
+
+        $sequence = Sequence::forBusiness($user->business_id)->find($id);
+
+        if (!$sequence) {
+            return response()->json(['error' => 'Sequence not found'], 404);
+        }
+
+        try {
+            $sequence = $this->sequenceService->activateSequence($sequence);
+            return response()->json(['data' => $sequence]);
+        } catch (\Exception $e) {
+            Log::error('Failed to activate sequence', ['error' => $e->getMessage()]);
+            return response()->json(['error' => $e->getMessage()], 500);
+        }
+    }
+
+    public function pause(Request $request, $id)
+    {
+        $user = Auth::user();
+        if (!$user || !$user->business_id) {
+            return response()->json(['error' => 'Business not found'], 404);
+        }
+
+        $sequence = Sequence::forBusiness($user->business_id)->find($id);
+
+        if (!$sequence) {
+            return response()->json(['error' => 'Sequence not found'], 404);
+        }
+
+        try {
+            $sequence = $this->sequenceService->pauseSequence($sequence);
+            return response()->json(['data' => $sequence]);
+        } catch (\Exception $e) {
+            Log::error('Failed to pause sequence', ['error' => $e->getMessage()]);
+            return response()->json(['error' => $e->getMessage()], 500);
+        }
+    }
+
+    public function duplicate(Request $request, $id)
+    {
+        $user = Auth::user();
+        if (!$user || !$user->business_id) {
+            return response()->json(['error' => 'Business not found'], 404);
+        }
+
+        $sequence = Sequence::forBusiness($user->business_id)->find($id);
+
+        if (!$sequence) {
+            return response()->json(['error' => 'Sequence not found'], 404);
+        }
+
+        try {
+            $newSequence = $this->sequenceService->duplicateSequence($sequence);
+            return response()->json(['data' => $newSequence], 201);
+        } catch (\Exception $e) {
+            Log::error('Failed to duplicate sequence', ['error' => $e->getMessage()]);
+            return response()->json(['error' => $e->getMessage()], 500);
+        }
+    }
+
+    public function analytics(Request $request, $id)
+    {
+        $user = Auth::user();
+        if (!$user || !$user->business_id) {
+            return response()->json(['error' => 'Business not found'], 404);
+        }
+
+        $sequence = Sequence::forBusiness($user->business_id)->find($id);
+
+        if (!$sequence) {
+            return response()->json(['error' => 'Sequence not found'], 404);
+        }
+
+        try {
+            $analytics = $this->sequenceService->getSequenceAnalytics($sequence);
+            return response()->json(['data' => $analytics]);
+        } catch (\Exception $e) {
+            Log::error('Failed to get sequence analytics', ['error' => $e->getMessage()]);
+            return response()->json(['error' => $e->getMessage()], 500);
+        }
+    }
+
+    public function enrollments(Request $request, $id)
+    {
+        $user = Auth::user();
+        if (!$user || !$user->business_id) {
+            return response()->json(['error' => 'Business not found'], 404);
+        }
+
+        $sequence = Sequence::forBusiness($user->business_id)->find($id);
+
+        if (!$sequence) {
+            return response()->json(['error' => 'Sequence not found'], 404);
+        }
+
+        $filters = [
+            'status' => $request->input('status'),
+        ];
+
+        try {
+            $enrollments = $this->enrollmentService->getEnrollmentsForSequence($sequence, $filters);
+            return response()->json(['data' => $enrollments]);
+        } catch (\Exception $e) {
+            Log::error('Failed to get sequence enrollments', ['error' => $e->getMessage()]);
+            return response()->json(['error' => $e->getMessage()], 500);
+        }
+    }
+
+    public function enroll(Request $request, $id)
+    {
+        $user = Auth::user();
+        if (!$user || !$user->business_id) {
+            return response()->json(['error' => 'Business not found'], 404);
+        }
+
+        $sequence = Sequence::forBusiness($user->business_id)->find($id);
+
+        if (!$sequence) {
+            return response()->json(['error' => 'Sequence not found'], 404);
+        }
+
+        $validated = $request->validate([
+            'conversation_id' => 'required|integer|exists:conversations,id',
+            'start_step' => 'nullable|integer|min:0',
+        ]);
+
+        try {
+            $conversation = \App\Models\Conversation::find($validated['conversation_id']);
+            
+            if (!$conversation || $conversation->business_id !== $user->business_id) {
+                return response()->json(['error' => 'Conversation not found or access denied'], 404);
             }
+
+            $enrollment = $this->enrollmentService->enrollConversation(
+                $sequence,
+                $conversation,
+                $validated['start_step'] ?? 0
+            );
+
+            return response()->json(['data' => $enrollment], 201);
+        } catch (\Exception $e) {
+            Log::error('Failed to enroll conversation', ['error' => $e->getMessage()]);
+            return response()->json(['error' => $e->getMessage()], 500);
+        }
+    }
+
+    public function unenroll(Request $request, $id)
+    {
+        $user = Auth::user();
+        if (!$user || !$user->business_id) {
+            return response()->json(['error' => 'Business not found'], 404);
         }
 
-        return response()->json(['success' => true, 'sequence' => $sequence->load('steps')]);
-    }
+        $sequence = Sequence::forBusiness($user->business_id)->find($id);
 
-    /**
-     * Delete a sequence
-     */
-    public function destroy(Request $request, $businessId, $sequenceId)
-    {
-        $sequence = Sequence::where('business_id', $businessId)
-            ->findOrFail($sequenceId);
-
-        $sequence->users()->delete();
-        $sequence->steps()->delete();
-        $sequence->delete();
-
-        return response()->json(['success' => true]);
-    }
-
-    /**
-     * Manually enroll a conversation in a sequence
-     */
-    public function enroll(Request $request, $businessId, $sequenceId)
-    {
-        $request->validate([
-            'conversation_id' => 'required|exists:conversations,id',
-        ]);
-
-        $sequence = Sequence::where('business_id', $businessId)
-            ->findOrFail($sequenceId);
-
-        $conversation = Conversation::find($request->conversation_id);
-
-        // Check if already enrolled
-        $existingEnrollment = SequenceUser::where('sequence_id', $sequence->id)
-            ->where('conversation_id', $conversation->id)
-            ->first();
-
-        if ($existingEnrollment) {
-            return response()->json(['error' => 'Conversation already enrolled in this sequence'], 400);
+        if (!$sequence) {
+            return response()->json(['error' => 'Sequence not found'], 404);
         }
 
-        // Create enrollment
-        $sequenceUser = SequenceUser::create([
-            'sequence_id' => $sequence->id,
-            'conversation_id' => $conversation->id,
-            'current_step' => 0,
-            'status' => 'active',
-            'started_at' => now(),
+        $validated = $request->validate([
+            'enrollment_id' => 'required|integer|exists:sequence_enrollments,id',
+            'reason' => 'nullable|string',
         ]);
 
-        // Trigger first step immediately
-        ProcessSequenceStep::dispatch($sequenceUser->id);
+        try {
+            $enrollment = SequenceEnrollment::find($validated['enrollment_id']);
 
-        return response()->json(['success' => true, 'sequence_user' => $sequenceUser]);
+            if (!$enrollment || $enrollment->sequence_id !== $sequence->id) {
+                return response()->json(['error' => 'Enrollment not found or access denied'], 404);
+            }
+
+            $this->enrollmentService->unenrollConversation($enrollment, $validated['reason'] ?? 'manual');
+            return response()->json(['success' => true]);
+        } catch (\Exception $e) {
+            Log::error('Failed to unenroll conversation', ['error' => $e->getMessage()]);
+            return response()->json(['error' => $e->getMessage()], 500);
+        }
     }
 
-    /**
-     * Get sequence enrollments
-     */
-    public function enrollments(Request $request, $businessId, $sequenceId)
+    public function queueMetrics()
     {
-        $sequence = Sequence::where('business_id', $businessId)
-            ->findOrFail($sequenceId);
+        $pendingExecutions = SequenceStepExecution::pending()->count();
+        $processingExecutions = SequenceStepExecution::processing()->count();
+        $failedExecutions = SequenceStepExecution::failed()->count();
+        $executedExecutions = SequenceStepExecution::executed()->count();
 
-        $enrollments = $sequence->users()
-            ->with(['conversation'])
-            ->orderBy('created_at', 'desc')
-            ->paginate(50);
+        $activeEnrollments = SequenceEnrollment::where('status', 'active')->count();
+        $completedEnrollments = SequenceEnrollment::where('status', 'completed')->count();
+        $stoppedEnrollments = SequenceEnrollment::where('status', 'stopped')->count();
+        $failedEnrollments = SequenceEnrollment::where('status', 'failed')->count();
 
-        return response()->json($enrollments);
+        $stuckExecutions = SequenceStepExecution::processing()
+            ->where('updated_at', '<', now()->subHour())
+            ->count();
+
+        $overdueExecutions = SequenceStepExecution::pending()
+            ->where('scheduled_at', '<', now())
+            ->count();
+
+        $healthScore = 100;
+        if ($failedExecutions > 10) $healthScore -= 20;
+        if ($stuckExecutions > 0) $healthScore -= 30;
+        if ($overdueExecutions > 5) $healthScore -= 15;
+
+        return response()->json([
+            'executions' => [
+                'pending' => $pendingExecutions,
+                'processing' => $processingExecutions,
+                'executed' => $executedExecutions,
+                'failed' => $failedExecutions,
+            ],
+            'enrollments' => [
+                'active' => $activeEnrollments,
+                'completed' => $completedEnrollments,
+                'stopped' => $stoppedEnrollments,
+                'failed' => $failedEnrollments,
+            ],
+            'health' => [
+                'score' => max(0, $healthScore),
+                'stuck_executions' => $stuckExecutions,
+                'overdue_executions' => $overdueExecutions,
+            ],
+        ]);
+    }
+
+    public function resetStuckExecutions()
+    {
+        $resetCount = SequenceStepExecution::processing()
+            ->where('updated_at', '<', now()->subHour())
+            ->update(['status' => 'pending']);
+
+        return response()->json([
+            'success' => true,
+            'reset_count' => $resetCount,
+        ]);
     }
 }

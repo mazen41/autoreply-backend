@@ -21,6 +21,7 @@ Schedule::command('email-campaigns:send-due')->everyMinute()->name('send-due-ema
 Schedule::command('campaigns:send-due')->everyMinute()->name('send-due-campaigns')->withoutOverlapping();
 Schedule::command('usage:check')->dailyAt('01:30')->name('check-usage-limits')->withoutOverlapping();
 Schedule::command('system:health-check')->hourly()->name('system-health-check')->withoutOverlapping();
+Schedule::command('sequences:check-no-reply')->hourly()->name('check-no-reply-sequences')->withoutOverlapping();
 
 // Performance optimization (run once manually or after migrations)
 // Schedule::command('performance:create-indexes')->daily()->name('create-performance-indexes')->withoutOverlapping();

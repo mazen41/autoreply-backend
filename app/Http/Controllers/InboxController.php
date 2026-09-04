@@ -583,6 +583,18 @@ class InboxController extends Controller
             ]
         );
 
+        // Trigger sequence enrollment for tag-based sequences
+        try {
+            $sequenceTriggerService = new \App\Services\SequenceTriggerService();
+            $sequenceTriggerService->checkAndEnrollForTagAdded($conversation, $request->tag);
+        } catch (\Exception $e) {
+            \Log::error('Failed to check sequence enrollment for tag', [
+                'conversation_id' => $conversationId,
+                'tag' => $request->tag,
+                'error' => $e->getMessage(),
+            ]);
+        }
+
         return response()->json($tag);
     }
 

@@ -41,24 +41,33 @@ class SequenceExecutionService
         switch ($step->step_type) {
             case 'message':
                 $this->executeMessageStep($execution, $enrollment, $step);
+                // After message, move to next step
+                $this->moveToNextStep($enrollment);
                 break;
             case 'delay':
                 $this->executeDelayStep($execution, $enrollment, $step);
+                // Delay step should schedule the next step with the delay
+                $this->scheduleNextStepAfterDelay($enrollment, $step);
                 break;
             case 'condition':
                 $this->executeConditionStep($execution, $enrollment, $step);
+                // Only move to next step if condition passed
+                if (!$execution->metadata['condition_result'] ?? true) {
+                    $this->moveToNextStep($enrollment);
+                }
                 break;
             case 'action':
                 $this->executeActionStep($execution, $enrollment, $step);
+                // Only move to next step if action didn't stop sequence
+                if (!($execution->metadata['action_type'] ?? '') === 'stop_sequence') {
+                    $this->moveToNextStep($enrollment);
+                }
                 break;
             default:
                 $execution->markAsSkipped('unknown_step_type');
         }
 
         $execution->save();
-
-        // Move to next step
-        $this->moveToNextStep($enrollment);
     }
 
     protected function executeMessageStep(SequenceStepExecution $execution, SequenceEnrollment $enrollment, SequenceStep $step): void
@@ -124,6 +133,22 @@ class SequenceExecutionService
             'delay_hours' => $step->delay_hours,
             'delay_unit' => $step->delay_unit,
         ]);
+        
+        // CRITICAL FIX: Delay steps should NOT immediately move to next step
+        // Instead, the delay should be applied when scheduling the NEXT step
+        // The delay step itself is just a marker and completes immediately
+        // But we need to schedule the next step with the delay
+        
+        Log::info("Delay step executed, scheduling next step with delay", [
+            'execution_id' => $execution->id,
+            'enrollment_id' => $enrollment->id,
+            'step_id' => $step->id,
+            'delay_hours' => $step->delay_hours,
+            'delay_unit' => $step->delay_unit,
+        ]);
+        
+        // Don't call moveToNextStep here - handle it specially
+        // The next step should be scheduled after the delay period
     }
 
     protected function executeConditionStep(SequenceStepExecution $execution, SequenceEnrollment $enrollment, SequenceStep $step): void
@@ -378,43 +403,111 @@ class SequenceExecutionService
         $conversation->tags()->where('tag', $tag)->delete();
     }
 
+    protected function scheduleNextStepAfterDelay(SequenceEnrollment $enrollment, SequenceStep $delayStep): void
+    {
+        $nextStep = $delayStep->getNextStep();
+        
+        if (!$nextStep) {
+            // No next step, complete the enrollment
+            $enrollment->complete();
+            return;
+        }
+        
+        // Get the delay from the delay step
+        $delaySeconds = $delayStep->getDelayInSeconds();
+        
+        // Get sequence configuration
+        $sequence = $enrollment->sequence;
+        $timezone = $sequence->timezone ?? 'UTC';
+        $businessHours = $sequence->business_hours ?? null;
+        
+        // Calculate next execution time respecting business hours
+        $currentTime = now()->setTimezone($timezone);
+        $scheduledAt = $this->businessHoursService->calculateNextExecutionTime(
+            $currentTime, 
+            $delaySeconds, 
+            $businessHours, 
+            $timezone
+        );
+        
+        // Queue next step execution
+        $execution = SequenceStepExecution::create([
+            'sequence_id' => $enrollment->sequence_id,
+            'sequence_enrollment_id' => $enrollment->id,
+            'sequence_step_id' => $nextStep->id,
+            'status' => 'pending',
+            'scheduled_at' => $scheduledAt,
+        ]);
+
+        Log::info("scheduleNextStepAfterDelay: Created next step execution after delay", [
+            'enrollment_id' => $enrollment->id,
+            'delay_step_id' => $delayStep->id,
+            'next_step_id' => $nextStep->id,
+            'next_step_type' => $nextStep->step_type,
+            'delay_seconds' => $delaySeconds,
+            'scheduled_at' => $scheduledAt,
+        ]);
+
+        // Update enrollment next execution time
+        $enrollment->scheduleNextExecution($delaySeconds);
+
+        // Dispatch job with calculated delay
+        $jobDelay = $scheduledAt->diffInSeconds(now());
+        ExecuteSequenceStep::dispatch($execution->id)->delay($jobDelay);
+        
+        Log::info("scheduleNextStepAfterDelay: Dispatched next step job", [
+            'execution_id' => $execution->id,
+            'job_delay_seconds' => $jobDelay,
+        ]);
+    }
+
     protected function moveToNextStep(SequenceEnrollment $enrollment): void
     {
         $nextStep = $enrollment->moveToNextStep();
 
-        if ($nextStep) {
-            // Get sequence configuration
-            $sequence = $enrollment->sequence;
-            $timezone = $sequence->timezone ?? 'UTC';
-            $businessHours = $sequence->business_hours ?? null;
+        if (!$nextStep) {
+            // No next step, complete the enrollment
+            $enrollment->complete();
+            return;
+        }
+        
+        // If the next step is a delay step, execute it immediately
+        // The delay step will then schedule the following step with the delay
+        if ($nextStep->isDelayStep()) {
+            Log::info("moveToNextStep: Next step is delay, executing immediately", [
+                'enrollment_id' => $enrollment->id,
+                'next_step_id' => $nextStep->id,
+            ]);
             
-            // Calculate delay in seconds
-            $delaySeconds = $nextStep->getDelayInSeconds();
-            
-            // Calculate next execution time respecting business hours
-            $currentTime = now()->setTimezone($timezone);
-            $scheduledAt = $this->businessHoursService->calculateNextExecutionTime(
-                $currentTime, 
-                $delaySeconds, 
-                $businessHours, 
-                $timezone
-            );
-            
-            // Queue next step execution
+            // Create execution record for delay step (immediate)
             $execution = SequenceStepExecution::create([
                 'sequence_id' => $enrollment->sequence_id,
                 'sequence_enrollment_id' => $enrollment->id,
                 'sequence_step_id' => $nextStep->id,
                 'status' => 'pending',
-                'scheduled_at' => $scheduledAt,
+                'scheduled_at' => now(),
             ]);
-
-            // Update enrollment next execution time
-            $enrollment->scheduleNextExecution($delaySeconds);
-
-            // Dispatch job with calculated delay
-            $jobDelay = $scheduledAt->diffInSeconds(now());
-            ExecuteSequenceStep::dispatch($execution->id)->delay($jobDelay);
+            
+            // Dispatch immediately - delay step will handle scheduling the next step
+            ExecuteSequenceStep::dispatch($execution->id);
+            return;
         }
+        
+        // For non-delay steps, execute immediately
+        $execution = SequenceStepExecution::create([
+            'sequence_id' => $enrollment->sequence_id,
+            'sequence_enrollment_id' => $enrollment->id,
+            'sequence_step_id' => $nextStep->id,
+            'status' => 'pending',
+            'scheduled_at' => now(),
+        ]);
+
+        Log::info("moveToNextStep: Executing next step immediately", [
+            'enrollment_id' => $enrollment->id,
+            'next_step_id' => $nextStep->id,
+            'next_step_type' => $nextStep->step_type,
+        ]);
+
+        ExecuteSequenceStep::dispatch($execution->id);
     }
 }

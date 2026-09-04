@@ -210,11 +210,8 @@ class SequenceEnrollmentService
             return;
         }
 
+        // Always execute immediately - delays are handled when moving to next step
         $delayInSeconds = 0;
-
-        if ($currentStep->isDelayStep()) {
-            $delayInSeconds = $currentStep->getDelayInSeconds();
-        }
 
         // Create step execution record
         $execution = SequenceStepExecution::create([
@@ -225,18 +222,23 @@ class SequenceEnrollmentService
             'scheduled_at' => now()->addSeconds($delayInSeconds),
         ]);
 
+        Log::info("QueueStepExecution: Created execution record", [
+            'execution_id' => $execution->id,
+            'enrollment_id' => $enrollment->id,
+            'step_id' => $currentStep->id,
+            'step_type' => $currentStep->step_type,
+            'scheduled_at' => $execution->scheduled_at,
+        ]);
+
         // Update enrollment next execution time
         $enrollment->scheduleNextExecution($delayInSeconds);
 
-        // Dispatch job for execution
-        if ($delayInSeconds > 0) {
-            // Delayed job
-            ExecuteSequenceStep::dispatch($execution->id)
-                ->delay(now()->addSeconds($delayInSeconds));
-        } else {
-            // Immediate execution
-            ExecuteSequenceStep::dispatch($execution->id);
-        }
+        // Dispatch job for immediate execution
+        ExecuteSequenceStep::dispatch($execution->id);
+        
+        Log::info("QueueStepExecution: Dispatched immediate job", [
+            'execution_id' => $execution->id,
+        ]);
     }
 
     public function canEnroll(Sequence $sequence, Conversation $conversation): bool

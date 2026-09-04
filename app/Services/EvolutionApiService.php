@@ -791,11 +791,26 @@ class EvolutionApiService
 
                 if ($status === 'ERROR') {
                     Log::error('ProcessAutoReply: WhatsApp delivery FAILED (Evolution reported ERROR)', [
-                        'instance'          => $instanceName,
-                        'key_id'            => $remoteMessageId,
-                        'remote_jid'        => $remoteJid,
+                        'instance'           => $instanceName,
+                        'key_id'             => $remoteMessageId,
+                        'remote_jid'         => $remoteJid,
                         'unified_message_id' => $inboxMessage->id,
-                        'conversation_id'   => $inboxMessage->conversation_id,
+                        'conversation_id'    => $inboxMessage->conversation_id,
+                    ]);
+
+                    // Mark the channel needs_reconnect so the dashboard shows
+                    // a warning and the user knows to re-scan QR. Evolution
+                    // returns ERROR when the WhatsApp session has silently died
+                    // even though the instance shows "connected" in Evolution.
+                    Channel::where('type', 'whatsapp')
+                        ->where('page_id', $instanceName)
+                        ->update([
+                            'status'           => 'error',
+                            'disconnected_at'  => now(),
+                        ]);
+
+                    Log::warning('ProcessAutoReply: marked WhatsApp channel as error — user must re-scan QR', [
+                        'instance' => $instanceName,
                     ]);
                 }
             }

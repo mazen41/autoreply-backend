@@ -837,6 +837,23 @@ class EvolutionApiService
             $this->ensureWhatsAppChannel($instance);
         } elseif ($state === 'close') {
             $instance->disconnected_at = now();
+
+            // Mark the matching Channel row as disconnected too. Previously only
+            // WhatsAppInstance.status was updated here, so the Channel row (which
+            // is what ProcessAutoReply, SequenceExecutionService, etc. actually
+            // query when deciding where to send a message) stayed 'connected'
+            // forever after a session died. This let sends silently route through
+            // a dead session — Evolution's API accepts the call (200 OK, queued)
+            // even though the underlying WhatsApp session is gone, so the send
+            // looked successful in our logs but never reached the phone.
+            $affected = Channel::where('type', 'whatsapp')
+                ->where('page_id', $instanceName)
+                ->update(['status' => 'disconnected']);
+
+            Log::info("Marked Channel(s) disconnected for closed instance", [
+                'instance_name'   => $instanceName,
+                'channels_updated' => $affected,
+            ]);
         }
 
         $instance->save();
@@ -910,6 +927,30 @@ class EvolutionApiService
                     'channel_id'    => $channel->id,
                     'business_id'   => $channel->fresh()->business_id,
                 ]);
+            }
+
+            // Defensive cleanup: mark every OTHER whatsapp channel for this
+            // business as disconnected. This covers the case where a merchant
+            // re-scans the QR code and a brand-new instance comes online before
+            // (or without) the old instance's own 'close' event ever arriving —
+            // which is exactly what happened in production (a new instance
+            // connected in the same second the old one closed). Without this,
+            // two Channel rows can both show status='connected' simultaneously,
+            // and any query without explicit ordering can pick the stale one.
+            if ($channel->business_id) {
+                $staleCount = Channel::where('business_id', $channel->business_id)
+                    ->where('type', 'whatsapp')
+                    ->where('id', '!=', $channel->id)
+                    ->where('status', 'connected')
+                    ->update(['status' => 'disconnected']);
+
+                if ($staleCount > 0) {
+                    Log::info("Disconnected stale duplicate WhatsApp channel(s) for business", [
+                        'business_id'    => $channel->business_id,
+                        'active_channel' => $channel->id,
+                        'stale_count'    => $staleCount,
+                    ]);
+                }
             }
         } catch (\Exception $e) {
             Log::error("Failed to ensure WhatsApp channel: {$e->getMessage()}", [

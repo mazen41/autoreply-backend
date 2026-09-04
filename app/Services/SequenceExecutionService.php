@@ -70,11 +70,38 @@ class SequenceExecutionService
             throw new \Exception('Conversation not found');
         }
 
-        // Get channel for sending
+        // Get channel for sending.
+        // IMPORTANT: order by most-recently-connected first. This is defense
+        // in depth against stale duplicate Channel rows (e.g. an old
+        // disconnected WhatsApp instance's channel that didn't get its status
+        // flipped in time) — even though EvolutionApiService now actively
+        // marks stale channels disconnected on reconnect/close, an explicit
+        // order here means we never silently pick the wrong one if that sync
+        // is ever delayed or missed.
         $channel = $sequence->channel ? Channel::where('business_id', $sequence->business_id)
             ->where('type', $sequence->channel)
             ->where('status', 'connected')
+            ->orderByDesc('connected_at')
             ->first() : $conversation->channel;
+
+        // Even if $conversation->channel resolved to something, it may be
+        // stale (e.g. the conversation was created against an instance that
+        // has since disconnected and been replaced). Re-verify it's actually
+        // still connected, and if not, fall back to the business's current
+        // live channel of the same type rather than sending into a dead session.
+        if ($channel && $channel->status !== 'connected') {
+            Log::warning('SequenceExecutionService: resolved channel is not connected, looking for a live replacement', [
+                'stale_channel_id' => $channel->id,
+                'business_id'      => $sequence->business_id,
+                'channel_type'     => $channel->type,
+            ]);
+
+            $channel = Channel::where('business_id', $sequence->business_id)
+                ->where('type', $channel->type)
+                ->where('status', 'connected')
+                ->orderByDesc('connected_at')
+                ->first();
+        }
 
         if (!$channel) {
             throw new \Exception('No connected channel found for sending message');
@@ -193,8 +220,21 @@ class SequenceExecutionService
     protected function sendWhatsAppMessage(Conversation $conversation, string $message, Channel $channel, Message $messageRecord): void
     {
         $evolutionService = new EvolutionApiService();
-        
-        // Send via Evolution API
+
+        // Send via Evolution API. A successful (200) response only confirms
+        // Evolution's REST layer accepted the request into its send queue —
+        // it does NOT confirm the message actually reached WhatsApp, since
+        // that depends on the underlying session (Baileys/WhatsApp Web) still
+        // being alive. Real delivery confirmation arrives later via the
+        // messages.update webhook (DELIVERY_ACK / READ status), the same way
+        // it's tracked for normal AI replies elsewhere in the app.
+        //
+        // Marking this 'delivered' immediately, before that webhook arrives,
+        // is what let a message look successfully sent in our own logs/dashboard
+        // while never actually reaching the customer's phone (the channel had
+        // silently disconnected). Mark it 'sent'/'pending' instead, and let the
+        // existing messages.update webhook handler update it to the real status
+        // once WhatsApp actually confirms delivery.
         $evolutionService->sendTextMessage(
             $channel->page_id, // instance name
             $conversation->sender_id,
@@ -204,7 +244,7 @@ class SequenceExecutionService
         $messageRecord->update([
             'whatsapp_message_id' => $messageRecord->id, // Use message ID as reference
             'send_status' => 'sent',
-            'delivery_status' => 'delivered',
+            'delivery_status' => 'pending',
         ]);
     }
 

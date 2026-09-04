@@ -10,6 +10,7 @@ use App\Models\SequenceStepExecution;
 use App\Jobs\ExecuteSequenceStep;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Log;
+use Illuminate\Database\QueryException;
 
 class SequenceEnrollmentService
 {
@@ -25,48 +26,91 @@ class SequenceEnrollmentService
             throw new \Exception('Conversation already has an active enrollment in this sequence');
         }
 
-        return DB::transaction(function () use ($sequence, $conversation, $startStep) {
-            $enrollment = SequenceEnrollment::create([
-                'sequence_id' => $sequence->id,
-                'conversation_id' => $conversation->id,
-                'current_step' => $startStep,
-                'status' => 'active',
-                'started_at' => now(),
-                'next_execution_at' => now(),
-                'metadata' => [
-                    'enrolled_by' => 'manual',
-                    'conversation_sender' => $conversation->sender_name,
-                ],
-            ]);
+        try {
+            return DB::transaction(function () use ($sequence, $conversation, $startStep) {
+                $enrollment = SequenceEnrollment::create([
+                    'sequence_id' => $sequence->id,
+                    'conversation_id' => $conversation->id,
+                    'current_step' => $startStep,
+                    'status' => 'active',
+                    'started_at' => now(),
+                    'next_execution_at' => now(),
+                    'metadata' => [
+                        'enrolled_by' => 'manual',
+                        'conversation_sender' => $conversation->sender_name,
+                    ],
+                ]);
 
-            // Queue first step execution
-            $this->queueStepExecution($enrollment);
+                // Queue first step execution
+                $this->queueStepExecution($enrollment);
 
-            return $enrollment;
-        });
+                return $enrollment;
+            });
+        } catch (QueryException $e) {
+            // DB-level unique constraint (seq_enroll_unique_active) caught a
+            // genuine race that the app-level check above missed. Treat it the
+            // same as the app-level duplicate check above, not as an unexpected
+            // DB error, so callers only ever need to catch one exception type.
+            if ($this->isDuplicateActiveEnrollmentViolation($e)) {
+                Log::info('SequenceEnrollmentService: DB constraint caught a concurrent duplicate enrollment', [
+                    'sequence_id' => $sequence->id,
+                    'conversation_id' => $conversation->id,
+                ]);
+                throw new \Exception('Conversation already has an active enrollment in this sequence');
+            }
+            throw $e;
+        }
     }
 
     public function enrollConversationWithoutDuplicateCheck(Sequence $sequence, Conversation $conversation, int $startStep = 0): SequenceEnrollment
     {
-        return DB::transaction(function () use ($sequence, $conversation, $startStep) {
-            $enrollment = SequenceEnrollment::create([
-                'sequence_id' => $sequence->id,
-                'conversation_id' => $conversation->id,
-                'current_step' => $startStep,
-                'status' => 'active',
-                'started_at' => now(),
-                'next_execution_at' => now(),
-                'metadata' => [
-                    'enrolled_by' => 'automatic',
-                    'conversation_sender' => $conversation->sender_name,
-                ],
-            ]);
+        try {
+            return DB::transaction(function () use ($sequence, $conversation, $startStep) {
+                $enrollment = SequenceEnrollment::create([
+                    'sequence_id' => $sequence->id,
+                    'conversation_id' => $conversation->id,
+                    'current_step' => $startStep,
+                    'status' => 'active',
+                    'started_at' => now(),
+                    'next_execution_at' => now(),
+                    'metadata' => [
+                        'enrolled_by' => 'automatic',
+                        'conversation_sender' => $conversation->sender_name,
+                    ],
+                ]);
 
-            // Queue first step execution
-            $this->queueStepExecution($enrollment);
+                // Queue first step execution
+                $this->queueStepExecution($enrollment);
 
-            return $enrollment;
-        });
+                return $enrollment;
+            });
+        } catch (QueryException $e) {
+            // This method skips the app-level check by design, but the DB
+            // constraint still applies — surface it the same way rather than
+            // letting a raw SQL exception bubble up to callers.
+            if ($this->isDuplicateActiveEnrollmentViolation($e)) {
+                Log::info('SequenceEnrollmentService: DB constraint caught a duplicate enrollment (no-duplicate-check path)', [
+                    'sequence_id' => $sequence->id,
+                    'conversation_id' => $conversation->id,
+                ]);
+                throw new \Exception('Conversation already has an active enrollment in this sequence');
+            }
+            throw $e;
+        }
+    }
+
+    /**
+     * Detect whether a QueryException was caused by the seq_enroll_unique_active
+     * constraint specifically, so we don't accidentally swallow unrelated DB
+     * errors (e.g. a genuine connection failure or a different constraint).
+     */
+    private function isDuplicateActiveEnrollmentViolation(QueryException $e): bool
+    {
+        // MySQL duplicate-entry SQLSTATE is 23000; error code 1062 is
+        // "Duplicate entry ... for key". We also check the constraint name
+        // to be specific rather than matching on any 1062 error.
+        return $e->getCode() === '23000'
+            && str_contains($e->getMessage(), 'seq_enroll_unique_active');
     }
 
     public function unenrollConversation(SequenceEnrollment $enrollment, string $reason = 'manual'): bool

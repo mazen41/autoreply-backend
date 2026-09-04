@@ -161,6 +161,51 @@ class ProcessAutoReply implements ShouldQueue
             return;
         }
 
+        // ── NEW-USER SEQUENCE PRIORITY CHECK ─────────────────────────────────
+        // This MUST happen before the AI flow. If the incoming message is from a
+        // new user AND an active sequence with trigger_type='new_user' exists for
+        // this business, the sequence takes full ownership of the response.
+        // The AI auto-reply is skipped entirely for that message so the customer
+        // never receives both a sequence greeting and an AI reply.
+        //
+        // "New user" is defined as: this inbound message is the FIRST inbound
+        // message ever recorded on this conversation. We count inbound messages
+        // on the conversation rather than checking whether the Conversation row
+        // itself is new, because the conversation row is created before any
+        // message processing begins (by the webhook handler).
+        //
+        // Idempotency: SequenceEnrollmentService::enrollConversation() checks for
+        // an existing active enrollment before creating one. Additionally, we use
+        // a per-conversation cache lock so that job retries for the same message
+        // do not attempt a second enrollment.
+        if ($business) {
+            $isNewUser = $this->isNewUserConversation($conversation, $message);
+
+            Log::info('ProcessAutoReply: new-user check', [
+                'conversation_id' => $conversation->id,
+                'message_id'      => $message->id,
+                'is_new_user'     => $isNewUser,
+            ]);
+
+            if ($isNewUser) {
+                $sequenceTriggered = $this->tryTriggerNewUserSequence($conversation, $business->id);
+
+                if ($sequenceTriggered) {
+                    // Sequence owns this response. Do NOT run the AI auto-reply.
+                    Log::info('ProcessAutoReply: new-user sequence triggered — skipping AI auto-reply', [
+                        'conversation_id' => $conversation->id,
+                        'message_id'      => $message->id,
+                    ]);
+                    return;
+                }
+
+                Log::info('ProcessAutoReply: no new-user sequence matched — continuing normal AI flow', [
+                    'conversation_id' => $conversation->id,
+                ]);
+            }
+        }
+        // ── END NEW-USER SEQUENCE PRIORITY CHECK ──────────────────────────────
+
         // Use atomic counter for AI replies limit check to prevent race conditions
         $cacheKey = "user_{$user->id}_ai_replies_" . now()->format('Y-m');
         $lockKey = "lock:{$cacheKey}";
@@ -1345,20 +1390,155 @@ class ProcessAutoReply implements ShouldQueue
             // Notify about the send failure
             $this->notifyAIFailure($channel->user, $conversation, 'Message send failure');
         }
-
-        // ── SEQUENCE TRIGGER INTEGRATION ───────────────────────────────────────
-        // After AI reply is sent, check if conversation should be enrolled in any sequences
-        // This is a small integration that doesn't affect the main AI processing logic
-        try {
-            $sequenceTriggerService = new SequenceTriggerService();
-            $sequenceTriggerService->checkAndEnrollForMessageReceived($conversation);
-        } catch (\Exception $e) {
-            Log::error('ProcessAutoReply: Failed to check sequence enrollment', [
-                'conversation_id' => $conversation->id,
-                'error' => $e->getMessage(),
-            ]);
-        }
+        // NOTE: Sequence enrollment for non-new-user messages (tag_added, no_reply, order_created)
+        // is handled by their respective triggers (SallaWebhookJob, scheduled commands, etc.)
+        // and NOT from ProcessAutoReply, to preserve separation of concerns.
     }
+
+    // ── SEQUENCE INTEGRATION HELPERS ─────────────────────────────────────────
+
+    /**
+     * Determine whether the incoming message is the very first inbound message
+     * on this conversation.
+     *
+     * "New user" means: this is the FIRST inbound message ever recorded on
+     * the conversation. We count inbound messages rather than checking whether
+     * the Conversation row is new, because the conversation is created by the
+     * webhook handler before any job runs — so created_at is not a reliable
+     * proxy for "has this person ever messaged us".
+     *
+     * We count messages with id <= $message->id to handle concurrent workers:
+     * if two inbound messages are processed simultaneously, only the one whose
+     * id is the lowest will be seen as the first message, which is correct.
+     */
+    private function isNewUserConversation(Conversation $conversation, Message $message): bool
+    {
+        // Count inbound messages on this conversation that were created at or
+        // before the current message. If count == 1, this IS the first inbound
+        // message, so this is a new user.
+        $inboundCount = Message::where('conversation_id', $conversation->id)
+            ->where('direction', 'inbound')
+            ->where('id', '<=', $message->id)
+            ->count();
+
+        return $inboundCount === 1;
+    }
+
+    /**
+     * Attempt to enroll the conversation in the first matching active
+     * new_user-triggered sequence for this business.
+     *
+     * Returns true if a sequence was successfully triggered (meaning the AI
+     * auto-reply must be skipped), false if no matching sequence exists or
+     * if enrollment failed.
+     *
+     * Idempotency: a cache lock keyed by conversation id prevents duplicate
+     * enrollment attempts on job retries. SequenceEnrollmentService also
+     * enforces uniqueness at the DB level (throws on duplicate active enrollment).
+     */
+    private function tryTriggerNewUserSequence(Conversation $conversation, int $businessId): bool
+    {
+        // Per-conversation idempotency lock: if this job is retried, we must not
+        // enroll the conversation twice. The lock is held for 5 minutes — long
+        // enough to cover the job retry window (backoff = 30s, tries = 3).
+        $lockKey = "seq_new_user_lock:conv:{$conversation->id}";
+
+        if (!Cache::add($lockKey, 1, now()->addMinutes(5))) {
+            // Another attempt already claimed or completed the enrollment.
+            Log::info('ProcessAutoReply: new-user sequence lock already held — treating as already-triggered', [
+                'conversation_id' => $conversation->id,
+            ]);
+            // Return true so this retry also skips the AI reply, consistent
+            // with what the original attempt did.
+            return true;
+        }
+
+        Log::info('ProcessAutoReply: checking new-user sequences', [
+            'conversation_id' => $conversation->id,
+            'business_id'     => $businessId,
+        ]);
+
+        // Find all active sequences with new_user trigger for this business.
+        // We take the first matching one. If a business has multiple new-user
+        // sequences, the one with the lowest id (oldest/first created) wins.
+        $sequences = \App\Models\Sequence::where('business_id', $businessId)
+            ->where('status', 'active')
+            ->where('trigger_type', 'new_user')
+            ->orderBy('id')
+            ->get();
+
+        if ($sequences->isEmpty()) {
+            Log::info('ProcessAutoReply: no active new-user sequences found', [
+                'business_id' => $businessId,
+            ]);
+            return false;
+        }
+
+        Log::info('ProcessAutoReply: found active new-user sequences', [
+            'business_id'   => $businessId,
+            'sequence_ids'  => $sequences->pluck('id')->toArray(),
+            'sequence_names' => $sequences->pluck('name')->toArray(),
+        ]);
+
+        // Resolve SequenceTriggerService from the container so Laravel injects
+        // its constructor dependency (SequenceEnrollmentService) automatically.
+        // This is the correct pattern — never call new SequenceTriggerService()
+        // directly because that bypasses DI and causes the constructor error.
+        /** @var SequenceTriggerService $triggerService */
+        $triggerService = app(SequenceTriggerService::class);
+
+        $enrolled = false;
+
+        foreach ($sequences as $sequence) {
+            try {
+                $enrollment = $triggerService->enrollInSequence($sequence, $conversation, checkDuplicates: true);
+
+                if ($enrollment !== null) {
+                    Log::info('ProcessAutoReply: new-user sequence enrollment succeeded', [
+                        'conversation_id' => $conversation->id,
+                        'sequence_id'     => $sequence->id,
+                        'sequence_name'   => $sequence->name,
+                        'enrollment_id'   => $enrollment->id,
+                    ]);
+                    $enrolled = true;
+                    // Only enroll in the first matching sequence. Stop here.
+                    break;
+                }
+
+                // canEnroll returned false (e.g. already enrolled) — log and
+                // continue to next sequence rather than failing silently.
+                Log::info('ProcessAutoReply: new-user sequence enrollment skipped (not eligible)', [
+                    'conversation_id' => $conversation->id,
+                    'sequence_id'     => $sequence->id,
+                ]);
+
+            } catch (\Exception $e) {
+                Log::error('ProcessAutoReply: new-user sequence enrollment threw an exception', [
+                    'conversation_id' => $conversation->id,
+                    'sequence_id'     => $sequence->id,
+                    'error'           => $e->getMessage(),
+                ]);
+                // Do NOT silently fall back to AI auto-reply on exception.
+                // The sequence was likely partially set up; better to skip the
+                // AI reply than to double-respond. Release the lock so a later
+                // retry can try again.
+                Cache::forget($lockKey);
+                // Propagate: let the job retry mechanism handle it.
+                throw $e;
+            }
+        }
+
+        if (!$enrolled) {
+            // All sequences were ineligible (e.g. already enrolled from a race).
+            // Release the lock so future new messages from this conversation
+            // don't get stuck thinking a sequence is pending.
+            Cache::forget($lockKey);
+        }
+
+        return $enrolled;
+    }
+
+    // ── END SEQUENCE INTEGRATION HELPERS ─────────────────────────────────────
 
     /**
      * Normalize an AI confidence value to the app's canonical 0–1 scale.

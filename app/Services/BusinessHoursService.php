@@ -55,13 +55,52 @@ class BusinessHoursService
 
     /**
      * Alias for isWithinBusinessHours for backward compatibility
+     * Can accept either a Carbon time with business hours array, or a BusinessProfile object
      */
-    public function isBusinessOpen(Carbon $time, ?array $businessHours = null): bool
+    public function isBusinessOpen($timeOrBusiness, $businessHours = null): bool
     {
-        if (!$businessHours || empty($businessHours)) {
-            return true; // If no business hours configured, assume always open
+        // Handle BusinessProfile object (legacy usage)
+        if ($timeOrBusiness instanceof \App\Models\BusinessProfile) {
+            $business = $timeOrBusiness;
+            $businessHours = $this->extractBusinessHoursFromProfile($business);
+            $time = now()->setTimezone($business->timezone ?? 'UTC');
+            return $this->isWithinBusinessHours($time, $businessHours);
         }
-        return $this->isWithinBusinessHours($time, $businessHours);
+        
+        // Handle Carbon time with business hours array
+        if ($timeOrBusiness instanceof Carbon) {
+            $time = $timeOrBusiness;
+            if (!$businessHours || empty($businessHours)) {
+                return true; // If no business hours configured, assume always open
+            }
+            return $this->isWithinBusinessHours($time, $businessHours);
+        }
+        
+        return true; // Fallback
+    }
+
+    /**
+     * Extract business hours from BusinessProfile
+     */
+    protected function extractBusinessHoursFromProfile(\App\Models\BusinessProfile $business): array
+    {
+        // Parse working_days JSON if available
+        $workingDays = json_decode($business->working_days ?? '[]', true);
+        
+        // Create business hours array format
+        $businessHours = [];
+        $daysMap = ['sun' => 0, 'mon' => 1, 'tue' => 2, 'wed' => 3, 'thu' => 4, 'fri' => 5, 'sat' => 6];
+        
+        foreach ($daysMap as $day => $index) {
+            $isEnabled = in_array($day, $workingDays);
+            $businessHours[$index] = [
+                'enabled' => $isEnabled,
+                'start' => $business->working_from ?? '09:00',
+                'end' => $business->working_to ?? '17:00',
+            ];
+        }
+        
+        return $businessHours;
     }
 
     /**
@@ -165,5 +204,13 @@ class BusinessHoursService
     protected function isValidTimeFormat(string $time): bool
     {
         return preg_match('/^([01]?[0-9]|2[0-3]):[0-5][0-9]$/', $time) === 1;
+    }
+
+    /**
+     * Get away message from business profile
+     */
+    public function getAwayMessage(\App\Models\BusinessProfile $business): ?string
+    {
+        return $business->after_hours_message ?? null;
     }
 }

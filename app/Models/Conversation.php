@@ -55,6 +55,11 @@ class Conversation extends Model
         return $this->hasMany(ConversationTag::class);
     }
 
+    public function sequenceEnrollments()
+    {
+        return $this->hasMany(SequenceEnrollment::class);
+    }
+
     public function latestMessage()
     {
         return $this->hasOne(Message::class)->latestOfMany();

@@ -54,6 +54,17 @@ class BusinessHoursService
     }
 
     /**
+     * Alias for isWithinBusinessHours for backward compatibility
+     */
+    public function isBusinessOpen(Carbon $time, ?array $businessHours = null): bool
+    {
+        if (!$businessHours || empty($businessHours)) {
+            return true; // If no business hours configured, assume always open
+        }
+        return $this->isWithinBusinessHours($time, $businessHours);
+    }
+
+    /**
      * Find the next available time slot within business hours
      */
     protected function findNextBusinessHourSlot(Carbon $time, array $businessHours): Carbon

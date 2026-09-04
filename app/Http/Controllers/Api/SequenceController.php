@@ -54,7 +54,7 @@ class SequenceController extends Controller
         $validated = $request->validate([
             'name' => 'required|string|max:255',
             'description' => 'nullable|string',
-            'trigger_type' => 'nullable|in:new_user,tag_added,no_reply,manual',
+            'trigger_type' => 'nullable|in:new_user,tag_added,no_reply,manual,order_created',
             'trigger_config' => 'nullable|array',
             'channel' => 'nullable|in:whatsapp,telegram,email',
             'settings' => 'nullable|array',
@@ -102,7 +102,7 @@ class SequenceController extends Controller
         $validated = $request->validate([
             'name' => 'sometimes|required|string|max:255',
             'description' => 'nullable|string',
-            'trigger_type' => 'nullable|in:new_user,tag_added,no_reply,manual',
+            'trigger_type' => 'nullable|in:new_user,tag_added,no_reply,manual,order_created',
             'trigger_config' => 'nullable|array',
             'channel' => 'nullable|in:whatsapp,telegram,email',
             'settings' => 'nullable|array',

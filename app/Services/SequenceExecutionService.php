@@ -413,6 +413,10 @@ class SequenceExecutionService
             return;
         }
         
+        // Update enrollment to next step BEFORE scheduling
+        $enrollment->current_step = $nextStep->step_order;
+        $enrollment->save();
+        
         // Get the delay from the delay step
         $delaySeconds = $delayStep->getDelayInSeconds();
         

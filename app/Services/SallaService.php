@@ -756,14 +756,7 @@ class SallaService
             'per_page'       => $pagination['per_page'] ?? null,
             'current_page'   => $pagination['current_page'] ?? null,
             'items'          => array_map(function ($p) {
-                // IMPORTANT: the LIST products endpoint (this one) returns the image
-                // under `thumbnail` -- confirmed against Salla's actual API docs.
-                // `main_image` / `images[].url` only appear on the SINGLE-product
-                // endpoint response, not here. Checking those first silently
-                // produced null for every item, which caused the "bot claims to
-                // send photos but sends nothing" production incident (zero image
-                // URLs ever made it into $images, so no send was ever attempted).
-                $imageUrl = $p['thumbnail'] ?? $p['main_image'] ?? $p['images'][0]['url'] ?? null;
+                $imageUrl = $this->extractImageUrl($p);
                 
                 return [
                     'id'       => $p['id']   ?? null,
@@ -775,6 +768,38 @@ class SallaService
                 ];
             }, array_slice($products, 0, 10)),
         ];
+    }
+
+    /**
+     * Safely extract a string image URL from any Salla product structure (handles string & array variants).
+     */
+    public function extractImageUrl(array $p): ?string
+    {
+        $candidates = [
+            $p['thumbnail'] ?? null,
+            $p['main_image'] ?? null,
+            $p['images'][0] ?? null,
+            $p['urls']['image'] ?? null,
+            $p['image'] ?? null,
+            $p['image_url'] ?? null,
+        ];
+
+        foreach ($candidates as $cand) {
+            if (empty($cand)) {
+                continue;
+            }
+            if (is_string($cand) && str_starts_with($cand, 'http')) {
+                return $cand;
+            }
+            if (is_array($cand)) {
+                $url = $cand['url'] ?? $cand['link'] ?? $cand['src'] ?? null;
+                if (is_string($url) && str_starts_with($url, 'http')) {
+                    return $url;
+                }
+            }
+        }
+
+        return null;
     }
 
     /**

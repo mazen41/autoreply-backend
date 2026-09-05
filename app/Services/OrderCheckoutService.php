@@ -18,6 +18,14 @@ class OrderCheckoutService
     {
         $existingState = is_array($conversation->checkout_state) ? $conversation->checkout_state : [];
 
+        // Normalize legacy field names to canonical standard (phone, full_name)
+        if (empty($existingState['phone']) && !empty($existingState['customer_phone'])) {
+            $existingState['phone'] = $existingState['customer_phone'];
+        }
+        if (empty($existingState['full_name']) && !empty($existingState['customer_name'])) {
+            $existingState['full_name'] = $existingState['customer_name'];
+        }
+
         // 1. Extract phone number
         $extractedPhone = null;
         if (preg_match('/(?:\+?[0-9]{8,15})/', preg_replace('/\s+/', '', $incomingText), $pm)) {
@@ -32,19 +40,19 @@ class OrderCheckoutService
         foreach ($namePatterns as $pattern) {
             if (preg_match($pattern, $incomingText, $nm)) {
                 $candidate = trim($nm[1]);
-                if (strlen($candidate) >= 2 && !preg_match('/(?:order|buy|help|address|phone|price|product|طلب|شراء|عنوان)/ui', $candidate)) {
+                if (strlen($candidate) >= 2 && !preg_match('/(?:order|buy|help|address|phone|price|product|طلب|شراء|عنوان|هاتف|جوال)/ui', $candidate)) {
                     $extractedName = $candidate;
                     break;
                 }
             }
         }
 
-        // Fallback: If customer is answering a direct name query and message is short (2-4 words, no numbers/keywords)
+        // Fallback: If customer is answering a direct name query and message is short (1-4 words, no numbers/keywords)
         if (!$extractedName && empty($existingState['full_name'])) {
             $words = array_filter(explode(' ', trim($incomingText)));
             if (count($words) >= 1 && count($words) <= 4 && !preg_match('/[0-9]/', $incomingText)) {
                 $textLower = mb_strtolower(trim($incomingText));
-                if (!preg_match('/(?:hi|hello|yes|no|ok|sure|thanks|order|buy|address|مرحبا|سلام|نعم|شكرا|اريد|طلب)/ui', $textLower)) {
+                if (!preg_match('/(?:hi|hello|yes|no|ok|sure|thanks|order|buy|address|confirm|مرحبا|سلام|نعم|شكرا|اريد|طلب|تأكيد|تم|اكد)/ui', $textLower)) {
                     $extractedName = trim($incomingText);
                 }
             }
@@ -62,12 +70,19 @@ class OrderCheckoutService
             }
         }
 
-        // Fallback address if address is the only missing field and text has address-like length
-        if (!$extractedAddress && empty($existingState['address']) && !empty($existingState['full_name']) && !empty($existingState['phone'])) {
-            if (strlen(trim($incomingText)) >= 4 && !preg_match('/[0-9]{8,}/', $incomingText)) {
+        // Fallback address if address is empty and text does not match explicit confirmation or standalone phone
+        if (!$extractedAddress && empty($existingState['address'])) {
+            $textLower = mb_strtolower(trim($incomingText));
+            $confirmKeywords = '/^(?:yes|yeah|sure|ok|okay|confirm|placed|thanks|نعم|تأكيد|تم|موافق|شكرا|اكد)$/ui';
+            if (!preg_match($confirmKeywords, $textLower)
+                && strlen(trim($incomingText)) >= 4
+                && !preg_match('/^\+?[0-9]{8,15}$/', trim($incomingText))) {
                 $extractedAddress = trim($incomingText);
             }
         }
+
+        $existingPhone = $existingState['phone'] ?? ($conversation->sender_id ?: null);
+        $existingName  = $existingState['full_name'] ?? ($conversation->sender_name !== $conversation->sender_id ? $conversation->sender_name : null);
 
         // Merge fields: preserve existing values if new extraction is null (NO OVERWRITING WITH NULL!)
         $mergedState = array_merge($existingState, array_filter([
@@ -76,8 +91,9 @@ class OrderCheckoutService
             'product_name'     => $referencedProduct['name']             ?? ($existingState['product_name']     ?? null),
             'product_price'    => $referencedProduct['price']            ?? ($existingState['product_price']    ?? null),
             'product_currency' => $referencedProduct['currency']         ?? ($existingState['product_currency'] ?? 'SAR'),
-            'full_name'        => $extractedName                     ?? ($existingState['full_name']        ?? ($conversation->sender_name !== $conversation->sender_id ? $conversation->sender_name : null)),
-            'phone'            => $extractedPhone                    ?? ($existingState['phone']            ?? ($conversation->sender_id ?: null)),
+            'full_name'        => $extractedName                     ?? $existingName,
+            'phone'            => $extractedPhone                    ?? $existingPhone,
+            'customer_phone'   => $extractedPhone                    ?? $existingPhone, // Alias for backward compatibility
             'address'          => $extractedAddress                  ?? ($existingState['address']          ?? null),
             'updated_at'       => now()->toISOString(),
         ], fn($v) => !is_null($v) && $v !== ''));
@@ -90,10 +106,19 @@ class OrderCheckoutService
      */
     public function computeFieldStatus(array $state): array
     {
+        // Normalize legacy field aliases
+        $phoneValue = $state['phone'] ?? $state['customer_phone'] ?? null;
+        $nameValue  = $state['full_name'] ?? $state['customer_name'] ?? null;
+
+        $normalizedState = array_merge($state, array_filter([
+            'phone'     => $phoneValue,
+            'full_name' => $nameValue,
+        ]));
+
         $known = [];
         foreach (self::REQUIRED_FIELDS as $field) {
-            if (!empty($state[$field])) {
-                $known[$field] = $state[$field];
+            if (!empty($normalizedState[$field])) {
+                $known[$field] = $normalizedState[$field];
             }
         }
 

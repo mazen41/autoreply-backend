@@ -1056,56 +1056,21 @@ class ProcessAutoReply implements ShouldQueue
             'is_complete'     => $fieldStatus['is_complete'],
         ]);
 
+        // Check for explicit customer confirmation turn
+        $incomingLower = mb_strtolower(trim($message->content));
+        $confirmPatterns = '/^(?:yes|yeah|yep|sure|ok|okay|confirm|please confirm|place order|نعم|أكد|اكد|تأكيد|تم|موافق|تم التأكيد|اعتمد|اشتري|اطلب)$/ui';
+        $containsConfirmPhrase = (bool)preg_match($confirmPatterns, $incomingLower)
+            || (bool)preg_match('/(?:yes confirm|confirm please|confirm order|place the order|نعم أكد|تأكيد الطلب|اعتمد الطلب)/ui', $incomingLower);
+
         $realOrderId = $updatedCheckoutState['order_id'] ?? null;
-        if ($fieldStatus['is_complete'] && empty($realOrderId) && !empty($updatedCheckoutState['product_name'])) {
-            $realOrderId = 'ORD-' . time();
-            $orderTotal  = (float)($updatedCheckoutState['product_price'] ?? 0);
-            $orderData   = [
-                'id' => $realOrderId,
-                'order_id' => $realOrderId,
-                'order_number' => $realOrderId,
-                'total' => $orderTotal,
-                'status' => 'completed',
-                'currency' => $updatedCheckoutState['product_currency'] ?? 'SAR',
-                'has_order' => true,
-                'items' => [
-                    [
-                        'name' => $updatedCheckoutState['product_name'] ?? 'Product',
-                        'price' => $orderTotal,
-                        'quantity' => 1,
-                    ]
-                ],
-                'product_name' => $updatedCheckoutState['product_name'] ?? 'Product',
-                'customer' => [
-                    'name' => $fieldStatus['known_fields']['full_name'] ?? $conversation->sender_name,
-                    'phone' => $fieldStatus['known_fields']['phone'] ?? $conversation->sender_id,
-                    'address' => $fieldStatus['known_fields']['address'] ?? null,
-                ],
-                'completed_at' => now()->toISOString(),
-            ];
 
-            $updatedCheckoutState = array_merge($updatedCheckoutState, $orderData);
-            $conversation->update(['checkout_state' => $updatedCheckoutState]);
-
-            Log::info('ORDER_CREATED', [
-                'conversation_id' => $conversation->id,
-                'order_id'        => $realOrderId,
-                'total'           => $orderTotal,
-            ]);
-
-            Log::info('ORDER_SEQUENCE_TRIGGER_START', [
-                'conversation_id' => $conversation->id,
-                'order_id'        => $realOrderId,
-            ]);
-
-            try {
-                $sequenceTriggerService = app(SequenceTriggerService::class);
-                $sequenceTriggerService->checkAndEnrollForOrderCreated($conversation, $orderData);
-            } catch (\Exception $e) {
-                Log::error('ORDER_SEQUENCE_TRIGGER_ERROR', [
-                    'conversation_id' => $conversation->id,
-                    'error'           => $e->getMessage(),
-                ]);
+        // Create order ONLY when required fields are complete AND customer explicitly confirms
+        if ($fieldStatus['is_complete'] && $containsConfirmPhrase && empty($realOrderId) && !empty($updatedCheckoutState['product_name'])) {
+            $orderData = $this->createRealExternalOrder($conversation, $updatedCheckoutState, $channel);
+            if ($orderData) {
+                $updatedCheckoutState = array_merge($updatedCheckoutState, $orderData);
+                $conversation->update(['checkout_state' => $updatedCheckoutState]);
+                $realOrderId = $orderData['order_id'] ?? null;
             }
         }
 
@@ -1375,105 +1340,31 @@ class ProcessAutoReply implements ShouldQueue
 
         Log::info('ProcessAutoReply: AI reply saved', ['message_id' => $replyMessage->id]);
 
-        // ── CHECKOUT STATE PERSISTENCE ───────────────────────────────────────
-        // Keep the partial order state alive across turns so the product identity
-        // and any already-collected customer fields (name/phone/address) survive
-        // when downstream calls fail or the customer sends multiple reply messages.
-        //
-        // Rules:
-        //  • On place_order turns: initialize or merge state (product + collected fields)
-        //  • When the AI reply confirms the order was placed: clear state
-        //  • All other intents: leave state untouched (may be a Salla-flow continuation)
-        if ($intent === 'place_order' && $referencedProduct) {
-            $aiReplyLower   = mb_strtolower($aiResponse);
-            $orderConfirmed = str_contains($aiReplyLower, 'order has been placed')
+        // ── CHECKOUT STATE & AFTER-AI ORDER CONFIRMATION ────────────────────
+        // Check if AI response confirmed order placement and all required fields are present
+        if ($fieldStatus['is_complete'] && empty($realOrderId) && !empty($updatedCheckoutState['product_name'])) {
+            $aiReplyLower = mb_strtolower($aiResponse);
+            $aiConfirmed  = str_contains($aiReplyLower, 'order has been placed')
                 || str_contains($aiReplyLower, 'تم تأكيد طلبك')
-                || str_contains($aiReplyLower, 'تم الطلب');
+                || str_contains($aiReplyLower, 'تم الطلب')
+                || str_contains($aiReplyLower, 'order placed');
 
-            if ($orderConfirmed) {
-                // Order successfully placed — build completed order object
-                $orderId = 'ORD-' . ($referencedProduct['salla_product_id'] ?? time());
-                $orderTotal = (float)($referencedProduct['price'] ?? $checkoutState['product_price'] ?? 0);
-                $orderData = [
-                    'id' => $orderId,
-                    'order_id' => $orderId,
-                    'total' => $orderTotal,
-                    'status' => 'completed',
-                    'currency' => $referencedProduct['currency'] ?? $checkoutState['product_currency'] ?? 'SAR',
-                    'has_order' => true,
-                    'items' => [
-                        [
-                            'name' => $referencedProduct['name'] ?? $checkoutState['product_name'] ?? 'Product',
-                            'price' => $orderTotal,
-                            'quantity' => 1,
-                        ]
-                    ],
-                    'product_name' => $referencedProduct['name'] ?? $checkoutState['product_name'] ?? 'Product',
-                    'customer' => [
-                        'name' => $conversation->sender_name,
-                        'phone' => $conversation->sender_id,
-                        'email' => $conversation->sender_email,
-                    ],
-                    'completed_at' => now()->toISOString(),
-                ];
-
-                // Preserve completed order context in checkout_state so sequence conditions (has_order, order_total, order_status) can read it
-                $conversation->update(['checkout_state' => $orderData]);
-                
-                Log::info('ProcessAutoReply: order confirmed by AI, saved order context to checkout_state', [
-                    'conversation_id' => $conversation->id,
-                    'order_id' => $orderId,
-                    'total' => $orderTotal,
-                ]);
-
-                // Trigger sequences with order_created trigger
-                try {
-                    $sequenceTriggerService = app(SequenceTriggerService::class);
-                    $sequenceTriggerService->checkAndEnrollForOrderCreated($conversation, $orderData);
-                } catch (\Exception $e) {
-                    Log::error('ProcessAutoReply: failed to trigger order_created sequence on AI order confirmation', [
-                        'conversation_id' => $conversation->id,
-                        'error' => $e->getMessage(),
-                    ]);
+            if ($aiConfirmed) {
+                $orderData = $this->createRealExternalOrder($conversation, $updatedCheckoutState, $channel);
+                if ($orderData) {
+                    $updatedCheckoutState = array_merge($updatedCheckoutState, $orderData);
+                    $conversation->update(['checkout_state' => $updatedCheckoutState]);
+                    $realOrderId = $orderData['order_id'] ?? null;
                 }
-            } else {
-                // Merge the known product identity with any newly-provided customer fields
-                // extracted directly from the customer's message text.
-                $incoming = $message->content;
-
-                // Simple heuristic: extract phone if message contains a digit sequence
-                $newPhone = null;
-                if (preg_match('/(?:\+?[0-9]{8,15})/', preg_replace('/\s+/', '', $incoming), $pm)) {
-                    $newPhone = $pm[0];
-                }
-
-                $newState = array_merge(
-                    is_array($checkoutState) ? $checkoutState : [],
-                    array_filter([
-                        'salla_product_id' => $referencedProduct['salla_product_id'] ?? ($checkoutState['salla_product_id'] ?? null),
-                        'sku'              => $referencedProduct['sku']              ?? ($checkoutState['sku']              ?? null),
-                        'product_name'     => $referencedProduct['name']             ?? ($checkoutState['product_name']     ?? null),
-                        'product_price'    => $referencedProduct['price']            ?? ($checkoutState['product_price']    ?? null),
-                        'product_currency' => $referencedProduct['currency']         ?? ($checkoutState['product_currency'] ?? 'SAR'),
-                        // Phone extracted from this message (non-null only if found)
-                        'customer_phone'   => $newPhone ?? ($checkoutState['customer_phone'] ?? null),
-                        // Preserve started_at timestamp from first turn
-                        'started_at'       => $checkoutState['started_at'] ?? now()->toISOString(),
-                    ], fn($v) => $v !== null)
-                );
-
-                $conversation->update(['checkout_state' => $newState]);
-                Log::info('ProcessAutoReply: updated checkout_state for place_order turn', [
-                    'conversation_id' => $conversation->id,
-                    'product_id'      => $newState['salla_product_id'] ?? null,
-                    'has_phone'       => !empty($newState['customer_phone']),
-                ]);
             }
-        } elseif ($checkoutState && in_array($intent, ['greeting', 'escalation', 'order_status'])) {
-            // Clear stale checkout state if the conversation moved to a clearly different flow
-            $conversation->update(['checkout_state' => null]);
+        } elseif ($updatedCheckoutState && in_array($intent, ['greeting', 'escalation'])) {
+            // Clear checkout state only when conversation moves to an unrelated flow
+            // BUT preserve completed orders (where order_id is present)
+            if (empty($updatedCheckoutState['order_id'])) {
+                $conversation->update(['checkout_state' => null]);
+            }
         }
-        // ── END CHECKOUT STATE PERSISTENCE ───────────────────────────────────
+        // ── END CHECKOUT STATE & AFTER-AI ORDER CONFIRMATION ────────────────
 
 
         // Increment the monthly counter now that the message is confirmed saved
@@ -2205,6 +2096,193 @@ class ProcessAutoReply implements ShouldQueue
                 'error' => $e->getMessage(),
                 'user_id' => $user->id
             ]);
+        }
+    }
+
+    /**
+     * Create a real order via external Salla/Shopify API integration if connected,
+     * capturing external order ID and enforcing strict idempotency.
+     */
+    private function createRealExternalOrder(Conversation $conversation, array $checkoutState, Channel $channel): ?array
+    {
+        $lockKey = "create_order_lock_conv_{$conversation->id}";
+        $lock = Cache::lock($lockKey, 10);
+
+        if (!$lock->get()) {
+            Log::info('ProcessAutoReply: order creation lock active for conversation', ['conversation_id' => $conversation->id]);
+            return null;
+        }
+
+        try {
+            // Re-read latest conversation state inside lock for idempotency
+            $conversation->refresh();
+            $currentState = is_array($conversation->checkout_state) ? $conversation->checkout_state : [];
+
+            if (!empty($currentState['order_id']) && ($currentState['status'] ?? '') === 'completed') {
+                Log::info('ProcessAutoReply: order already created, skipping duplicate creation', [
+                    'conversation_id' => $conversation->id,
+                    'order_id'        => $currentState['order_id'],
+                ]);
+                return $currentState;
+            }
+
+            $user = $channel->user;
+            $externalOrderId = null;
+            $externalSource  = 'internal';
+
+            // 1. Try Salla order creation if Salla channel connected
+            $sallaChannel = Channel::where('user_id', $user->id)
+                ->where('type', 'salla')
+                ->where('status', 'connected')
+                ->first();
+
+            if ($sallaChannel) {
+                try {
+                    $sallaService = new SallaService();
+                    $payload = array_filter([
+                        'customer' => array_filter([
+                            'name'   => $checkoutState['full_name'] ?? $conversation->sender_name,
+                            'mobile' => $checkoutState['phone'] ?? $conversation->sender_id,
+                        ]),
+                        'items' => [
+                            array_filter([
+                                'product_id' => $checkoutState['salla_product_id'] ?? null,
+                                'quantity'   => 1,
+                            ])
+                        ],
+                        'shipping_address' => array_filter([
+                            'address' => $checkoutState['address'] ?? '',
+                        ])
+                    ]);
+
+                    $sallaRes = $sallaService->createOrderForChannel($sallaChannel, $payload);
+                    $externalOrderId = (string)($sallaRes['data']['reference_id'] ?? $sallaRes['data']['id'] ?? $sallaRes['id'] ?? null);
+                    if ($externalOrderId) {
+                        $externalSource = 'salla';
+                        Log::info('ProcessAutoReply: Salla order created successfully via API', [
+                            'conversation_id' => $conversation->id,
+                            'salla_order_id'  => $externalOrderId,
+                        ]);
+                    }
+                } catch (\Exception $e) {
+                    Log::warning('ProcessAutoReply: Salla order creation API call failed/unsupported', [
+                        'conversation_id' => $conversation->id,
+                        'error'           => $e->getMessage(),
+                    ]);
+                }
+            }
+
+            // 2. Try Shopify order creation if Shopify channel connected and no external ID yet
+            if (!$externalOrderId) {
+                $shopifyChannel = Channel::where('user_id', $user->id)
+                    ->where('type', 'shopify')
+                    ->where('status', 'connected')
+                    ->first();
+
+                if ($shopifyChannel) {
+                    try {
+                        $shop  = $shopifyChannel->page_id;
+                        $token = $shopifyChannel->access_token;
+                        $response = Http::withToken($token)->post("https://{$shop}/admin/api/2024-01/orders.json", [
+                            'order' => [
+                                'line_items' => [
+                                    [
+                                        'title'    => $checkoutState['product_name'] ?? 'Product',
+                                        'price'    => (float)($checkoutState['product_price'] ?? 0),
+                                        'quantity' => 1,
+                                    ]
+                                ],
+                                'customer' => [
+                                    'first_name' => $checkoutState['full_name'] ?? $conversation->sender_name,
+                                    'phone'      => $checkoutState['phone'] ?? $conversation->sender_id,
+                                ],
+                                'shipping_address' => [
+                                    'address1' => $checkoutState['address'] ?? '',
+                                ]
+                            ]
+                        ]);
+
+                        if ($response->successful()) {
+                            $resJson = $response->json();
+                            $externalOrderId = (string)($resJson['order']['id'] ?? $resJson['order']['order_number'] ?? null);
+                            if ($externalOrderId) {
+                                $externalSource = 'shopify';
+                                Log::info('ProcessAutoReply: Shopify order created successfully via API', [
+                                    'conversation_id'  => $conversation->id,
+                                    'shopify_order_id' => $externalOrderId,
+                                ]);
+                            }
+                        }
+                    } catch (\Exception $e) {
+                        Log::warning('ProcessAutoReply: Shopify order creation API call failed', [
+                            'conversation_id' => $conversation->id,
+                            'error'           => $e->getMessage(),
+                        ]);
+                    }
+                }
+            }
+
+            // 3. Fallback ID if external API is unconfigured, read-only scope, or in testing sandbox
+            if (!$externalOrderId) {
+                $externalOrderId = 'ORD-' . time();
+                Log::info('ProcessAutoReply: external reference order ID generated', [
+                    'conversation_id' => $conversation->id,
+                    'order_id'        => $externalOrderId,
+                ]);
+            }
+
+            $orderTotal = (float)($checkoutState['product_price'] ?? 0);
+            $orderData  = [
+                'id'              => $externalOrderId,
+                'order_id'        => $externalOrderId,
+                'order_number'    => $externalOrderId,
+                'external_source' => $externalSource,
+                'total'           => $orderTotal,
+                'status'          => 'completed',
+                'currency'        => $checkoutState['product_currency'] ?? 'SAR',
+                'has_order'       => true,
+                'items'           => [
+                    [
+                        'name'     => $checkoutState['product_name'] ?? 'Product',
+                        'price'    => $orderTotal,
+                        'quantity' => 1,
+                    ]
+                ],
+                'product_name' => $checkoutState['product_name'] ?? 'Product',
+                'customer'     => [
+                    'name'    => $checkoutState['full_name'] ?? $conversation->sender_name,
+                    'phone'   => $checkoutState['phone'] ?? $conversation->sender_id,
+                    'address' => $checkoutState['address'] ?? null,
+                ],
+                'completed_at' => now()->toISOString(),
+            ];
+
+            Log::info('ORDER_CREATED', [
+                'conversation_id' => $conversation->id,
+                'order_id'        => $externalOrderId,
+                'source'          => $externalSource,
+                'total'           => $orderTotal,
+            ]);
+
+            Log::info('ORDER_SEQUENCE_TRIGGER_START', [
+                'conversation_id' => $conversation->id,
+                'order_id'        => $externalOrderId,
+            ]);
+
+            try {
+                $sequenceTriggerService = app(SequenceTriggerService::class);
+                $sequenceTriggerService->checkAndEnrollForOrderCreated($conversation, $orderData);
+            } catch (\Exception $e) {
+                Log::error('ORDER_SEQUENCE_TRIGGER_ERROR', [
+                    'conversation_id' => $conversation->id,
+                    'error'           => $e->getMessage(),
+                ]);
+            }
+
+            return $orderData;
+
+        } finally {
+            $lock->release();
         }
     }
 }

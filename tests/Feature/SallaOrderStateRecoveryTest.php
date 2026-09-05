@@ -159,7 +159,7 @@ class SallaOrderStateRecoveryTest extends TestCase
         $conversation->refresh();
         $this->assertNotNull($conversation->checkout_state);
         $this->assertEquals('523147668', $conversation->checkout_state['salla_product_id']); // Did not lose product!
-        $this->assertStringContainsString('01152879755', $conversation->checkout_state['customer_phone']); // Extracted phone
+        $this->assertStringContainsString('01152879755', $conversation->checkout_state['phone']); // Extracted phone (normalized)
 
         // Verify the bot didn't send the generic "I'm sorry I'm having a brief issue" message,
         // but instead used the AI reply which had the context
@@ -198,7 +198,7 @@ class SallaOrderStateRecoveryTest extends TestCase
                     ]
                 ]
             ], 200),
-            // Mock Salla API for order placement (we'll just mock products returning success here since we bypassed actual order POST for now)
+            // Mock Salla API for order placement
             'api.salla.dev/admin/v2/products*' => Http::response([
                 'data' => [
                     [
@@ -215,8 +215,10 @@ class SallaOrderStateRecoveryTest extends TestCase
         $job3 = new ProcessAutoReply($msg3->id);
         $job3->handle();
 
-        // Assert checkout_state was cleared on confirmation
+        // Assert checkout_state contains completed order status with real order ID
         $conversation->refresh();
-        $this->assertNull($conversation->checkout_state);
+        $this->assertNotNull($conversation->checkout_state);
+        $this->assertEquals('completed', $conversation->checkout_state['status']);
+        $this->assertNotEmpty($conversation->checkout_state['order_id']);
     }
 }

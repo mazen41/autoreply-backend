@@ -469,6 +469,14 @@ class SallaService
     }
 
     /**
+     * Create an order in Salla store using channel-aware auto-refresh token.
+     */
+    public function createOrderForChannel(Channel $channel, array $data = []): array
+    {
+        return $this->apiCallForChannel($channel, 'POST', '/orders', $data);
+    }
+
+    /**
      * Priority 1 fix: channel-aware (auto-refresh) product LIST endpoint, for
      * aggregate/count queries ("how many products", "list your products").
      * Correct endpoint: GET /admin/v2/products — never a single-resource lookup.

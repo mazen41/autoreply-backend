@@ -335,18 +335,20 @@ ROLE;
             }
 
             if ($isComplete && $realOrderId) {
-                $p .= "🎉 REAL ORDER CREATED SUCCESSFULLY!\n";
-                $p .= "• Real Order ID: {$realOrderId}\n";
-                $p .= "• Action: Inform the customer that their order #{$realOrderId} has been successfully placed and confirmed!\n\n";
+                $p .= "🎉 REAL ORDER CREATED SUCCESSFULLY IN STORE!\n";
+                $p .= "• Real External Order ID: {$realOrderId}\n";
+                $p .= "• Action: Inform the customer that their order #{$realOrderId} has been successfully placed in our store!\n\n";
             } elseif ($isComplete && $orderFailedReason === 'address_city_unresolved') {
                 // Order creation failed because city in address couldn't be matched — ask for clarification
                 $p .= "⚠️ ORDER CREATION FAILED — ADDRESS CITY UNRESOLVED\n";
-                $p .= "The customer provided an address but the city/district name could not be matched.\n";
-                $p .= "DO NOT say the order was placed. DO NOT claim success.\n";
-                $p .= "Ask the customer to provide a clearer city or neighborhood name so the delivery address can be confirmed.\n";
-                $p .= "Example: \"Could you please confirm the city or district name for your delivery address? I want to make sure we get it right for your order! 😊\"\n\n";
+                $p .= "The customer provided an address but the city/district name could not be matched with our store.\n";
+                $p .= "CRITICAL RULE: DO NOT say the order was placed. DO NOT claim success or invent an order number.\n";
+                $p .= "Ask the customer to clearly specify their city and neighborhood name so the order can be submitted.\n";
+                $p .= "Example: \"Could you please specify your city name for the delivery address? I need to verify it to complete your order! 😊\"\n\n";
             } elseif ($isComplete && !$realOrderId) {
-                $p .= "Confirm order details with customer and ask: \"Shall I confirm this order? ✅\"\n\n";
+                $p .= "⚠️ STAGE: AWAITING CUSTOMER FINAL CONFIRMATION (ORDER IS NOT PLACED YET!)\n";
+                $p .= "CRITICAL MANDATORY RULE: The order has NOT been submitted to the store yet! YOU MUST NEVER say \"Your order has been placed\", \"Order confirmed\", or \"Your order is processed\".\n";
+                $p .= "Action: Summarize the product, total price, name, and delivery address. Ask the customer explicitly: \"Would you like me to confirm and submit this order now? Please reply YES to confirm! ✅\"\n\n";
             } else {
                 $p .= "⚠️ DO NOT claim the order has been placed because required fields are still missing!\n\n";
             }

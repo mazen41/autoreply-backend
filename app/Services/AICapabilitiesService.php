@@ -689,6 +689,50 @@ JSON;
                 }
             }
 
+            // Strategy 3.5: Field-level regex extraction for truncated JSON strings
+            if (!$aiResult) {
+                if (preg_match('/"reply"\s*:\s*"((?:[^"\\\\]|\\\\.)*)"/u', $response, $mReply) &&
+                    preg_match('/"intent"\s*:\s*"([^"]+)"/u', $response, $mIntent)) {
+
+                    $extractedReply = json_decode('"' . $mReply[1] . '"');
+                    if ($extractedReply !== null && !empty(trim($extractedReply))) {
+                        $needsEscalation = false;
+                        if (preg_match('/"needs_escalation"\s*:\s*(true|false)/u', $response, $mEsc)) {
+                            $needsEscalation = filter_var($mEsc[1], FILTER_VALIDATE_BOOLEAN);
+                        }
+
+                        $needsImages = false;
+                        if (preg_match('/"needs_images"\s*:\s*(true|false)/u', $response, $mImg)) {
+                            $needsImages = filter_var($mImg[1], FILTER_VALIDATE_BOOLEAN);
+                        }
+
+                        $confidence = 0.8;
+                        if (preg_match('/"confidence"\s*:\s*([0-9\.]+)/u', $response, $mConf)) {
+                            $confidence = (float)$mConf[1];
+                        }
+
+                        $escReason = 'none';
+                        if (preg_match('/"escalation_reason"\s*:\s*"([^"]*)"/u', $response, $mReason)) {
+                            $escReason = $mReason[1];
+                        }
+
+                        $aiResult = [
+                            'reply'             => $extractedReply,
+                            'intent'            => $mIntent[1],
+                            'needs_escalation'  => $needsEscalation,
+                            'needs_images'      => $needsImages,
+                            'confidence'        => $confidence,
+                            'escalation_reason' => $escReason,
+                        ];
+
+                        Log::info('AICapabilitiesService: successfully recovered truncated JSON via field extraction', [
+                            'intent' => $mIntent[1],
+                            'reply'  => substr($extractedReply, 0, 100),
+                        ]);
+                    }
+                }
+            }
+
             // Strategy 4: Gemini returned plain text with no JSON at all —
             // wrap it as a valid reply ONLY if it is genuine prose.
             // If it still looks like raw JSON (starts with { or [), do NOT send it
@@ -853,7 +897,7 @@ JSON;
             'model'       => $model,
             'messages'    => $messages,
             'temperature' => (float) env('AI_TEMPERATURE', 0.7),
-            'max_tokens'  => (int) env('AI_MAX_TOKENS', 1024),
+            'max_tokens'  => (int) env('AI_MAX_TOKENS', 2048),
             'response_format' => ['type' => 'json_object'],
         ];
 

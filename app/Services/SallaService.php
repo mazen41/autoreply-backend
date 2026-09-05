@@ -639,9 +639,40 @@ class SallaService
         }
 
         $productId = (int)($checkoutState['salla_product_id'] ?? null);
+        if (!$productId && !empty($checkoutState['product_name'])) {
+            try {
+                $productsRes = $this->getProductsForChannel($channel, ['per_page' => 20]);
+                $items = $productsRes['data'] ?? [];
+                $targetName = mb_strtolower(trim($checkoutState['product_name']));
+
+                foreach ($items as $item) {
+                    $itemName = !empty($item['name']) ? mb_strtolower(trim($item['name'])) : '';
+                    if ($itemName !== '' && (str_contains($itemName, $targetName) || str_contains($targetName, $itemName))) {
+                        $productId = (int)$item['id'];
+                        Log::info('SallaService: resolved product_id by matching product_name', [
+                            'product_name' => $checkoutState['product_name'],
+                            'matched_id'   => $productId,
+                        ]);
+                        break;
+                    }
+                }
+
+                // If store has only 1 product, fallback to that single product
+                if (!$productId && count($items) === 1 && isset($items[0]['id'])) {
+                    $productId = (int)$items[0]['id'];
+                    Log::info('SallaService: store has single product — using it as fallback for order', [
+                        'matched_id' => $productId,
+                    ]);
+                }
+            } catch (\Exception $e) {
+                Log::warning('SallaService: product lookup by name failed', ['error' => $e->getMessage()]);
+            }
+        }
+
         if (!$productId) {
             Log::warning('SallaService: missing salla_product_id for order creation', [
                 'channel_id' => $channel->id,
+                'checkout_state' => $checkoutState,
             ]);
             return null;
         }

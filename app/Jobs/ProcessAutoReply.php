@@ -1058,9 +1058,9 @@ class ProcessAutoReply implements ShouldQueue
 
         // Check for explicit customer confirmation turn
         $incomingLower = mb_strtolower(trim($message->content));
-        $confirmPatterns = '/^(?:yes|yeah|yep|sure|ok|okay|confirm|please confirm|place order|نعم|أكد|اكد|تأكيد|تم|موافق|تم التأكيد|اعتمد|اشتري|اطلب)$/ui';
-        $containsConfirmPhrase = (bool)preg_match($confirmPatterns, $incomingLower)
-            || (bool)preg_match('/(?:yes confirm|confirm please|confirm order|place the order|نعم أكد|تأكيد الطلب|اعتمد الطلب)/ui', $incomingLower);
+        $confirmKeywords = '/(?:yes|yeah|yep|sure|ok|okay|confirm|please confirm|place order|نعم|أكد|اكد|تأكيد|تم|موافق|تم التأكيد|اعتمد|اشتري|اطلب|شراء|توكل|اعتمدوا|اعتمدلي|اطلبلي|اكدلي|ابي|ابغا|اريد|ارغب|باشر)/ui';
+        $containsConfirmPhrase = (bool)preg_match($confirmKeywords, $incomingLower)
+            || ($fieldStatus['is_complete'] && !empty($updatedCheckoutState['product_name']));
 
         $realOrderId = $updatedCheckoutState['order_id'] ?? null;
 

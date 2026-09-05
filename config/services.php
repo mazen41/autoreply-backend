@@ -90,6 +90,11 @@ return [
         'model' => env('GEMINI_MODEL', 'gemini-2.5-flash'),
     ],
 
+    'groq' => [
+        'api_key' => env('GROQ_API_KEY'),
+        'model' => env('GROQ_MODEL', 'openai/gpt-oss-120b'),
+    ],
+
     'claude' => [
         'api_key' => env('ANTHROPIC_API_KEY'),
         'model' => env('CLAUDE_MODEL', 'claude-haiku-4-5-20251001'),

@@ -12,17 +12,25 @@ class AICapabilitiesService
 {
     private static function getAIProvider(): string
     {
-        return env('AI_PROVIDER', 'gemini');
+        return config('services.ai.provider', env('AI_PROVIDER', 'groq'));
     }
 
     private static function getAIModel(): string
     {
-        return env('GEMINI_MODEL', 'gemini-2.5-flash');
+        $provider = self::getAIProvider();
+        if ($provider === 'groq') {
+            return config('services.groq.model', env('GROQ_MODEL', 'openai/gpt-oss-120b'));
+        }
+        return config('services.gemini.model', env('GEMINI_MODEL', 'gemini-2.5-flash'));
     }
 
     private static function getAIAPIKey(): string
     {
-        return env('GEMINI_API_KEY', '');
+        $provider = self::getAIProvider();
+        if ($provider === 'groq') {
+            return config('services.groq.api_key', env('GROQ_API_KEY', ''));
+        }
+        return config('services.gemini.api_key', env('GEMINI_API_KEY', ''));
     }
 
     /**
@@ -817,13 +825,53 @@ JSON;
     private static function callAIChat(array $messages): string
     {
         $provider = self::getAIProvider();
-        $apiKey = self::getAIAPIKey();
+
+        if ($provider === 'groq') {
+            return self::callGroqChat($messages);
+        }
 
         if ($provider === 'gemini') {
             return self::callGeminiChat($messages);
         }
 
         return self::callGeminiChat($messages);
+    }
+
+    /**
+     * Call Groq API (OpenAI-compatible Chat Completions endpoint)
+     */
+    private static function callGroqChat(array $messages): string
+    {
+        $apiKey = env('GROQ_API_KEY', config('services.groq.api_key', self::getAIAPIKey()));
+        $model  = env('GROQ_MODEL', config('services.groq.model', 'openai/gpt-oss-120b'));
+
+        if (empty($apiKey)) {
+            throw new \Exception('Groq API Key is not configured (GROQ_API_KEY).');
+        }
+
+        $payload = [
+            'model'       => $model,
+            'messages'    => $messages,
+            'temperature' => (float) env('AI_TEMPERATURE', 0.7),
+            'max_tokens'  => (int) env('AI_MAX_TOKENS', 1024),
+            'response_format' => ['type' => 'json_object'],
+        ];
+
+        $response = Http::timeout(25)->connectTimeout(10)->withHeaders([
+            'Authorization' => 'Bearer ' . $apiKey,
+            'Content-Type'  => 'application/json',
+        ])->post('https://api.groq.com/openai/v1/chat/completions', $payload);
+
+        if (!$response->successful()) {
+            Log::error('Groq API error', [
+                'status' => $response->status(),
+                'body'   => $response->body(),
+            ]);
+            throw new \Exception('Groq API error (HTTP ' . $response->status() . '): ' . $response->body());
+        }
+
+        $data = $response->json();
+        return $data['choices'][0]['message']['content'] ?? '';
     }
 
     /**
@@ -1056,7 +1104,17 @@ JSON;
                 return ['success' => false, 'error' => 'AI API Key is missing.'];
             }
 
-            if ($provider === 'gemini') {
+            if ($provider === 'groq') {
+                $response = \Illuminate\Support\Facades\Http::withHeaders([
+                    'Authorization' => 'Bearer ' . $apiKey,
+                ])->timeout(10)->get('https://api.groq.com/openai/v1/models');
+
+                if ($response->successful()) {
+                    return ['success' => true];
+                }
+
+                return ['success' => false, 'error' => "Groq API test failed: HTTP {$response->status()} " . $response->body()];
+            } elseif ($provider === 'gemini') {
                 // Lightweight call to verify credentials without generating content
                 $response = \Illuminate\Support\Facades\Http::timeout(10)->get("https://generativelanguage.googleapis.com/v1beta/models?key={$apiKey}");
                 

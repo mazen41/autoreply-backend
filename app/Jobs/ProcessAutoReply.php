@@ -1063,6 +1063,21 @@ class ProcessAutoReply implements ShouldQueue
             || (bool)preg_match('/(?:yes confirm|confirm please|confirm order|place the order|نعم أكد|تأكيد الطلب|اعتمد الطلب)/ui', $incomingLower);
 
         $realOrderId = $updatedCheckoutState['order_id'] ?? null;
+
+        // Purge/ignore legacy fake ORD-* IDs from pre-fix database records
+        if ($realOrderId && (str_starts_with($realOrderId, 'ORD-') || ($updatedCheckoutState['external_source'] ?? '') === 'internal')) {
+            Log::info('ProcessAutoReply: ignoring legacy fake order ID from pre-fix checkout state', [
+                'conversation_id' => $conversation->id,
+                'legacy_order_id' => $realOrderId,
+            ]);
+            $realOrderId = null;
+            unset($updatedCheckoutState['order_id'], $updatedCheckoutState['id'], $updatedCheckoutState['order_number'], $updatedCheckoutState['has_order']);
+            if (($updatedCheckoutState['status'] ?? '') === 'completed') {
+                $updatedCheckoutState['status'] = 'in_progress';
+            }
+            $conversation->update(['checkout_state' => $updatedCheckoutState]);
+        }
+
         $orderCreationFailedReason = null; // Reason why order couldn't be created (unmapped city, API error, etc.)
 
         // Create order ONLY when required fields are complete AND customer explicitly confirms

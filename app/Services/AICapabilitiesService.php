@@ -296,31 +296,47 @@ ROLE;
             }
 
             $p .= "✅ AVAILABLE PRODUCTS:\n{$productList}\n";
-            $p .= "ORDER COLLECTION FLOW — follow these steps strictly:\n";
-            if ($hasReferencedProduct) {
-                $p .= "Step 1: The product is ALREADY confirmed (see DETERMINISTIC PRODUCT REFERENCE above).\n";
-                $p .= "        Do NOT ask which product — skip directly to Step 2.\n";
-            } else {
-                $p .= "Step 1: Present the product list above. Ask: \"Which product are you interested in?\"\n";
+
+            // ── CHECKOUT & FIELD COLLECTION STATE ─────────────────────────────
+            $knownFields   = $context['known_fields'] ?? [];
+            $missingFields = $context['missing_fields'] ?? [];
+            $isComplete    = $context['is_checkout_complete'] ?? false;
+            $realOrderId   = $context['real_order_id'] ?? null;
+
+            $p .= "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n";
+            $p .= "CHECKOUT FIELD COLLECTION STATE\n";
+            $p .= "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n";
+            $p .= "Required Fields: [Full Name, Phone Number, Delivery Address]\n\n";
+
+            if (!empty($knownFields)) {
+                $p .= "✅ ALREADY KNOWN FIELDS (CRITICAL: NEVER ASK FOR THESE AGAIN!):\n";
+                foreach ($knownFields as $fieldKey => $fieldVal) {
+                    $p .= "  • {$fieldKey}: {$fieldVal}\n";
+                }
+                $p .= "\n";
             }
-            $p .= "Step 2: Confirm the chosen product. Ask any needed follow-ups (size, color, quantity).\n";
-            $p .= "Step 3: Collect ALL of the following — ask for missing fields one at a time:\n";
-            $p .= "        • Full Name\n";
-            $p .= "        • Phone Number\n";
-            $p .= "        • Delivery Address\n";
-            $p .= "        • City / Area\n";
-            $p .= "        • Quantity\n";
-            $p .= "        • Any special notes\n";
-            $p .= "Step 4: Validate the data. If anything seems wrong, ask the customer to confirm.\n";
-            $p .= "Step 5: Show a complete order summary and ask: \"Shall I confirm this order? ✅\"\n";
-            $p .= "Step 6: On confirmation → reply: \"Your order has been placed! 🎉 Our team will contact you shortly to arrange delivery.\"\n\n";
+
+            if (!empty($missingFields)) {
+                $p .= "❌ CURRENTLY MISSING REQUIRED FIELDS:\n";
+                foreach ($missingFields as $mf) {
+                    $p .= "  • {$mf}\n";
+                }
+                $p .= "\n⚠️ CRITICAL RULE: ASK FOR ALL CURRENTLY MISSING REQUIRED FIELDS TOGETHER IN ONE SINGLE MESSAGE!\n";
+                $p .= "Do NOT ask for fields one-by-one in separate turns. Do NOT re-ask for any field listed under ALREADY KNOWN FIELDS.\n\n";
+            }
+
+            if ($isComplete && $realOrderId) {
+                $p .= "🎉 REAL ORDER CREATED SUCCESSFULLY!\n";
+                $p .= "• Real Order ID: {$realOrderId}\n";
+                $p .= "• Action: Inform the customer that their order #{$realOrderId} has been successfully placed and confirmed!\n\n";
+            } elseif ($isComplete && !$realOrderId) {
+                $p .= "Confirm order details with customer and ask: \"Shall I confirm this order? ✅\"\n\n";
+            } else {
+                $p .= "⚠️ DO NOT claim the order has been placed because required fields are still missing!\n\n";
+            }
+
             $p .= "intent = place_order\n\n";
         } else {
-            // No product catalogue was pre-loaded for this turn.
-            // DO NOT escalate — the backend should always load products for
-            // place_order turns. If we still ended up here, reply politely
-            // and let the customer re-state their order (the next message
-            // will be processed fresh and will load the catalogue).
             $p .= "⚠️ Product catalogue not available right now.\n";
             $p .= "Reply: \"I'm sorry, I'm having a brief issue loading our product catalogue. Could you let me know which product you'd like to order and I'll get it sorted for you right away? 😊\"\n";
             $p .= "needs_escalation = false, intent = place_order\n\n";

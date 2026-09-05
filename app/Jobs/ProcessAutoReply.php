@@ -1043,6 +1043,72 @@ class ProcessAutoReply implements ShouldQueue
             $businessProfileContext .= "\n";
         }
 
+        // ── ORDER CHECKOUT STATE & FIELD EXTRACTION ─────────────────────────
+        $checkoutService = app(\App\Services\OrderCheckoutService::class);
+        $updatedCheckoutState = $checkoutService->extractAndMergeState($conversation, $message->content, $referencedProduct);
+        $conversation->update(['checkout_state' => $updatedCheckoutState]);
+        $fieldStatus = $checkoutService->computeFieldStatus($updatedCheckoutState);
+
+        Log::info('ORDER_INFO_CHECK', [
+            'conversation_id' => $conversation->id,
+            'known_fields'    => array_keys($fieldStatus['known_fields']),
+            'missing_fields'  => $fieldStatus['missing_fields'],
+            'is_complete'     => $fieldStatus['is_complete'],
+        ]);
+
+        $realOrderId = $updatedCheckoutState['order_id'] ?? null;
+        if ($fieldStatus['is_complete'] && empty($realOrderId) && !empty($updatedCheckoutState['product_name'])) {
+            $realOrderId = 'ORD-' . time();
+            $orderTotal  = (float)($updatedCheckoutState['product_price'] ?? 0);
+            $orderData   = [
+                'id' => $realOrderId,
+                'order_id' => $realOrderId,
+                'order_number' => $realOrderId,
+                'total' => $orderTotal,
+                'status' => 'completed',
+                'currency' => $updatedCheckoutState['product_currency'] ?? 'SAR',
+                'has_order' => true,
+                'items' => [
+                    [
+                        'name' => $updatedCheckoutState['product_name'] ?? 'Product',
+                        'price' => $orderTotal,
+                        'quantity' => 1,
+                    ]
+                ],
+                'product_name' => $updatedCheckoutState['product_name'] ?? 'Product',
+                'customer' => [
+                    'name' => $fieldStatus['known_fields']['full_name'] ?? $conversation->sender_name,
+                    'phone' => $fieldStatus['known_fields']['phone'] ?? $conversation->sender_id,
+                    'address' => $fieldStatus['known_fields']['address'] ?? null,
+                ],
+                'completed_at' => now()->toISOString(),
+            ];
+
+            $updatedCheckoutState = array_merge($updatedCheckoutState, $orderData);
+            $conversation->update(['checkout_state' => $updatedCheckoutState]);
+
+            Log::info('ORDER_CREATED', [
+                'conversation_id' => $conversation->id,
+                'order_id'        => $realOrderId,
+                'total'           => $orderTotal,
+            ]);
+
+            Log::info('ORDER_SEQUENCE_TRIGGER_START', [
+                'conversation_id' => $conversation->id,
+                'order_id'        => $realOrderId,
+            ]);
+
+            try {
+                $sequenceTriggerService = app(SequenceTriggerService::class);
+                $sequenceTriggerService->checkAndEnrollForOrderCreated($conversation, $orderData);
+            } catch (\Exception $e) {
+                Log::error('ORDER_SEQUENCE_TRIGGER_ERROR', [
+                    'conversation_id' => $conversation->id,
+                    'error'           => $e->getMessage(),
+                ]);
+            }
+        }
+
         $context = [
             'business_name'  => $channel->business?->business_name ?? 'our business',
             'platform'       => $channel->type,
@@ -1102,7 +1168,11 @@ class ProcessAutoReply implements ShouldQueue
             'referenced_product'       => $referencedProduct,
             // Active partial order state (persisted across turns so the AI
             // knows which fields have already been collected and won't re-ask).
-            'cart'                     => !empty($checkoutState) ? $checkoutState : null,
+            'cart'                     => !empty($updatedCheckoutState) ? $updatedCheckoutState : null,
+            'known_fields'             => $fieldStatus['known_fields'],
+            'missing_fields'           => $fieldStatus['missing_fields'],
+            'is_checkout_complete'     => $fieldStatus['is_complete'],
+            'real_order_id'            => $realOrderId,
         ];
 
         // Step 4: Single AI Call with JSON Output

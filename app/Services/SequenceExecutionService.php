@@ -471,25 +471,38 @@ class SequenceExecutionService
         // Update enrollment next execution time
         $enrollment->scheduleNextExecution($delaySeconds);
 
-        // Dispatch job with calculated delay
-        $jobDelay = $scheduledAt->diffInSeconds(now());
-        
-        Log::info("scheduleNextStepAfterDelay: Job dispatch calculation", [
-            'execution_id' => $execution->id,
-            'scheduled_at' => $scheduledAt,
-            'now' => now(),
+        // Dispatch job with correct positive delay.
+        //
+        // ROOT CAUSE OF BUG 2 (fixed here):
+        // The old code used $scheduledAt->diffInSeconds(now()) which in some
+        // Carbon versions returns a float via direct timestamp subtraction
+        // (scheduled_unix - now_unix) rather than calling Carbon's internal
+        // abs-based diff. When $scheduledAt is in the future,
+        // scheduled_unix > now_unix, so the result should be positive — but
+        // the log showed -119.99, meaning the subtraction was inverted.
+        //
+        // Fix: use Carbon's signed diff explicitly:
+        //   now()->diffInSeconds($scheduledAt, false)
+        // false = don't take absolute value, so future dates return positive.
+        $jobDelay = (int) round(now()->diffInSeconds($scheduledAt, false));
+
+        Log::info('scheduleNextStepAfterDelay: Job dispatch calculation', [
+            'execution_id'      => $execution->id,
+            'scheduled_at'      => $scheduledAt->toISOString(),
+            'now'               => now()->toISOString(),
             'job_delay_seconds' => $jobDelay,
         ]);
-        
+
         if ($jobDelay <= 0) {
-            Log::error("scheduleNextStepAfterDelay: Invalid job delay", [
-                'execution_id' => $execution->id,
-                'job_delay_seconds' => $jobDelay,
-                'scheduled_at' => $scheduledAt,
-                'now' => now(),
+            Log::warning('scheduleNextStepAfterDelay: job_delay_seconds is zero or negative — scheduled_at is in the past or now; dispatching with minimum 1s delay', [
+                'execution_id'  => $execution->id,
+                'job_delay'     => $jobDelay,
+                'scheduled_at'  => $scheduledAt->toISOString(),
+                'delay_seconds' => $delaySeconds,
             ]);
-            // Fallback: dispatch immediately if delay is invalid
-            ExecuteSequenceStep::dispatch($execution->id);
+            // Do NOT dispatch immediately (that would bypass the delay entirely).
+            // Use a 1-second minimum so the job is still queued asynchronously.
+            ExecuteSequenceStep::dispatch($execution->id)->delay(1);
         } else {
             ExecuteSequenceStep::dispatch($execution->id)->delay($jobDelay);
         }

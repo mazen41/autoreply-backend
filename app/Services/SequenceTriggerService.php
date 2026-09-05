@@ -53,26 +53,48 @@ class SequenceTriggerService
             try {
                 $triggerConfig = $sequence->trigger_config ?? [];
 
-                // Resolve delay from the configured unit.
-                // Supports: minutes, hours, days. Default: 60 minutes.
-                $delayValue = (int) ($triggerConfig['delay_value']
-                    ?? $triggerConfig['minutes']
-                    ?? ($triggerConfig['hours'] !== null ? $triggerConfig['hours'] * 60 : null)
-                    ?? 60);
+                // ── Resolve delay seconds from trigger_config ────────────────
+                //
+                // NEW format (stored by fixed frontend):
+                //   { delay_value: 3, delay_unit: 'minutes' }
+                //
+                // LEGACY format (old frontend stored fractional hours):
+                //   { hours: 0.05 }  ← 3 minutes stored as 3/60
+                //   (int)0.05 === 0, so old code always produced delay_seconds=0)
+                //
+                // Both formats are handled here without any (int) cast on the
+                // raw value so fractional legacy values still work.
 
-                $delayUnit = $triggerConfig['delay_unit']
-                    ?? (isset($triggerConfig['minutes']) ? 'minutes' : 'hours');
+                if (isset($triggerConfig['delay_value']) && isset($triggerConfig['delay_unit'])) {
+                    // New format — delay_value is always a whole number
+                    $delayValue = (float) $triggerConfig['delay_value'];
+                    $delayUnit  = (string) $triggerConfig['delay_unit'];
+                } elseif (isset($triggerConfig['hours'])) {
+                    // Legacy format — convert fractional hours directly to seconds
+                    // Skip the intermediate (int) cast that was dropping fractions.
+                    $delayValue = (float) $triggerConfig['hours'];
+                    $delayUnit  = 'hours';
+                } else {
+                    // No config at all — default to 60 minutes
+                    $delayValue = 60;
+                    $delayUnit  = 'minutes';
+                }
 
-                $delaySeconds = match ($delayUnit) {
+                $delaySeconds = (int) round(match ($delayUnit) {
                     'minutes' => $delayValue * 60,
                     'hours'   => $delayValue * 3600,
                     'days'    => $delayValue * 86400,
                     default   => $delayValue * 60,
-                };
+                });
 
-                // Also handle legacy 'hours' key directly (hours as a numeric value)
-                if (isset($triggerConfig['hours']) && !isset($triggerConfig['delay_value']) && !isset($triggerConfig['minutes'])) {
-                    $delaySeconds = (int) $triggerConfig['hours'] * 3600;
+                if ($delaySeconds <= 0) {
+                    Log::warning('SequenceTriggerService: computed delay_seconds is zero or negative — using 60s fallback', [
+                        'sequence_id'  => $sequence->id,
+                        'trigger_config' => $triggerConfig,
+                        'delay_value'  => $delayValue,
+                        'delay_unit'   => $delayUnit,
+                    ]);
+                    $delaySeconds = 60; // 1-minute safety floor
                 }
 
                 // Determine the current cycle number for this sequence+conversation.
@@ -90,7 +112,10 @@ class SequenceTriggerService
                     'sequence_id'     => $sequence->id,
                     'conversation_id' => $conversation->id,
                     'ai_reply_id'     => $aiReplyMessage->id,
+                    'delay_value'     => $delayValue,
+                    'delay_unit'      => $delayUnit,
                     'delay_seconds'   => $delaySeconds,
+                    'fires_at'        => now()->addSeconds($delaySeconds)->toISOString(),
                     'cycle'           => $newCycle,
                 ]);
 

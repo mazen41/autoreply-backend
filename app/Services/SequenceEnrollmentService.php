@@ -14,7 +14,7 @@ use Illuminate\Database\QueryException;
 
 class SequenceEnrollmentService
 {
-    public function enrollConversation(Sequence $sequence, Conversation $conversation, int $startStep = 1): SequenceEnrollment
+    public function enrollConversation(Sequence $sequence, Conversation $conversation, int $startStep = 1, array $extraMetadata = []): SequenceEnrollment
     {
         // Check for duplicate active enrollment
         $existingEnrollment = SequenceEnrollment::forSequence($sequence->id)
@@ -27,7 +27,7 @@ class SequenceEnrollmentService
         }
 
         try {
-            return DB::transaction(function () use ($sequence, $conversation, $startStep) {
+            return DB::transaction(function () use ($sequence, $conversation, $startStep, $extraMetadata) {
                 $enrollment = SequenceEnrollment::create([
                     'sequence_id' => $sequence->id,
                     'conversation_id' => $conversation->id,
@@ -35,10 +35,10 @@ class SequenceEnrollmentService
                     'status' => 'active',
                     'started_at' => now(),
                     'next_execution_at' => now(),
-                    'metadata' => [
-                        'enrolled_by' => 'manual',
+                    'metadata' => array_merge([
+                        'enrolled_by' => 'automatic',
                         'conversation_sender' => $conversation->sender_name,
-                    ],
+                    ], $extraMetadata),
                 ]);
 
                 // Queue first step execution

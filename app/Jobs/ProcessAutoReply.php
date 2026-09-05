@@ -1321,11 +1321,51 @@ class ProcessAutoReply implements ShouldQueue
                 || str_contains($aiReplyLower, 'تم الطلب');
 
             if ($orderConfirmed) {
-                // Order successfully placed — clear state
-                $conversation->update(['checkout_state' => null]);
-                Log::info('ProcessAutoReply: cleared checkout_state after order confirmed', [
+                // Order successfully placed — build completed order object
+                $orderId = 'ORD-' . ($referencedProduct['salla_product_id'] ?? time());
+                $orderTotal = (float)($referencedProduct['price'] ?? $checkoutState['product_price'] ?? 0);
+                $orderData = [
+                    'id' => $orderId,
+                    'order_id' => $orderId,
+                    'total' => $orderTotal,
+                    'status' => 'completed',
+                    'currency' => $referencedProduct['currency'] ?? $checkoutState['product_currency'] ?? 'SAR',
+                    'has_order' => true,
+                    'items' => [
+                        [
+                            'name' => $referencedProduct['name'] ?? $checkoutState['product_name'] ?? 'Product',
+                            'price' => $orderTotal,
+                            'quantity' => 1,
+                        ]
+                    ],
+                    'product_name' => $referencedProduct['name'] ?? $checkoutState['product_name'] ?? 'Product',
+                    'customer' => [
+                        'name' => $conversation->sender_name,
+                        'phone' => $conversation->sender_id,
+                        'email' => $conversation->sender_email,
+                    ],
+                    'completed_at' => now()->toISOString(),
+                ];
+
+                // Preserve completed order context in checkout_state so sequence conditions (has_order, order_total, order_status) can read it
+                $conversation->update(['checkout_state' => $orderData]);
+                
+                Log::info('ProcessAutoReply: order confirmed by AI, saved order context to checkout_state', [
                     'conversation_id' => $conversation->id,
+                    'order_id' => $orderId,
+                    'total' => $orderTotal,
                 ]);
+
+                // Trigger sequences with order_created trigger
+                try {
+                    $sequenceTriggerService = app(SequenceTriggerService::class);
+                    $sequenceTriggerService->checkAndEnrollForOrderCreated($conversation, $orderData);
+                } catch (\Exception $e) {
+                    Log::error('ProcessAutoReply: failed to trigger order_created sequence on AI order confirmation', [
+                        'conversation_id' => $conversation->id,
+                        'error' => $e->getMessage(),
+                    ]);
+                }
             } else {
                 // Merge the known product identity with any newly-provided customer fields
                 // extracted directly from the customer's message text.

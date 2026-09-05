@@ -115,13 +115,13 @@ class ConditionEvaluationService
             'does_not_need_escalation', 'ai_does_not_need_escalation' => $conversation->requires_human === false,
 
             // ── 5. ORDER CONDITIONS ──────────────────────────────────────────
-            'has_order' => !empty($conversation->checkout_state['order_id'] ?? $conversation->checkout_state['id'] ?? null),
-            'does_not_have_order' => empty($conversation->checkout_state['order_id'] ?? $conversation->checkout_state['id'] ?? null),
-            'order_status', 'order_status_equals' => $this->evaluateOperator($operator ?: 'equals', $conversation->checkout_state['status'] ?? null, $targetValue),
-            'order_status_does_not_equal' => $this->evaluateOperator('not_equals', $conversation->checkout_state['status'] ?? null, $targetValue),
-            'order_total', 'order_total_greater_than' => $this->evaluateOperator($operator ?: 'greater_than', (float)($conversation->checkout_state['total'] ?? 0), (float)$targetValue),
-            'order_total_less_than' => $this->evaluateOperator('less_than', (float)($conversation->checkout_state['total'] ?? 0), (float)$targetValue),
-            'product_exists' => $this->evaluateProductExists($conversation, $targetValue),
+            'has_order' => !empty(($orderData = $this->resolveOrderData($enrollment))['id'] ?? $orderData['order_id'] ?? null),
+            'does_not_have_order' => empty(($orderData = $this->resolveOrderData($enrollment))['id'] ?? $orderData['order_id'] ?? null),
+            'order_status', 'order_status_equals' => $this->evaluateOperator($operator ?: 'equals', ($orderData = $this->resolveOrderData($enrollment))['status'] ?? null, $targetValue),
+            'order_status_does_not_equal' => $this->evaluateOperator('not_equals', ($orderData = $this->resolveOrderData($enrollment))['status'] ?? null, $targetValue),
+            'order_total', 'order_total_greater_than' => $this->evaluateOperator($operator ?: 'greater_than', (float)(($orderData = $this->resolveOrderData($enrollment))['total'] ?? $orderData['product_price'] ?? 0), (float)$targetValue),
+            'order_total_less_than' => $this->evaluateOperator('less_than', (float)(($orderData = $this->resolveOrderData($enrollment))['total'] ?? $orderData['product_price'] ?? 0), (float)$targetValue),
+            'product_exists' => $this->evaluateProductExists($enrollment, $targetValue),
 
             // ── 6. CHANNEL CONDITIONS ────────────────────────────────────────
             'channel' => $this->evaluateChannel($conversation, $operator, $targetValue),
@@ -252,10 +252,27 @@ class ConditionEvaluationService
         return $this->evaluateOperator($operator, $score, $target);
     }
 
-    protected function evaluateProductExists(Conversation $conversation, $targetValue): bool
+    public function resolveOrderData(SequenceEnrollment $enrollment): array
+    {
+        if (!empty($enrollment->metadata['order_data']) && is_array($enrollment->metadata['order_data'])) {
+            return $enrollment->metadata['order_data'];
+        }
+
+        if (!empty($enrollment->conversation?->checkout_state) && is_array($enrollment->conversation->checkout_state)) {
+            return $enrollment->conversation->checkout_state;
+        }
+
+        if (!empty($enrollment->conversation?->channel?->metadata['last_order']) && is_array($enrollment->conversation->channel->metadata['last_order'])) {
+            return $enrollment->conversation->channel->metadata['last_order'];
+        }
+
+        return [];
+    }
+
+    protected function evaluateProductExists(SequenceEnrollment $enrollment, $targetValue): bool
     {
         if (!$targetValue) return false;
-        $checkout = $conversation->checkout_state ?? [];
+        $checkout = $this->resolveOrderData($enrollment);
         $items = $checkout['items'] ?? [];
         if (is_array($items)) {
             foreach ($items as $item) {

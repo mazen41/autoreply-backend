@@ -180,6 +180,46 @@ class ConditionEvaluationServiceTest extends TestCase
     }
 
     /** @test */
+    public function it_evaluates_order_details_from_enrollment_metadata_isolated_from_later_orders()
+    {
+        // Enrollment triggered by Order #123 (SAR 650)
+        $enrollmentOrder123 = SequenceEnrollment::factory()->create([
+            'sequence_id' => $this->sequence->id,
+            'conversation_id' => $this->conversation->id,
+            'status' => 'active',
+            'current_step' => 1,
+            'started_at' => now(),
+            'metadata' => [
+                'order_data' => [
+                    'id' => 'ORD-123',
+                    'total' => 650.00,
+                    'status' => 'completed',
+                    'product_name' => 'Premium Headphones',
+                ],
+                'trigger_order_id' => 'ORD-123',
+            ],
+        ]);
+
+        // Customer places Order #124 (SAR 100) later, updating conversation checkout_state
+        $this->conversation->update([
+            'checkout_state' => [
+                'id' => 'ORD-124',
+                'total' => 100.00,
+                'status' => 'pending',
+                'product_name' => 'Cable',
+            ],
+        ]);
+
+        // Order Total > 500 must evaluate Order #123 from enrollment metadata -> TRUE
+        $result = $this->service->evaluate($enrollmentOrder123, $this->step, [
+            'type' => 'order_total',
+            'operator' => 'greater_than',
+            'value' => 500,
+        ]);
+        $this->assertTrue($result);
+    }
+
+    /** @test */
     public function it_evaluates_channel_and_escalation()
     {
         $isWhatsapp = $this->service->evaluate($this->enrollment, $this->step, ['type' => 'channel_equals_whatsapp']);

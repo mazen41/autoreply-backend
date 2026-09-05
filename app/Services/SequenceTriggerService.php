@@ -336,7 +336,11 @@ class SequenceTriggerService
                 $orderValue = $orderData['total'] ?? 0;
                 
                 if ($orderValue >= $minOrderValue) {
-                    $this->enrollIfEligible($sequence, $conversation);
+                    $this->enrollIfEligible($sequence, $conversation, [
+                        'order_data' => $orderData,
+                        'trigger_order_id' => $orderData['id'] ?? $orderData['order_id'] ?? null,
+                        'enrolled_by' => 'order_created',
+                    ]);
                 }
             } catch (\Exception $e) {
                 Log::error('Failed to enroll conversation in order-triggered sequence', [
@@ -352,7 +356,7 @@ class SequenceTriggerService
     /**
      * Check eligibility and enroll if conditions are met
      */
-    private function enrollIfEligible(Sequence $sequence, Conversation $conversation): void
+    private function enrollIfEligible(Sequence $sequence, Conversation $conversation, array $extraMetadata = []): void
     {
         // Check if already enrolled
         $existingEnrollment = SequenceEnrollment::forSequence($sequence->id)
@@ -381,7 +385,7 @@ class SequenceTriggerService
         }
 
         // Enroll the conversation
-        $this->enrollmentService->enrollConversation($sequence, $conversation);
+        $this->enrollmentService->enrollConversation($sequence, $conversation, 1, $extraMetadata);
         
         Log::info('Auto-enrolled conversation in sequence', [
             'sequence_id' => $sequence->id,

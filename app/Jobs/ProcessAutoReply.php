@@ -1371,6 +1371,118 @@ class ProcessAutoReply implements ShouldQueue
 
         Log::info('ProcessAutoReply: AI reply saved', ['message_id' => $replyMessage->id]);
 
+        // ── REAL SALLA ORDER CREATION ────────────────────────────────────────────
+        // The AI generated a "your order will be placed" reply, but we must
+        // ACTUALLY call Salla here and only confirm to the customer if Salla
+        // returns a real order ID. If Salla fails, we override the reply with
+        // an honest failure message and escalate to a human agent.
+        //
+        // Trigger conditions (ALL must be true for us to attempt creation):
+        //   1. intent is place_order
+        //   2. A Salla channel is connected for this user
+        //   3. checkout_state has the 4 required fields collected by the AI:
+        //      salla_product_id, customer_phone, address, full_name
+        //   4. The AI reply is NOT still collecting info (no trailing question)
+        //
+        // This block runs BEFORE the checkout-state-persistence block so that
+        // when the order succeeds we clear checkout_state there, and when it
+        // fails we escalate rather than silently persisting a dead state.
+        if (
+            $intent === 'place_order'
+            && $sallaChannel
+            && !empty($checkoutState['salla_product_id'])
+            && !empty($checkoutState['customer_phone'] ?? $checkoutState['phone'] ?? '')
+            && !empty($checkoutState['address'] ?? $checkoutState['customer_address'] ?? '')
+            && !empty($checkoutState['full_name'] ?? $checkoutState['customer_name'] ?? '')
+        ) {
+            $aiReplyLower  = mb_strtolower($aiResponse);
+            $stillAsking   = str_contains($aiReplyLower, '?')
+                || str_contains($aiReplyLower, 'what is your')
+                || str_contains($aiReplyLower, 'please provide')
+                || str_contains($aiReplyLower, 'could you')
+                || str_contains($aiReplyLower, 'اسمك')
+                || str_contains($aiReplyLower, 'عنوانك')
+                || str_contains($aiReplyLower, 'رقمك')
+                || str_contains($aiReplyLower, 'من فضلك');
+
+            if (!$stillAsking) {
+                Log::info('ProcessAutoReply: triggering real Salla order creation', [
+                    'conversation_id' => $conversation->id,
+                    'product_id'      => $checkoutState['salla_product_id'],
+                    'customer_phone'  => $checkoutState['customer_phone'] ?? $checkoutState['phone'] ?? '',
+                ]);
+
+                // Normalise checkout_state keys to what SallaService expects
+                $orderInput = [
+                    'salla_product_id' => $checkoutState['salla_product_id'],
+                    'product_name'     => $checkoutState['product_name']     ?? null,
+                    'product_price'    => $checkoutState['product_price']    ?? 0,
+                    'full_name'        => $checkoutState['full_name']         ?? $checkoutState['customer_name']    ?? null,
+                    'phone'            => $checkoutState['customer_phone']    ?? $checkoutState['phone']             ?? '',
+                    'address'          => $checkoutState['address']           ?? $checkoutState['customer_address'] ?? '',
+                    'email'            => $checkoutState['customer_email']    ?? null,
+                ];
+
+                $orderData = $this->createRealExternalOrder($conversation, $orderInput, $channel);
+
+                if ($orderData && !empty($orderData['order_id'])) {
+                    // ✅ SUCCESS — override the AI reply with the real order confirmation
+                    $realOrderId  = $orderData['order_id'];
+                    $customerName = $orderInput['full_name'] ?? '';
+                    $productName  = $orderInput['product_name'] ?? '';
+
+                    if ($detectedLanguage === 'arabic') {
+                        $aiResponse = "✅ تم تأكيد طلبك بنجاح!" .
+                            (!empty($customerName) ? " شكراً {$customerName}" : '') . "\n" .
+                            (!empty($productName)  ? "المنتج: {$productName}\n" : '') .
+                            "رقم الطلب: #{$realOrderId}\n" .
+                            "سيتم التواصل معك قريباً لتأكيد التفاصيل 🚀";
+                    } else {
+                        $aiResponse = "✅ Your order has been placed successfully!" .
+                            (!empty($customerName) ? " Thank you, {$customerName}" : '') . "\n" .
+                            (!empty($productName)  ? "Product: {$productName}\n" : '') .
+                            "Order #: {$realOrderId}\n" .
+                            "We'll contact you shortly to confirm the details 🚀";
+                    }
+
+                    // Clear checkout state — order is complete
+                    $conversation->update(['checkout_state' => null]);
+                    $checkoutState = []; // prevent the persistence block below from re-saving it
+
+                    Log::info('ProcessAutoReply: Salla order created and reply overridden with real order ID', [
+                        'conversation_id' => $conversation->id,
+                        'order_id'        => $realOrderId,
+                    ]);
+                } else {
+                    // ❌ FAILURE — Salla API returned no order ID or threw an exception
+                    Log::error('ProcessAutoReply: Salla order creation returned no order ID — sending honest failure reply', [
+                        'conversation_id' => $conversation->id,
+                        'order_data'      => $orderData,
+                    ]);
+
+                    if ($detectedLanguage === 'arabic') {
+                        $aiResponse = "عذراً، واجهنا مشكلة تقنية في إتمام طلبك الآن 😔\n" .
+                            "سيتواصل معك أحد فريقنا قريباً لإتمام الطلب يدوياً. نعتذر عن الإزعاج.";
+                    } else {
+                        $aiResponse = "I'm sorry, we encountered a technical issue processing your order 😔\n" .
+                            "A team member will contact you shortly to complete your order manually. We apologize for the inconvenience.";
+                    }
+
+                    // Escalate to human since Salla failed
+                    $conversation->update([
+                        'requires_human'    => true,
+                        'escalated_at'      => now(),
+                        'escalation_reason' => 'salla_order_creation_failed',
+                    ]);
+                }
+            } else {
+                Log::info('ProcessAutoReply: place_order intent but AI still collecting info — skipping Salla API call', [
+                    'conversation_id' => $conversation->id,
+                ]);
+            }
+        }
+        // ── END REAL SALLA ORDER CREATION ────────────────────────────────────
+
         // ── CHECKOUT STATE PERSISTENCE ─────────────────────────────────────
         // The checkout state is already saved by the pre-AI confirmation block above.
         // No post-AI order creation — orders are created BEFORE the AI reply so

@@ -1063,14 +1063,26 @@ class ProcessAutoReply implements ShouldQueue
             || (bool)preg_match('/(?:yes confirm|confirm please|confirm order|place the order|نعم أكد|تأكيد الطلب|اعتمد الطلب)/ui', $incomingLower);
 
         $realOrderId = $updatedCheckoutState['order_id'] ?? null;
+        $orderCreationFailedReason = null; // Reason why order couldn't be created (unmapped city, API error, etc.)
 
         // Create order ONLY when required fields are complete AND customer explicitly confirms
         if ($fieldStatus['is_complete'] && $containsConfirmPhrase && empty($realOrderId) && !empty($updatedCheckoutState['product_name'])) {
+            Log::info('ProcessAutoReply: customer confirmed order — attempting external order creation', [
+                'conversation_id' => $conversation->id,
+            ]);
             $orderData = $this->createRealExternalOrder($conversation, $updatedCheckoutState, $channel);
             if ($orderData) {
                 $updatedCheckoutState = array_merge($updatedCheckoutState, $orderData);
                 $conversation->update(['checkout_state' => $updatedCheckoutState]);
                 $realOrderId = $orderData['order_id'] ?? null;
+            } else {
+                // Order creation failed — capture reason so AI can ask customer for missing info
+                // (most common: city name in address doesn't match any Salla city)
+                $orderCreationFailedReason = 'address_city_unresolved';
+                Log::warning('ProcessAutoReply: order creation returned null — will prompt customer for missing/invalid info', [
+                    'conversation_id' => $conversation->id,
+                    'checkout_state'  => $updatedCheckoutState,
+                ]);
             }
         }
 
@@ -1138,6 +1150,10 @@ class ProcessAutoReply implements ShouldQueue
             'missing_fields'           => $fieldStatus['missing_fields'],
             'is_checkout_complete'     => $fieldStatus['is_complete'],
             'real_order_id'            => $realOrderId,
+            // When order creation failed (e.g. city couldn't be matched), tell the AI
+            // so it prompts the customer for the missing/clarifying information instead
+            // of falsely claiming the order was placed.
+            'order_creation_failed_reason' => $orderCreationFailedReason,
         ];
 
         // Step 4: Single AI Call with JSON Output
@@ -1340,31 +1356,16 @@ class ProcessAutoReply implements ShouldQueue
 
         Log::info('ProcessAutoReply: AI reply saved', ['message_id' => $replyMessage->id]);
 
-        // ── CHECKOUT STATE & AFTER-AI ORDER CONFIRMATION ────────────────────
-        // Check if AI response confirmed order placement and all required fields are present
-        if ($fieldStatus['is_complete'] && empty($realOrderId) && !empty($updatedCheckoutState['product_name'])) {
-            $aiReplyLower = mb_strtolower($aiResponse);
-            $aiConfirmed  = str_contains($aiReplyLower, 'order has been placed')
-                || str_contains($aiReplyLower, 'تم تأكيد طلبك')
-                || str_contains($aiReplyLower, 'تم الطلب')
-                || str_contains($aiReplyLower, 'order placed');
-
-            if ($aiConfirmed) {
-                $orderData = $this->createRealExternalOrder($conversation, $updatedCheckoutState, $channel);
-                if ($orderData) {
-                    $updatedCheckoutState = array_merge($updatedCheckoutState, $orderData);
-                    $conversation->update(['checkout_state' => $updatedCheckoutState]);
-                    $realOrderId = $orderData['order_id'] ?? null;
-                }
-            }
-        } elseif ($updatedCheckoutState && in_array($intent, ['greeting', 'escalation'])) {
-            // Clear checkout state only when conversation moves to an unrelated flow
-            // BUT preserve completed orders (where order_id is present)
-            if (empty($updatedCheckoutState['order_id'])) {
-                $conversation->update(['checkout_state' => null]);
-            }
+        // ── CHECKOUT STATE PERSISTENCE ─────────────────────────────────────
+        // The checkout state is already saved by the pre-AI confirmation block above.
+        // No post-AI order creation — orders are created BEFORE the AI reply so
+        // the AI can correctly reference the real order ID in its response.
+        //
+        // Only clear checkout state on a fresh greeting when there is no in-progress order.
+        if ($updatedCheckoutState && $intent === 'greeting' && empty($updatedCheckoutState['order_id']) && empty($updatedCheckoutState['product_name'])) {
+            $conversation->update(['checkout_state' => null]);
         }
-        // ── END CHECKOUT STATE & AFTER-AI ORDER CONFIRMATION ────────────────
+        // ── END CHECKOUT STATE PERSISTENCE ─────────────────────────────────
 
 
         // Increment the monthly counter now that the message is confirmed saved
@@ -2272,6 +2273,10 @@ class ProcessAutoReply implements ShouldQueue
             ]);
 
             try {
+                // Ensure channel relationship is loaded for business_id fallback in SequenceTriggerService
+                if (!$conversation->relationLoaded('channel')) {
+                    $conversation->load('channel');
+                }
                 $sequenceTriggerService = app(SequenceTriggerService::class);
                 $sequenceTriggerService->checkAndEnrollForOrderCreated($conversation, $orderData);
             } catch (\Exception $e) {

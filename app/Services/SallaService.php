@@ -48,7 +48,7 @@ class SallaService
             'client_id'     => $this->clientId,
             'redirect_uri'  => $this->redirectUri,
             'response_type' => 'code',
-            'scope'         => 'offline_access settings.read orders.read products.read customers.read',
+            'scope'         => 'offline_access settings.read orders.read orders.create customers.read customers.write products.read',
             'state'         => $state,
         ];
 
@@ -679,15 +679,45 @@ class SallaService
         }
 
         if (empty($data)) {
+            Log::error('SALLA_ORDER_CREATE_FAILED', [
+                'channel_id' => $channel->id,
+                'reason'     => 'Canonical Salla order payload could not be constructed (unmapped city ID, missing customer, or missing product)',
+            ]);
             throw new \Exception('Canonical Salla order payload could not be constructed: missing customer, product, or unmapped city ID');
         }
 
-        Log::info('SallaService: posting canonical order payload to Salla', [
+        Log::info('SALLA_ORDER_CREATE_START', ['channel_id' => $channel->id]);
+        Log::info('SALLA_ORDER_CREATE_REQUEST', [
             'channel_id' => $channel->id,
             'payload'    => $data,
         ]);
 
-        return $this->apiCallForChannel($channel, 'POST', '/orders', $data);
+        try {
+            $res = $this->apiCallForChannel($channel, 'POST', '/orders', $data);
+
+            Log::info('SALLA_ORDER_CREATE_RESPONSE', [
+                'channel_id' => $channel->id,
+                'status'     => 200,
+                'response'   => $res,
+            ]);
+
+            $orderId = (string)($res['data']['reference_id'] ?? $res['data']['id'] ?? $res['id'] ?? null);
+            if ($orderId) {
+                Log::info('SALLA_ORDER_CREATE_SUCCESS', [
+                    'channel_id' => $channel->id,
+                    'order_id'   => $orderId,
+                ]);
+            }
+
+            return $res;
+        } catch (\Exception $e) {
+            Log::error('SALLA_ORDER_CREATE_FAILED', [
+                'channel_id' => $channel->id,
+                'error'      => $e->getMessage(),
+                'payload'    => $data,
+            ]);
+            throw $e;
+        }
     }
 
     /**

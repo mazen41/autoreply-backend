@@ -135,4 +135,41 @@ class OrderCheckoutService
             'is_complete'    => empty($missing),
         ];
     }
+
+    /**
+     * Manage deterministic confirmation state transitions:
+     * - 'collecting_info': details are missing
+     * - 'confirmation_pending': all details present, awaiting explicit customer confirmation
+     * - 'confirmed': customer sent an explicit confirmation message
+     * - 'order_placed': external order created successfully
+     */
+    public function updateConfirmationState(array $state, string $incomingText, bool $isComplete): array
+    {
+        $currentState = $state['confirmation_state'] ?? null;
+        $orderId = $state['order_id'] ?? null;
+
+        if (!empty($orderId) && ($state['status'] ?? '') === 'completed') {
+            $state['confirmation_state'] = 'order_placed';
+            return $state;
+        }
+
+        if (!$isComplete) {
+            $state['confirmation_state'] = 'collecting_info';
+            return $state;
+        }
+
+        // All fields complete — check if customer message explicitly confirms
+        $incomingLower = mb_strtolower(trim($incomingText));
+        $confirmPatterns = '/^(?:yes|yeah|yep|sure|ok|okay|confirm|please confirm|place order|نعم|أكد|اكد|تأكيد|تم|موافق|تم التأكيد|اعتمد|اشتري|اطلب)$/ui';
+        $containsConfirmPhrase = (bool)preg_match($confirmPatterns, $incomingLower)
+            || (bool)preg_match('/(?:yes confirm|confirm please|confirm order|place the order|نعم أكد|تأكيد الطلب|اعتمد الطلب|أكد الطلب)/ui', $incomingLower);
+
+        if ($containsConfirmPhrase) {
+            $state['confirmation_state'] = 'confirmed';
+        } elseif (empty($currentState) || $currentState === 'collecting_info') {
+            $state['confirmation_state'] = 'confirmation_pending';
+        }
+
+        return $state;
+    }
 }

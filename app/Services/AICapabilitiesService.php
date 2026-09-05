@@ -302,6 +302,7 @@ ROLE;
             $missingFields = $context['missing_fields'] ?? [];
             $isComplete    = $context['is_checkout_complete'] ?? false;
             $realOrderId   = $context['real_order_id'] ?? null;
+            $orderFailedReason = $context['order_creation_failed_reason'] ?? null;
 
             $p .= "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n";
             $p .= "CHECKOUT FIELD COLLECTION STATE\n";
@@ -329,6 +330,13 @@ ROLE;
                 $p .= "🎉 REAL ORDER CREATED SUCCESSFULLY!\n";
                 $p .= "• Real Order ID: {$realOrderId}\n";
                 $p .= "• Action: Inform the customer that their order #{$realOrderId} has been successfully placed and confirmed!\n\n";
+            } elseif ($isComplete && $orderFailedReason === 'address_city_unresolved') {
+                // Order creation failed because city in address couldn't be matched — ask for clarification
+                $p .= "⚠️ ORDER CREATION FAILED — ADDRESS CITY UNRESOLVED\n";
+                $p .= "The customer provided an address but the city/district name could not be matched.\n";
+                $p .= "DO NOT say the order was placed. DO NOT claim success.\n";
+                $p .= "Ask the customer to provide a clearer city or neighborhood name so the delivery address can be confirmed.\n";
+                $p .= "Example: \"Could you please confirm the city or district name for your delivery address? I want to make sure we get it right for your order! 😊\"\n\n";
             } elseif ($isComplete && !$realOrderId) {
                 $p .= "Confirm order details with customer and ask: \"Shall I confirm this order? ✅\"\n\n";
             } else {

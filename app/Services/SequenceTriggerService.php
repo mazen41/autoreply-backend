@@ -311,15 +311,29 @@ class SequenceTriggerService
     }
 
     /**
-     * Check and enroll for order_created trigger (from Salla webhook)
+     * Check and enroll for order_created trigger (from Salla webhook or AI order creation)
      */
     public function checkAndEnrollForOrderCreated(Conversation $conversation, array $orderData): void
     {
-        $businessId = $conversation->business_id;
+        // business_id on Conversation is nullable (old rows pre-migration).
+        // Fall back to channel->business_id which is always set.
+        $businessId = $conversation->business_id
+            ?? optional($conversation->channel)->business_id
+            ?? null;
         
         if (!$businessId) {
+            Log::warning('SequenceTriggerService: checkAndEnrollForOrderCreated — no business_id resolvable', [
+                'conversation_id' => $conversation->id,
+                'order_id'        => $orderData['id'] ?? $orderData['order_id'] ?? null,
+            ]);
             return;
         }
+
+        Log::info('SequenceTriggerService: checkAndEnrollForOrderCreated', [
+            'conversation_id' => $conversation->id,
+            'business_id'     => $businessId,
+            'order_id'        => $orderData['id'] ?? $orderData['order_id'] ?? null,
+        ]);
 
         // Find active sequences with order_created trigger
         $orderSequences = Sequence::forBusiness($businessId)

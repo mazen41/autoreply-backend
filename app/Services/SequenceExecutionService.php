@@ -51,10 +51,7 @@ class SequenceExecutionService
                 break;
             case 'condition':
                 $this->executeConditionStep($execution, $enrollment, $step);
-                // Only move to next step if condition passed
-                if (!$execution->metadata['condition_result'] ?? true) {
-                    $this->moveToNextStep($enrollment);
-                }
+                // Condition step handles moving to next step, jumping, or stopping internally
                 break;
             case 'action':
                 $this->executeActionStep($execution, $enrollment, $step);
@@ -153,18 +150,60 @@ class SequenceExecutionService
 
     protected function executeConditionStep(SequenceStepExecution $execution, SequenceEnrollment $enrollment, SequenceStep $step): void
     {
-        $conditionResult = $this->evaluateCondition($enrollment, $step->condition_config ?? []);
+        $conditionConfig = $step->condition_config ?? [];
+        $conditionResult = app(ConditionEvaluationService::class)->evaluate($enrollment, $step, $conditionConfig);
 
         $execution->metadata = array_merge($execution->metadata ?? [], [
             'condition_result' => $conditionResult,
-            'condition_config' => $step->condition_config,
+            'condition_config' => $conditionConfig,
         ]);
 
-        // If condition fails, stop the sequence
-        if (!$conditionResult) {
-            $enrollment->stop('condition_failed');
-            $execution->markAsSkipped('condition_failed');
+        if ($conditionResult) {
+            $onTrue = $conditionConfig['on_true'] ?? 'continue';
+            if ($onTrue === 'jump' && isset($conditionConfig['true_step_order'])) {
+                $this->jumpToStep($enrollment, (int)$conditionConfig['true_step_order']);
+            } elseif ($onTrue === 'stop') {
+                $enrollment->stop('condition_true_stop');
+            } else { // 'continue'
+                $this->moveToNextStep($enrollment);
+            }
+        } else {
+            $onFalse = $conditionConfig['on_false'] ?? 'stop';
+            if ($onFalse === 'jump' && isset($conditionConfig['false_step_order'])) {
+                $this->jumpToStep($enrollment, (int)$conditionConfig['false_step_order']);
+            } elseif ($onFalse === 'continue') {
+                $this->moveToNextStep($enrollment);
+            } else { // 'stop'
+                $enrollment->stop('condition_failed');
+                $execution->markAsSkipped('condition_failed');
+            }
         }
+    }
+
+    public function jumpToStep(SequenceEnrollment $enrollment, int $targetStepOrder): void
+    {
+        $targetStep = $enrollment->sequence->steps()
+            ->where('step_order', $targetStepOrder)
+            ->active()
+            ->first();
+
+        if (!$targetStep) {
+            $enrollment->complete();
+            return;
+        }
+
+        $enrollment->current_step = $targetStep->step_order;
+        $enrollment->save();
+
+        $execution = SequenceStepExecution::create([
+            'sequence_id' => $enrollment->sequence_id,
+            'sequence_enrollment_id' => $enrollment->id,
+            'sequence_step_id' => $targetStep->id,
+            'status' => 'pending',
+            'scheduled_at' => now(),
+        ]);
+
+        ExecuteSequenceStep::dispatch($execution->id);
     }
 
     protected function executeActionStep(SequenceStepExecution $execution, SequenceEnrollment $enrollment, SequenceStep $step): void
@@ -323,20 +362,7 @@ class SequenceExecutionService
 
     protected function evaluateCondition(SequenceEnrollment $enrollment, array $conditionConfig): bool
     {
-        $conditionType = $conditionConfig['type'] ?? null;
-
-        switch ($conditionType) {
-            case 'customer_replied':
-                return $this->checkCustomerReplied($enrollment);
-            case 'has_tag':
-                return $this->checkHasTag($enrollment, $conditionConfig['tag'] ?? null);
-            case 'time_based':
-                return $this->checkTimeCondition($conditionConfig);
-            case 'message_delivered':
-                return $this->checkMessageDelivered($enrollment, $conditionConfig['message_id'] ?? null);
-            default:
-                return true; // Default to true if condition type unknown
-        }
+        return app(ConditionEvaluationService::class)->evaluate($enrollment, $enrollment->getCurrentStep() ?? new SequenceStep(), $conditionConfig);
     }
 
     protected function checkCustomerReplied(SequenceEnrollment $enrollment): bool

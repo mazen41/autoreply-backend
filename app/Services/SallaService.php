@@ -469,10 +469,224 @@ class SallaService
     }
 
     /**
+     * Resolve existing Salla customer_id or create a new customer via POST /customers.
+     */
+    public function resolveOrCreateCustomerForChannel(Channel $channel, string $phone, ?string $fullName = null, ?string $email = null): ?int
+    {
+        $cleanPhone = preg_replace('/[^0-9]/', '', $phone);
+        if (empty($cleanPhone)) {
+            return null;
+        }
+
+        // 1. Check if customer already exists in Salla by searching mobile
+        $last9 = substr($cleanPhone, -9);
+        $local = '0' . $last9;
+        foreach ([$cleanPhone, $local] as $searchPhone) {
+            try {
+                $res = $this->apiCallForChannel($channel, 'GET', '/customers', ['mobile' => $searchPhone]);
+                $candidates = $res['data'] ?? [];
+                foreach ($candidates as $cand) {
+                    $candRaw = preg_replace('/[^0-9]/', '', $cand['mobile'] ?? '');
+                    if (substr($candRaw, -9) === $last9 && !empty($cand['id'])) {
+                        Log::info('SallaService: found existing Salla customer_id', ['customer_id' => $cand['id']]);
+                        return (int)$cand['id'];
+                    }
+                }
+            } catch (\Exception $e) {
+                Log::warning('SallaService: GET /customers lookup failed', ['error' => $e->getMessage()]);
+            }
+        }
+
+        // 2. Create customer via POST /customers if not found
+        try {
+            $mobileCode = str_starts_with($cleanPhone, '966') ? '+966' : '+20';
+            $phoneWithoutCode = substr($cleanPhone, -9);
+
+            $payload = [
+                'first_name'  => $fullName ?: 'Customer',
+                'mobile'      => $phoneWithoutCode,
+                'mobile_code' => $mobileCode,
+            ];
+            if ($email) {
+                $payload['email'] = $email;
+            }
+
+            $res = $this->apiCallForChannel($channel, 'POST', '/customers', $payload);
+            $customerId = $res['data']['id'] ?? $res['id'] ?? null;
+            if ($customerId) {
+                Log::info('SallaService: created new Salla customer', ['customer_id' => $customerId]);
+                return (int)$customerId;
+            }
+        } catch (\Exception $e) {
+            Log::warning('SallaService: POST /customers failed', ['error' => $e->getMessage()]);
+        }
+
+        return null;
+    }
+
+    /**
+     * Dynamically resolve Salla shipping address fields against the merchant's Salla account data.
+     * Returns null if city_id or required address components cannot be confidently resolved.
+     */
+    public function resolveShippingAddressForChannel(Channel $channel, string $freeformAddress): ?array
+    {
+        if (empty(trim($freeformAddress))) {
+            return null;
+        }
+
+        // 1. Fetch cities dynamically from the merchant's Salla account API
+        $matchedCityId = null;
+        try {
+            $citiesRes = \Illuminate\Support\Facades\Cache::remember("salla_cities_ch_{$channel->id}", 43200, function () use ($channel) {
+                return $this->apiCallForChannel($channel, 'GET', '/cities');
+            });
+            $cities = $citiesRes['data'] ?? [];
+
+            $addressLower = mb_strtolower($freeformAddress);
+
+            foreach ($cities as $c) {
+                $cityNameEn = !empty($c['name']) ? mb_strtolower(trim($c['name'])) : '';
+                $cityNameAr = !empty($c['name_ar']) ? mb_strtolower(trim($c['name_ar'])) : '';
+
+                if (($cityNameEn !== '' && str_contains($addressLower, $cityNameEn)) ||
+                    ($cityNameAr !== '' && str_contains($addressLower, $cityNameAr))) {
+                    $matchedCityId = (int)$c['id'];
+                    break;
+                }
+            }
+        } catch (\Exception $e) {
+            Log::warning('SallaService: GET /cities lookup failed for channel', [
+                'channel_id' => $channel->id,
+                'error'      => $e->getMessage(),
+            ]);
+        }
+
+        // STRICT RULE 1: If city cannot be matched against merchant's Salla city list, DO NOT fake city_id = 1! Return null.
+        if (!$matchedCityId) {
+            Log::info('SallaService: could not match city in address against merchant Salla cities', [
+                'channel_id' => $channel->id,
+                'address'    => $freeformAddress,
+            ]);
+            return null;
+        }
+
+        // 2. Parse street number (extracted if present)
+        $streetNumber = null;
+        if (preg_match('/\b(\d{1,5})\b/', $freeformAddress, $sm)) {
+            $streetNumber = $sm[1];
+        }
+
+        // 3. Parse block/district
+        $block = null;
+        if (preg_match('/(?:district|block|neighborhood|حي|منطقة|شارع|فصل|فيصل|طريق)\s*[:\-]?\s*([A-Za-z\x{0600}-\x{06FF}\s]{2,30})/ui', $freeformAddress, $bm)) {
+            $block = trim($bm[1]);
+        } else {
+            $words = array_filter(explode(' ', trim($freeformAddress)));
+            if (count($words) >= 1) {
+                $block = implode(' ', array_slice($words, 0, 3));
+            }
+        }
+
+        // 4. Parse postal code (if 5-digit zip exists)
+        $postalCode = null;
+        if (preg_match('/\b(\d{5})\b/', $freeformAddress, $pm)) {
+            $postalCode = $pm[1];
+        }
+
+        $addressData = array_filter([
+            'city_id'       => $matchedCityId,
+            'country_id'    => 1,
+            'street_number' => $streetNumber,
+            'block'         => $block,
+            'postal_code'   => $postalCode,
+            'address'       => $freeformAddress,
+        ], fn($v) => !is_null($v) && $v !== '');
+
+        if (empty($addressData['city_id']) || empty($addressData['address'])) {
+            return null;
+        }
+
+        return $addressData;
+    }
+
+    /**
+     * Build canonical Salla POST /admin/v2/orders payload containing all required API fields.
+     */
+    public function buildCanonicalOrderPayload(Channel $channel, array $checkoutState): ?array
+    {
+        $phone    = $checkoutState['phone'] ?? $checkoutState['customer_phone'] ?? '';
+        $fullName = $checkoutState['full_name'] ?? null;
+        $email    = $checkoutState['email'] ?? null;
+
+        $customerId = $this->resolveOrCreateCustomerForChannel($channel, $phone, $fullName, $email);
+        if (!$customerId) {
+            Log::warning('SallaService: unable to resolve or create customer_id for order creation', [
+                'channel_id' => $channel->id,
+                'phone'      => $phone,
+            ]);
+            return null;
+        }
+
+        $freeformAddress = $checkoutState['address'] ?? '';
+        $shippingAddress = $this->resolveShippingAddressForChannel($channel, $freeformAddress);
+
+        if (!$shippingAddress) {
+            Log::warning('SallaService: shipping address could not be confidently mapped to merchant Salla city/fields', [
+                'channel_id' => $channel->id,
+                'address'    => $freeformAddress,
+            ]);
+            return null;
+        }
+
+        $productId = (int)($checkoutState['salla_product_id'] ?? null);
+        if (!$productId) {
+            Log::warning('SallaService: missing salla_product_id for order creation', [
+                'channel_id' => $channel->id,
+            ]);
+            return null;
+        }
+
+        $price = (float)($checkoutState['product_price'] ?? 0);
+
+        $products = [
+            [
+                'id'       => $productId,
+                'quantity' => 1,
+                'price'    => $price,
+            ]
+        ];
+
+        $payment = [
+            'method' => 'cod',
+            'status' => 'pending',
+        ];
+
+        return [
+            'customer_id'      => $customerId,
+            'products'         => $products,
+            'shipping_address' => $shippingAddress,
+            'payment'          => $payment,
+        ];
+    }
+
+    /**
      * Create an order in Salla store using channel-aware auto-refresh token.
      */
     public function createOrderForChannel(Channel $channel, array $data = []): array
     {
+        if (isset($data['salla_product_id']) || isset($data['address']) || isset($data['full_name'])) {
+            $data = $this->buildCanonicalOrderPayload($channel, $data);
+        }
+
+        if (empty($data)) {
+            throw new \Exception('Canonical Salla order payload could not be constructed: missing customer, product, or unmapped city ID');
+        }
+
+        Log::info('SallaService: posting canonical order payload to Salla', [
+            'channel_id' => $channel->id,
+            'payload'    => $data,
+        ]);
+
         return $this->apiCallForChannel($channel, 'POST', '/orders', $data);
     }
 

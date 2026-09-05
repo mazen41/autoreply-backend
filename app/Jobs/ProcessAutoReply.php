@@ -2128,7 +2128,7 @@ class ProcessAutoReply implements ShouldQueue
 
             $user = $channel->user;
             $externalOrderId = null;
-            $externalSource  = 'internal';
+            $externalSource  = null;
 
             // 1. Try Salla order creation if Salla channel connected
             $sallaChannel = Channel::where('user_id', $user->id)
@@ -2139,23 +2139,8 @@ class ProcessAutoReply implements ShouldQueue
             if ($sallaChannel) {
                 try {
                     $sallaService = new SallaService();
-                    $payload = array_filter([
-                        'customer' => array_filter([
-                            'name'   => $checkoutState['full_name'] ?? $conversation->sender_name,
-                            'mobile' => $checkoutState['phone'] ?? $conversation->sender_id,
-                        ]),
-                        'items' => [
-                            array_filter([
-                                'product_id' => $checkoutState['salla_product_id'] ?? null,
-                                'quantity'   => 1,
-                            ])
-                        ],
-                        'shipping_address' => array_filter([
-                            'address' => $checkoutState['address'] ?? '',
-                        ])
-                    ]);
-
-                    $sallaRes = $sallaService->createOrderForChannel($sallaChannel, $payload);
+                    $sallaRes = $sallaService->createOrderForChannel($sallaChannel, $checkoutState);
+                    
                     $externalOrderId = (string)($sallaRes['data']['reference_id'] ?? $sallaRes['data']['id'] ?? $sallaRes['id'] ?? null);
                     if ($externalOrderId) {
                         $externalSource = 'salla';
@@ -2163,12 +2148,22 @@ class ProcessAutoReply implements ShouldQueue
                             'conversation_id' => $conversation->id,
                             'salla_order_id'  => $externalOrderId,
                         ]);
+                    } else {
+                        Log::error('SALLA_ORDER_CREATION_FAILED', [
+                            'conversation_id' => $conversation->id,
+                            'channel_id'      => $sallaChannel->id,
+                            'response'        => $sallaRes,
+                        ]);
+                        return null;
                     }
                 } catch (\Exception $e) {
-                    Log::warning('ProcessAutoReply: Salla order creation API call failed/unsupported', [
+                    Log::error('SALLA_ORDER_CREATION_FAILED', [
                         'conversation_id' => $conversation->id,
+                        'channel_id'      => $sallaChannel->id,
                         'error'           => $e->getMessage(),
                     ]);
+                    // STRICT RULE: DO NOT generate a fake ID or pretend success when Salla fails!
+                    return null;
                 }
             }
 
@@ -2212,23 +2207,30 @@ class ProcessAutoReply implements ShouldQueue
                                     'shopify_order_id' => $externalOrderId,
                                 ]);
                             }
+                        } else {
+                            Log::error('SHOPIFY_ORDER_CREATION_FAILED', [
+                                'conversation_id' => $conversation->id,
+                                'status'          => $response->status(),
+                                'body'            => $response->body(),
+                            ]);
+                            return null;
                         }
                     } catch (\Exception $e) {
-                        Log::warning('ProcessAutoReply: Shopify order creation API call failed', [
+                        Log::error('SHOPIFY_ORDER_CREATION_FAILED', [
                             'conversation_id' => $conversation->id,
                             'error'           => $e->getMessage(),
                         ]);
+                        return null;
                     }
                 }
             }
 
-            // 3. Fallback ID if external API is unconfigured, read-only scope, or in testing sandbox
+            // STRICT RULE: If no external commerce channel was connected or order creation did not return 2xx success:
             if (!$externalOrderId) {
-                $externalOrderId = 'ORD-' . time();
-                Log::info('ProcessAutoReply: external reference order ID generated', [
+                Log::warning('ProcessAutoReply: no external order created by commerce platform — aborting order completion', [
                     'conversation_id' => $conversation->id,
-                    'order_id'        => $externalOrderId,
                 ]);
+                return null;
             }
 
             $orderTotal = (float)($checkoutState['product_price'] ?? 0);

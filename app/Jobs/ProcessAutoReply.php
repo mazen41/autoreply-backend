@@ -179,6 +179,18 @@ class ProcessAutoReply implements ShouldQueue
         // a per-conversation cache lock so that job retries for the same message
         // do not attempt a second enrollment.
         if ($business) {
+            // When a customer sends an inbound message, cancel any active no-reply
+            // sequence enrollments. Pending delayed jobs for older cycles are
+            // invalidated automatically via the cycle-number gate in CheckNoReplyForMessage.
+            try {
+                app(SequenceTriggerService::class)->cancelNoReplySequencesOnCustomerReply($conversation);
+            } catch (\Exception $e) {
+                Log::warning('ProcessAutoReply: failed to cancel no-reply sequences on customer reply', [
+                    'conversation_id' => $conversation->id,
+                    'error'           => $e->getMessage(),
+                ]);
+            }
+
             $isNewUser = $this->isNewUserConversation($conversation, $message);
 
             Log::info('ProcessAutoReply: new-user check', [
@@ -1393,6 +1405,22 @@ class ProcessAutoReply implements ShouldQueue
         // NOTE: Sequence enrollment for non-new-user messages (tag_added, no_reply, order_created)
         // is handled by their respective triggers (SallaWebhookJob, scheduled commands, etc.)
         // and NOT from ProcessAutoReply, to preserve separation of concerns.
+        //
+        // EXCEPTION: no_reply sequences ARE triggered from here because only ProcessAutoReply
+        // knows the exact moment the AI replied. We schedule a delayed job anchored to this
+        // specific AI reply message. The job checks at execution time if the customer replied.
+        if ($sendSuccess) {
+            try {
+                $triggerSvc = app(SequenceTriggerService::class);
+                $triggerSvc->scheduleNoReplyTimers($message->conversation, $replyMessage);
+            } catch (\Exception $e) {
+                // Never let sequence scheduling break the reply flow.
+                Log::warning('ProcessAutoReply: failed to schedule no-reply timers', [
+                    'conversation_id' => $conversation->id,
+                    'error'           => $e->getMessage(),
+                ]);
+            }
+        }
     }
 
     // ── SEQUENCE INTEGRATION HELPERS ─────────────────────────────────────────

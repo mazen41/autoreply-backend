@@ -17,7 +17,6 @@ class WorkflowExecutionFactory extends Factory
         return [
             'workflow_id' => AutomationWorkflow::factory(),
             'conversation_id' => Conversation::factory(),
-            'business_id' => BusinessProfile::factory(),
             'status' => fake()->randomElement(['pending', 'running', 'completed', 'failed']),
             'trigger_data' => [
                 'trigger_type' => fake()->word(),

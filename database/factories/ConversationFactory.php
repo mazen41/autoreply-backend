@@ -13,9 +13,11 @@ class ConversationFactory extends Factory
 
     public function definition(): array
     {
+        $business = BusinessProfile::factory()->create();
+
         return [
-            'business_id' => BusinessProfile::factory(),
-            'channel_id' => Channel::factory(),
+            'business_id' => $business->id,
+            'channel_id' => Channel::factory()->create(['business_id' => $business->id])->id,
             'sender_id' => fake()->numerify('##########'),
             'sender_name' => fake()->name(),
             'status' => 'open',

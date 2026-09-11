@@ -13,14 +13,16 @@ class ChannelFactory extends Factory
     public function definition(): array
     {
         return [
-            'user_id' => 1,
+            'user_id' => null,
             'business_id' => BusinessProfile::factory(),
             'type' => fake()->randomElement(['whatsapp', 'telegram', 'facebook', 'instagram', 'gmail']),
             'page_id' => fake()->numerify('#########'),
             'page_name' => fake()->company(),
-            'page_access_token' => fake()->sha256(),
-            'webhook_secret' => fake()->sha256(),
-            'is_active' => true,
+            'instagram_account_id' => null,
+            'access_token' => fake()->sha256(),
+            'refresh_token' => null,
+            'status' => 'connected',
+            'connected_at' => now(),
         ];
     }
 }

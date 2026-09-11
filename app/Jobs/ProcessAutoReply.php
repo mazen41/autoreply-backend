@@ -1340,6 +1340,30 @@ class ProcessAutoReply implements ShouldQueue
                 : "I'm sorry, I'm not able to send product photos right now. Let me connect you with a team member who can send them directly 🙏";
         }
 
+        // STRICT GUARDRAIL: Prevent AI from hallucinating order confirmation if order creation failed
+        if ($orderCreationFailedReason === 'address_city_unresolved') {
+            $lowerAiResponse = mb_strtolower($aiResponse);
+            $hallucinationKeywords = ['placed', 'confirmed', 'تم تأكيد', 'تم طلب', 'successfully', 'will be placed'];
+            $hallucinated = false;
+            foreach ($hallucinationKeywords as $keyword) {
+                if (str_contains($lowerAiResponse, $keyword)) {
+                    $hallucinated = true;
+                    break;
+                }
+            }
+
+            if ($hallucinated) {
+                Log::warning('ProcessAutoReply: AI hallucinated order confirmation despite order creation failure -- overriding reply text to stay honest', [
+                    'conversation_id' => $conversation->id,
+                    'original_reply'  => substr($aiResponse, 0, 200),
+                ]);
+                
+                $aiResponse = $detectedLanguage === 'arabic'
+                    ? "عذراً، لم أتمكن من تأكيد الطلب لأن مدينتك غير موجودة في نظام الشحن الخاص بنا. هل يمكنك توضيح اسم مدينتك والحي بدقة حتى أتمكن من إرسال الطلب؟ 🙏"
+                    : "I'm sorry, I couldn't confirm your order because your city name wasn't recognized by our shipping system. Could you please reply with your exact city and neighborhood name so I can place it? 🙏";
+            }
+        }
+
         // Auto-tag conversation based on AI-detected intent
         if ($aiResult['intent'] !== 'unknown') {
             \App\Models\ConversationTag::firstOrCreate(
@@ -1549,6 +1573,17 @@ class ProcessAutoReply implements ShouldQueue
                     'error'           => $e->getMessage(),
                 ]);
             }
+
+            // Evaluate workflows for this business
+            try {
+                $this->evaluateWorkflows($conversation, $message);
+            } catch (\Exception $e) {
+                // Never let workflow evaluation break the reply flow.
+                Log::warning('ProcessAutoReply: failed to evaluate workflows', [
+                    'conversation_id' => $conversation->id,
+                    'error'           => $e->getMessage(),
+                ]);
+            }
         }
     }
 
@@ -1693,6 +1728,47 @@ class ProcessAutoReply implements ShouldQueue
         }
 
         return $enrolled;
+    }
+
+    /**
+     * Evaluate and execute active workflows for this conversation's business.
+     *
+     * Workflows are evaluated after the AI reply is sent successfully. Each workflow
+     * checks its trigger configuration against the conversation/message context. If the
+     * trigger matches, the workflow's actions are executed.
+     *
+     * This is intentionally fire-and-forget: errors are logged but do not affect the
+     * main AI reply flow.
+     */
+    private function evaluateWorkflows(Conversation $conversation, Message $message): void
+    {
+        $businessId = $conversation->business_id;
+        if (!$businessId) {
+            return;
+        }
+
+        // Load active workflows for this business
+        $workflows = \App\Models\AutomationWorkflow::forBusiness($businessId)
+            ->active()
+            ->get();
+
+        if ($workflows->isEmpty()) {
+            return;
+        }
+
+        $automationEngine = app(\App\Services\AutomationEngine::class);
+
+        foreach ($workflows as $workflow) {
+            try {
+                $automationEngine->executeWorkflow($workflow, $conversation, testMode: false);
+            } catch (\Exception $e) {
+                Log::error('ProcessAutoReply: workflow execution failed', [
+                    'workflow_id' => $workflow->id,
+                    'conversation_id' => $conversation->id,
+                    'error' => $e->getMessage(),
+                ]);
+            }
+        }
     }
 
     // ── END SEQUENCE INTEGRATION HELPERS ─────────────────────────────────────

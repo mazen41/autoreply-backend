@@ -56,7 +56,7 @@ class SequenceExecutionService
             case 'action':
                 $this->executeActionStep($execution, $enrollment, $step);
                 // Only move to next step if action didn't stop sequence
-                if (!($execution->metadata['action_type'] ?? '') === 'stop_sequence') {
+                if (($execution->metadata['action_type'] ?? '') !== 'stop_sequence') {
                     $this->moveToNextStep($enrollment);
                 }
                 break;
@@ -113,11 +113,43 @@ class SequenceExecutionService
             throw new \Exception('No connected channel found for sending message');
         }
 
-        // Send message based on channel type
-        $message = $this->sendMessageToConversation($conversation, $step->message, $channel, $step->config ?? []);
+        // CRITICAL FIX: Move external provider call OUTSIDE DB transaction
+        // to prevent rollback after provider success causing duplicate sends.
+        // New order:
+        // 1. Create message record (in transaction)
+        // 2. Call provider (outside transaction)
+        // 3. Update status based on provider result (outside transaction)
 
-        if ($message) {
-            $execution->message_id = $message->id;
+        DB::transaction(function () use ($conversation, $step, $execution) {
+            // Create message record with pending status
+            $messageRecord = Message::create([
+                'conversation_id' => $conversation->id,
+                'content' => $step->message,
+                'type' => 'text',
+                'direction' => 'outbound',
+                'status' => 'sent',
+                'is_ai' => true,
+                'source' => 'sequence',
+                'delivery_status' => 'pending',
+                'metadata' => array_merge($step->config ?? [], [
+                    'sequence_automated' => true,
+                    'channel_type' => $channel->type,
+                ]),
+            ]);
+
+            $execution->message_id = $messageRecord->id;
+        });
+
+        // Now call the provider OUTSIDE the transaction
+        try {
+            $this->sendMessageToConversation($conversation, $step->message, $channel, $execution->message_id, $step->config ?? []);
+        } catch (\Exception $e) {
+            // Provider failed - update message status to failed
+            Message::where('id', $execution->message_id)->update([
+                'delivery_status' => 'failed',
+                'error_details' => $e->getMessage(),
+            ]);
+            throw $e; // Re-throw to trigger retry logic
         }
     }
 
@@ -228,26 +260,12 @@ class SequenceExecutionService
         }
     }
 
-    protected function sendMessageToConversation(Conversation $conversation, string $message, Channel $channel, array $config = []): ?Message
+    protected function sendMessageToConversation(Conversation $conversation, string $message, Channel $channel, int $messageId, array $config = []): void
     {
-        $senderId = $conversation->sender_id;
-        $senderName = $conversation->sender_name;
-
-        // Create message record with delivery tracking
-        $messageRecord = Message::create([
-            'conversation_id' => $conversation->id,
-            'content' => $message,
-            'type' => 'text',
-            'direction' => 'outbound',
-            'status' => 'sent',
-            'is_ai' => true,
-            'source' => 'sequence',
-            'delivery_status' => 'pending',
-            'metadata' => array_merge($config, [
-                'sequence_automated' => true,
-                'channel_type' => $channel->type,
-            ]),
-        ]);
+        $messageRecord = Message::find($messageId);
+        if (!$messageRecord) {
+            throw new \Exception("Message record not found: {$messageId}");
+        }
 
         // Send based on channel type
         try {
@@ -265,6 +283,12 @@ class SequenceExecutionService
                     Log::warning("Unsupported channel type for sequence: {$channel->type}");
                     throw new \Exception("Channel type {$channel->type} is not supported");
             }
+
+            // Provider succeeded - update delivery status
+            $messageRecord->update([
+                'delivery_status' => 'sent',
+            ]);
+
         } catch (\Exception $e) {
             Log::error("Failed to send sequence message", [
                 'message_id' => $messageRecord->id,
@@ -277,8 +301,6 @@ class SequenceExecutionService
             ]);
             throw $e; // Re-throw to trigger retry logic
         }
-
-        return $messageRecord;
     }
 
     protected function sendWhatsAppMessage(Conversation $conversation, string $message, Channel $channel, Message $messageRecord): void
@@ -308,7 +330,6 @@ class SequenceExecutionService
         $messageRecord->update([
             'whatsapp_message_id' => $messageRecord->id, // Use message ID as reference
             'send_status' => 'sent',
-            'delivery_status' => 'pending',
         ]);
     }
 
@@ -316,10 +337,10 @@ class SequenceExecutionService
     {
         // Use existing TelegramService
         $telegramService = new TelegramService();
-        
+
         // Extract bot token from channel metadata or config
         $botToken = $channel->metadata['bot_token'] ?? null;
-        
+
         if (!$botToken) {
             Log::error("Telegram bot token not found in channel metadata", [
                 'channel_id' => $channel->id,
@@ -335,7 +356,6 @@ class SequenceExecutionService
 
         $messageRecord->update([
             'send_status' => 'sent',
-            'delivery_status' => 'delivered',
         ]);
     }
 
@@ -343,7 +363,7 @@ class SequenceExecutionService
     {
         // Use Laravel Mail facade for email sending
         $recipientEmail = $conversation->sender_email ?? $conversation->sender_id;
-        
+
         if (!$recipientEmail) {
             throw new \Exception('No email address found for conversation');
         }
@@ -356,7 +376,6 @@ class SequenceExecutionService
 
         $messageRecord->update([
             'send_status' => 'sent',
-            'delivery_status' => 'delivered',
         ]);
     }
 

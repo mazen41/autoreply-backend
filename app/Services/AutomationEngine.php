@@ -7,7 +7,10 @@ use App\Models\Conversation;
 use App\Models\Message;
 use App\Models\ConversationTag;
 use App\Models\Sequence;
+use App\Models\WorkflowExecution;
 use App\Services\SequenceTriggerService;
+use App\Services\SequenceEnrollmentService;
+use App\Services\ChannelMessageService;
 use Illuminate\Support\Facades\Http;
 use Illuminate\Support\Facades\Log;
 
@@ -18,6 +21,19 @@ class AutomationEngine
      */
     public function executeWorkflow(AutomationWorkflow $workflow, Conversation $conversation, bool $testMode = false): array
     {
+        $execution = WorkflowExecution::create([
+            'workflow_id' => $workflow->id,
+            'conversation_id' => $conversation->id,
+            'business_id' => $conversation->business_id,
+            'status' => 'running',
+            'test_mode' => $testMode,
+            'trigger_data' => [
+                'trigger_config' => $workflow->trigger_config,
+                'conversation_id' => $conversation->id,
+            ],
+            'started_at' => now(),
+        ]);
+
         $results = [
             'triggered' => false,
             'actions_executed' => [],
@@ -27,6 +43,11 @@ class AutomationEngine
         try {
             // Check if trigger conditions are met
             if (!$this->checkTriggerConditions($workflow->trigger_config, $conversation)) {
+                $execution->update([
+                    'status' => 'completed',
+                    'results' => ['triggered' => false],
+                    'completed_at' => now(),
+                ]);
                 return $results;
             }
 
@@ -45,7 +66,14 @@ class AutomationEngine
             // Update execution count if not in test mode
             if (!$testMode) {
                 $workflow->increment('executions_count');
+                $workflow->update(['last_executed_at' => now()]);
             }
+
+            $execution->update([
+                'status' => empty($results['errors']) ? 'completed' : 'failed',
+                'results' => $results,
+                'completed_at' => now(),
+            ]);
 
             Log::info('Automation workflow executed', [
                 'workflow_id' => $workflow->id,
@@ -60,6 +88,14 @@ class AutomationEngine
                 'conversation_id' => $conversation->id,
                 'error' => $e->getMessage()
             ]);
+
+            $execution->update([
+                'status' => 'failed',
+                'error_message' => $e->getMessage(),
+                'results' => $results,
+                'completed_at' => now(),
+            ]);
+
             $results['errors'][] = $e->getMessage();
         }
 
@@ -231,6 +267,9 @@ class AutomationEngine
                 case 'start_sequence':
                     $result = $this->executeStartSequence($action, $conversation, $testMode);
                     break;
+                case 'stop_sequence':
+                    $result = $this->executeStopSequence($action, $conversation, $testMode);
+                    break;
                 default:
                     $result['error'] = "Unknown action type: {$actionType}";
             }
@@ -254,6 +293,16 @@ class AutomationEngine
             ];
         }
 
+        $channel = $conversation->channel;
+        if (!$channel) {
+            return [
+                'type' => 'send_message',
+                'success' => false,
+                'error' => 'No channel found for conversation'
+            ];
+        }
+
+        // Create message record first with pending status
         $message = Message::create([
             'conversation_id' => $conversation->id,
             'content' => $action['message'],
@@ -264,12 +313,14 @@ class AutomationEngine
             'send_status' => 'pending',
         ]);
 
-        // Send through channel
-        $this->sendMessageThroughChannel($conversation->channel, $conversation, $message);
+        // Send through channel provider
+        // ChannelMessageService handles provider call and status update
+        $channelMessageService = app(ChannelMessageService::class);
+        $sendSuccess = $channelMessageService->sendMessage($channel, $conversation, $message);
 
         return [
             'type' => 'send_message',
-            'success' => true,
+            'success' => $sendSuccess,
             'message_id' => $message->id
         ];
     }
@@ -436,12 +487,12 @@ class AutomationEngine
             ];
         }
 
-        // Use SequenceTriggerService to enroll
-        $sequenceTriggerService = new SequenceTriggerService();
-        
+        // Use SequenceTriggerService to enroll via container
+        $sequenceTriggerService = app(SequenceTriggerService::class);
+
         try {
             $enrollment = $sequenceTriggerService->enrollInSequence($sequence, $conversation, false);
-            
+
             return [
                 'type' => 'start_sequence',
                 'success' => true,
@@ -457,18 +508,67 @@ class AutomationEngine
     }
 
     /**
-     * Send message through appropriate channel
+     * Execute stop sequence action
      */
-    private function sendMessageThroughChannel($channel, $conversation, $message): void
+    private function executeStopSequence(array $action, Conversation $conversation, bool $testMode): array
     {
-        // This would use the existing send logic from ProcessAutoReply
-        // For now, just mark as sent
-        $message->update(['send_status' => 'sent']);
-        
-        Log::info('Automation message sent', [
-            'channel_type' => $channel->type,
-            'conversation_id' => $conversation->id,
-            'message_id' => $message->id
-        ]);
+        if ($testMode) {
+            return [
+                'type' => 'stop_sequence',
+                'success' => true,
+                'sequence_id' => $action['sequence_id'] ?? null
+            ];
+        }
+
+        $sequenceId = $action['sequence_id'] ?? null;
+        if (!$sequenceId) {
+            return [
+                'type' => 'stop_sequence',
+                'success' => false,
+                'error' => 'Sequence ID is required'
+            ];
+        }
+
+        $sequence = Sequence::find($sequenceId);
+        if (!$sequence) {
+            return [
+                'type' => 'stop_sequence',
+                'success' => false,
+                'error' => 'Sequence not found'
+            ];
+        }
+
+        // Verify business ownership
+        if ($sequence->business_id !== $conversation->business_id) {
+            return [
+                'type' => 'stop_sequence',
+                'success' => false,
+                'error' => 'Sequence does not belong to this business'
+            ];
+        }
+
+        // Stop active enrollments for this conversation and sequence
+        $enrollmentService = app(SequenceEnrollmentService::class);
+
+        try {
+            // Stop all enrollments for this specific sequence and conversation
+            $stopped = \App\Models\SequenceEnrollment::where('sequence_id', $sequence->id)
+                ->where('conversation_id', $conversation->id)
+                ->where('status', 'active')
+                ->update(['status' => 'stopped', 'stopped_at' => now(), 'stop_reason' => 'workflow_action']);
+
+            return [
+                'type' => 'stop_sequence',
+                'success' => true,
+                'stopped_count' => $stopped
+            ];
+        } catch (\Exception $e) {
+            return [
+                'type' => 'stop_sequence',
+                'success' => false,
+                'error' => $e->getMessage()
+            ];
+        }
     }
+
 }

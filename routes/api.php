@@ -343,14 +343,18 @@ Route::middleware('auth:sanctum')->group(function () {
         Route::get('/{id}/stats', [ProactiveController::class, 'getStats']);
     });
 
-    // Automation Workflows
-    Route::prefix('automation')->group(function () {
+    // Automation Workflows (canonical /api/workflows)
+    Route::prefix('workflows')->group(function () {
         Route::get('/', [AutomationController::class, 'index']);
         Route::get('/templates', [AutomationController::class, 'getTemplates']);
         Route::post('/', [AutomationController::class, 'store']);
+        Route::get('/{id}', [AutomationController::class, 'show']);
         Route::patch('/{id}', [AutomationController::class, 'update']);
         Route::delete('/{id}', [AutomationController::class, 'destroy']);
+        Route::post('/{id}/toggle', [AutomationController::class, 'toggle']);
+        Route::post('/{id}/duplicate', [AutomationController::class, 'duplicate']);
         Route::post('/{id}/test', [AutomationController::class, 'test']);
+        Route::get('/{id}/executions', [AutomationController::class, 'executions']);
         Route::get('/{id}/stats', [AutomationController::class, 'getStats']);
     });
 

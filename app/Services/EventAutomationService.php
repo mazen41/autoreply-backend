@@ -10,6 +10,22 @@ use App\Models\Webhook;
 use App\Services\WebhookService;
 use Illuminate\Support\Facades\Log;
 
+/**
+ * DEPRECATED - This service is no longer used in production.
+ *
+ * The canonical automation path is now:
+ * - Incoming events → ProcessAutoReply → evaluateWorkflows() → AutomationEngine
+ * - Sequence triggers → SequenceTriggerService → SequenceEnrollmentService
+ *
+ * This service contains legacy sequence enrollment logic using SequenceUser
+ * and ProcessSequenceStep, which have been replaced by SequenceEnrollment
+ * and ExecuteSequenceStep.
+ *
+ * DO NOT call this service from new code. It is retained only for
+ * potential legacy compatibility but has no verified production callers.
+ *
+ * To be removed in a future cleanup once legacy compatibility is confirmed unnecessary.
+ */
 class EventAutomationService
 {
     private $webhookService;

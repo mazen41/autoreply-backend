@@ -17,6 +17,12 @@ return new class extends Migration
      */
     public function up(): void
     {
+        // Skip this on SQLite since information_schema.STATISTICS doesn't exist
+        // and generated columns with STORED may not be supported
+        if (DB::getDriverName() === 'sqlite') {
+            return;
+        }
+        
         // Step 1 — add the generated column if it doesn't exist yet.
         // The column already exists in production (added by a previous failed
         // migration attempt), so the hasColumn guard makes this safe to re-run.
@@ -77,6 +83,11 @@ return new class extends Migration
 
     public function down(): void
     {
+        // Skip this on SQLite
+        if (DB::getDriverName() === 'sqlite') {
+            return;
+        }
+        
         $indexExists = DB::select("
             SELECT INDEX_NAME
             FROM information_schema.STATISTICS

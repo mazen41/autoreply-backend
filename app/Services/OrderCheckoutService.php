@@ -74,7 +74,10 @@ class OrderCheckoutService
         if (!$extractedAddress && empty($existingState['address'])) {
             $textLower = mb_strtolower(trim($incomingText));
             $confirmKeywords = '/^(?:yes|yeah|sure|ok|okay|confirm|placed|thanks|نعم|تأكيد|تم|موافق|شكرا|اكد)$/ui';
+            $intentKeywords = '/(?:hi|hello|want|order|buy|product|place order|how much|price|مرحبا|سلام|اريد|طلب|شراء|منتج|بكم|سعر|تفاصيل)/ui';
+            
             if (!preg_match($confirmKeywords, $textLower)
+                && !preg_match($intentKeywords, $textLower)
                 && strlen(trim($incomingText)) >= 4
                 && !preg_match('/^\+?[0-9]{8,15}$/', trim($incomingText))) {
                 $extractedAddress = trim($incomingText);

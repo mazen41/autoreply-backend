@@ -129,4 +129,9 @@ class BusinessProfile extends Model
     {
         return $this->hasMany(Channel::class, 'business_id');
     }
+
+    public function workflows()
+    {
+        return $this->hasMany(AutomationWorkflow::class, 'business_id');
+    }
 }

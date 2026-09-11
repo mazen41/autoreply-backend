@@ -15,6 +15,7 @@ use Illuminate\Queue\InteractsWithQueue;
 use Illuminate\Queue\SerializesModels;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Log;
+use Illuminate\Support\Facades\Cache;
 
 class ExecuteSequenceStep implements ShouldQueue
 {
@@ -66,36 +67,52 @@ class ExecuteSequenceStep implements ShouldQueue
             return;
         }
 
-        // Mark as processing to prevent concurrent execution
-        $execution->status = 'processing';
-        $execution->save();
+        // Concurrency lock: prevent multiple workers from executing the same step simultaneously
+        $lockKey = "sequence_step_execution:{$enrollment->id}:{$step->id}";
+        $lock = Cache::lock($lockKey, 60); // 60 second lock
 
-        DB::transaction(function () use ($execution, $enrollment, $step, $executionService) {
-            try {
-                $executionService->executeStep($execution, $enrollment, $step);
-            } catch (\Exception $e) {
-                $execution->markAsFailed($e->getMessage());
-                $enrollment->fail($e->getMessage());
-                Log::error("Sequence step execution failed", [
-                    'execution_id' => $execution->id,
-                    'enrollment_id' => $enrollment->id,
-                    'step_id' => $step->id,
-                    'error' => $e->getMessage(),
-                    'trace' => $e->getTraceAsString(),
-                ]);
-                throw $e;
-            }
-        });
+        if (!$lock->get()) {
+            Log::warning("Sequence step execution already in progress, skipping", [
+                'execution_id' => $this->executionId,
+                'enrollment_id' => $enrollment->id,
+                'step_id' => $step->id,
+            ]);
+            return;
+        }
+
+        try {
+            // Mark as processing
+            $execution->status = 'processing';
+            $execution->save();
+
+            // Execute the step - external provider calls happen inside but should be safe now
+            // because we've moved the transaction boundary
+            $executionService->executeStep($execution, $enrollment, $step);
+
+        } catch (\Exception $e) {
+            $execution->markAsFailed($e->getMessage());
+            $enrollment->fail($e->getMessage());
+            Log::error("Sequence step execution failed", [
+                'execution_id' => $execution->id,
+                'enrollment_id' => $enrollment->id,
+                'step_id' => $step->id,
+                'error' => $e->getMessage(),
+                'trace' => $e->getTraceAsString(),
+            ]);
+            throw $e;
+        } finally {
+            $lock->release();
+        }
     }
 
     public function failed(\Throwable $exception): void
     {
         $execution = SequenceStepExecution::find($this->executionId);
-        
+
         if ($execution) {
             // Mark as failed after all retries exhausted
             $execution->markAsFailed($exception->getMessage());
-            
+
             // Stop the enrollment if this was a critical failure
             $enrollment = $execution->enrollment;
             if ($enrollment && $this->attempts() >= $this->tries) {

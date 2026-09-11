@@ -3,11 +3,16 @@
 namespace App\Http\Controllers\Api;
 
 use App\Http\Controllers\Controller;
+use App\Models\AutomationWorkflow;
 use App\Models\BusinessHour;
 use App\Models\AutoMessage;
 use App\Models\BusinessProfile;
+use App\Models\Conversation;
+use App\Models\WorkflowExecution;
+use App\Services\AutomationEngine;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\Auth;
+use Illuminate\Support\Facades\Log;
 
 class AutomationController extends Controller
 {
@@ -203,5 +208,473 @@ class AutomationController extends Controller
         ]));
 
         return response()->json(['success' => true]);
+    }
+
+    // ── WORKFLOW CRUD METHODS ───────────────────────────────────────────────────
+
+    /**
+     * Get workflows for the authenticated user's businesses
+     */
+    public function index(Request $request)
+    {
+        $user = Auth::user();
+
+        // Get all business IDs the user has access to (as owner or team member)
+        $businessIds = BusinessProfile::where('user_id', $user->id)
+            ->pluck('id')
+            ->merge(
+                \App\Models\TeamMember::where('user_id', $user->id)
+                    ->where('is_active', true)
+                    ->pluck('business_id')
+            )
+            ->unique();
+
+        $workflows = AutomationWorkflow::whereIn('business_id', $businessIds)
+            ->with('business')
+            ->orderBy('created_at', 'desc')
+            ->get()
+            ->map(function ($workflow) {
+                return [
+                    'id' => $workflow->id,
+                    'name' => $workflow->name,
+                    'description' => $workflow->description,
+                    'is_active' => $workflow->active,
+                    'trigger' => $workflow->trigger_config,
+                    'conditions' => $workflow->conditions,
+                    'actions' => $workflow->actions_config,
+                    'execution_count' => $workflow->executions_count,
+                    'last_executed_at' => $workflow->last_executed_at?->toISOString(),
+                    'created_at' => $workflow->created_at->toISOString(),
+                ];
+            });
+
+        return response()->json($workflows);
+    }
+
+    /**
+     * Store a new workflow
+     */
+    public function store(Request $request)
+    {
+        $request->validate([
+            'name' => 'required|string|max:255',
+            'description' => 'nullable|string',
+            'trigger' => 'required|array',
+            'trigger.type' => 'required|string',
+            'conditions' => 'nullable|array',
+            'actions' => 'required|array|min:1',
+        ]);
+
+        $user = Auth::user();
+
+        // Resolve business_id from request or use user's primary business
+        $businessId = $request->business_id;
+        if (!$businessId) {
+            $business = BusinessProfile::where('user_id', $user->id)->first();
+            if (!$business) {
+                return response()->json(['error' => 'No business found for user'], 400);
+            }
+            $businessId = $business->id;
+        }
+
+        // Verify user has access to this business
+        $hasAccess = BusinessProfile::where('id', $businessId)
+            ->where('user_id', $user->id)
+            ->exists() ||
+            \App\Models\TeamMember::where('business_id', $businessId)
+                ->where('user_id', $user->id)
+                ->where('is_active', true)
+                ->exists();
+
+        if (!$hasAccess) {
+            return response()->json(['error' => 'Unauthorized access to business'], 403);
+        }
+
+        $workflow = AutomationWorkflow::create([
+            'user_id' => $user->id,
+            'business_id' => $businessId,
+            'name' => $request->name,
+            'description' => $request->description,
+            'active' => true,
+            'trigger_config' => $request->trigger,
+            'conditions' => $request->conditions,
+            'actions_config' => $request->actions,
+            'executions_count' => 0,
+        ]);
+
+        return response()->json([
+            'id' => $workflow->id,
+            'name' => $workflow->name,
+            'description' => $workflow->description,
+            'is_active' => $workflow->active,
+            'trigger' => $workflow->trigger_config,
+            'conditions' => $workflow->conditions,
+            'actions' => $workflow->actions_config,
+            'execution_count' => $workflow->executions_count,
+            'last_executed_at' => $workflow->last_executed_at?->toISOString(),
+            'created_at' => $workflow->created_at->toISOString(),
+        ], 201);
+    }
+
+    /**
+     * Get a specific workflow
+     */
+    public function show(Request $request, $id)
+    {
+        $user = Auth::user();
+
+        $businessIds = BusinessProfile::where('user_id', $user->id)
+            ->pluck('id')
+            ->merge(
+                \App\Models\TeamMember::where('user_id', $user->id)
+                    ->where('is_active', true)
+                    ->pluck('business_id')
+            )
+            ->unique();
+
+        $workflow = AutomationWorkflow::whereIn('business_id', $businessIds)
+            ->findOrFail($id);
+
+        return response()->json([
+            'id' => $workflow->id,
+            'name' => $workflow->name,
+            'description' => $workflow->description,
+            'is_active' => $workflow->active,
+            'trigger' => $workflow->trigger_config,
+            'conditions' => $workflow->conditions,
+            'actions' => $workflow->actions_config,
+            'execution_count' => $workflow->executions_count,
+            'last_executed_at' => $workflow->last_executed_at?->toISOString(),
+            'created_at' => $workflow->created_at->toISOString(),
+        ]);
+    }
+
+    /**
+     * Update a workflow
+     */
+    public function update(Request $request, $id)
+    {
+        $request->validate([
+            'name' => 'sometimes|required|string|max:255',
+            'description' => 'nullable|string',
+            'trigger' => 'sometimes|required|array',
+            'trigger.type' => 'sometimes|required|string',
+            'conditions' => 'nullable|array',
+            'actions' => 'sometimes|required|array|min:1',
+        ]);
+
+        $user = Auth::user();
+
+        $businessIds = BusinessProfile::where('user_id', $user->id)
+            ->pluck('id')
+            ->merge(
+                \App\Models\TeamMember::where('user_id', $user->id)
+                    ->where('is_active', true)
+                    ->pluck('business_id')
+            )
+            ->unique();
+
+        $workflow = AutomationWorkflow::whereIn('business_id', $businessIds)
+            ->findOrFail($id);
+
+        $workflow->update([
+            'name' => $request->name ?? $workflow->name,
+            'description' => $request->description ?? $workflow->description,
+            'trigger_config' => $request->trigger ?? $workflow->trigger_config,
+            'conditions' => $request->conditions ?? $workflow->conditions,
+            'actions_config' => $request->actions ?? $workflow->actions_config,
+        ]);
+
+        return response()->json([
+            'id' => $workflow->id,
+            'name' => $workflow->name,
+            'description' => $workflow->description,
+            'is_active' => $workflow->active,
+            'trigger' => $workflow->trigger_config,
+            'conditions' => $workflow->conditions,
+            'actions' => $workflow->actions_config,
+            'execution_count' => $workflow->executions_count,
+            'last_executed_at' => $workflow->last_executed_at?->toISOString(),
+            'created_at' => $workflow->created_at->toISOString(),
+        ]);
+    }
+
+    /**
+     * Delete a workflow
+     */
+    public function destroy(Request $request, $id)
+    {
+        $user = Auth::user();
+
+        $businessIds = BusinessProfile::where('user_id', $user->id)
+            ->pluck('id')
+            ->merge(
+                \App\Models\TeamMember::where('user_id', $user->id)
+                    ->where('is_active', true)
+                    ->pluck('business_id')
+            )
+            ->unique();
+
+        $workflow = AutomationWorkflow::whereIn('business_id', $businessIds)
+            ->findOrFail($id);
+
+        $workflow->delete();
+
+        return response()->json(['success' => true]);
+    }
+
+    /**
+     * Toggle workflow active status
+     */
+    public function toggle(Request $request, $id)
+    {
+        $user = Auth::user();
+
+        $businessIds = BusinessProfile::where('user_id', $user->id)
+            ->pluck('id')
+            ->merge(
+                \App\Models\TeamMember::where('user_id', $user->id)
+                    ->where('is_active', true)
+                    ->pluck('business_id')
+            )
+            ->unique();
+
+        $workflow = AutomationWorkflow::whereIn('business_id', $businessIds)
+            ->findOrFail($id);
+
+        $workflow->update(['active' => !$workflow->active]);
+
+        return response()->json([
+            'id' => $workflow->id,
+            'is_active' => $workflow->active,
+        ]);
+    }
+
+    /**
+     * Duplicate a workflow
+     */
+    public function duplicate(Request $request, $id)
+    {
+        $user = Auth::user();
+
+        $businessIds = BusinessProfile::where('user_id', $user->id)
+            ->pluck('id')
+            ->merge(
+                \App\Models\TeamMember::where('user_id', $user->id)
+                    ->where('is_active', true)
+                    ->pluck('business_id')
+            )
+            ->unique();
+
+        $original = AutomationWorkflow::whereIn('business_id', $businessIds)
+            ->findOrFail($id);
+
+        $duplicate = $original->replicate();
+        $duplicate->name = $original->name . ' (Copy)';
+        $duplicate->executions_count = 0;
+        $duplicate->last_executed_at = null;
+        $duplicate->save();
+
+        return response()->json([
+            'id' => $duplicate->id,
+            'name' => $duplicate->name,
+            'description' => $duplicate->description,
+            'is_active' => $duplicate->active,
+            'trigger' => $duplicate->trigger_config,
+            'conditions' => $duplicate->conditions,
+            'actions' => $duplicate->actions_config,
+            'execution_count' => $duplicate->executions_count,
+            'last_executed_at' => $duplicate->last_executed_at?->toISOString(),
+            'created_at' => $duplicate->created_at->toISOString(),
+        ], 201);
+    }
+
+    /**
+     * Test a workflow against a conversation
+     */
+    public function test(Request $request, $id)
+    {
+        $request->validate([
+            'conversation_id' => 'required|integer',
+        ]);
+
+        $user = Auth::user();
+
+        $businessIds = BusinessProfile::where('user_id', $user->id)
+            ->pluck('id')
+            ->merge(
+                \App\Models\TeamMember::where('user_id', $user->id)
+                    ->where('is_active', true)
+                    ->pluck('business_id')
+            )
+            ->unique();
+
+        $workflow = AutomationWorkflow::whereIn('business_id', $businessIds)
+            ->findOrFail($id);
+
+        $conversation = Conversation::whereIn('business_id', $businessIds)
+            ->findOrFail($request->conversation_id);
+
+        $automationEngine = app(AutomationEngine::class);
+        $results = $automationEngine->executeWorkflow($workflow, $conversation, testMode: true);
+
+        return response()->json($results);
+    }
+
+    /**
+     * Get workflow execution history
+     */
+    public function executions(Request $request, $id)
+    {
+        $user = Auth::user();
+
+        $businessIds = BusinessProfile::where('user_id', $user->id)
+            ->pluck('id')
+            ->merge(
+                \App\Models\TeamMember::where('user_id', $user->id)
+                    ->where('is_active', true)
+                    ->pluck('business_id')
+            )
+            ->unique();
+
+        $workflow = AutomationWorkflow::whereIn('business_id', $businessIds)
+            ->findOrFail($id);
+
+        $executions = WorkflowExecution::where('workflow_id', $workflow->id)
+            ->orderBy('created_at', 'desc')
+            ->paginate(50);
+
+        return response()->json([
+            'data' => $executions->map(function ($execution) {
+                return [
+                    'id' => $execution->id,
+                    'workflow_id' => $execution->workflow_id,
+                    'status' => $execution->status,
+                    'trigger_data' => $execution->trigger_data,
+                    'results' => $execution->results,
+                    'error_message' => $execution->error_message,
+                    'test_mode' => $execution->test_mode,
+                    'started_at' => $execution->started_at?->toISOString(),
+                    'completed_at' => $execution->completed_at?->toISOString(),
+                    'created_at' => $execution->created_at->toISOString(),
+                ];
+            }),
+            'meta' => [
+                'total' => $executions->total(),
+                'per_page' => $executions->perPage(),
+                'current_page' => $executions->currentPage(),
+                'last_page' => $executions->lastPage(),
+            ],
+        ]);
+    }
+
+    /**
+     * Get workflow stats
+     */
+    public function getStats(Request $request, $id)
+    {
+        $user = Auth::user();
+
+        $businessIds = BusinessProfile::where('user_id', $user->id)
+            ->pluck('id')
+            ->merge(
+                \App\Models\TeamMember::where('user_id', $user->id)
+                    ->where('is_active', true)
+                    ->pluck('business_id')
+            )
+            ->unique();
+
+        $workflow = AutomationWorkflow::whereIn('business_id', $businessIds)
+            ->findOrFail($id);
+
+        $stats = [
+            'total_executions' => $workflow->executions_count,
+            'last_executed_at' => $workflow->last_executed_at?->toISOString(),
+            'successful_executions' => WorkflowExecution::where('workflow_id', $workflow->id)
+                ->where('status', 'completed')
+                ->count(),
+            'failed_executions' => WorkflowExecution::where('workflow_id', $workflow->id)
+                ->where('status', 'failed')
+                ->count(),
+            'test_executions' => WorkflowExecution::where('workflow_id', $workflow->id)
+                ->where('test_mode', true)
+                ->count(),
+        ];
+
+        return response()->json($stats);
+    }
+
+    /**
+     * Get workflow templates
+     */
+    public function getTemplates(Request $request)
+    {
+        $templates = [
+            [
+                'id' => 'template-welcome',
+                'name' => 'Welcome New Customers',
+                'description' => 'Automatically welcome new customers and add a tag',
+                'trigger' => [
+                    'type' => 'first_contact',
+                    'conditions' => [],
+                ],
+                'actions' => [
+                    [
+                        'type' => 'send_message',
+                        'message' => 'Welcome! How can we help you today?',
+                    ],
+                    [
+                        'type' => 'add_tag',
+                        'tag' => 'new_customer',
+                    ],
+                ],
+            ],
+            [
+                'id' => 'template-price',
+                'name' => 'Price Inquiry Handler',
+                'description' => 'Detect price-related keywords and provide information',
+                'trigger' => [
+                    'type' => 'keyword',
+                    'conditions' => [
+                        'keywords' => ['price', 'cost', 'how much'],
+                        'match_type' => 'any',
+                    ],
+                ],
+                'actions' => [
+                    [
+                        'type' => 'add_tag',
+                        'tag' => 'price_inquiry',
+                    ],
+                    [
+                        'type' => 'send_message',
+                        'message' => 'I\'d be happy to help with pricing information. What product are you interested in?',
+                    ],
+                ],
+            ],
+            [
+                'id' => 'template-escalate',
+                'name' => 'Escalate Complex Issues',
+                'description' => 'Escalate conversations with specific keywords to human agents',
+                'trigger' => [
+                    'type' => 'keyword',
+                    'conditions' => [
+                        'keywords' => ['complaint', 'angry', 'refund'],
+                        'match_type' => 'any',
+                    ],
+                ],
+                'actions' => [
+                    [
+                        'type' => 'add_tag',
+                        'tag' => 'needs_attention',
+                    ],
+                    [
+                        'type' => 'escalate',
+                        'reason' => 'Customer expressed dissatisfaction',
+                    ],
+                ],
+            ],
+        ];
+
+        return response()->json($templates);
     }
 }

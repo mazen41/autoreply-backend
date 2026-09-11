@@ -16,6 +16,11 @@ return new class extends Migration
         // The constraint name is: sequence_users_sequence_id_conversation_id_unique
         // It was created when the table was originally sequence_users
         
+        // Skip this on SQLite since information_schema.TABLE_CONSTRAINTS doesn't exist
+        if (DB::getDriverName() === 'sqlite') {
+            return;
+        }
+        
         if (Schema::hasTable('sequence_enrollments')) {
             // Get the actual constraint name
             $constraintName = DB::select("

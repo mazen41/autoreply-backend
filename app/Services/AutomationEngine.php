@@ -341,7 +341,8 @@ class AutomationEngine
         $tag = ConversationTag::firstOrCreate([
             'conversation_id' => $conversation->id,
             'tag' => $action['tag'],
-            'source' => 'automation'
+        ], [
+            'source' => 'manual',
         ]);
 
         return [

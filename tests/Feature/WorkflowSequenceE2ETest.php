@@ -132,14 +132,14 @@ class WorkflowSequenceE2ETest extends TestCase
 
         // Verify workflow executed
         $this->assertTrue($results['triggered']);
-        $this->assertCount(3, $results['actions_executed']);
+        $this->assertCount(3, $results['actions_executed'], json_encode($results));
 
         // Verify workflow execution record created
         $this->assertDatabaseHas('workflow_executions', [
             'workflow_id' => $workflow->id,
             'conversation_id' => $conversation->id,
             'status' => 'completed',
-        ]);
+        ], json_encode($results));
 
         // Verify tag was added
         $this->assertDatabaseHas('conversation_tags', [

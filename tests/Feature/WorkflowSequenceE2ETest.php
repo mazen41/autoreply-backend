@@ -171,10 +171,11 @@ class WorkflowSequenceE2ETest extends TestCase
         $this->assertEquals(1, $enrollment->current_step);
 
         // Verify sequence step execution record exists
+        $firstStep = $sequence->steps()->where('step_order', 1)->first();
         $this->assertDatabaseHas('sequence_step_executions', [
             'sequence_id' => $sequence->id,
-            'enrollment_id' => $enrollment->id,
-            'step_order' => 1,
+            'sequence_enrollment_id' => $enrollment->id,
+            'sequence_step_id' => $firstStep->id,
         ]);
 
         // Verify workflow execution count incremented

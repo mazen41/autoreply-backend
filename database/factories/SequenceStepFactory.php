@@ -17,10 +17,10 @@ class SequenceStepFactory extends Factory
             'step_order' => fake()->numberBetween(1, 10),
             'step_type' => fake()->randomElement(['message', 'delay', 'condition', 'action']),
             'message' => fake()->optional()->sentence(),
-            'config' => fake()->optional()->json(),
+            'config' => fake()->boolean() ? json_encode(['key' => fake()->word()]) : null,
             'delay_hours' => fake()->numberBetween(0, 48),
             'delay_unit' => fake()->randomElement(['minutes', 'hours', 'days']),
-            'condition_config' => fake()->optional()->json(),
+            'condition_config' => fake()->boolean() ? json_encode(['key' => fake()->word()]) : null,
             'is_active' => true,
         ];
     }

@@ -21,6 +21,8 @@ class SequenceEnrollment extends Model
         'started_at',
         'completed_at',
         'stopped_at',
+        'stop_reason',
+        'failed_reason',
         'next_execution_at',
         'metadata',
     ];

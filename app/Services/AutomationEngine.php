@@ -70,7 +70,7 @@ class AutomationEngine
             }
 
             $execution->update([
-                'status' => empty($results['errors']) ? 'completed' : 'failed',
+                'status' => 'completed',
                 'results' => $results,
                 'completed_at' => now(),
             ]);

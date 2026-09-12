@@ -22,7 +22,7 @@ class SequenceEnrollmentFactory extends Factory
             'completed_at' => fake()->optional()->dateTimeThisMonth(),
             'stopped_at' => fake()->optional()->dateTimeThisMonth(),
             'next_execution_at' => fake()->optional()->dateTimeThisMonth(),
-            'metadata' => fake()->optional()->json(),
+            'metadata' => fake()->boolean(50) ? ['source' => fake()->word()] : null,
         ];
     }
 }

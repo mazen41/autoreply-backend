@@ -118,18 +118,18 @@ class TrainingStatsService
             'total_conversations'      => $totalConversations,
             'conversations_with_ai_reply' => $withAiReply,
             'auto_reply_rate'          => $totalConversations > 0
-                ? round(($withAiReply / $totalConversations) * 100, 1)
+                ? (float) round(($withAiReply / $totalConversations) * 100, 1)
                 : null,
 
             // Confidence (0–100; null when there are no AI messages with confidence)
-            'avg_confidence'   => $conf->avg_conf !== null ? round(((float) $conf->avg_conf) * 100, 1) : null,
+            'avg_confidence'   => $conf->avg_conf !== null ? (float) round(((float) $conf->avg_conf) * 100, 1) : null,
             'confidence_count' => (int) $conf->with_conf,
             'confidence_total' => $totalAiMessages,
 
             // Escalation
             'escalated_conversations' => $escalatedInRange,
             'escalation_rate'         => $totalConversations > 0
-                ? round(($escalatedInRange / $totalConversations) * 100, 1)
+                ? (float) round(($escalatedInRange / $totalConversations) * 100, 1)
                 : null,
             'escalations_today'   => $escalatedToday,
             'escalations_this_week' => $escalatedWeek,
@@ -310,8 +310,8 @@ class TrainingStatsService
             'total'    => $total,
             'positive' => $positive,
             'negative' => $negative,
-            'rate'     => $aiMessages > 0 ? round(($total / $aiMessages) * 100, 1) : null,
-            'satisfaction' => $total > 0 ? round(($positive / $total) * 100, 1) : null,
+            'rate'     => $aiMessages > 0 ? (float) round(($total / $aiMessages) * 100, 1) : null,
+            'satisfaction' => $total > 0 ? (float) round(($positive / $total) * 100, 1) : null,
             'issue_breakdown' => $issueBreakdown,
         ];
     }

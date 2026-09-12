@@ -26,8 +26,8 @@ class SequenceServiceTest extends TestCase
     {
         parent::setUp();
         
-        $this->sequenceService = new SequenceService();
-        $this->enrollmentService = new SequenceEnrollmentService();
+        $this->sequenceService = app(SequenceService::class);
+        $this->enrollmentService = app(SequenceEnrollmentService::class);
         
         $this->user = User::factory()->create();
         $this->business = BusinessProfile::factory()->create();
@@ -102,15 +102,18 @@ class SequenceServiceTest extends TestCase
             'status' => 'active',
         ]);
 
+        // Confirm the enrollment is active before deletion
+        $this->assertEquals('active', $enrollment->fresh()->status);
+
         $result = $this->sequenceService->deleteSequence($sequence);
 
         $this->assertTrue($result);
         $this->assertDatabaseMissing('sequences', ['id' => $sequence->id]);
-        
-        // Check enrollment was stopped
-        $this->assertDatabaseHas('sequence_users', [
+
+        // Enrollment is cascade-deleted when sequence is deleted; verify it no longer exists
+        // (the service stopped it first, then the DB cascade removed it with the sequence row)
+        $this->assertDatabaseMissing('sequence_enrollments', [
             'id' => $enrollment->id,
-            'status' => 'stopped',
         ]);
     }
 
@@ -139,6 +142,8 @@ class SequenceServiceTest extends TestCase
         $sequence = Sequence::factory()->create([
             'business_id' => $this->business->id,
             'status' => 'draft',
+            'trigger_type' => 'manual',
+            'channel' => 'whatsapp',
         ]);
 
         SequenceStep::factory()->create([

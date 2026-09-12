@@ -12,15 +12,19 @@ class SequenceStepFactory extends Factory
 
     public function definition(): array
     {
+        static $stepOrders = [];
+
+        $sequenceId = null; // will be resolved after creation
+
         return [
             'sequence_id' => Sequence::factory(),
-            'step_order' => fake()->numberBetween(1, 10),
-            'step_type' => fake()->randomElement(['message', 'delay', 'condition', 'action']),
-            'message' => fake()->optional()->sentence(),
-            'config' => fake()->boolean() ? json_encode(['key' => fake()->word()]) : null,
+            'step_order' => 1,
+            'step_type' => 'message',
+            'message' => fake()->sentence(),
+            'config' => null,
             'delay_hours' => fake()->numberBetween(0, 48),
             'delay_unit' => fake()->randomElement(['minutes', 'hours', 'days']),
-            'condition_config' => fake()->boolean() ? json_encode(['key' => fake()->word()]) : null,
+            'condition_config' => null,
             'is_active' => true,
         ];
     }

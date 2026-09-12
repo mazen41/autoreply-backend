@@ -14,6 +14,7 @@ class BusinessProfileFactory extends Factory
     {
         return [
             'user_id' => User::factory(),
+            'name' => fake()->company(),
             'business_name' => fake()->company(),
             'business_type' => fake()->randomElement(['retail', 'service', 'restaurant', 'other']),
             'phone' => fake()->phoneNumber(),

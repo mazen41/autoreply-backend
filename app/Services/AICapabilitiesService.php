@@ -1052,7 +1052,56 @@ JSON;
 
         $confidence = ($intentConfidence * 0.5) + ($evaluationConfidence * 0.3) + ($contextScore * 0.2);
 
-        return max(0, min(100, $confidence * 100));
+        return (float) round(max(0, min(100, $confidence * 100)));
+    }
+
+    public static function evaluateResponse(string $question, string $response): array
+    {
+        $issues = [];
+        $confidence = 0.8;
+
+        if (empty(trim($response))) {
+            $confidence = 0.0;
+            $issues[] = 'empty_response';
+        } elseif (strlen($response) < 5) {
+            $confidence = 0.4;
+            $issues[] = 'too_short';
+        }
+
+        $lowerResponse = mb_strtolower($response);
+        $uncertainPhrases = ['i think', 'maybe', 'possibly', 'might be'];
+        foreach ($uncertainPhrases as $phrase) {
+            if (str_contains($lowerResponse, $phrase)) {
+                $confidence -= 0.1;
+                $issues[] = 'uncertain_language';
+                break;
+            }
+        }
+
+        return [
+            'confidence' => max(0.0, min(1.0, $confidence)),
+            'issues' => $issues,
+        ];
+    }
+
+    public static function calculateContextScore(array $context): float
+    {
+        $score = 0.0;
+
+        if (!empty($context['has_store_data'])) {
+            $score += 0.3;
+        }
+        if (!empty($context['has_product_info'])) {
+            $score += 0.3;
+        }
+        if (!empty($context['has_order_data'])) {
+            $score += 0.3;
+        }
+        if (!empty($context['has_knowledge_base'])) {
+            $score += 0.1;
+        }
+
+        return min(1.0, $score);
     }
 
     public static function detectIntent(string $message): array

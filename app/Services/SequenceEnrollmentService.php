@@ -16,6 +16,11 @@ class SequenceEnrollmentService
 {
     public function enrollConversation(Sequence $sequence, Conversation $conversation, int $startStep = 1, array $extraMetadata = []): SequenceEnrollment
     {
+        // Enforce business isolation: conversation must belong to the same business as the sequence
+        if ($conversation->business_id !== $sequence->business_id) {
+            throw new \Exception('Conversation does not belong to the same business as the sequence');
+        }
+
         // Check for duplicate active enrollment
         $existingEnrollment = SequenceEnrollment::forSequence($sequence->id)
             ->forConversation($conversation->id)
@@ -303,14 +308,12 @@ class SequenceEnrollmentService
 
     public function getEnrollmentStatsForSequence(Sequence $sequence): array
     {
-        $enrollments = $sequence->enrollments();
-
         return [
-            'total' => $enrollments->count(),
-            'active' => $enrollments->active()->count(),
-            'completed' => $enrollments->completed()->count(),
-            'stopped' => $enrollments->stopped()->count(),
-            'failed' => $enrollments->failed()->count(),
+            'total'     => $sequence->enrollments()->count(),
+            'active'    => $sequence->enrollments()->active()->count(),
+            'completed' => $sequence->enrollments()->completed()->count(),
+            'stopped'   => $sequence->enrollments()->stopped()->count(),
+            'failed'    => $sequence->enrollments()->failed()->count(),
         ];
     }
 }

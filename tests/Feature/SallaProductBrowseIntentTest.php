@@ -226,6 +226,14 @@ class SallaProductBrowseIntentTest extends TestCase
             'api.salla.dev/admin/v2/products*'                    => Http::response($this->fakeSallaProducts(), 200),
         ]);
         (new ProcessAutoReply($fixture['message']->id))->handle();
+
+        // An AI reply must have been persisted (system must not crash on this input).
+        $reply = Message::where('conversation_id', $fixture['conversation']->id)
+            ->where('direction', 'outbound')->where('is_ai', true)->latest('id')->first();
+        $this->assertNotNull($reply, 'An AI reply must be persisted for the Arabic product browse phrase');
+
+        // The reply content must be a non-empty string.
+        $this->assertNotEmpty($reply->content, 'Reply content must not be empty');
     }
 
     /**

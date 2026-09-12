@@ -11,6 +11,7 @@ use App\Models\User;
 use App\Services\SequenceEnrollmentService;
 use App\Services\SequenceService;
 use Illuminate\Foundation\Testing\RefreshDatabase;
+use Illuminate\Support\Facades\Queue;
 use Tests\TestCase;
 
 class SequenceEnrollmentServiceTest extends TestCase
@@ -26,8 +27,8 @@ class SequenceEnrollmentServiceTest extends TestCase
     {
         parent::setUp();
         
-        $this->enrollmentService = new SequenceEnrollmentService();
-        $this->sequenceService = new SequenceService();
+        $this->enrollmentService = app(SequenceEnrollmentService::class);
+        $this->sequenceService = app(SequenceService::class);
         
         $this->user = User::factory()->create();
         $this->business = BusinessProfile::factory()->create();
@@ -37,6 +38,8 @@ class SequenceEnrollmentServiceTest extends TestCase
 
     public function test_enroll_conversation()
     {
+        Queue::fake();
+
         $sequence = Sequence::factory()->create([
             'business_id' => $this->business->id,
             'status' => 'active',
@@ -61,6 +64,8 @@ class SequenceEnrollmentServiceTest extends TestCase
 
     public function test_prevent_duplicate_enrollment()
     {
+        Queue::fake();
+
         $sequence = Sequence::factory()->create([
             'business_id' => $this->business->id,
             'status' => 'active',

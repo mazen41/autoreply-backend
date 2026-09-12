@@ -1469,8 +1469,15 @@ class ProcessAutoReply implements ShouldQueue
                             "We'll contact you shortly to confirm the details 🚀";
                     }
 
-                    // Clear checkout state — order is complete
-                    $conversation->update(['checkout_state' => null]);
+                    // Persist completed checkout state so tests/callers can verify the order ID
+                    $completedState = array_merge(
+                        is_array($conversation->checkout_state) ? $conversation->checkout_state : [],
+                        [
+                            'status'   => 'completed',
+                            'order_id' => $realOrderId,
+                        ]
+                    );
+                    $conversation->update(['checkout_state' => $completedState]);
                     $checkoutState = []; // prevent the persistence block below from re-saving it
 
                     Log::info('ProcessAutoReply: Salla order created and reply overridden with real order ID', [

@@ -22,9 +22,9 @@ class SallaService
     {
         // Salla REST API base — all merchant/store endpoints live here
         $this->apiBaseUrl = 'https://api.salla.dev/admin/v2';
-        $this->clientId = env('SALLA_CLIENT_ID', '');
-        $this->clientSecret = env('SALLA_CLIENT_SECRET', '');
-        $this->redirectUri = env('SALLA_REDIRECT_URI', env('APP_URL') . '/api/channels/callback/salla');
+        $this->clientId = config('services.salla.client_id', env('SALLA_CLIENT_ID', ''));
+        $this->clientSecret = config('services.salla.client_secret', env('SALLA_CLIENT_SECRET', ''));
+        $this->redirectUri = config('services.salla.redirect_uri', env('SALLA_REDIRECT_URI', env('APP_URL') . '/api/channels/callback/salla'));
 
         if (empty($this->clientId) || empty($this->clientSecret)) {
             Log::error('Salla credentials not configured', [
@@ -44,15 +44,18 @@ class SallaService
             throw new \Exception('Salla credentials are not configured');
         }
 
+        $clientId    = config('services.salla.client_id', $this->clientId);
+        $redirectUri = config('services.salla.redirect_uri', $this->redirectUri);
+
         $params = [
-            'client_id'     => $this->clientId,
-            'redirect_uri'  => $this->redirectUri,
+            'client_id'     => $clientId,
+            'redirect_uri'  => $redirectUri,
             'response_type' => 'code',
             'scope'         => 'offline_access settings.read orders.read orders.create customers.read customers.write products.read',
             'state'         => $state,
         ];
 
-        return 'https://accounts.salla.sa/oauth2/auth?' . http_build_query($params);
+        return 'https://accounts.salla.sa/oauth2/authorize?' . http_build_query($params);
     }
 
     /**
@@ -883,7 +886,7 @@ class SallaService
             Log::warning('Webhook signature is empty');
             return false;
         }
-        $webhookSecret = env('SALLA_WEBHOOK_SECRET');
+        $webhookSecret = config('services.salla.webhook_secret', env('SALLA_WEBHOOK_SECRET'));
         if (empty($webhookSecret)) {
             Log::error('SALLA_WEBHOOK_SECRET not configured');
             return false;

@@ -41,7 +41,7 @@ class TrainingStatsEndpointTest extends TestCase
     {
         $attrs = array_merge([
             'channel_id' => $channel->id,
-            'sender_id' => 'buyer-1',
+            'sender_id' => 'buyer-' . uniqid(),
             'sender_name' => 'Buyer',
             'status' => 'open',
             'ai_enabled' => true,

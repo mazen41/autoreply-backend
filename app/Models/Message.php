@@ -38,6 +38,8 @@ class Message extends Model
         'last_retry_at',
         'delivery_status',
         'error_details',
+        'created_at',
+        'updated_at',
     ];
 
     protected $casts = [

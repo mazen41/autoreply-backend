@@ -223,6 +223,7 @@ class WorkflowTest extends TestCase
         $workflow = AutomationWorkflow::factory()->create([
             'user_id' => $this->user->id,
             'business_id' => $this->business->id,
+            'executions_count' => 0,
             'trigger_config' => [
                 'type' => 'keyword',
                 'conditions' => [

@@ -33,7 +33,7 @@ class AutomationWorkflowFactory extends Factory
                     'tag' => fake()->word(),
                 ],
             ],
-            'executions_count' => fake()->numberBetween(0, 100),
+            'executions_count' => 0,
             'last_executed_at' => fake()->optional()->dateTime(),
         ];
     }

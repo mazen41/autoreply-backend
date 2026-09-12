@@ -4,6 +4,7 @@ namespace Tests\Feature;
 
 use App\Models\AutomationWorkflow;
 use App\Models\WorkflowExecution;
+use App\Models\Channel;
 use App\Models\Conversation;
 use App\Models\Message;
 use App\Models\BusinessProfile;
@@ -23,6 +24,7 @@ class WorkflowSequenceE2ETest extends TestCase
 
     private User $user;
     private BusinessProfile $business;
+    private Channel $channel;
     private User $otherUser;
     private BusinessProfile $otherBusiness;
 
@@ -33,6 +35,11 @@ class WorkflowSequenceE2ETest extends TestCase
         $this->user = User::factory()->create();
         $this->business = BusinessProfile::factory()->create([
             'user_id' => $this->user->id,
+        ]);
+        $this->channel = Channel::factory()->create([
+            'business_id' => $this->business->id,
+            'type'        => 'whatsapp',
+            'status'      => 'connected',
         ]);
 
         $this->otherUser = User::factory()->create();
@@ -110,6 +117,7 @@ class WorkflowSequenceE2ETest extends TestCase
         // Create conversation with matching message
         $conversation = Conversation::factory()->create([
             'business_id' => $this->business->id,
+            'channel_id'  => $this->channel->id,
         ]);
 
         Message::factory()->create([
@@ -214,6 +222,7 @@ class WorkflowSequenceE2ETest extends TestCase
 
         $conversation = Conversation::factory()->create([
             'business_id' => $this->business->id,
+            'channel_id'  => $this->channel->id,
         ]);
 
         Message::factory()->create([
@@ -292,6 +301,7 @@ class WorkflowSequenceE2ETest extends TestCase
         // Create Business A conversation with trigger
         $conversationA = Conversation::factory()->create([
             'business_id' => $this->business->id,
+            'channel_id'  => $this->channel->id,
         ]);
 
         Message::factory()->create([
@@ -348,6 +358,7 @@ class WorkflowSequenceE2ETest extends TestCase
 
         $conversation = Conversation::factory()->create([
             'business_id' => $this->business->id,
+            'channel_id'  => $this->channel->id,
         ]);
 
         // First message should trigger
@@ -391,6 +402,7 @@ class WorkflowSequenceE2ETest extends TestCase
 
         $conversation = Conversation::factory()->create([
             'business_id' => $this->business->id,
+            'channel_id'  => $this->channel->id,
         ]);
 
         // Add the tag
@@ -423,6 +435,7 @@ class WorkflowSequenceE2ETest extends TestCase
 
         $conversation = Conversation::factory()->create([
             'business_id' => $this->business->id,
+            'channel_id'  => $this->channel->id,
         ]);
 
         // Enroll in sequence

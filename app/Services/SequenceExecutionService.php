@@ -120,7 +120,7 @@ class SequenceExecutionService
         // 2. Call provider (outside transaction)
         // 3. Update status based on provider result (outside transaction)
 
-        DB::transaction(function () use ($conversation, $step, $execution) {
+        DB::transaction(function () use ($conversation, $step, $execution, $channel) {
             // Create message record with pending status
             $messageRecord = Message::create([
                 'conversation_id' => $conversation->id,

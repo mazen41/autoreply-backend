@@ -139,7 +139,7 @@ class WorkflowSequenceE2ETest extends TestCase
             'workflow_id' => $workflow->id,
             'conversation_id' => $conversation->id,
             'status' => 'completed',
-        ], json_encode($results));
+        ]);
 
         // Verify tag was added
         $this->assertDatabaseHas('conversation_tags', [

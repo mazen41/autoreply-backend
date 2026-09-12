@@ -497,14 +497,35 @@ class AutomationEngine
         $sequenceTriggerService = app(SequenceTriggerService::class);
 
         try {
+            // Debug: log canEnroll result
+            $enrollmentService = app(SequenceEnrollmentService::class);
+            $canEnroll = $enrollmentService->canEnroll($sequence, $conversation);
+            Log::info('AutomationEngine: start_sequence canEnroll check', [
+                'sequence_id' => $sequence->id,
+                'sequence_status' => $sequence->status,
+                'steps_count' => $sequence->steps()->count(),
+                'conversation_id' => $conversation->id,
+                'can_enroll' => $canEnroll,
+                'business_match' => $sequence->business_id === $conversation->business_id,
+            ]);
+
             $enrollment = $sequenceTriggerService->enrollInSequence($sequence, $conversation, false);
+
+            Log::info('AutomationEngine: enrollment result', [
+                'enrollment' => $enrollment?->id,
+            ]);
 
             return [
                 'type' => 'start_sequence',
-                'success' => true,
-                'enrollment_id' => $enrollment?->id ?? null
+                'success' => $enrollment !== null,
+                'enrollment_id' => $enrollment?->id ?? null,
+                'error' => $enrollment === null ? 'canEnroll returned false' : null,
             ];
         } catch (\Exception $e) {
+            Log::error('AutomationEngine: start_sequence exception', [
+                'error' => $e->getMessage(),
+                'trace' => $e->getTraceAsString(),
+            ]);
             return [
                 'type' => 'start_sequence',
                 'success' => false,

@@ -91,13 +91,13 @@ class ExecuteSequenceStep implements ShouldQueue
 
         } catch (\Exception $e) {
             $execution->markAsFailed($e->getMessage());
-            $enrollment->fail($e->getMessage());
+            // Do NOT fail the enrollment here — let the job retry first.
+            // Enrollment is only failed in failed() after all retries exhausted.
             Log::error("Sequence step execution failed", [
                 'execution_id' => $execution->id,
                 'enrollment_id' => $enrollment->id,
                 'step_id' => $step->id,
                 'error' => $e->getMessage(),
-                'trace' => $e->getTraceAsString(),
             ]);
             throw $e;
         } finally {

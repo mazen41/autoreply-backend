@@ -82,7 +82,7 @@ class AutomationEngine
                 'results' => $results
             ]);
 
-        } catch (\Exception $e) {
+        } catch (\Throwable $e) {
             Log::error('Automation workflow execution failed', [
                 'workflow_id' => $workflow->id,
                 'conversation_id' => $conversation->id,
@@ -273,8 +273,13 @@ class AutomationEngine
                 default:
                     $result['error'] = "Unknown action type: {$actionType}";
             }
-        } catch (\Exception $e) {
+        } catch (\Throwable $e) {
             $result['error'] = $e->getMessage();
+            Log::error('AutomationEngine: action execution error', [
+                'action_type' => $actionType,
+                'error' => $e->getMessage(),
+                'trace' => $e->getTraceAsString(),
+            ]);
         }
 
         return $result;

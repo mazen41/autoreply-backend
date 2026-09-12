@@ -17,6 +17,7 @@ class SequenceStep extends Model
         'message',
         'config',
         'delay_hours',
+        'delay_minutes',
         'delay_unit',
         'condition_config',
         'is_active',

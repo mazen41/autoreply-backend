@@ -27,7 +27,7 @@ class SequenceEnrollmentService
         }
 
         try {
-            return DB::transaction(function () use ($sequence, $conversation, $startStep, $extraMetadata) {
+            $enrollment = DB::transaction(function () use ($sequence, $conversation, $startStep, $extraMetadata) {
                 $enrollment = SequenceEnrollment::create([
                     'sequence_id' => $sequence->id,
                     'conversation_id' => $conversation->id,
@@ -41,11 +41,16 @@ class SequenceEnrollmentService
                     ], $extraMetadata),
                 ]);
 
-                // Queue first step execution
-                $this->queueStepExecution($enrollment);
+                // Create step execution record only (no dispatch inside transaction)
+                $this->createStepExecutionRecord($enrollment);
 
                 return $enrollment;
             });
+
+            // Dispatch job OUTSIDE transaction so queue errors don't roll back enrollment
+            $this->dispatchStepExecution($enrollment);
+
+            return $enrollment;
         } catch (QueryException $e) {
             // DB-level unique constraint (seq_enroll_unique_active) caught a
             // genuine race that the app-level check above missed. Treat it the
@@ -65,7 +70,7 @@ class SequenceEnrollmentService
     public function enrollConversationWithoutDuplicateCheck(Sequence $sequence, Conversation $conversation, int $startStep = 1): SequenceEnrollment
     {
         try {
-            return DB::transaction(function () use ($sequence, $conversation, $startStep) {
+            $enrollment = DB::transaction(function () use ($sequence, $conversation, $startStep) {
                 $enrollment = SequenceEnrollment::create([
                     'sequence_id' => $sequence->id,
                     'conversation_id' => $conversation->id,
@@ -79,11 +84,16 @@ class SequenceEnrollmentService
                     ],
                 ]);
 
-                // Queue first step execution
-                $this->queueStepExecution($enrollment);
+                // Create step execution record only (no dispatch inside transaction)
+                $this->createStepExecutionRecord($enrollment);
 
                 return $enrollment;
             });
+
+            // Dispatch job OUTSIDE transaction so queue errors don't roll back enrollment
+            $this->dispatchStepExecution($enrollment);
+
+            return $enrollment;
         } catch (QueryException $e) {
             // This method skips the app-level check by design, but the DB
             // constraint still applies — surface it the same way rather than
@@ -202,24 +212,29 @@ class SequenceEnrollmentService
 
     public function queueStepExecution(SequenceEnrollment $enrollment): void
     {
+        $this->createStepExecutionRecord($enrollment);
+        $this->dispatchStepExecution($enrollment);
+    }
+
+    /**
+     * Create the step execution record (safe to call inside a DB transaction).
+     * Stores the execution ID on the enrollment for dispatchStepExecution to use.
+     */
+    public function createStepExecutionRecord(SequenceEnrollment $enrollment): void
+    {
         $currentStep = $enrollment->getCurrentStep();
 
         if (!$currentStep) {
-            // No current step, complete the enrollment
             $enrollment->complete();
             return;
         }
 
-        // Always execute immediately - delays are handled when moving to next step
-        $delayInSeconds = 0;
-
-        // Create step execution record
         $execution = SequenceStepExecution::create([
             'sequence_id' => $enrollment->sequence_id,
             'sequence_enrollment_id' => $enrollment->id,
             'sequence_step_id' => $currentStep->id,
             'status' => 'pending',
-            'scheduled_at' => now()->addSeconds($delayInSeconds),
+            'scheduled_at' => now(),
         ]);
 
         Log::info("QueueStepExecution: Created execution record", [
@@ -227,17 +242,37 @@ class SequenceEnrollmentService
             'enrollment_id' => $enrollment->id,
             'step_id' => $currentStep->id,
             'step_type' => $currentStep->step_type,
-            'scheduled_at' => $execution->scheduled_at,
         ]);
 
-        // Update enrollment next execution time
-        $enrollment->scheduleNextExecution($delayInSeconds);
+        $enrollment->scheduleNextExecution(0);
 
-        // Dispatch job for immediate execution
-        ExecuteSequenceStep::dispatch($execution->id);
-        
-        Log::info("QueueStepExecution: Dispatched immediate job", [
-            'execution_id' => $execution->id,
+        // Store on enrollment so dispatchStepExecution can find it without a query
+        $enrollment->_pendingExecutionId = $execution->id;
+    }
+
+    /**
+     * Dispatch the queued job — call this OUTSIDE any DB transaction.
+     */
+    public function dispatchStepExecution(SequenceEnrollment $enrollment): void
+    {
+        // Use stored ID if available, otherwise look up from DB
+        $executionId = $enrollment->_pendingExecutionId
+            ?? SequenceStepExecution::where('sequence_enrollment_id', $enrollment->id)
+                ->where('status', 'pending')
+                ->orderByDesc('id')
+                ->value('id');
+
+        if (!$executionId) {
+            Log::warning("dispatchStepExecution: no pending execution found", [
+                'enrollment_id' => $enrollment->id,
+            ]);
+            return;
+        }
+
+        ExecuteSequenceStep::dispatch($executionId);
+
+        Log::info("QueueStepExecution: Dispatched job", [
+            'execution_id' => $executionId,
         ]);
     }
 

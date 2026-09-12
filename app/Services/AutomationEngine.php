@@ -59,7 +59,7 @@ class AutomationEngine
                 $results['actions_executed'][] = $actionResult;
 
                 if (!$actionResult['success']) {
-                    $results['errors'][] = $actionResult['error'];
+                    $results['errors'][] = $actionResult['error'] ?? 'Unknown error';
                 }
             }
 

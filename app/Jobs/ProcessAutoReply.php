@@ -1017,8 +1017,12 @@ class ProcessAutoReply implements ShouldQueue
                 } elseif (is_array($business->faqs)) {
                     $faqItems = [];
                     foreach ($business->faqs as $faq) {
-                        if (is_array($faq) && isset($faq['question'], $faq['answer'])) {
-                            $faqItems[] = "Q: {$faq['question']}\nA: {$faq['answer']}";
+                        if (is_array($faq)) {
+                            $q = $faq['question'] ?? $faq['q'] ?? null;
+                            $a = $faq['answer'] ?? $faq['a'] ?? null;
+                            if ($q && $a) {
+                                $faqItems[] = "Q: {$q}\nA: {$a}";
+                            }
                         } elseif (is_string($faq)) {
                             $faqItems[] = $faq;
                         }

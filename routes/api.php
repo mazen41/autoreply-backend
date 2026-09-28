@@ -66,6 +66,8 @@ Route::prefix('auth')->group(function () {
     Route::post('/login',    [AuthController::class, 'login']);
     Route::post('/forgot-password', [AuthController::class, 'forgotPassword']);
     Route::post('/reset-password',  [AuthController::class, 'resetPassword']);
+    Route::post('/verify-email',       [AuthController::class, 'verifyEmail']);
+    Route::post('/resend-verification',[AuthController::class, 'resendVerification']);
     
     // Social login routes
     Route::get('/google/redirect',  [SocialAuthController::class, 'redirectToGoogle']);

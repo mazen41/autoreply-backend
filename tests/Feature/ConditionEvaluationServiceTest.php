@@ -182,10 +182,22 @@ class ConditionEvaluationServiceTest extends TestCase
     /** @test */
     public function it_evaluates_order_details_from_enrollment_metadata_isolated_from_later_orders()
     {
+        // Use a fresh conversation to avoid the unique (sequence_id, conversation_id) constraint
+        // that's already occupied by $this->enrollment created in setUp().
+        $isolatedConversation = Conversation::factory()->create([
+            'business_id' => $this->business->id,
+            'checkout_state' => [
+                'order_id' => '1001',
+                'status'   => 'shipped',
+                'total'    => 250.00,
+                'product_name' => 'Wireless Headphones',
+            ],
+        ]);
+
         // Enrollment triggered by Order #123 (SAR 650)
         $enrollmentOrder123 = SequenceEnrollment::factory()->create([
             'sequence_id' => $this->sequence->id,
-            'conversation_id' => $this->conversation->id,
+            'conversation_id' => $isolatedConversation->id,
             'status' => 'active',
             'current_step' => 1,
             'started_at' => now(),
@@ -201,7 +213,7 @@ class ConditionEvaluationServiceTest extends TestCase
         ]);
 
         // Customer places Order #124 (SAR 100) later, updating conversation checkout_state
-        $this->conversation->update([
+        $isolatedConversation->update([
             'checkout_state' => [
                 'id' => 'ORD-124',
                 'total' => 100.00,
@@ -261,9 +273,29 @@ class ConditionEvaluationServiceTest extends TestCase
     /** @test */
     public function it_executes_branching_routes_in_sequence_execution()
     {
+        // Use a fresh sequence so step_order values don't conflict with
+        // $this->step (step_order=1) created for $this->sequence in setUp().
+        $branchSequence = Sequence::factory()->create([
+            'business_id' => $this->business->id,
+            'status' => 'active',
+            'channel' => 'whatsapp',
+        ]);
+
+        $branchConversation = Conversation::factory()->create([
+            'business_id' => $this->business->id,
+        ]);
+
+        $branchEnrollment = SequenceEnrollment::factory()->create([
+            'sequence_id' => $branchSequence->id,
+            'conversation_id' => $branchConversation->id,
+            'status' => 'active',
+            'current_step' => 1,
+            'started_at' => now()->subMinutes(10),
+        ]);
+
         // Setup step 1: condition (VIP tag) -> if TRUE jump to step 3, if FALSE stop
         $step1 = SequenceStep::factory()->create([
-            'sequence_id' => $this->sequence->id,
+            'sequence_id' => $branchSequence->id,
             'step_order' => 1,
             'step_type' => 'condition',
             'condition_config' => [
@@ -277,35 +309,35 @@ class ConditionEvaluationServiceTest extends TestCase
         ]);
 
         $step2 = SequenceStep::factory()->create([
-            'sequence_id' => $this->sequence->id,
+            'sequence_id' => $branchSequence->id,
             'step_order' => 2,
             'step_type' => 'message',
             'message' => 'Regular customer message',
         ]);
 
         $step3 = SequenceStep::factory()->create([
-            'sequence_id' => $this->sequence->id,
+            'sequence_id' => $branchSequence->id,
             'step_order' => 3,
             'step_type' => 'message',
             'message' => 'VIP customer message',
         ]);
 
         ConversationTag::create([
-            'conversation_id' => $this->conversation->id,
+            'conversation_id' => $branchConversation->id,
             'tag' => 'VIP',
         ]);
 
         $execution = SequenceStepExecution::factory()->create([
-            'sequence_id' => $this->sequence->id,
-            'sequence_enrollment_id' => $this->enrollment->id,
+            'sequence_id' => $branchSequence->id,
+            'sequence_enrollment_id' => $branchEnrollment->id,
             'sequence_step_id' => $step1->id,
             'status' => 'pending',
         ]);
 
         $executionService = app(SequenceExecutionService::class);
-        $executionService->executeStep($execution, $this->enrollment, $step1);
+        $executionService->executeStep($execution, $branchEnrollment, $step1);
 
-        $this->enrollment->refresh();
-        $this->assertEquals(3, $this->enrollment->current_step);
+        $branchEnrollment->refresh();
+        $this->assertEquals(3, $branchEnrollment->current_step);
     }
 }

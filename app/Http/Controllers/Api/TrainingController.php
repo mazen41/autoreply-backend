@@ -243,6 +243,6 @@ class TrainingController extends Controller
 
         $stats = app(TrainingStatsService::class)->statistics($preset, $businessId);
 
-        return response()->json($stats);
+        return response()->json($stats, 200, [], JSON_PRESERVE_ZERO_FRACTION);
     }
 }

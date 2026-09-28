@@ -28,11 +28,90 @@ class AuthController extends Controller
 
         $token = $user->createToken('auth_token')->plainTextToken;
 
+        $this->sendVerificationOtp($user);
+
         return response()->json([
             'user'    => $user,
             'token'   => $token,
             'message' => 'تم إنشاء الحساب بنجاح',
         ], 201);
+    }
+
+    /**
+     * Generate a 6-digit OTP, store it (hashed) and email it to the user.
+     * Failure to send is logged but never blocks registration/resend.
+     */
+    private function sendVerificationOtp(User $user): void
+    {
+        $otp = sprintf('%06d', random_int(0, 999999));
+
+        \DB::table('email_verification_otps')->updateOrInsert(
+            ['email' => $user->email],
+            [
+                'otp'        => Hash::make($otp),
+                'created_at' => now(),
+            ]
+        );
+
+        try {
+            \Illuminate\Support\Facades\Mail::raw("Your Naz Biz verification code is: {$otp}\n\nThis code will expire in 30 minutes.", function ($message) use ($user) {
+                $message->to($user->email)->subject('Naz Biz - Verify your email');
+            });
+        } catch (\Exception $e) {
+            \Illuminate\Support\Facades\Log::error('Verification Email Error: ' . $e->getMessage());
+        }
+    }
+
+    public function verifyEmail(Request $request)
+    {
+        $request->validate([
+            'email' => 'required|email',
+            'otp'   => 'required|string|size:6',
+        ]);
+
+        $user = User::where('email', $request->email)->first();
+        if (!$user) {
+            return response()->json(['message' => 'User not found.'], 404);
+        }
+
+        if ($user->email_verified_at) {
+            return response()->json(['message' => 'Email already verified.']);
+        }
+
+        $record = \DB::table('email_verification_otps')->where('email', $request->email)->first();
+
+        if (!$record || !Hash::check($request->otp, $record->otp)) {
+            return response()->json(['message' => 'Invalid or expired verification code.'], 422);
+        }
+
+        if (\Carbon\Carbon::parse($record->created_at)->addMinutes(30)->isPast()) {
+            \DB::table('email_verification_otps')->where('email', $request->email)->delete();
+            return response()->json(['message' => 'Verification code has expired. Please request a new one.'], 422);
+        }
+
+        $user->update(['email_verified_at' => now()]);
+        \DB::table('email_verification_otps')->where('email', $request->email)->delete();
+
+        return response()->json(['message' => 'Email verified successfully.']);
+    }
+
+    public function resendVerification(Request $request)
+    {
+        $request->validate(['email' => 'required|email']);
+
+        $user = User::where('email', $request->email)->first();
+        if (!$user) {
+            // Same generic message either way — don't leak account existence
+            return response()->json(['message' => 'If your account exists, a new verification code has been sent.']);
+        }
+
+        if ($user->email_verified_at) {
+            return response()->json(['message' => 'Email already verified.']);
+        }
+
+        $this->sendVerificationOtp($user);
+
+        return response()->json(['message' => 'If your account exists, a new verification code has been sent.']);
     }
 
     public function login(Request $request)

@@ -39,12 +39,12 @@ class CheckoutOrderFlowTest extends TestCase
 
         $channel = Channel::factory()->create([
             'user_id' => $user->id,
+            'business_id' => $business->id,
             'type' => 'salla',
             'status' => 'connected',
             'access_token' => 'test_token',
+            'ai_enabled' => true,
         ]);
-        $channel->business_id = $business->id;
-        $channel->save();
 
         $conversation = Conversation::factory()->create([
             'channel_id' => $channel->id,

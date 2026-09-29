@@ -989,13 +989,25 @@ class ProcessAutoReply implements ShouldQueue
                         $bot = $activeBots->first();
                         $botResolutionSource = 'channel_assignment';
                     } elseif ($activeBots->count() > 1) {
-                        Log::warning('ProcessAutoReply: ambiguous Bot selection — multiple active bots assigned to channel', [
-                            'channel_id' => $channel->id,
-                            'business_id' => $business->id,
-                            'bot_ids' => $activeBots->pluck('id')->toArray(),
-                        ]);
-                        $botResolutionSource = 'ambiguous_multiple';
-                        $bot = null;
+                        // Check if one of the assigned bots is marked as primary for this channel
+                        $primaryBot = $activeBots->first(function ($b) {
+                            return (bool)($b->pivot->is_primary ?? false);
+                        });
+
+                        if ($primaryBot) {
+                            $bot = $primaryBot;
+                            $botResolutionSource = 'channel_primary_bot';
+                        } else {
+                            // Fallback to first created active bot as primary default
+                            $bot = $activeBots->first();
+                            $botResolutionSource = 'channel_default_first_active';
+                            Log::warning('ProcessAutoReply: multiple bots assigned to channel without explicit primary, selected first active', [
+                                'channel_id' => $channel->id,
+                                'business_id' => $business->id,
+                                'selected_bot_id' => $bot->id,
+                                'all_bot_ids' => $activeBots->pluck('id')->toArray(),
+                            ]);
+                        }
                     } else {
                         $botResolutionSource = 'no_bot_assigned';
                     }

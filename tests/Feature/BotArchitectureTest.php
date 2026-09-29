@@ -222,5 +222,52 @@ class BotArchitectureTest extends TestCase
         $this->assertCount(1, $results);
         $this->assertEquals($legacyFile->id, $results[0]->business_knowledge_file_id);
     }
+
+    public function test_multi_bot_primary_channel_resolution()
+    {
+        $user = User::factory()->create();
+        $business = BusinessProfile::create(['user_id' => $user->id, 'name' => 'Multi Bot Store']);
+
+        $channel = Channel::create([
+            'user_id' => $user->id,
+            'business_id' => $business->id,
+            'type' => 'facebook',
+            'page_id' => 'fb_page_multi',
+            'page_name' => 'Multi Bot Page',
+            'access_token' => 'token_multi',
+            'status' => 'connected',
+            'ai_enabled' => true,
+        ]);
+
+        $secondaryBot = Bot::create([
+            'business_profile_id' => $business->id,
+            'name' => 'Secondary Bot',
+            'status' => 'active',
+        ]);
+
+        $primaryBot = Bot::create([
+            'business_profile_id' => $business->id,
+            'name' => 'Primary Bot',
+            'status' => 'active',
+        ]);
+
+        // Attach both to channel, mark $primaryBot as primary
+        $secondaryBot->channels()->attach($channel->id, ['is_primary' => false]);
+        $primaryBot->channels()->attach($channel->id, ['is_primary' => true]);
+
+        $activeBots = $channel->bots()
+            ->where('status', 'active')
+            ->where('business_profile_id', $business->id)
+            ->get();
+
+        $this->assertCount(2, $activeBots);
+
+        $selectedPrimary = $activeBots->first(function ($b) {
+            return (bool)($b->pivot->is_primary ?? false);
+        });
+
+        $this->assertNotNull($selectedPrimary);
+        $this->assertEquals($primaryBot->id, $selectedPrimary->id);
+    }
 }
 

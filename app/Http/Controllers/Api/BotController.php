@@ -70,7 +70,13 @@ class BotController extends Controller
                 ->where('user_id', $request->user()->id)
                 ->pluck('id')
                 ->toArray();
-            $bot->channels()->sync($validChannelIds);
+
+            $primaryIds = $request->primary_channel_ids ?? [];
+            $syncData = [];
+            foreach ($validChannelIds as $chId) {
+                $syncData[$chId] = ['is_primary' => in_array($chId, $primaryIds)];
+            }
+            $bot->channels()->sync($syncData);
         }
 
         if (!empty($request->knowledge_assignments)) {
@@ -135,7 +141,13 @@ class BotController extends Controller
                 ->where('user_id', $request->user()->id)
                 ->pluck('id')
                 ->toArray();
-            $bot->channels()->sync($validChannelIds);
+
+            $primaryIds = $request->primary_channel_ids ?? [];
+            $syncData = [];
+            foreach ($validChannelIds as $chId) {
+                $syncData[$chId] = ['is_primary' => in_array($chId, $primaryIds)];
+            }
+            $bot->channels()->sync($syncData);
         }
 
         if ($request->has('knowledge_assignments')) {

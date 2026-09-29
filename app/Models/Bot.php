@@ -39,6 +39,7 @@ class Bot extends Model
     public function channels(): BelongsToMany
     {
         return $this->belongsToMany(Channel::class, 'bot_channels', 'bot_id', 'channel_id')
+            ->withPivot('is_primary')
             ->withTimestamps();
     }
 

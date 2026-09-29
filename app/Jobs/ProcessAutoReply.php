@@ -964,6 +964,7 @@ class ProcessAutoReply implements ShouldQueue
 
         // Step 3: Resolve Bot & Build AI Context
         $bot = null;
+        $botResolutionSource = 'none';
         if ($business) {
             try {
                 // 1. Check existing snapshot on conversation
@@ -972,6 +973,9 @@ class ProcessAutoReply implements ShouldQueue
                         ->where('business_profile_id', $business->id)
                         ->where('status', 'active')
                         ->first();
+                    if ($bot) {
+                        $botResolutionSource = 'conversation_snapshot';
+                    }
                 }
 
                 // 2. Resolve from channel's assigned bots if not set on conversation
@@ -983,13 +987,17 @@ class ProcessAutoReply implements ShouldQueue
 
                     if ($activeBots->count() === 1) {
                         $bot = $activeBots->first();
+                        $botResolutionSource = 'channel_assignment';
                     } elseif ($activeBots->count() > 1) {
                         Log::warning('ProcessAutoReply: ambiguous Bot selection — multiple active bots assigned to channel', [
                             'channel_id' => $channel->id,
                             'business_id' => $business->id,
                             'bot_ids' => $activeBots->pluck('id')->toArray(),
                         ]);
+                        $botResolutionSource = 'ambiguous_multiple';
                         $bot = null;
+                    } else {
+                        $botResolutionSource = 'no_bot_assigned';
                     }
                 }
 
@@ -1003,9 +1011,22 @@ class ProcessAutoReply implements ShouldQueue
                     'channel_id' => $channel->id ?? null,
                     'business_id' => $business->id,
                 ]);
+                $botResolutionSource = 'error_fallback';
                 $bot = null;
             }
         }
+
+        // Audit: Bot resolution result
+        Log::info('ProcessAutoReply: Bot resolution', [
+            'conversation_id' => $conversation->id,
+            'channel_id' => $channel->id ?? null,
+            'business_id' => $business->id ?? null,
+            'resolved_bot_id' => $bot?->id,
+            'resolved_bot_name' => $bot?->name,
+            'resolution_source' => $botResolutionSource,
+            'ai_provider' => !empty($bot?->ai_provider) ? $bot->ai_provider : ($business?->ai_provider ?? env('AI_PROVIDER', 'groq')),
+            'ai_model' => !empty($bot?->ai_model) ? $bot->ai_model : ($business?->ai_model ?? env('AI_MODEL')),
+        ]);
 
         // Pass raw order array directly — avoids the lossy string→array round-trip
         // that parseSallaContext() was doing, which silently dropped fields on

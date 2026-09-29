@@ -11,6 +11,7 @@ class Conversation extends Model
     protected $fillable = [
         'channel_id',
         'business_id',
+        'bot_id',
         'sender_id',
         'sender_name',
         'sender_email',
@@ -45,6 +46,11 @@ class Conversation extends Model
     public function business()
     {
         return $this->belongsTo(BusinessProfile::class, 'business_id');
+    }
+
+    public function bot()
+    {
+        return $this->belongsTo(Bot::class, 'bot_id');
     }
 
     public function messages()

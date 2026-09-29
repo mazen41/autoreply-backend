@@ -1039,29 +1039,18 @@ class EvolutionApiService
                 ]);
             }
 
-            // Defensive cleanup: mark every OTHER whatsapp channel for this
-            // business as disconnected. This covers the case where a merchant
-            // re-scans the QR code and a brand-new instance comes online before
-            // (or without) the old instance's own 'close' event ever arriving —
-            // which is exactly what happened in production (a new instance
-            // connected in the same second the old one closed). Without this,
-            // two Channel rows can both show status='connected' simultaneously,
-            // and any query without explicit ordering can pick the stale one.
-            if ($channel->business_id) {
-                $staleCount = Channel::where('business_id', $channel->business_id)
-                    ->where('type', 'whatsapp')
-                    ->where('id', '!=', $channel->id)
-                    ->where('status', 'connected')
-                    ->update(['status' => 'disconnected']);
-
-                if ($staleCount > 0) {
-                    Log::info("Disconnected stale duplicate WhatsApp channel(s) for business", [
-                        'business_id'    => $channel->business_id,
-                        'active_channel' => $channel->id,
-                        'stale_count'    => $staleCount,
-                    ]);
-                }
-            }
+            // Multi-account note: we intentionally do NOT disconnect other
+            // WhatsApp channels for the same business here.  Each WhatsApp
+            // instance is its own channel account and they can all be active
+            // concurrently.  The old "defensive cleanup" block that set every
+            // sibling channel to 'disconnected' was correct for single-account
+            // mode but breaks multi-account support.
+            //
+            // Stale-status cleanup (e.g. a QR re-scan where the 'close' event
+            // for the OLD instance never arrived) is now handled per-instance:
+            // the close/disconnected event for an instance always arrives as a
+            // separate webhook and updates THAT instance's channel via
+            // updateConnectionStatus(), which already keys on instance_name.
         } catch (\Exception $e) {
             Log::error("Failed to ensure WhatsApp channel: {$e->getMessage()}", [
                 'instance_id' => $instance->id,

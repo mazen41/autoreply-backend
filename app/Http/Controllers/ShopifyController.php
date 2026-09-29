@@ -164,13 +164,40 @@ class ShopifyController extends Controller
             return response()->json(['error' => 'Phone number is required'], 400);
         }
 
-        $channel = Channel::where('type', 'shopify')
-            ->where('user_id', auth()->id())
-            ->where('status', 'connected')
-            ->first();
+        // Exact resolution: if a specific channel_id is provided (e.g. the
+        // dashboard already knows which store the user is viewing), use it.
+        // Otherwise, only auto-resolve when the account has exactly ONE
+        // connected Shopify store — with multiple stores there is no
+        // "first" that's safe to guess; the caller must specify which one.
+        $channelId = $request->query('channel_id');
+        if ($channelId) {
+            $channel = Channel::where('type', 'shopify')
+                ->where('id', $channelId)
+                ->where('user_id', auth()->id())
+                ->where('status', 'connected')
+                ->first();
 
-        if (!$channel) {
-            return response()->json(['error' => 'Shopify channel not connected'], 404);
+            if (!$channel) {
+                return response()->json(['error' => 'Shopify channel not connected'], 404);
+            }
+        } else {
+            $candidates = Channel::where('type', 'shopify')
+                ->where('user_id', auth()->id())
+                ->where('status', 'connected')
+                ->get();
+
+            if ($candidates->count() === 0) {
+                return response()->json(['error' => 'Shopify channel not connected'], 404);
+            }
+
+            if ($candidates->count() > 1) {
+                return response()->json([
+                    'error' => 'Multiple Shopify stores are connected — specify channel_id',
+                    'channels' => $candidates->map(fn ($c) => ['id' => $c->id, 'name' => $c->page_name])->values(),
+                ], 409);
+            }
+
+            $channel = $candidates->first();
         }
 
         try {

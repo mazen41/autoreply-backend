@@ -107,8 +107,8 @@ class TikTokController extends Controller
             $userInfo = $userResponse->json();
             $tiktokUser = $userInfo['data']['user'] ?? [];
             $username = $tiktokUser['username'] ?? 'TikTok User';
-            $displayName = $tikTokUser['display_name'] ?? $username;
-            $openId = $tikTokUser['open_id'] ?? '';
+            $displayName = $tiktokUser['display_name'] ?? $username;
+            $openId = $tiktokUser['open_id'] ?? '';
 
             // Save channel
             $businessProfile = \App\Models\BusinessProfile::where('user_id', $userId)->first();
@@ -156,7 +156,73 @@ class TikTokController extends Controller
             $update = $request->all();
             Log::info('TikTok webhook received', $update);
 
-            // Handle comment events
+            // TikTok's actual public Webhooks API (developers.tiktok.com/doc/webhooks-events)
+            // only defines FOUR events, every one delivered in this envelope:
+            //   { client_key, event, create_time, user_openid, content }
+            // `user_openid` is always present at the top level (except for
+            // portability.download.ready) and is the verified, documented identifier
+            // for the connected account — it is exactly what `openId`/`page_id` is set
+            // to in connect()/callback() above, now that the $tikTokUser/$tiktokUser
+            // typo is fixed.
+            if (isset($update['user_openid']) && isset($update['event'])) {
+                $userOpenId = $update['user_openid'];
+                $eventName = $update['event'];
+                $content = json_decode($update['content'] ?? '{}', true) ?? [];
+
+                $channel = Channel::where('type', 'tiktok')
+                    ->where('page_id', $userOpenId)
+                    ->first();
+
+                if (!$channel) {
+                    Log::warning('TikTok webhook: no channel found for user_openid', ['user_openid' => $userOpenId]);
+                    return response('OK', 200);
+                }
+
+                if ($eventName === 'authorization.removed') {
+                    // Documented `content.reason`: 0 unknown, 1 user disconnect,
+                    // 2 account deleted, 3 age change, 4 banned, 5 developer revoke.
+                    $channel->update([
+                        'status' => 'disconnected',
+                        'metadata' => array_merge($channel->metadata ?? [], [
+                            'disconnected_reason' => $content['reason'] ?? null,
+                            'disconnected_at' => now()->toISOString(),
+                        ]),
+                    ]);
+                    Log::info('TikTok channel deauthorized', [
+                        'channel_id' => $channel->id,
+                        'reason' => $content['reason'] ?? null,
+                    ]);
+                } else {
+                    // video.upload.failed / video.publish.completed / portability.download.ready
+                    // are informational Video Kit events — no conversation/message is
+                    // implied by them. Logged for now; wire up handling here if/when the
+                    // product needs to react to them.
+                    Log::info('TikTok webhook event (no handler needed yet)', [
+                        'channel_id' => $channel->id,
+                        'event' => $eventName,
+                        'content' => $content,
+                    ]);
+                }
+
+                return response('OK', 200);
+            }
+
+            // -----------------------------------------------------------------
+            // UNVERIFIED LEGACY PATH — DO NOT EXTEND.
+            //
+            // The block below handles a `comment` payload shape that does not match
+            // TikTok's documented public Webhooks API in any way (see the block above
+            // for the real, documented envelope). TikTok's public API has no
+            // comment-created webhook event, so this code path has no known way to
+            // actually be triggered by TikTok in production. Per the audit
+            // instructions ("do not guess the account identifier... mark clearly
+            // instead of inventing behavior"), this is left in place unmodified
+            // rather than rewritten, since fixing its account-resolution logic would
+            // require guessing a payload shape TikTok does not document. If this
+            // needs to work, it requires product/vendor clarification: TikTok does
+            // not offer comment-reply automation via its public API — this would
+            // need a different provider or TikTok's (invite-only) Comment Kit.
+            // -----------------------------------------------------------------
             if (isset($update['comment'])) {
                 $comment = $update['comment'];
                 $text = $comment['text'] ?? '';

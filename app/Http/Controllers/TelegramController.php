@@ -38,22 +38,11 @@ class TelegramController extends Controller
             $botUsername = $botInfo['result']['username'] ?? null;
             $botName = $botInfo['result']['first_name'] ?? 'Telegram Bot';
 
-            // Set webhook for this bot with user_id in URL
-            $webhookUrl = env('APP_URL') . "/api/telegram/webhook/{$userId}";
-            $webhookResponse = Http::timeout(10)->post("https://api.telegram.org/bot{$botToken}/setWebhook", [
-                'url' => $webhookUrl,
-            ]);
-
-            if (!$webhookResponse->successful()) {
-                Log::error('Telegram webhook registration failed', [
-                    'user_id' => $userId,
-                    'bot_username' => $botUsername,
-                    'response' => $webhookResponse->json(),
-                ]);
-                return response()->json(['error' => 'Failed to register webhook'], 500);
-            }
-
-            // Save channel with encrypted token and metadata
+            // Save channel FIRST so we have its id, then register the webhook
+            // against a channel-specific URL. The old URL
+            // (/api/telegram/webhook/{userId} with no channel id) cannot tell
+            // two bots for the same user apart, so it must not be used for
+            // new connections.
             $businessProfile = \App\Models\BusinessProfile::where('user_id', $userId)->first();
 
             $channel = Channel::updateOrCreate(
@@ -76,6 +65,21 @@ class TelegramController extends Controller
                     ],
                 ]
             );
+
+            $webhookUrl = env('APP_URL') . "/api/telegram/webhook/{$userId}/{$channel->id}";
+            $webhookResponse = Http::timeout(10)->post("https://api.telegram.org/bot{$botToken}/setWebhook", [
+                'url' => $webhookUrl,
+            ]);
+
+            if (!$webhookResponse->successful()) {
+                Log::error('Telegram webhook registration failed', [
+                    'user_id' => $userId,
+                    'channel_id' => $channel->id,
+                    'bot_username' => $botUsername,
+                    'response' => $webhookResponse->json(),
+                ]);
+                return response()->json(['error' => 'Failed to register webhook'], 500);
+            }
 
             Log::info('Telegram channel connected', [
                 'user_id' => $userId,
@@ -104,11 +108,11 @@ class TelegramController extends Controller
         }
     }
 
-    public function webhook(Request $request, $userId)
+    public function webhook(Request $request, $userId, $channelId = null)
     {
         try {
             $update = $request->all();
-            Log::info('Telegram webhook received', ['user_id' => $userId]);
+            Log::info('Telegram webhook received', ['user_id' => $userId, 'channel_id' => $channelId]);
 
             if (!isset($update['message'])) {
                 return response('OK', 200);
@@ -120,15 +124,45 @@ class TelegramController extends Controller
             $from = $message['from'] ?? [];
             $messageId = $message['message_id'] ?? null;
 
-            // Find channel by user_id and type
-            $channel = Channel::where('type', 'telegram')
-                ->where('user_id', $userId)
-                ->where('status', 'connected')
-                ->first();
+            if ($channelId !== null) {
+                // Exact resolution — the webhook URL itself names the Channel.
+                $channel = Channel::where('id', $channelId)
+                    ->where('type', 'telegram')
+                    ->where('user_id', $userId)
+                    ->where('status', 'connected')
+                    ->first();
 
-            if (!$channel) {
-                Log::warning('Telegram webhook: no channel found for user', ['user_id' => $userId]);
-                return response('OK', 200);
+                if (!$channel) {
+                    Log::warning('Telegram webhook: channel id in URL not found/connected', [
+                        'user_id' => $userId,
+                        'channel_id' => $channelId,
+                    ]);
+                    return response('OK', 200);
+                }
+            } else {
+                // Legacy URL with no channel id (registered before this fix).
+                // Only safe to resolve when the user has exactly one connected
+                // Telegram bot — otherwise we cannot know which bot this
+                // update belongs to, and must not guess.
+                $candidates = Channel::where('type', 'telegram')
+                    ->where('user_id', $userId)
+                    ->where('status', 'connected')
+                    ->get();
+
+                if ($candidates->count() === 0) {
+                    Log::warning('Telegram webhook (legacy URL): no connected channel for user', ['user_id' => $userId]);
+                    return response('OK', 200);
+                }
+
+                if ($candidates->count() > 1) {
+                    Log::error('Telegram webhook (legacy URL): ambiguous — user has multiple connected Telegram bots and this webhook URL does not identify which one. Run php artisan telegram:resync-webhooks to fix.', [
+                        'user_id' => $userId,
+                        'candidate_channel_ids' => $candidates->pluck('id'),
+                    ]);
+                    return response('OK', 200);
+                }
+
+                $channel = $candidates->first();
             }
 
             // Build sender name
@@ -193,7 +227,7 @@ class TelegramController extends Controller
         }
 
         $botToken = decrypt($channel->access_token);
-        $webhookUrl = env('APP_URL') . "/api/telegram/webhook/{$channel->user_id}";
+        $webhookUrl = env('APP_URL') . "/api/telegram/webhook/{$channel->user_id}/{$channel->id}";
 
         try {
             $response = Http::timeout(10)->post("https://api.telegram.org/bot{$botToken}/setWebhook", [

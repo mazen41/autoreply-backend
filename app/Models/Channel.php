@@ -121,4 +121,10 @@ class Channel extends Model
     {
         return $this->hasManyThrough(Message::class, Conversation::class);
     }
+
+    public function bots()
+    {
+        return $this->belongsToMany(Bot::class, 'bot_channels', 'channel_id', 'bot_id')
+            ->withTimestamps();
+    }
 }

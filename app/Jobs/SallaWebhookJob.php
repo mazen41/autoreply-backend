@@ -39,19 +39,28 @@ class SallaWebhookJob implements ShouldQueue
             return;
         }
 
-        // Find the Salla channel by store ID
-        $storeId = $this->data['store_id'] ?? null;
-        if (!$storeId) {
-            Log::error('No store_id in webhook data');
+        // Find the Salla channel by merchant ID.
+        //
+        // NOTE: The OAuth callback (ChannelController::callbackSalla) stores the
+        // merchant/store identity in `channels.page_id` (keyed as [user_id, type, page_id]),
+        // the same way handleAppInstalled() below already resolves it. `channels.store_id`
+        // is a column that exists in the schema but is never written anywhere in this
+        // codebase, so querying by it can never match a real channel. Salla's webhook
+        // payload carries the merchant id in the top-level `merchant` field (merged into
+        // $this->data by SallaWebhookController), so we resolve against that + page_id,
+        // consistent with how the app.installed handler already does it.
+        $merchantId = $this->data['merchant'] ?? $this->data['store_id'] ?? null;
+        if (!$merchantId) {
+            Log::error('No merchant/store id in webhook data', ['data_keys' => array_keys($this->data)]);
             return;
         }
 
         $channel = Channel::where('type', 'salla')
-            ->where('store_id', $storeId)
+            ->where('page_id', (string) $merchantId)
             ->first();
 
         if (!$channel) {
-            Log::error('Salla channel not found for store', ['store_id' => $storeId]);
+            Log::error('Salla channel not found for merchant', ['merchant_id' => $merchantId]);
             return;
         }
 

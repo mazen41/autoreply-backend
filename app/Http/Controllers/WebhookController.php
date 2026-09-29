@@ -203,7 +203,10 @@ class WebhookController extends Controller
                         ->first();
                 }
 
-                // Strategy 3: find facebook channel by page_id, then get instagram for same user
+                // Strategy 3: find facebook channel by page_id, then get instagram for same user.
+                // Only safe when the user has exactly one Instagram channel — if they have multiple
+                // we cannot guess which one this webhook is for, and we refuse to route blindly.
+                // This fallback covers accounts connected before instagram_account_id was stored.
                 if (!$channel) {
                     $fbChannel = Channel::where('page_id', $entryId)
                         ->where('type', 'facebook')
@@ -212,15 +215,24 @@ class WebhookController extends Controller
                         ->first();
 
                     if ($fbChannel) {
-                        $channel = Channel::where('type', 'instagram')
+                        $igCandidates = Channel::where('type', 'instagram')
                             ->where('status', 'connected')
                             ->where('user_id', $fbChannel->user_id)
-                            ->latest('connected_at')
-                            ->first();
+                            ->get();
 
-                        // Cache the page_id on instagram channel for future lookups
-                        if ($channel && empty($channel->page_id)) {
-                            $channel->update(['page_id' => $entryId]);
+                        if ($igCandidates->count() === 1) {
+                            $channel = $igCandidates->first();
+
+                            // Cache page_id so Strategy 2 works next time
+                            if ($channel && empty($channel->page_id)) {
+                                $channel->update(['page_id' => $entryId]);
+                            }
+                        } elseif ($igCandidates->count() > 1) {
+                            Log::warning('WebhookController: ambiguous Instagram routing — multiple accounts for same user, cannot use Strategy 3', [
+                                'entry_id' => $entryId,
+                                'user_id'  => $fbChannel->user_id,
+                                'count'    => $igCandidates->count(),
+                            ]);
                         }
                     }
                 }

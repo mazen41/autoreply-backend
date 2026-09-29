@@ -137,4 +137,9 @@ class BusinessProfile extends Model
     {
         return $this->hasMany(AutomationWorkflow::class, 'business_id');
     }
+
+    public function bots()
+    {
+        return $this->hasMany(Bot::class, 'business_profile_id');
+    }
 }

@@ -105,6 +105,12 @@ Route::get('/channels/connect/shopify',    [ShopifyController::class, 'connect']
 Route::get('/channels/callback/shopify',   [ShopifyController::class, 'callback']);
 
 // Webhook endpoints (public)
+// New, exact-account URL: identifies the precise Channel that registered the
+// webhook, so multiple Telegram bots for the same user route correctly.
+Route::post('/telegram/webhook/{userId}/{channelId}', [TelegramController::class, 'webhook']);
+// Legacy URL kept for bots registered before this fix, until they are
+// re-synced (see php artisan telegram:resync-webhooks). Falls back to
+// "first connected channel" ONLY when unambiguous — see webhook() below.
 Route::post('/telegram/webhook/{userId}',  [TelegramController::class, 'webhook']);
 Route::post('/tiktok/webhook',             [TikTokController::class, 'webhook']);
 Route::post('/shopify/webhook',            [ShopifyController::class, 'webhook']);
@@ -149,6 +155,9 @@ Route::middleware('auth:sanctum')->group(function () {
         Route::post('/reindex', [KnowledgeController::class, 'reindex']);
         Route::post('/search', [KnowledgeController::class, 'search']);
     });
+
+    // Bot Management
+    Route::apiResource('bots', \App\Http\Controllers\Api\BotController::class);
 
     // Channels – listing and disconnect
     Route::get('/channels/connect/gmail',     [GmailController::class, 'connect']);

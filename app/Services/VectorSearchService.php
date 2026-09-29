@@ -13,19 +13,29 @@ class VectorSearchService
      * @param array<float> $queryEmbedding The embedding of the search query
      * @param int $businessProfileId The ID of the business profile (tenant isolation)
      * @param int $limit Number of top results to return
+     * @param array<int>|null $allowedFileIds Optional array of business_knowledge_file_ids allowed for search
      * @return array Array of chunks
      */
-    public function search(array $queryEmbedding, int $businessProfileId, int $limit = 3): array
+    public function search(array $queryEmbedding, int $businessProfileId, int $limit = 3, ?array $allowedFileIds = null): array
     {
         if (empty($queryEmbedding)) {
             return [];
         }
 
-        // Fetch all chunks for this tenant
-        // Since we are using standard MySQL and doing math in PHP,
-        // this requires fetching all vectors for the tenant.
-        // We limit to the active tenant to ensure this stays fast (typically < 1000 rows).
-        $chunks = BusinessKnowledgeChunk::where('business_profile_id', $businessProfileId)->get();
+        // If explicit allowedFileIds array was passed and it is empty,
+        // no knowledge files are accessible to this bot/channel context.
+        if (is_array($allowedFileIds) && empty($allowedFileIds)) {
+            return [];
+        }
+
+        // Fetch chunks for this tenant, optionally filtered by allowed file IDs
+        $query = BusinessKnowledgeChunk::where('business_profile_id', $businessProfileId);
+
+        if (is_array($allowedFileIds)) {
+            $query->whereIn('business_knowledge_file_id', $allowedFileIds);
+        }
+
+        $chunks = $query->get();
 
         if ($chunks->isEmpty()) {
             return [];

@@ -106,13 +106,38 @@ class WooCommerceController extends Controller
             return response()->json(['error' => 'Phone number is required'], 400);
         }
 
-        $channel = Channel::where('type', 'woocommerce')
-            ->where('user_id', auth()->id())
-            ->where('status', 'connected')
-            ->first();
+        // Same exact-resolution pattern as ShopifyController::getOrders() —
+        // an explicit channel_id wins; otherwise only auto-resolve when the
+        // account has exactly one connected WooCommerce store.
+        $channelId = $request->query('channel_id');
+        if ($channelId) {
+            $channel = Channel::where('type', 'woocommerce')
+                ->where('id', $channelId)
+                ->where('user_id', auth()->id())
+                ->where('status', 'connected')
+                ->first();
 
-        if (!$channel) {
-            return response()->json(['error' => 'WooCommerce channel not connected'], 404);
+            if (!$channel) {
+                return response()->json(['error' => 'WooCommerce channel not connected'], 404);
+            }
+        } else {
+            $candidates = Channel::where('type', 'woocommerce')
+                ->where('user_id', auth()->id())
+                ->where('status', 'connected')
+                ->get();
+
+            if ($candidates->count() === 0) {
+                return response()->json(['error' => 'WooCommerce channel not connected'], 404);
+            }
+
+            if ($candidates->count() > 1) {
+                return response()->json([
+                    'error' => 'Multiple WooCommerce stores are connected — specify channel_id',
+                    'channels' => $candidates->map(fn ($c) => ['id' => $c->id, 'name' => $c->page_name])->values(),
+                ], 409);
+            }
+
+            $channel = $candidates->first();
         }
 
         try {

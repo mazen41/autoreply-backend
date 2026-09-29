@@ -63,7 +63,7 @@ class GmailController extends Controller
             $businessProfile = \App\Models\BusinessProfile::where('user_id', $userId)->first();
 
             $channel = Channel::updateOrCreate(
-                ['user_id' => $userId, 'type' => 'gmail'],
+                ['user_id' => $userId, 'type' => 'gmail', 'page_id' => $email],
                 [
                     'page_name'     => $email,
                     'access_token'  => json_encode($token),   // mutator encrypts this automatically
@@ -204,13 +204,33 @@ class GmailController extends Controller
      */
     public function fetchEmails(Request $request)
     {
-        $channel = Channel::where('user_id', auth()->id())
-            ->where('type', 'gmail')
-            ->where('status', 'connected')
-            ->first();
-
-        if (!$channel) {
-            return response()->json(['message' => 'No Gmail channel connected'], 404);
+        // Exact resolution: if caller passes channel_id, use it.
+        // Otherwise only auto-resolve when there is exactly one Gmail account.
+        $channelId = $request->query('channel_id');
+        if ($channelId) {
+            $channel = Channel::where('user_id', auth()->id())
+                ->where('id', $channelId)
+                ->where('type', 'gmail')
+                ->where('status', 'connected')
+                ->first();
+            if (!$channel) {
+                return response()->json(['message' => 'Gmail channel not found'], 404);
+            }
+        } else {
+            $candidates = Channel::where('user_id', auth()->id())
+                ->where('type', 'gmail')
+                ->where('status', 'connected')
+                ->get();
+            if ($candidates->count() === 0) {
+                return response()->json(['message' => 'No Gmail channel connected'], 404);
+            }
+            if ($candidates->count() > 1) {
+                return response()->json([
+                    'message'  => 'Multiple Gmail accounts connected — specify channel_id',
+                    'channels' => $candidates->map(fn ($c) => ['id' => $c->id, 'name' => $c->page_name])->values(),
+                ], 409);
+            }
+            $channel = $candidates->first();
         }
 
         $client = $this->getAuthenticatedClient($channel);

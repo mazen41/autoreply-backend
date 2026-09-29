@@ -622,11 +622,14 @@ class ProcessAutoReply implements ShouldQueue
             }
         }
 
-        // Find Salla channel for this user
-        $sallaChannel = Channel::where('user_id', $user->id)
-            ->where('type', 'salla')
-            ->where('status', 'connected')
-            ->first();
+        // Find Salla channel — use the conversation's own channel if it IS a
+        // Salla channel; otherwise fall back to resolveUniqueConnectedChannel
+        // (safe: returns null if 0 or multiple Salla stores are connected).
+        if ($channel->type === 'salla') {
+            $sallaChannel = $channel;
+        } else {
+            $sallaChannel = $this->resolveUniqueConnectedChannel($user->id, 'salla');
+        }
 
         // ── SALLA EXCLUSIVE MODE DETECTION ────────────────────────────────────
         // Check if the conversation is actively in a Salla-related flow (products/orders/checkout).
@@ -773,11 +776,8 @@ class ProcessAutoReply implements ShouldQueue
                         // Fallback to Shopify if Salla lookup failed
                         if (!$sallaContext) {
                             try {
-                                $shopifyChannel = Channel::where('user_id', $channel->user_id)
-                                    ->where('type', 'shopify')
-                                    ->where('status', 'connected')
-                                    ->first();
-                                
+                                $shopifyChannel = $this->resolveUniqueConnectedChannel($channel->user_id, 'shopify');
+
                                 if ($shopifyChannel && $phoneMatch) {
                                     $shopifyResponse = Http::withToken($shopifyChannel->access_token)
                                         ->get("https://{$shopifyChannel->page_id}/admin/api/2024-01/orders.json", [
@@ -802,10 +802,9 @@ class ProcessAutoReply implements ShouldQueue
                         // Fallback to WooCommerce if Shopify lookup also failed
                         if (!$sallaContext) {
                             try {
-                                $wooCommerceChannel = Channel::where('user_id', $channel->user_id)
-                                    ->where('type', 'woocommerce')
-                                    ->where('status', 'connected')
-                                    ->first();
+                                $wooCommerceChannel = ($channel->type === 'woocommerce')
+                                    ? $channel
+                                    : $this->resolveUniqueConnectedChannel($channel->user_id, 'woocommerce');
                                 
                                 if ($wooCommerceChannel && $phoneMatch) {
                                     $wooCommerceService = new \App\Services\WooCommerceService();
@@ -963,7 +962,42 @@ class ProcessAutoReply implements ShouldQueue
             return;
         }
 
-        // Step 3: Build AI Context
+        // Step 3: Resolve Bot & Build AI Context
+        $bot = null;
+        if ($business) {
+            // 1. Check existing snapshot on conversation
+            if (!empty($conversation->bot_id)) {
+                $bot = \App\Models\Bot::where('id', $conversation->bot_id)
+                    ->where('business_profile_id', $business->id)
+                    ->where('status', 'active')
+                    ->first();
+            }
+
+            // 2. Resolve from channel's assigned bots if not set on conversation
+            if (!$bot) {
+                $activeBots = $channel->bots()
+                    ->where('status', 'active')
+                    ->where('business_profile_id', $business->id)
+                    ->get();
+
+                if ($activeBots->count() === 1) {
+                    $bot = $activeBots->first();
+                } elseif ($activeBots->count() > 1) {
+                    Log::warning('ProcessAutoReply: ambiguous Bot selection — multiple active bots assigned to channel', [
+                        'channel_id' => $channel->id,
+                        'business_id' => $business->id,
+                        'bot_ids' => $activeBots->pluck('id')->toArray(),
+                    ]);
+                    $bot = null;
+                }
+            }
+
+            // 3. Persist bot snapshot on conversation
+            if ($bot && empty($conversation->bot_id)) {
+                $conversation->update(['bot_id' => $bot->id]);
+            }
+        }
+
         // Pass raw order array directly — avoids the lossy string→array round-trip
         // that parseSallaContext() was doing, which silently dropped fields on
         // prefix-mismatch and caused the AI to ask for the order number even
@@ -978,6 +1012,10 @@ class ProcessAutoReply implements ShouldQueue
             Log::info('ProcessAutoReply: order context built for AI', ['order_context' => $orderContext]);
         }
 
+        // Precedence: Bot setting overrides BusinessProfile default fallback
+        $effectiveAiInstructions = !empty($bot?->ai_instructions) ? $bot->ai_instructions : ($business?->ai_instructions ?? null);
+        $effectiveReplyStyle     = !empty($bot?->reply_style) ? $bot->reply_style : ($business?->reply_style ?? null);
+
         // Build business profile context separate from uploaded knowledge
         $businessProfileContext = '';
         if ($business) {
@@ -986,6 +1024,10 @@ class ProcessAutoReply implements ShouldQueue
             $businessProfileContext .= "================\n";
             $businessName = $business->business_name ?? 'our business';
             $businessProfileContext .= "Business Name: {$businessName}\n";
+
+            if ($bot) {
+                $businessProfileContext .= "Bot Name: {$bot->name}\n";
+            }
 
             // Business type
             if (!empty($business->business_type)) {
@@ -1034,14 +1076,14 @@ class ProcessAutoReply implements ShouldQueue
                 $businessProfileContext .= "FAQs:\n{$faqs}\n";
             }
 
-            // AI instructions
-            if (!empty($business->ai_instructions)) {
-                $businessProfileContext .= "AI Instructions: {$business->ai_instructions}\n";
+            // AI instructions (Bot override or Business default)
+            if (!empty($effectiveAiInstructions)) {
+                $businessProfileContext .= "AI Instructions: {$effectiveAiInstructions}\n";
             }
 
-            // Reply style
-            if (!empty($business->reply_style)) {
-                $businessProfileContext .= "Reply Style: {$business->reply_style}\n";
+            // Reply style (Bot override or Business default)
+            if (!empty($effectiveReplyStyle)) {
+                $businessProfileContext .= "Reply Style: {$effectiveReplyStyle}\n";
             }
 
             $businessProfileContext .= "\n";
@@ -1111,7 +1153,7 @@ class ProcessAutoReply implements ShouldQueue
             'language'       => $detectedLanguage,
             'salla_exclusive_mode' => $isSallaFlow,
             'business_profile' => $isSallaFlow ? '' : $businessProfileContext,
-            'knowledge_base' => (function() use ($business, $message, $isSallaFlow) {
+            'knowledge_base' => (function() use ($business, $bot, $channel, $message, $isSallaFlow) {
                 if (!$business || $isSallaFlow) {
                     return '';
                 }
@@ -1125,8 +1167,22 @@ class ProcessAutoReply implements ShouldQueue
                     return ''; // Fallback if embedding fails
                 }
 
-                // 2. Search for relevant chunks
-                $relevantChunks = $vectorSearch->search($queryEmbedding, $business->id, 5);
+                // 2. Determine allowed knowledge file IDs for the Bot + Channel
+                $allowedFileIds = null;
+                if ($bot) {
+                    // For a bot, query explicitly assigned knowledge files (shared across channels OR channel-specific)
+                    $allowedFileIds = \App\Models\BotKnowledgeAssignment::where('bot_id', $bot->id)
+                        ->where(function ($q) use ($channel) {
+                            $q->whereNull('channel_id')
+                              ->orWhere('channel_id', $channel->id);
+                        })
+                        ->pluck('business_knowledge_file_id')
+                        ->unique()
+                        ->toArray();
+                }
+
+                // 3. Search for relevant chunks
+                $relevantChunks = $vectorSearch->search($queryEmbedding, $business->id, 5, $allowedFileIds);
 
                 if (empty($relevantChunks)) {
                     return '';
@@ -2346,10 +2402,11 @@ class ProcessAutoReply implements ShouldQueue
             $externalSource  = null;
 
             // 1. Try Salla order creation if Salla channel connected
-            $sallaChannel = Channel::where('user_id', $user->id)
-                ->where('type', 'salla')
-                ->where('status', 'connected')
-                ->first();
+            // Prefer the conversation's own channel if it IS Salla; otherwise
+            // resolve safely (null when 0 or multiple Salla stores).
+            $sallaChannel = ($channel->type === 'salla')
+                ? $channel
+                : $this->resolveUniqueConnectedChannel($user->id, 'salla');
 
             if ($sallaChannel) {
                 try {
@@ -2384,10 +2441,9 @@ class ProcessAutoReply implements ShouldQueue
 
             // 2. Try Shopify order creation if Shopify channel connected and no external ID yet
             if (!$externalOrderId) {
-                $shopifyChannel = Channel::where('user_id', $user->id)
-                    ->where('type', 'shopify')
-                    ->where('status', 'connected')
-                    ->first();
+                $shopifyChannel = ($channel->type === 'shopify')
+                    ? $channel
+                    : $this->resolveUniqueConnectedChannel($user->id, 'shopify');
 
                 if ($shopifyChannel) {
                     try {
@@ -2505,5 +2561,32 @@ class ProcessAutoReply implements ShouldQueue
         } finally {
             $lock->release();
         }
+    }
+
+    /**
+     * Resolve a connected channel of the given type for a user only when there
+     * is EXACTLY one such channel.  Returns null when:
+     *   - no connected channel of that type exists (safe — nothing to query)
+     *   - multiple channels of that type exist (safe — we cannot pick randomly)
+     *
+     * Callers MUST handle a null return gracefully (skip the lookup, log a
+     * warning if useful).  This method never throws.
+     */
+    private function resolveUniqueConnectedChannel(int $userId, string $type): ?Channel
+    {
+        $candidates = Channel::where('user_id', $userId)
+            ->where('type', $type)
+            ->where('status', 'connected')
+            ->get();
+
+        if ($candidates->count() === 1) {
+            return $candidates->first();
+        }
+
+        if ($candidates->count() > 1) {
+            Log::warning("ProcessAutoReply: multiple {$type} channels for user {$userId} — skipping ambiguous lookup");
+        }
+
+        return null;
     }
 }

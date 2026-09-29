@@ -25,4 +25,19 @@ class BusinessKnowledgeFile extends Model
     {
         return $this->belongsTo(BusinessProfile::class);
     }
+
+    public function botAssignments()
+    {
+        return $this->hasMany(BotKnowledgeAssignment::class, 'business_knowledge_file_id');
+    }
+
+    public function bots()
+    {
+        return $this->belongsToMany(
+            Bot::class,
+            'bot_knowledge_assignments',
+            'business_knowledge_file_id',
+            'bot_id'
+        )->withPivot('channel_id')->withTimestamps();
+    }
 }

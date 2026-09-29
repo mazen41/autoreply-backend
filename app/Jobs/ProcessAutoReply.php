@@ -1246,6 +1246,9 @@ class ProcessAutoReply implements ShouldQueue
             // so it prompts the customer for the missing/clarifying information instead
             // of falsely claiming the order was placed.
             'order_creation_failed_reason' => $orderCreationFailedReason,
+            // Inject bot AI preferences
+            'ai_provider'                  => !empty($bot?->ai_provider) ? $bot->ai_provider : ($business?->ai_provider ?? null),
+            'ai_model'                     => !empty($bot?->ai_model) ? $bot->ai_model : ($business?->ai_model ?? null),
         ];
 
         // Step 4: Single AI Call with JSON Output

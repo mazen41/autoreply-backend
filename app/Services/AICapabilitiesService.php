@@ -10,23 +10,29 @@ use Illuminate\Support\Facades\Redis;
 
 class AICapabilitiesService
 {
-    private static function getAIProvider(): string
+    private static function getAIProvider(array $context = []): string
     {
+        if (!empty($context['ai_provider'])) {
+            return $context['ai_provider'];
+        }
         return config('services.ai.provider', env('AI_PROVIDER', 'groq'));
     }
 
-    private static function getAIModel(): string
+    private static function getAIModel(array $context = []): string
     {
-        $provider = self::getAIProvider();
+        if (!empty($context['ai_model'])) {
+            return $context['ai_model'];
+        }
+        $provider = self::getAIProvider($context);
         if ($provider === 'groq') {
             return config('services.groq.model', env('GROQ_MODEL', 'openai/gpt-oss-120b'));
         }
         return config('services.gemini.model', env('GEMINI_MODEL', 'gemini-2.5-flash'));
     }
 
-    private static function getAIAPIKey(): string
+    private static function getAIAPIKey(array $context = []): string
     {
-        $provider = self::getAIProvider();
+        $provider = self::getAIProvider($context);
         if ($provider === 'groq') {
             return config('services.groq.api_key', env('GROQ_API_KEY', ''));
         }
@@ -656,7 +662,7 @@ JSON;
                 ['role' => 'user',   'content' => $message],
             ];
 
-            $response = self::callAIChatWithRetry($messages);
+            $response = self::callAIChatWithRetry($messages, $context);
 
             // ── Robust JSON extraction ────────────────────────────────────────
             // Gemini sometimes wraps the JSON in markdown fences, adds a preamble
@@ -838,13 +844,13 @@ JSON;
     /**
      * AI Chat with Retry Logic
      */
-    private static function callAIChatWithRetry(array $messages, int $maxRetries = 3, int $baseDelay = 1000): string
+    private static function callAIChatWithRetry(array $messages, array $context = [], int $maxRetries = 3, int $baseDelay = 1000): string
     {
         $lastError = null;
 
         for ($attempt = 1; $attempt <= $maxRetries; $attempt++) {
             try {
-                return self::callAIChat($messages);
+                return self::callAIChat($messages, $context);
             } catch (\Exception $e) {
                 $lastError = $e;
 
@@ -868,28 +874,34 @@ JSON;
     /**
      * Call AI Chat
      */
-    private static function callAIChat(array $messages): string
+    private static function callAIChat(array $messages, array $context = []): string
     {
-        $provider = self::getAIProvider();
+        $provider = self::getAIProvider($context);
 
         if ($provider === 'groq') {
-            return self::callGroqChat($messages);
+            try {
+                return self::callGroqChat($messages, $context);
+            } catch (\Exception $e) {
+                // If Groq fails (e.g. invalid API key), try Gemini as a fallback if configured
+                Log::warning('Groq API failed. Falling back to Gemini.', ['error' => $e->getMessage()]);
+                return self::callGeminiChat($messages, $context);
+            }
         }
 
         if ($provider === 'gemini') {
-            return self::callGeminiChat($messages);
+            return self::callGeminiChat($messages, $context);
         }
 
-        return self::callGeminiChat($messages);
+        return self::callGeminiChat($messages, $context);
     }
 
     /**
      * Call Groq API (OpenAI-compatible Chat Completions endpoint)
      */
-    private static function callGroqChat(array $messages): string
+    private static function callGroqChat(array $messages, array $context = []): string
     {
-        $apiKey = env('GROQ_API_KEY', config('services.groq.api_key', self::getAIAPIKey()));
-        $model  = env('GROQ_MODEL', config('services.groq.model', 'openai/gpt-oss-120b'));
+        $apiKey = env('GROQ_API_KEY', config('services.groq.api_key', self::getAIAPIKey($context)));
+        $model  = env('GROQ_MODEL', config('services.groq.model', self::getAIModel($context)));
 
         if (empty($apiKey)) {
             throw new \Exception('Groq API Key is not configured (GROQ_API_KEY).');
@@ -929,10 +941,10 @@ JSON;
      * user→user) confuses the model and often causes API errors or empty
      * responses that trigger our fallback message.
      */
-    private static function callGeminiChat(array $messages): string
+    private static function callGeminiChat(array $messages, array $context = []): string
     {
-        $apiKey = self::getAIAPIKey();
-        $model  = self::getAIModel();
+        $apiKey = self::getAIAPIKey($context);
+        $model  = self::getAIModel($context);
 
         // Separate system prompt from chat turns
         $systemText = '';

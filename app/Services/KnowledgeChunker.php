@@ -172,7 +172,8 @@ class KnowledgeChunker
         $output = "\n### {$sourceName} ###\n";
         
         foreach ($chunks as $index => $chunk) {
-            $output .= "\n[Chunk {$index + 1}]\n{$chunk}\n";
+            $chunkNum = $index + 1;
+            $output .= "\n[Chunk {$chunkNum}]\n{$chunk}\n";
         }
         
         return $output;

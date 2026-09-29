@@ -965,36 +965,45 @@ class ProcessAutoReply implements ShouldQueue
         // Step 3: Resolve Bot & Build AI Context
         $bot = null;
         if ($business) {
-            // 1. Check existing snapshot on conversation
-            if (!empty($conversation->bot_id)) {
-                $bot = \App\Models\Bot::where('id', $conversation->bot_id)
-                    ->where('business_profile_id', $business->id)
-                    ->where('status', 'active')
-                    ->first();
-            }
-
-            // 2. Resolve from channel's assigned bots if not set on conversation
-            if (!$bot) {
-                $activeBots = $channel->bots()
-                    ->where('status', 'active')
-                    ->where('business_profile_id', $business->id)
-                    ->get();
-
-                if ($activeBots->count() === 1) {
-                    $bot = $activeBots->first();
-                } elseif ($activeBots->count() > 1) {
-                    Log::warning('ProcessAutoReply: ambiguous Bot selection — multiple active bots assigned to channel', [
-                        'channel_id' => $channel->id,
-                        'business_id' => $business->id,
-                        'bot_ids' => $activeBots->pluck('id')->toArray(),
-                    ]);
-                    $bot = null;
+            try {
+                // 1. Check existing snapshot on conversation
+                if (!empty($conversation->bot_id)) {
+                    $bot = \App\Models\Bot::where('id', $conversation->bot_id)
+                        ->where('business_profile_id', $business->id)
+                        ->where('status', 'active')
+                        ->first();
                 }
-            }
 
-            // 3. Persist bot snapshot on conversation
-            if ($bot && empty($conversation->bot_id)) {
-                $conversation->update(['bot_id' => $bot->id]);
+                // 2. Resolve from channel's assigned bots if not set on conversation
+                if (!$bot && method_exists($channel, 'bots')) {
+                    $activeBots = $channel->bots()
+                        ->where('status', 'active')
+                        ->where('business_profile_id', $business->id)
+                        ->get();
+
+                    if ($activeBots->count() === 1) {
+                        $bot = $activeBots->first();
+                    } elseif ($activeBots->count() > 1) {
+                        Log::warning('ProcessAutoReply: ambiguous Bot selection — multiple active bots assigned to channel', [
+                            'channel_id' => $channel->id,
+                            'business_id' => $business->id,
+                            'bot_ids' => $activeBots->pluck('id')->toArray(),
+                        ]);
+                        $bot = null;
+                    }
+                }
+
+                // 3. Persist bot snapshot on conversation
+                if ($bot && empty($conversation->bot_id)) {
+                    $conversation->update(['bot_id' => $bot->id]);
+                }
+            } catch (\Throwable $e) {
+                Log::warning('ProcessAutoReply: Bot resolution skipped (legacy fallback)', [
+                    'error' => $e->getMessage(),
+                    'channel_id' => $channel->id ?? null,
+                    'business_id' => $business->id,
+                ]);
+                $bot = null;
             }
         }
 
@@ -1170,15 +1179,23 @@ class ProcessAutoReply implements ShouldQueue
                 // 2. Determine allowed knowledge file IDs for the Bot + Channel
                 $allowedFileIds = null;
                 if ($bot) {
-                    // For a bot, query explicitly assigned knowledge files (shared across channels OR channel-specific)
-                    $allowedFileIds = \App\Models\BotKnowledgeAssignment::where('bot_id', $bot->id)
-                        ->where(function ($q) use ($channel) {
-                            $q->whereNull('channel_id')
-                              ->orWhere('channel_id', $channel->id);
-                        })
-                        ->pluck('business_knowledge_file_id')
-                        ->unique()
-                        ->toArray();
+                    try {
+                        // For a bot, query explicitly assigned knowledge files (shared across channels OR channel-specific)
+                        $allowedFileIds = \App\Models\BotKnowledgeAssignment::where('bot_id', $bot->id)
+                            ->where(function ($q) use ($channel) {
+                                $q->whereNull('channel_id')
+                                  ->orWhere('channel_id', $channel->id);
+                            })
+                            ->pluck('business_knowledge_file_id')
+                            ->unique()
+                            ->toArray();
+                    } catch (\Throwable $e) {
+                        Log::warning('ProcessAutoReply: BotKnowledgeAssignment query failed (legacy fallback)', [
+                            'error' => $e->getMessage(),
+                            'bot_id' => $bot->id,
+                        ]);
+                        $allowedFileIds = null;
+                    }
                 }
 
                 // 3. Search for relevant chunks

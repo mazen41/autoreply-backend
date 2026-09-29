@@ -21,7 +21,7 @@ class BotController extends Controller
     {
         $business = $this->getBusinessProfile($request);
         $bots = Bot::where('business_profile_id', $business->id)
-            ->with(['channels:id,type,page_name,page_id', 'knowledgeAssignments'])
+            ->with(['channels:id,type,page_name,page_id', 'ecommerceChannel:id,type,page_name,page_id', 'knowledgeAssignments'])
             ->orderBy('created_at', 'desc')
             ->get();
 
@@ -44,6 +44,7 @@ class BotController extends Controller
             'reply_style' => 'nullable|string',
             'ai_confidence_threshold' => 'nullable|numeric|min:0|max:1',
             'escalation_config' => 'nullable|array',
+            'ecommerce_channel_id' => 'nullable|integer',
             'channel_ids' => 'nullable|array',
             'channel_ids.*' => 'integer',
             'knowledge_assignments' => 'nullable|array',
@@ -53,6 +54,7 @@ class BotController extends Controller
 
         $bot = Bot::create([
             'business_profile_id' => $business->id,
+            'ecommerce_channel_id' => $request->ecommerce_channel_id,
             'name' => $request->name,
             'status' => $request->status ?? 'active',
             'ai_provider' => $request->ai_provider ?? 'gemini',
@@ -91,7 +93,7 @@ class BotController extends Controller
 
         return response()->json([
             'message' => 'Bot created successfully',
-            'bot' => $bot->load(['channels:id,type,page_name,page_id', 'knowledgeAssignments']),
+            'bot' => $bot->load(['channels:id,type,page_name,page_id', 'ecommerceChannel:id,type,page_name,page_id', 'knowledgeAssignments']),
         ], 201);
     }
 
@@ -99,7 +101,7 @@ class BotController extends Controller
     {
         $business = $this->getBusinessProfile($request);
         $bot = Bot::where('business_profile_id', $business->id)
-            ->with(['channels', 'knowledgeAssignments.knowledgeFile', 'knowledgeAssignments.channel'])
+            ->with(['channels', 'ecommerceChannel', 'knowledgeAssignments.knowledgeFile', 'knowledgeAssignments.channel'])
             ->findOrFail($id);
 
         return response()->json(['bot' => $bot]);
@@ -120,6 +122,7 @@ class BotController extends Controller
             'reply_style' => 'nullable|string',
             'ai_confidence_threshold' => 'nullable|numeric|min:0|max:1',
             'escalation_config' => 'nullable|array',
+            'ecommerce_channel_id' => 'nullable|integer',
             'channel_ids' => 'nullable|array',
             'knowledge_assignments' => 'nullable|array',
         ]);
@@ -134,6 +137,7 @@ class BotController extends Controller
             'reply_style',
             'ai_confidence_threshold',
             'escalation_config',
+            'ecommerce_channel_id',
         ]));
 
         if ($request->has('channel_ids')) {

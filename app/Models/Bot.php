@@ -14,6 +14,7 @@ class Bot extends Model
 
     protected $fillable = [
         'business_profile_id',
+        'ecommerce_channel_id',
         'name',
         'status',
         'ai_provider',
@@ -34,6 +35,11 @@ class Bot extends Model
     public function businessProfile(): BelongsTo
     {
         return $this->belongsTo(BusinessProfile::class, 'business_profile_id');
+    }
+
+    public function ecommerceChannel(): BelongsTo
+    {
+        return $this->belongsTo(Channel::class, 'ecommerce_channel_id');
     }
 
     public function channels(): BelongsToMany

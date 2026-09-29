@@ -622,13 +622,106 @@ class ProcessAutoReply implements ShouldQueue
             }
         }
 
-        // Find Salla channel — use the conversation's own channel if it IS a
-        // Salla channel; otherwise fall back to resolveUniqueConnectedChannel
-        // (safe: returns null if 0 or multiple Salla stores are connected).
-        if ($channel->type === 'salla') {
-            $sallaChannel = $channel;
-        } else {
-            $sallaChannel = $this->resolveUniqueConnectedChannel($user->id, 'salla');
+        // ── BOT RESOLUTION ───────────────────────────────────────────────────
+        $bot = null;
+        $botResolutionSource = 'none';
+        if ($business) {
+            try {
+                // 1. Check existing snapshot on conversation
+                if (!empty($conversation->bot_id)) {
+                    $bot = \App\Models\Bot::where('id', $conversation->bot_id)
+                        ->where('business_profile_id', $business->id)
+                        ->where('status', 'active')
+                        ->first();
+                    if ($bot) {
+                        $botResolutionSource = 'conversation_snapshot';
+                    }
+                }
+
+                // 2. Resolve from channel's assigned bots if not set on conversation
+                if (!$bot && method_exists($channel, 'bots')) {
+                    $activeBots = $channel->bots()
+                        ->where('status', 'active')
+                        ->where('business_profile_id', $business->id)
+                        ->get();
+
+                    if ($activeBots->count() === 1) {
+                        $bot = $activeBots->first();
+                        $botResolutionSource = 'channel_assignment';
+                    } elseif ($activeBots->count() > 1) {
+                        // Check if one of the assigned bots is marked as primary for this channel
+                        $primaryBot = $activeBots->first(function ($b) {
+                            return (bool)($b->pivot->is_primary ?? false);
+                        });
+
+                        if ($primaryBot) {
+                            $bot = $primaryBot;
+                            $botResolutionSource = 'channel_primary_bot';
+                        } else {
+                            // Fallback to first created active bot as primary default
+                            $bot = $activeBots->first();
+                            $botResolutionSource = 'channel_default_first_active';
+                            Log::warning('ProcessAutoReply: multiple bots assigned to channel without explicit primary, selected first active', [
+                                'channel_id' => $channel->id,
+                                'business_id' => $business->id,
+                                'selected_bot_id' => $bot->id,
+                                'all_bot_ids' => $activeBots->pluck('id')->toArray(),
+                            ]);
+                        }
+                    } else {
+                        $botResolutionSource = 'no_bot_assigned';
+                    }
+                }
+
+                // 3. Persist bot snapshot on conversation
+                if ($bot && empty($conversation->bot_id)) {
+                    $conversation->update(['bot_id' => $bot->id]);
+                }
+            } catch (\Throwable $e) {
+                Log::warning('ProcessAutoReply: Bot resolution skipped (legacy fallback)', [
+                    'error' => $e->getMessage(),
+                    'channel_id' => $channel->id ?? null,
+                    'business_id' => $business->id,
+                ]);
+                $botResolutionSource = 'error_fallback';
+                $bot = null;
+            }
+        }
+
+        // Audit: Bot resolution result
+        Log::info('ProcessAutoReply: Bot resolution', [
+            'conversation_id' => $conversation->id,
+            'channel_id' => $channel->id ?? null,
+            'business_id' => $business->id ?? null,
+            'resolved_bot_id' => $bot?->id,
+            'resolved_bot_name' => $bot?->name,
+            'resolution_source' => $botResolutionSource,
+            'ecommerce_channel_id' => $bot?->ecommerce_channel_id,
+            'ai_provider' => !empty($bot?->ai_provider) ? $bot->ai_provider : ($business?->ai_provider ?? env('AI_PROVIDER', 'groq')),
+            'ai_model' => !empty($bot?->ai_model) ? $bot->ai_model : ($business?->ai_model ?? env('AI_MODEL')),
+        ]);
+
+        // Find Salla channel — Priority 1: Bot's explicit ecommerce_channel_id if set
+        // Priority 2: Conversation's own channel if it IS a Salla channel
+        // Priority 3: Fall back to resolveUniqueConnectedChannel
+        $sallaChannel = null;
+        if (!empty($bot?->ecommerce_channel_id)) {
+            $assignedStore = Channel::where('id', $bot->ecommerce_channel_id)
+                ->where('user_id', $user->id)
+                ->where('status', 'connected')
+                ->first();
+
+            if ($assignedStore && $assignedStore->type === 'salla') {
+                $sallaChannel = $assignedStore;
+            }
+        }
+
+        if (!$sallaChannel) {
+            if ($channel->type === 'salla') {
+                $sallaChannel = $channel;
+            } else {
+                $sallaChannel = $this->resolveUniqueConnectedChannel($user->id, 'salla');
+            }
         }
 
         // ── SALLA EXCLUSIVE MODE DETECTION ────────────────────────────────────
@@ -961,84 +1054,6 @@ class ProcessAutoReply implements ShouldQueue
             $this->sendReply($channel, $conversation, $replyMessage);
             return;
         }
-
-        // Step 3: Resolve Bot & Build AI Context
-        $bot = null;
-        $botResolutionSource = 'none';
-        if ($business) {
-            try {
-                // 1. Check existing snapshot on conversation
-                if (!empty($conversation->bot_id)) {
-                    $bot = \App\Models\Bot::where('id', $conversation->bot_id)
-                        ->where('business_profile_id', $business->id)
-                        ->where('status', 'active')
-                        ->first();
-                    if ($bot) {
-                        $botResolutionSource = 'conversation_snapshot';
-                    }
-                }
-
-                // 2. Resolve from channel's assigned bots if not set on conversation
-                if (!$bot && method_exists($channel, 'bots')) {
-                    $activeBots = $channel->bots()
-                        ->where('status', 'active')
-                        ->where('business_profile_id', $business->id)
-                        ->get();
-
-                    if ($activeBots->count() === 1) {
-                        $bot = $activeBots->first();
-                        $botResolutionSource = 'channel_assignment';
-                    } elseif ($activeBots->count() > 1) {
-                        // Check if one of the assigned bots is marked as primary for this channel
-                        $primaryBot = $activeBots->first(function ($b) {
-                            return (bool)($b->pivot->is_primary ?? false);
-                        });
-
-                        if ($primaryBot) {
-                            $bot = $primaryBot;
-                            $botResolutionSource = 'channel_primary_bot';
-                        } else {
-                            // Fallback to first created active bot as primary default
-                            $bot = $activeBots->first();
-                            $botResolutionSource = 'channel_default_first_active';
-                            Log::warning('ProcessAutoReply: multiple bots assigned to channel without explicit primary, selected first active', [
-                                'channel_id' => $channel->id,
-                                'business_id' => $business->id,
-                                'selected_bot_id' => $bot->id,
-                                'all_bot_ids' => $activeBots->pluck('id')->toArray(),
-                            ]);
-                        }
-                    } else {
-                        $botResolutionSource = 'no_bot_assigned';
-                    }
-                }
-
-                // 3. Persist bot snapshot on conversation
-                if ($bot && empty($conversation->bot_id)) {
-                    $conversation->update(['bot_id' => $bot->id]);
-                }
-            } catch (\Throwable $e) {
-                Log::warning('ProcessAutoReply: Bot resolution skipped (legacy fallback)', [
-                    'error' => $e->getMessage(),
-                    'channel_id' => $channel->id ?? null,
-                    'business_id' => $business->id,
-                ]);
-                $botResolutionSource = 'error_fallback';
-                $bot = null;
-            }
-        }
-
-        // Audit: Bot resolution result
-        Log::info('ProcessAutoReply: Bot resolution', [
-            'conversation_id' => $conversation->id,
-            'channel_id' => $channel->id ?? null,
-            'business_id' => $business->id ?? null,
-            'resolved_bot_id' => $bot?->id,
-            'resolved_bot_name' => $bot?->name,
-            'resolution_source' => $botResolutionSource,
-            'ai_provider' => !empty($bot?->ai_provider) ? $bot->ai_provider : ($business?->ai_provider ?? env('AI_PROVIDER', 'groq')),
-            'ai_model' => !empty($bot?->ai_model) ? $bot->ai_model : ($business?->ai_model ?? env('AI_MODEL')),
-        ]);
 
         // Pass raw order array directly — avoids the lossy string→array round-trip
         // that parseSallaContext() was doing, which silently dropped fields on

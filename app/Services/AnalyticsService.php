@@ -111,6 +111,102 @@ class AnalyticsService
     }
 
     /**
+     * Get revenue attribution report for a business.
+     *
+     * Categorizes revenue into:
+     * - AI-Driven: Orders where conversation had ai_enabled=true and no human takeover
+     * - Agent-Assisted: Orders where conversation had requires_human=true or assigned agent
+     * - Direct: Orders without active messaging conversations
+     *
+     * @param int $businessId
+     * @param string $startDate
+     * @param string $endDate
+     * @return array
+     */
+    public function getRevenueAttributionReport(int $businessId, string $startDate, string $endDate): array
+    {
+        $start = Carbon::parse($startDate)->startOfDay();
+        $end = Carbon::parse($endDate)->endOfDay();
+
+        // Get all conversations for the business in the date range
+        $conversations = Conversation::where('business_id', $businessId)
+            ->whereBetween('created_at', [$start, $end])
+            ->get();
+
+        $aiDrivenRevenue = 0;
+        $agentAssistedRevenue = 0;
+        $directRevenue = 0;
+        $aiDrivenOrders = 0;
+        $agentAssistedOrders = 0;
+        $directOrders = 0;
+
+        foreach ($conversations as $conversation) {
+            $checkoutState = $conversation->checkout_state ?? [];
+            $orderId = $checkoutState['order_id'] ?? null;
+            $orderValue = $checkoutState['product_price'] ?? 0;
+
+            if (!$orderId || !$orderValue) {
+                continue;
+            }
+
+            // Check if this is AI-driven (ai_enabled=true, no human takeover)
+            $isAiDriven = $conversation->ai_enabled
+                && !$conversation->requires_human
+                && !$conversation->assigned_agent_id;
+
+            // Check if this is agent-assisted (requires_human=true or has assigned agent)
+            $isAgentAssisted = $conversation->requires_human
+                || $conversation->assigned_agent_id;
+
+            if ($isAiDriven) {
+                $aiDrivenRevenue += $orderValue;
+                $aiDrivenOrders++;
+            } elseif ($isAgentAssisted) {
+                $agentAssistedRevenue += $orderValue;
+                $agentAssistedOrders++;
+            } else {
+                $directRevenue += $orderValue;
+                $directOrders++;
+            }
+        }
+
+        $totalRevenue = $aiDrivenRevenue + $agentAssistedRevenue + $directRevenue;
+        $totalOrders = $aiDrivenOrders + $agentAssistedOrders + $directOrders;
+
+        return [
+            'period' => [
+                'start' => $startDate,
+                'end' => $endDate,
+            ],
+            'summary' => [
+                'total_revenue' => round($totalRevenue, 2),
+                'total_orders' => $totalOrders,
+                'average_order_value' => $totalOrders > 0 ? round($totalRevenue / $totalOrders, 2) : 0,
+            ],
+            'breakdown' => [
+                'ai_driven' => [
+                    'revenue' => round($aiDrivenRevenue, 2),
+                    'orders' => $aiDrivenOrders,
+                    'percentage' => $totalRevenue > 0 ? round(($aiDrivenRevenue / $totalRevenue) * 100, 1) : 0,
+                    'aov' => $aiDrivenOrders > 0 ? round($aiDrivenRevenue / $aiDrivenOrders, 2) : 0,
+                ],
+                'agent_assisted' => [
+                    'revenue' => round($agentAssistedRevenue, 2),
+                    'orders' => $agentAssistedOrders,
+                    'percentage' => $totalRevenue > 0 ? round(($agentAssistedRevenue / $totalRevenue) * 100, 1) : 0,
+                    'aov' => $agentAssistedOrders > 0 ? round($agentAssistedRevenue / $agentAssistedOrders, 2) : 0,
+                ],
+                'direct' => [
+                    'revenue' => round($directRevenue, 2),
+                    'orders' => $directOrders,
+                    'percentage' => $totalRevenue > 0 ? round(($directRevenue / $totalRevenue) * 100, 1) : 0,
+                    'aov' => $directOrders > 0 ? round($directRevenue / $directOrders, 2) : 0,
+                ],
+            ],
+        ];
+    }
+
+    /**
      * Calculate AI metrics for a business
      */
     public function calculateAiMetrics(int $businessId, string $date = null): void

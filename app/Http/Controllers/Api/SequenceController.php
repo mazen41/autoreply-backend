@@ -24,20 +24,62 @@ class SequenceController extends Controller
         $this->enrollmentService = $enrollmentService;
     }
 
+    /**
+     * Resolve the business profile for the current request.
+     */
+    private function getResolvedBusinessProfile(Request $request): \App\Models\BusinessProfile
+    {
+        $user = $request->user();
+        $requestedBusinessId = $request->header('X-Business-Id') ?? $request->input('business_id');
+
+        if ($requestedBusinessId) {
+            $requestedBusinessId = (int) $requestedBusinessId;
+            $hasAccess = \App\Models\BusinessProfile::where('id', $requestedBusinessId)
+                ->where('user_id', $user->id)
+                ->exists() ||
+                \App\Models\TeamMember::where('business_id', $requestedBusinessId)
+                    ->where('user_id', $user->id)
+                    ->where('is_active', true)
+                    ->exists();
+
+            if ($hasAccess) {
+                return \App\Models\BusinessProfile::findOrFail($requestedBusinessId);
+            }
+        }
+
+        return \App\Models\BusinessProfile::firstOrCreate(['user_id' => $user->id]);
+    }
+
     public function index(Request $request)
     {
-        $user = Auth::user();
-        if (!$user || !$user->business_id) {
-            return response()->json(['error' => 'Business not found'], 404);
-        }
+        $business = $this->getResolvedBusinessProfile($request);
 
         $filters = [
             'status' => $request->input('status'),
             'channel' => $request->input('channel'),
             'trigger_type' => $request->input('trigger_type'),
+            'bot_id' => $request->input('bot_id'),
         ];
 
-        $sequences = $this->sequenceService->getSequencesForBusiness($user->business_id, $filters);
+        $query = Sequence::forBusiness($business->id);
+
+        // Apply bot filter if provided
+        if (!empty($filters['bot_id'])) {
+            $query->where('bot_id', (int) $filters['bot_id']);
+        }
+
+        // Apply other filters
+        if (!empty($filters['status'])) {
+            $query->where('status', $filters['status']);
+        }
+        if (!empty($filters['channel'])) {
+            $query->where('channel', $filters['channel']);
+        }
+        if (!empty($filters['trigger_type'])) {
+            $query->where('trigger_type', $filters['trigger_type']);
+        }
+
+        $sequences = $query->with('steps')->orderBy('created_at', 'desc')->get();
 
         return response()->json([
             'data' => $sequences,

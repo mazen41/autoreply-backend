@@ -157,7 +157,13 @@ Route::middleware('auth:sanctum')->group(function () {
     });
 
     // Bot Management
-    Route::apiResource('bots', \App\Http\Controllers\Api\BotController::class);
+    Route::apiResource('bots', \App\Http\Controllers\Api\BotController::class)->middleware('plan.enforce:max_bots');
+
+    // Customer / CRM
+    Route::get('/customers', [\App\Http\Controllers\Api\CustomerController::class, 'index']);
+    Route::get('/customers/{id}', [\App\Http\Controllers\Api\CustomerController::class, 'show']);
+    Route::post('/customers/{customerId}/notes', [\App\Http\Controllers\Api\CustomerController::class, 'storeNote']);
+    Route::patch('/customers/{customerId}/tags', [\App\Http\Controllers\Api\CustomerController::class, 'updateTags']);
 
     // Channels – listing and disconnect
     Route::get('/channels/connect/gmail',     [GmailController::class, 'connect']);
@@ -167,10 +173,10 @@ Route::middleware('auth:sanctum')->group(function () {
     Route::delete('/channels/{id}',           [ChannelController::class, 'disconnect']);
     
     // New channel endpoints (protected)
-    Route::post('/channels/telegram/connect', [TelegramController::class, 'connect']);
+    Route::post('/channels/telegram/connect', [TelegramController::class, 'connect'])->middleware('plan.enforce:max_channels');
     Route::post('/channels/telegram/set-webhook', [TelegramController::class, 'setWebhook']);
     Route::post('/channels/telegram/disconnect', [TelegramController::class, 'disconnect']);
-    Route::post('/channels/woocommerce/connect', [WooCommerceController::class, 'connect']);
+    Route::post('/channels/woocommerce/connect', [WooCommerceController::class, 'connect'])->middleware('plan.enforce:max_channels');
     Route::get('/channels/shopify/orders',    [ShopifyController::class, 'getOrders']);
     Route::get('/channels/woocommerce/orders', [WooCommerceController::class, 'getOrders']);
     
@@ -191,6 +197,7 @@ Route::middleware('auth:sanctum')->group(function () {
     Route::post('/inbox/{conversationId}/media',        [InboxController::class, 'mediaReply']);
     Route::patch('/inbox/{conversationId}/toggle-ai',   [InboxController::class, 'toggleAi']);
     Route::patch('/inbox/{conversationId}/status',      [InboxController::class, 'updateStatus']);
+    Route::patch('/conversations/{id}/bot',             [InboxController::class, 'updateBot']);
     Route::post('/messages/{messageId}/react',          [InboxController::class, 'reactToMessage']);
     
     // Tag management
@@ -206,7 +213,7 @@ Route::middleware('auth:sanctum')->group(function () {
 
     // Team Management
     Route::get('/businesses/{businessId}/team',       [TeamController::class, 'index']);
-    Route::post('/businesses/{businessId}/team/invite', [TeamController::class, 'invite']);
+    Route::post('/businesses/{businessId}/team/invite', [TeamController::class, 'invite'])->middleware('plan.enforce:max_team_members');
     Route::patch('/businesses/{businessId}/team/{memberId}/role', [TeamController::class, 'updateRole']);
     Route::delete('/businesses/{businessId}/team/{memberId}', [TeamController::class, 'remove']);
     Route::post('/conversations/{conversationId}/assign', [TeamController::class, 'assignConversation']);
@@ -358,9 +365,9 @@ Route::middleware('auth:sanctum')->group(function () {
     Route::prefix('workflows')->group(function () {
         Route::get('/', [AutomationController::class, 'index']);
         Route::get('/templates', [AutomationController::class, 'getTemplates']);
-        Route::post('/', [AutomationController::class, 'store']);
+        Route::post('/', [AutomationController::class, 'store'])->middleware('feature.flag:advanced_automation');
         Route::get('/{id}', [AutomationController::class, 'show']);
-        Route::patch('/{id}', [AutomationController::class, 'update']);
+        Route::patch('/{id}', [AutomationController::class, 'update'])->middleware('feature.flag:advanced_automation');
         Route::delete('/{id}', [AutomationController::class, 'destroy']);
         Route::post('/{id}/toggle', [AutomationController::class, 'toggle']);
         Route::post('/{id}/duplicate', [AutomationController::class, 'duplicate']);
@@ -458,7 +465,15 @@ Route::post('/whatsapp/webhook', [WhatsAppController::class, 'webhook'])
 Route::middleware(['auth:sanctum', 'admin'])->prefix('admin')->group(function () {
     // Dashboard
     Route::get('/dashboard', [AdminController::class, 'dashboard']);
-    
+
+    // Queue Management
+    Route::get('/queue/stats', [AdminController::class, 'queueStats']);
+    Route::post('/queue/retry/{id}', [AdminController::class, 'retryFailedJob']);
+    Route::delete('/queue/failed/{id}', [AdminController::class, 'deleteFailedJob']);
+
+    // System Logs
+    Route::get('/logs', [AdminController::class, 'systemLogs']);
+
     // Users
     Route::get('/users', [AdminController::class, 'users']);
     Route::get('/users/{id}', [AdminController::class, 'showUser']);

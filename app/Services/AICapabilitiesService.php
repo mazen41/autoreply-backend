@@ -143,6 +143,89 @@ ROLE;
             $p .= "• Only confirm presence on these platforms. If a platform is not listed, politely state you are not on it.\n\n";
         }
 
+        // ── Tone & Communication Style (Bot or BusinessProfile override) ──
+        if (!empty($context['ai_tone_style'])) {
+            $toneStyle = $context['ai_tone_style'];
+            $p .= "\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n";
+            $p .= "### Tone & Communication Style:\n";
+            $p .= "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n";
+
+            if (is_array($toneStyle)) {
+                if (!empty($toneStyle['tone'])) {
+                    $p .= "• Tone: " . $toneStyle['tone'] . "\n";
+                }
+                if (!empty($toneStyle['formality'])) {
+                    $p .= "• Formality: " . $toneStyle['formality'] . "\n";
+                }
+                if (!empty($toneStyle['focus'])) {
+                    $p .= "• Focus: " . $toneStyle['focus'] . "\n";
+                }
+                // Include any additional tone style keys
+                foreach ($toneStyle as $key => $value) {
+                    if (!in_array($key, ['tone', 'formality', 'focus']) && !empty($value)) {
+                        $p .= "• " . ucfirst($key) . ": " . (is_array($value) ? implode(', ', $value) : $value) . "\n";
+                    }
+                }
+            } elseif (is_string($toneStyle)) {
+                $p .= "• " . $toneStyle . "\n";
+            }
+            $p .= "\n";
+        }
+
+        // ── Human Escalation Triggers (Bot or BusinessProfile config) ─────
+        if (!empty($context['escalation_config'])) {
+            $escalationConfig = $context['escalation_config'];
+            $p .= "\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n";
+            $p .= "### Human Escalation Triggers:\n";
+            $p .= "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n";
+
+            if (is_array($escalationConfig)) {
+                // Keyword-based escalation
+                if (!empty($escalationConfig['keywords']) && is_array($escalationConfig['keywords'])) {
+                    $p .= "• IMMEDIATELY transfer to a human agent when the customer mentions any of these keywords:\n";
+                    foreach ($escalationConfig['keywords'] as $keyword) {
+                        $p .= "  - \"{$keyword}\"\n";
+                    }
+                    $p .= "  Set needs_escalation = true and escalation_reason = 'keyword_match'.\n\n";
+                }
+
+                // Intent-based escalation
+                if (!empty($escalationConfig['intents']) && is_array($escalationConfig['intents'])) {
+                    $p .= "• IMMEDIATELY transfer to a human agent when the AI detects any of these intents:\n";
+                    foreach ($escalationConfig['intents'] as $intent) {
+                        $p .= "  - \"{$intent}\"\n";
+                    }
+                    $p .= "  Set needs_escalation = true and escalation_reason = 'intent_match'.\n\n";
+                }
+
+                // Confidence threshold directive
+                if (!empty($escalationConfig['confidence_threshold'])) {
+                    $p .= "• If your confidence in the response is below " . ($escalationConfig['confidence_threshold'] * 100) . "%, transfer to a human agent.\n";
+                    $p .= "  Set needs_escalation = true and escalation_reason = 'low_confidence'.\n\n";
+                }
+
+                // Fallback directive
+                if (!empty($escalationConfig['fallback_message'])) {
+                    $p .= "• When escalating, use this message: \"{$escalationConfig['fallback_message']}\"\n\n";
+                }
+
+                // Custom rules
+                if (!empty($escalationConfig['custom_rules']) && is_array($escalationConfig['custom_rules'])) {
+                    $p .= "• Additional escalation rules:\n";
+                    foreach ($escalationConfig['custom_rules'] as $rule) {
+                        if (is_string($rule)) {
+                            $p .= "  - {$rule}\n";
+                        } elseif (is_array($rule) && !empty($rule['condition'])) {
+                            $p .= "  - {$rule['condition']}\n";
+                        }
+                    }
+                    $p .= "\n";
+                }
+            } elseif (is_string($escalationConfig)) {
+                $p .= "• " . $escalationConfig . "\n\n";
+            }
+        }
+
         // ── Order data (pre-fetched by ProcessAutoReply) ──────────────────────
         $p .= "\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n";
         // ── Store aggregate data (pre-fetched by ProcessAutoReply from the live Salla API) ──
@@ -839,6 +922,93 @@ JSON;
             'confidence' => 0.5,
             'validation' => ['valid' => false, 'reasons' => ['ai_failure']]
         ];
+    }
+
+    /**
+     * Calculate estimated cost based on provider, model, and token usage.
+     *
+     * @param string $provider
+     * @param string $model
+     * @param int $promptTokens
+     * @param int $completionTokens
+     * @return float Estimated cost in USD
+     */
+    public static function calculateCost(string $provider, string $model, int $promptTokens, int $completionTokens): float
+    {
+        // Cost per 1k tokens (USD)
+        $rates = [
+            'openai' => [
+                'gpt-4o' => ['input' => 0.0025, 'output' => 0.0100],
+                'gpt-4o-mini' => ['input' => 0.00015, 'output' => 0.0006],
+                'gpt-4-turbo' => ['input' => 0.0100, 'output' => 0.0300],
+                'o3-mini' => ['input' => 0.0011, 'output' => 0.0044],
+            ],
+            'anthropic' => [
+                'claude-sonnet-4-20250514' => ['input' => 0.003, 'output' => 0.015],
+                'claude-3-5-haiku-20241022' => ['input' => 0.0008, 'output' => 0.004],
+                'claude-3-5-sonnet-20241022' => ['input' => 0.003, 'output' => 0.015],
+            ],
+            'gemini' => [
+                'gemini-2.5-flash' => ['input' => 0.000075, 'output' => 0.0003],
+                'gemini-2.5-pro' => ['input' => 0.00125, 'output' => 0.0100],
+                'gemini-2.0-flash' => ['input' => 0.0001, 'output' => 0.0004],
+                'gemini-1.5-pro' => ['input' => 0.00125, 'output' => 0.0050],
+            ],
+            'groq' => [
+                'llama-3.3-70b-versatile' => ['input' => 0.00059, 'output' => 0.00079],
+                'llama-3.1-8b-instant' => ['input' => 0.00005, 'output' => 0.00008],
+                'mixtral-8x7b-32768' => ['input' => 0.00024, 'output' => 0.00024],
+            ],
+        ];
+
+        $providerRates = $rates[$provider] ?? [];
+        $modelRates = $providerRates[$model] ?? ['input' => 0, 'output' => 0];
+
+        $inputCost = ($promptTokens / 1000) * $modelRates['input'];
+        $outputCost = ($completionTokens / 1000) * $modelRates['output'];
+
+        return round($inputCost + $outputCost, 6);
+    }
+
+    /**
+     * Log AI metrics for analytics and cost tracking.
+     *
+     * @param string $provider
+     * @param string $model
+     * @param int $promptTokens
+     * @param int $completionTokens
+     * @param int|null $responseTimeMs
+     * @param int|null $businessProfileId
+     * @param int|null $botId
+     */
+    public static function logMetrics(
+        string $provider,
+        string $model,
+        int $promptTokens,
+        int $completionTokens,
+        ?int $responseTimeMs = null,
+        ?int $businessProfileId = null,
+        ?int $botId = null
+    ): void {
+        try {
+            $totalTokens = $promptTokens + $completionTokens;
+            $estimatedCost = self::calculateCost($provider, $model, $promptTokens, $completionTokens);
+
+            \App\Models\AiMetric::create([
+                'business_profile_id' => $businessProfileId,
+                'bot_id' => $botId,
+                'provider' => $provider,
+                'model' => $model,
+                'prompt_tokens' => $promptTokens,
+                'completion_tokens' => $completionTokens,
+                'total_tokens' => $totalTokens,
+                'estimated_cost' => $estimatedCost,
+                'response_time_ms' => $responseTimeMs,
+            ]);
+        } catch (\Throwable $e) {
+            // Never let metric logging break the AI flow
+            Log::warning('Failed to log AI metrics: ' . $e->getMessage());
+        }
     }
 
     /**

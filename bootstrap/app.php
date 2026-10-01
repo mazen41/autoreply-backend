@@ -30,6 +30,8 @@ return Application::configure(basePath: dirname(__DIR__))
             'verified' => \Illuminate\Auth\Middleware\EnsureEmailIsVerified::class,
             'admin' => \App\Http\Middleware\IsAdmin::class,
             'validate.input' => \App\Http\Middleware\ValidateInput::class,
+            'plan.enforce' => \App\Http\Middleware\PlanEnforcement::class,
+            'feature.flag' => \App\Http\Middleware\CheckFeatureFlag::class,
         ]);
     })
     ->withExceptions(function (Exceptions $exceptions): void {

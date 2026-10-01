@@ -285,6 +285,59 @@ class ProcessAutoReply implements ShouldQueue
 
         $detectedLanguage = $this->detectLanguage($message->content);
 
+        // ── VOICE MESSAGE TRANSCRIPTION ────────────────────────────────────
+        $voiceTranscription = null;
+        if (in_array($message->type ?? '', ['voice', 'audio']) && $message->media_url) {
+            try {
+                $voiceService = new \App\Services\VoiceService();
+                $audioPath = storage_path('app/public/' . str_replace('/storage/', '', $message->media_url));
+
+                if (file_exists($audioPath)) {
+                    $voiceTranscription = $voiceService->transcribeAudio($audioPath);
+                    Log::info('ProcessAutoReply: voice message transcribed', [
+                        'conversation_id' => $conversation->id,
+                        'transcription_length' => strlen($voiceTranscription),
+                    ]);
+
+                    // Use transcription as the message content for AI processing
+                    $message->content = $voiceTranscription;
+                }
+            } catch (\Throwable $e) {
+                Log::warning('ProcessAutoReply: voice transcription failed', [
+                    'conversation_id' => $conversation->id,
+                    'error' => $e->getMessage(),
+                ]);
+            }
+        }
+
+        // ── IMAGE UNDERSTANDING ─────────────────────────────────────────────
+        $imageAnalysis = null;
+        if (($message->type ?? '') === 'image' && $message->media_url) {
+            try {
+                $imageService = new \App\Services\ImageUnderstandingService();
+                $imageAnalysis = $imageService->analyzeImage($message->media_url);
+
+                if (!empty($imageAnalysis['raw_analysis'])) {
+                    Log::info('ProcessAutoReply: image analyzed', [
+                        'conversation_id' => $conversation->id,
+                        'detected_intent' => $imageAnalysis['detected_intent'],
+                    ]);
+
+                    // Append image analysis to message content for AI context
+                    $imageContext = "\n\n[Image Analysis: {$imageAnalysis['raw_analysis']}]";
+                    if (!empty($imageAnalysis['extracted_text'])) {
+                        $imageContext .= "\n[Extracted Text: {$imageAnalysis['extracted_text']}]";
+                    }
+                    $message->content .= $imageContext;
+                }
+            } catch (\Throwable $e) {
+                Log::warning('ProcessAutoReply: image analysis failed', [
+                    'conversation_id' => $conversation->id,
+                    'error' => $e->getMessage(),
+                ]);
+            }
+        }
+
         // Get last 10 messages for context
         $contextMessages = Message::where('conversation_id', $message->conversation_id)
             ->orderBy('created_at', 'desc')
@@ -332,12 +385,12 @@ class ProcessAutoReply implements ShouldQueue
             return;
         }
 
-        // Apply tone/persona customization
-        $toneStyle = $channel->business?->ai_tone_style ?? [
+        // Apply tone/persona customization — Bot overrides BusinessProfile
+        $effectiveToneStyle = !empty($bot?->ai_tone_style) ? $bot->ai_tone_style : ($channel->business?->ai_tone_style ?? [
             'tone' => 'friendly',
             'formality' => 'casual',
             'focus' => 'support'
-        ];
+        ]);
         
         // ── CRITICAL ISSUE — REPLY-TO-PRODUCT CONTEXT / PRODUCT SELECTION ──────
         // If this incoming message is a WhatsApp reply to a specific product
@@ -622,12 +675,12 @@ class ProcessAutoReply implements ShouldQueue
             }
         }
 
-        // ── BOT RESOLUTION ───────────────────────────────────────────────────
+        // ── BOT RESOLUTION (Deterministic Hierarchy) ──────────────────────────
         $bot = null;
         $botResolutionSource = 'none';
         if ($business) {
             try {
-                // 1. Check existing snapshot on conversation
+                // Priority 1: Existing conversation bot (sticky)
                 if (!empty($conversation->bot_id)) {
                     $bot = \App\Models\Bot::where('id', $conversation->bot_id)
                         ->where('business_profile_id', $business->id)
@@ -635,10 +688,18 @@ class ProcessAutoReply implements ShouldQueue
                         ->first();
                     if ($bot) {
                         $botResolutionSource = 'conversation_snapshot';
+                    } else {
+                        // Bot exists on conversation but is inactive or from another business
+                        Log::warning('ProcessAutoReply: conversation bot_id is invalid or inactive, clearing', [
+                            'conversation_id' => $conversation->id,
+                            'invalid_bot_id' => $conversation->bot_id,
+                            'business_id' => $business->id,
+                        ]);
+                        $conversation->update(['bot_id' => null]);
                     }
                 }
 
-                // 2. Resolve from channel's assigned bots if not set on conversation
+                // Priority 2-4: Resolve from channel's assigned bots
                 if (!$bot && method_exists($channel, 'bots')) {
                     $activeBots = $channel->bots()
                         ->where('status', 'active')
@@ -646,10 +707,11 @@ class ProcessAutoReply implements ShouldQueue
                         ->get();
 
                     if ($activeBots->count() === 1) {
+                        // Priority 3: Exactly one active bot
                         $bot = $activeBots->first();
                         $botResolutionSource = 'channel_assignment';
                     } elseif ($activeBots->count() > 1) {
-                        // Check if one of the assigned bots is marked as primary for this channel
+                        // Priority 2: Check for primary bot
                         $primaryBot = $activeBots->first(function ($b) {
                             return (bool)($b->pivot->is_primary ?? false);
                         });
@@ -658,22 +720,23 @@ class ProcessAutoReply implements ShouldQueue
                             $bot = $primaryBot;
                             $botResolutionSource = 'channel_primary_bot';
                         } else {
-                            // Fallback to first created active bot as primary default
-                            $bot = $activeBots->first();
-                            $botResolutionSource = 'channel_default_first_active';
-                            Log::warning('ProcessAutoReply: multiple bots assigned to channel without explicit primary, selected first active', [
+                            // Priority 4: Multiple bots, no primary — DO NOT make arbitrary choice
+                            $botResolutionSource = 'channel_multiple_bots_no_primary';
+                            Log::error('ProcessAutoReply: multiple active bots assigned to channel without explicit primary — no bot selected', [
                                 'channel_id' => $channel->id,
                                 'business_id' => $business->id,
-                                'selected_bot_id' => $bot->id,
                                 'all_bot_ids' => $activeBots->pluck('id')->toArray(),
+                                'all_bot_names' => $activeBots->pluck('name')->toArray(),
+                                'conversation_id' => $conversation->id,
                             ]);
                         }
                     } else {
+                        // Priority 5: No bot assigned
                         $botResolutionSource = 'no_bot_assigned';
                     }
                 }
 
-                // 3. Persist bot snapshot on conversation
+                // Persist bot snapshot on conversation (only for new assignments)
                 if ($bot && empty($conversation->bot_id)) {
                     $conversation->update(['bot_id' => $bot->id]);
                 }
@@ -1072,6 +1135,8 @@ class ProcessAutoReply implements ShouldQueue
         // Precedence: Bot setting overrides BusinessProfile default fallback
         $effectiveAiInstructions = !empty($bot?->ai_instructions) ? $bot->ai_instructions : ($business?->ai_instructions ?? null);
         $effectiveReplyStyle     = !empty($bot?->reply_style) ? $bot->reply_style : ($business?->reply_style ?? null);
+        $effectiveConfidenceThreshold = !empty($bot?->ai_confidence_threshold) ? $bot->ai_confidence_threshold : ($business?->ai_confidence_threshold ?? 0.80);
+        $effectiveEscalationConfig = !empty($bot?->escalation_config) ? $bot->escalation_config : ($business?->escalation_config ?? null);
 
         // Build business profile context separate from uploaded knowledge
         $businessProfileContext = '';
@@ -1294,9 +1359,12 @@ class ProcessAutoReply implements ShouldQueue
             // so it prompts the customer for the missing/clarifying information instead
             // of falsely claiming the order was placed.
             'order_creation_failed_reason' => $orderCreationFailedReason,
-            // Inject bot AI preferences
+            // Inject bot AI preferences (Bot overrides BusinessProfile)
             'ai_provider'                  => !empty($bot?->ai_provider) ? $bot->ai_provider : ($business?->ai_provider ?? null),
             'ai_model'                     => !empty($bot?->ai_model) ? $bot->ai_model : ($business?->ai_model ?? null),
+            'ai_tone_style'                => $effectiveToneStyle,
+            'ai_confidence_threshold'      => $effectiveConfidenceThreshold,
+            'escalation_config'            => $effectiveEscalationConfig,
         ];
 
         // Step 4: Single AI Call with JSON Output
@@ -1344,15 +1412,17 @@ class ProcessAutoReply implements ShouldQueue
         //   1. Customer explicitly requested human (customer_requested_human)
         //   2. Customer is making a serious complaint/problem (complaint, sensitive_issue)
         //   3. Business rule requires escalation (business_rule)
+        //   4. AI confidence below configured threshold
+        //   5. Keyword match from escalation_config
         //
         // DO NOT escalate for:
         //   - general questions (even if AI doesn't know the answer)
         //   - information_missing (AI should just say it doesn't know and ask if user wants human)
-        //   - low_confidence (AI should still reply, just be honest about uncertainty)
 
         $escalationReason    = $aiResult['escalation_reason'] ?? 'none';
         $needsEscalation     = $aiResult['needs_escalation'] ?? false;
         $intent              = $aiResult['intent'] ?? 'unknown';
+        $confidenceScore     = $aiResult['confidence'] ?? 1.0;
 
         // Reasons that should ALWAYS trigger escalation
         $hardEscalationReasons = [
@@ -1366,21 +1436,62 @@ class ProcessAutoReply implements ShouldQueue
         $shouldEscalate   = false;
         $decisionReason   = 'auto_reply_default';
 
+        // Check 1: AI hard escalation reasons
         if ($needsEscalation && in_array($escalationReason, $hardEscalationReasons)) {
-            // Hard escalation: AI has a concrete reason to hand off
             $shouldEscalate = true;
             $decisionReason = "ai_hard_escalation: {$escalationReason}";
-        } else {
-            // Never escalate for other reasons - trust the AI's reply
-            $shouldEscalate = false;
-            $decisionReason = 'auto_reply_trust_ai_response';
+        }
+
+        // Check 2: Confidence threshold enforcement
+        $effectiveThreshold = $effectiveConfidenceThreshold ?? 0.70;
+        if (!$shouldEscalate && $confidenceScore < $effectiveThreshold) {
+            $shouldEscalate = true;
+            $decisionReason = 'ai_confidence_below_threshold';
+            Log::info('ProcessAutoReply: AI confidence below threshold', [
+                'conversation_id' => $conversation->id,
+                'confidence' => $confidenceScore,
+                'threshold' => $effectiveThreshold,
+            ]);
+        }
+
+        // Check 3: Keyword-based escalation from escalation_config
+        if (!$shouldEscalate && !empty($effectiveEscalationConfig['keywords']) && is_array($effectiveEscalationConfig['keywords'])) {
+            $messageContent = mb_strtolower($message->content);
+            foreach ($effectiveEscalationConfig['keywords'] as $keyword) {
+                if (str_contains($messageContent, mb_strtolower($keyword))) {
+                    $shouldEscalate = true;
+                    $decisionReason = "escalation_keyword_match: {$keyword}";
+                    Log::info('ProcessAutoReply: Escalation keyword matched', [
+                        'conversation_id' => $conversation->id,
+                        'keyword' => $keyword,
+                    ]);
+                    break;
+                }
+            }
+        }
+
+        // Check 4: Intent-based escalation from escalation_config
+        if (!$shouldEscalate && !empty($effectiveEscalationConfig['intents']) && is_array($effectiveEscalationConfig['intents'])) {
+            $intentLower = mb_strtolower($intent);
+            foreach ($effectiveEscalationConfig['intents'] as $escalationIntent) {
+                if ($intentLower === mb_strtolower($escalationIntent)) {
+                    $shouldEscalate = true;
+                    $decisionReason = "escalation_intent_match: {$intent}";
+                    Log::info('ProcessAutoReply: Escalation intent matched', [
+                        'conversation_id' => $conversation->id,
+                        'intent' => $intent,
+                    ]);
+                    break;
+                }
+            }
         }
 
         // Log full AI decision for diagnostics
         Log::info('ProcessAutoReply: AI decision', [
             'conversation_id'  => $conversation->id,
             'intent'           => $intent,
-            'confidence'       => round(($aiResult['confidence'] ?? 0) * 100, 1),
+            'confidence'       => round($confidenceScore * 100, 1),
+            'threshold'        => $effectiveThreshold,
             'needs_escalation' => $needsEscalation,
             'escalation_reason' => $escalationReason,
         ]);
@@ -1392,13 +1503,36 @@ class ProcessAutoReply implements ShouldQueue
         ]);
 
         if ($shouldEscalate) {
+            // Update conversation with full escalation state
             $conversation->update([
-                'requires_human'   => true,
-                'escalated_at'     => now(),
-                'escalation_reason' => "{$decisionReason} (intent={$intent})",
+                'requires_human'    => true,
+                'ai_enabled'        => false,
+                'status'            => 'pending_human',
+                'escalated_at'      => now(),
+                'escalation_reason' => "{$decisionReason} (intent={$intent}, confidence=" . round($confidenceScore, 2) . ")",
             ]);
 
-            $escalationMessage = "Sure 👍 I'm connecting you with a team member now. Please wait a moment.";
+            // Halt/Pause active sequences for this conversation
+            try {
+                if (class_exists(\App\Services\SequenceEnrollmentService::class)) {
+                    $enrollmentService = app(\App\Services\SequenceEnrollmentService::class);
+                    $enrollmentService->stopEnrollmentsForConversation($conversation, 'conversation_escalated');
+                    Log::info('ProcessAutoReply: stopped active sequences on escalation', [
+                        'conversation_id' => $conversation->id,
+                    ]);
+                }
+            } catch (\Exception $seqEx) {
+                Log::warning('ProcessAutoReply: failed to stop sequences on escalation', [
+                    'conversation_id' => $conversation->id,
+                    'error' => $seqEx->getMessage(),
+                ]);
+            }
+
+            // Use custom fallback message if configured
+            $escalationMessage = !empty($effectiveEscalationConfig['fallback_message'])
+                ? $effectiveEscalationConfig['fallback_message']
+                : "Sure 👍 I'm connecting you with a team member now. Please wait a moment.";
+
             $replyMessage = Message::create([
                 'conversation_id' => $message->conversation_id,
                 'content'         => $escalationMessage,

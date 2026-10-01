@@ -27,10 +27,11 @@ class InboxController extends Controller
                 $q->where('user_id', auth()->id());
             })
             ->with([
-                'channel:id,type,page_name',
+                'channel:id,type,page_name,page_id',
+                'bot:id,name',
                 'latestMessage',
             ])
-            ->select(['id', 'channel_id', 'business_id', 'sender_id', 'sender_name', 'sender_email', 'subject', 'status', 'ai_enabled', 'requires_human', 'escalated_at', 'escalation_reason', 'last_message_at', 'assigned_agent_id', 'assigned_at']);
+            ->select(['id', 'channel_id', 'business_id', 'bot_id', 'sender_id', 'sender_name', 'sender_email', 'subject', 'status', 'ai_enabled', 'requires_human', 'escalated_at', 'escalation_reason', 'last_message_at', 'assigned_agent_id', 'assigned_at']);
 
         // Agent-specific filter
         if ($request->has('assigned_to_me')) {
@@ -50,11 +51,41 @@ class InboxController extends Controller
             });
         }
 
-        // Channel filter
+        // Channel type filter
         if ($request->has('channel_type') && !empty($request->channel_type)) {
             $query->whereHas('channel', function ($q) use ($request) {
                 $q->where('type', $request->channel_type);
             });
+        }
+
+        // Channel ID filter (specific channel account) — verify ownership
+        if ($request->has('channel_id') && !empty($request->channel_id)) {
+            $channelId = (int) $request->channel_id;
+            $channelOwned = \App\Models\Channel::where('id', $channelId)
+                ->where('user_id', auth()->id())
+                ->exists();
+            if (!$channelOwned) {
+                // Channel not owned by this user — return empty results
+                $query->whereRaw('1 = 0');
+            } else {
+                $query->where('channel_id', $channelId);
+            }
+        }
+
+        // Bot filter — verify bot belongs to a channel owned by this user
+        if ($request->has('bot_id') && !empty($request->bot_id)) {
+            $botId = (int) $request->bot_id;
+            $botOwned = \App\Models\Bot::where('id', $botId)
+                ->whereHas('channels', function ($q) {
+                    $q->where('user_id', auth()->id());
+                })
+                ->exists();
+            if (!$botOwned) {
+                // Bot not owned by this user — return empty results
+                $query->whereRaw('1 = 0');
+            } else {
+                $query->where('bot_id', $botId);
+            }
         }
 
         // Status filter
@@ -770,6 +801,84 @@ class InboxController extends Controller
         return response()->json([
             'message'    => 'AI toggled successfully',
             'ai_enabled' => $newValue,
+        ]);
+    }
+
+    /**
+     * Add an internal note to a conversation.
+     */
+    public function addNote(Request $request, $conversationId)
+    {
+        $request->validate([
+            'content' => 'required|string|max:5000',
+        ]);
+
+        $conversation = Conversation::whereHas('channel', function ($q) {
+                $q->where('user_id', auth()->id());
+            })
+            ->findOrFail($conversationId);
+
+        $note = \App\Models\CustomerNote::create([
+            'customer_id' => $conversation->customer_id,
+            'user_id' => auth()->id(),
+            'conversation_id' => $conversation->id,
+            'content' => $request->input('content'),
+        ]);
+
+        // Audit log
+        \App\Services\AuditLoggerService::log('conversation.note_added', $note, [
+            'conversation_id' => $conversation->id,
+        ]);
+
+        return response()->json([
+            'message' => 'Note added successfully',
+            'note' => $note->load('author:id,name'),
+        ], 201);
+    }
+
+    /**
+     * Update the Bot assigned to a conversation.
+     *
+     * Allows switching the active Bot for a conversation, or clearing it (null).
+     * Validates that the new Bot is active and assigned to the conversation's channel.
+     */
+    public function updateBot(Request $request, $id)
+    {
+        $request->validate([
+            'bot_id' => 'nullable|integer',
+        ]);
+
+        $conversation = Conversation::whereHas('channel', function ($q) {
+                $q->where('user_id', auth()->id());
+            })
+            ->with('bot:id,name')
+            ->findOrFail($id);
+
+        $botId = $request->input('bot_id');
+
+        if ($botId !== null) {
+            $botId = (int) $botId;
+
+            // Verify the bot exists, is active, and is assigned to this conversation's channel
+            $bot = \App\Models\Bot::where('id', $botId)
+                ->where('status', 'active')
+                ->whereHas('channels', function ($q) use ($conversation) {
+                    $q->where('channel_id', $conversation->channel_id);
+                })
+                ->first();
+
+            if (!$bot) {
+                return response()->json([
+                    'error' => 'Bot not found, inactive, or not assigned to this conversation\'s channel',
+                ], 422);
+            }
+        }
+
+        $conversation->update(['bot_id' => $botId]);
+
+        return response()->json([
+            'message' => 'Bot updated successfully',
+            'conversation' => $conversation->fresh('bot:id,name'),
         ]);
     }
 }

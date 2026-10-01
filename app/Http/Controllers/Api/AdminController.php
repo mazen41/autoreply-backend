@@ -50,6 +50,128 @@ class AdminController extends Controller
         ]);
     }
 
+    /**
+     * Get queue statistics for admin monitoring.
+     */
+    public function queueStats()
+    {
+        $queueStats = [
+            'pending_jobs' => \DB::table('jobs')->count(),
+            'failed_jobs' => \DB::table('failed_jobs')->count(),
+            'queues' => [],
+        ];
+
+        // Get pending jobs grouped by queue
+        $pendingByQueue = \DB::table('jobs')
+            ->select('queue', \DB::raw('count(*) as count'))
+            ->groupBy('queue')
+            ->get();
+
+        foreach ($pendingByQueue as $queue) {
+            $queueStats['queues'][] = [
+                'name' => $queue->queue,
+                'pending' => (int) $queue->count,
+            ];
+        }
+
+        // Get recent failed jobs
+        $failedJobs = \DB::table('failed_jobs')
+            ->orderBy('failed_at', 'desc')
+            ->paginate(20);
+
+        $queueStats['failed_jobs_list'] = $failedJobs;
+
+        return response()->json($queueStats);
+    }
+
+    /**
+     * Retry a failed job.
+     */
+    public function retryFailedJob($id)
+    {
+        try {
+            Artisan::call('queue:retry', ['id' => $id]);
+            return response()->json(['message' => 'Job retried successfully']);
+        } catch (\Exception $e) {
+            return response()->json(['error' => $e->getMessage()], 500);
+        }
+    }
+
+    /**
+     * Delete a failed job.
+     */
+    public function deleteFailedJob($id)
+    {
+        $deleted = \DB::table('failed_jobs')->where('id', $id)->delete();
+
+        if (!$deleted) {
+            return response()->json(['error' => 'Failed job not found'], 404);
+        }
+
+        return response()->json(['message' => 'Failed job deleted successfully']);
+    }
+
+    /**
+     * Get system logs with filtering.
+     */
+    public function systemLogs(Request $request)
+    {
+        $logPath = storage_path('logs/laravel.log');
+
+        if (!file_exists($logPath)) {
+            return response()->json(['logs' => [], 'message' => 'No log file found']);
+        }
+
+        $level = $request->input('level');
+        $search = $request->input('search');
+        $lines = (int) $request->input('lines', 100);
+
+        // Read the last N lines of the log file
+        $content = file_get_contents($logPath);
+        $allLines = explode("\n", $content);
+        $allLines = array_slice($allLines, -$lines);
+
+        $parsedLogs = [];
+        foreach ($allLines as $line) {
+            if (empty(trim($line))) continue;
+
+            // Parse log level from the line
+            $logLevel = null;
+            if (str_contains($line, 'ERROR')) $logLevel = 'ERROR';
+            elseif (str_contains($line, 'WARNING')) $logLevel = 'WARNING';
+            elseif (str_contains($line, 'INFO')) $logLevel = 'INFO';
+            elseif (str_contains($line, 'DEBUG')) $logLevel = 'DEBUG';
+
+            // Filter by level
+            if ($level && $logLevel !== strtoupper($level)) continue;
+
+            // Filter by search query
+            if ($search && !str_contains(strtolower($line), strtolower($search))) continue;
+
+            $parsedLogs[] = [
+                'level' => $logLevel ?? 'UNKNOWN',
+                'message' => $line,
+                'timestamp' => $this->extractTimestamp($line),
+            ];
+        }
+
+        return response()->json([
+            'logs' => $parsedLogs,
+            'total' => count($parsedLogs),
+        ]);
+    }
+
+    /**
+     * Extract timestamp from a log line.
+     */
+    private function extractTimestamp(string $line): ?string
+    {
+        if (preg_match('/\[(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})\]/', $line, $matches)) {
+            return $matches[1];
+        }
+        return null;
+    }
+
     public function users(Request $request)
     {
         $query = User::query()

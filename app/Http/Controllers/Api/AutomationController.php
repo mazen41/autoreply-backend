@@ -229,8 +229,14 @@ class AutomationController extends Controller
             )
             ->unique();
 
-        $workflows = AutomationWorkflow::whereIn('business_id', $businessIds)
-            ->with('business')
+        $query = AutomationWorkflow::whereIn('business_id', $businessIds);
+
+        // Apply bot filter if provided
+        if ($request->has('bot_id') && !empty($request->bot_id)) {
+            $query->where('bot_id', (int) $request->bot_id);
+        }
+
+        $workflows = $query->with('business')
             ->orderBy('created_at', 'desc')
             ->get()
             ->map(function ($workflow) {
@@ -252,6 +258,42 @@ class AutomationController extends Controller
     }
 
     /**
+     * Resolve the business profile for the current request.
+     *
+     * Supports multi-business users via X-Business-Id header or business_id input.
+     * Falls back to the user's primary business profile without creating duplicates.
+     */
+    private function getResolvedBusinessProfile(Request $request): BusinessProfile
+    {
+        $user = $request->user();
+
+        // Check for explicit business ID from header or input
+        $requestedBusinessId = $request->header('X-Business-Id') ?? $request->input('business_id');
+
+        if ($requestedBusinessId) {
+            $requestedBusinessId = (int) $requestedBusinessId;
+
+            // Verify user has access to this business (as owner or team member)
+            $hasAccess = BusinessProfile::where('id', $requestedBusinessId)
+                ->where('user_id', $user->id)
+                ->exists() ||
+                \App\Models\TeamMember::where('business_id', $requestedBusinessId)
+                    ->where('user_id', $user->id)
+                    ->where('is_active', true)
+                    ->exists();
+
+            if ($hasAccess) {
+                return BusinessProfile::findOrFail($requestedBusinessId);
+            }
+
+            // If no access, fall through to default behavior
+        }
+
+        // Fallback: get or create the user's primary business profile
+        return BusinessProfile::firstOrCreate(['user_id' => $user->id]);
+    }
+
+    /**
      * Store a new workflow
      */
     public function store(Request $request)
@@ -268,7 +310,7 @@ class AutomationController extends Controller
         $user = Auth::user();
 
         // Resolve business_id from request or use user's primary business
-        $businessId = $request->business_id;
+        $businessId = $request->input('business_id');
         if (!$businessId) {
             $business = BusinessProfile::where('user_id', $user->id)->first();
             if (!$business) {

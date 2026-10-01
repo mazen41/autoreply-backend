@@ -112,6 +112,7 @@ class AutomationEngine
 
         switch ($triggerType) {
             case 'keyword':
+            case 'keyword_matched':
                 return $this->checkKeywordTrigger($conditions, $conversation);
             case 'time':
                 return $this->checkTimeTrigger($conditions, $conversation);
@@ -121,6 +122,12 @@ class AutomationEngine
                 return $this->checkTagTrigger($conditions, $conversation);
             case 'message_received':
                 return $this->checkMessageReceivedTrigger($conditions, $conversation);
+            case 'order_status_changed':
+                return $this->checkOrderStatusTrigger($conditions, $conversation);
+            case 'escalation_triggered':
+                return $this->checkEscalationTrigger($conditions, $conversation);
+            case 'sequence_completed':
+                return $this->checkSequenceCompletedTrigger($conditions, $conversation);
             default:
                 return false;
         }
@@ -233,6 +240,78 @@ class AutomationEngine
     }
 
     /**
+     * Check order status changed trigger
+     */
+    private function checkOrderStatusTrigger(array $conditions, Conversation $conversation): bool
+    {
+        $orderStatus = $conditions['order_status'] ?? null;
+        if (!$orderStatus) {
+            return false;
+        }
+
+        // Check conversation checkout_state for order status
+        $checkoutState = $conversation->checkout_state ?? [];
+        $currentStatus = $checkoutState['status'] ?? null;
+
+        if ($currentStatus && $currentStatus === $orderStatus) {
+            return true;
+        }
+
+        // Check conditions for specific status transitions
+        if (!empty($conditions['statuses']) && is_array($conditions['statuses'])) {
+            return in_array($currentStatus, $conditions['statuses']);
+        }
+
+        return false;
+    }
+
+    /**
+     * Check escalation triggered
+     */
+    private function checkEscalationTrigger(array $conditions, Conversation $conversation): bool
+    {
+        // Check if conversation is currently escalated
+        if ($conversation->requires_human) {
+            return true;
+        }
+
+        // Check for escalation keywords in recent messages
+        if (!empty($conditions['keywords']) && is_array($conditions['keywords'])) {
+            $recentMessages = $conversation->messages()
+                ->where('direction', 'inbound')
+                ->orderBy('created_at', 'desc')
+                ->take(3)
+                ->get();
+
+            $messageText = mb_strtolower($recentMessages->pluck('content')->implode(' '));
+            foreach ($conditions['keywords'] as $keyword) {
+                if (str_contains($messageText, mb_strtolower($keyword))) {
+                    return true;
+                }
+            }
+        }
+
+        return false;
+    }
+
+    /**
+     * Check sequence completed trigger
+     */
+    private function checkSequenceCompletedTrigger(array $conditions, Conversation $conversation): bool
+    {
+        $sequenceId = $conditions['sequence_id'] ?? null;
+
+        $query = \App\Models\SequenceEnrollment::where('conversation_id', $conversation->id)
+            ->where('status', 'completed');
+
+        if ($sequenceId) {
+            $query->where('sequence_id', $sequenceId);
+        }
+
+        return $query->exists();
+    }
+
+    /**
      * Execute a single action
      */
     private function executeAction(array $action, Conversation $conversation, bool $testMode): array
@@ -259,10 +338,20 @@ class AutomationEngine
                     $result = $this->executeEscalate($action, $conversation, $testMode);
                     break;
                 case 'webhook':
+                case 'send_webhook':
                     $result = $this->executeWebhook($action, $conversation, $testMode);
                     break;
                 case 'pause_ai':
                     $result = $this->executePauseAI($action, $conversation, $testMode);
+                    break;
+                case 'toggle_ai':
+                    $result = $this->executeToggleAI($action, $conversation, $testMode);
+                    break;
+                case 'assign_agent':
+                    $result = $this->executeAssignAgent($action, $conversation, $testMode);
+                    break;
+                case 'update_custom_field':
+                    $result = $this->executeUpdateCustomField($action, $conversation, $testMode);
                     break;
                 case 'start_sequence':
                     $result = $this->executeStartSequence($action, $conversation, $testMode);
@@ -596,6 +685,145 @@ class AutomationEngine
                 'error' => $e->getMessage()
             ];
         }
+    }
+
+    /**
+     * Execute toggle AI action
+     */
+    private function executeToggleAI(array $action, Conversation $conversation, bool $testMode): array
+    {
+        if ($testMode) {
+            return [
+                'type' => 'toggle_ai',
+                'success' => true,
+                'ai_enabled' => $action['ai_enabled'] ?? true,
+            ];
+        }
+
+        $aiEnabled = $action['ai_enabled'] ?? true;
+        $conversation->update(['ai_enabled' => $aiEnabled]);
+
+        return [
+            'type' => 'toggle_ai',
+            'success' => true,
+            'ai_enabled' => $aiEnabled,
+        ];
+    }
+
+    /**
+     * Execute assign agent action
+     */
+    private function executeAssignAgent(array $action, Conversation $conversation, bool $testMode): array
+    {
+        if ($testMode) {
+            return [
+                'type' => 'assign_agent',
+                'success' => true,
+                'agent_id' => $action['agent_id'] ?? null,
+            ];
+        }
+
+        $agentId = $action['agent_id'] ?? null;
+        if (!$agentId) {
+            return [
+                'type' => 'assign_agent',
+                'success' => false,
+                'error' => 'Agent ID is required'
+            ];
+        }
+
+        // Verify agent belongs to the same business
+        $agent = \App\Models\TeamMember::where('user_id', $agentId)
+            ->where('business_id', $conversation->business_id)
+            ->where('is_active', true)
+            ->first();
+
+        if (!$agent) {
+            return [
+                'type' => 'assign_agent',
+                'success' => false,
+                'error' => 'Agent not found or not in this business'
+            ];
+        }
+
+        $conversation->update([
+            'assigned_agent_id' => $agentId,
+            'assigned_at' => now(),
+        ]);
+
+        // Broadcast agent assignment event
+        if ($conversation->channel && $conversation->channel->user_id) {
+            broadcast(new \App\Events\MessageReceived(
+                $conversation->messages()->latest('id')->first() ?? new Message(),
+                $conversation,
+                $conversation->channel->user_id
+            ));
+        }
+
+        // Audit log
+        \App\Services\AuditLoggerService::log('conversation.agent_assigned', $conversation, [
+            'agent_id' => $agentId,
+        ]);
+
+        return [
+            'type' => 'assign_agent',
+            'success' => true,
+            'agent_id' => $agentId,
+        ];
+    }
+
+    /**
+     * Execute update custom field action
+     */
+    private function executeUpdateCustomField(array $action, Conversation $conversation, bool $testMode): array
+    {
+        if ($testMode) {
+            return [
+                'type' => 'update_custom_field',
+                'success' => true,
+                'field' => $action['field'] ?? null,
+                'value' => $action['value'] ?? null,
+            ];
+        }
+
+        $field = $action['field'] ?? null;
+        $value = $action['value'] ?? null;
+
+        if (!$field) {
+            return [
+                'type' => 'update_custom_field',
+                'success' => false,
+                'error' => 'Field name is required'
+            ];
+        }
+
+        // Update or create customer record
+        $customer = \App\Models\Customer::firstOrCreate(
+            ['business_profile_id' => $conversation->business_id],
+            [
+                'name' => $conversation->sender_name,
+                'phone' => $conversation->sender_id,
+                'email' => $conversation->sender_email,
+                'custom_fields' => [],
+            ]
+        );
+
+        $customFields = $customer->custom_fields ?? [];
+        $customFields[$field] = $value;
+        $customer->update(['custom_fields' => $customFields]);
+
+        // Link conversation to customer
+        if (!$conversation->customer_id) {
+            $conversation->update(['customer_id' => $customer->id]);
+        }
+
+        return [
+            'type' => 'update_custom_field',
+            'success' => true,
+            'field' => $field,
+            'value' => $value,
+            'customer_id' => $customer->id,
+        ];
     }
 
 }

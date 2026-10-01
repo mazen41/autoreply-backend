@@ -12,9 +12,40 @@ use Illuminate\Support\Facades\Log;
 
 class BotController extends Controller
 {
-    private function getBusinessProfile(Request $request): BusinessProfile
+    /**
+     * Resolve the business profile for the current request.
+     *
+     * Supports multi-business users via X-Business-Id header or business_id input.
+     * Falls back to the user's primary business profile without creating duplicates.
+     */
+    private function getResolvedBusinessProfile(Request $request): BusinessProfile
     {
-        return BusinessProfile::firstOrCreate(['user_id' => $request->user()->id]);
+        $user = $request->user();
+
+        // Check for explicit business ID from header or input
+        $requestedBusinessId = $request->header('X-Business-Id') ?? $request->input('business_id');
+
+        if ($requestedBusinessId) {
+            $requestedBusinessId = (int) $requestedBusinessId;
+
+            // Verify user has access to this business (as owner or team member)
+            $hasAccess = BusinessProfile::where('id', $requestedBusinessId)
+                ->where('user_id', $user->id)
+                ->exists() ||
+                \App\Models\TeamMember::where('business_id', $requestedBusinessId)
+                    ->where('user_id', $user->id)
+                    ->where('is_active', true)
+                    ->exists();
+
+            if ($hasAccess) {
+                return BusinessProfile::findOrFail($requestedBusinessId);
+            }
+
+            // If no access, fall through to default behavior
+        }
+
+        // Fallback: get or create the user's primary business profile
+        return BusinessProfile::firstOrCreate(['user_id' => $user->id]);
     }
 
     public function index(Request $request)
@@ -74,6 +105,16 @@ class BotController extends Controller
                 ->toArray();
 
             $primaryIds = $request->primary_channel_ids ?? [];
+
+            // Enforce is_primary integrity: only one primary bot per channel
+            if (!empty($primaryIds)) {
+                // Remove is_primary from all other bots for channels where this bot is being set as primary
+                \DB::table('bot_channels')
+                    ->whereIn('channel_id', $primaryIds)
+                    ->where('bot_id', '!=', $bot->id)
+                    ->update(['is_primary' => false]);
+            }
+
             $syncData = [];
             foreach ($validChannelIds as $chId) {
                 $syncData[$chId] = ['is_primary' => in_array($chId, $primaryIds)];
@@ -147,6 +188,15 @@ class BotController extends Controller
                 ->toArray();
 
             $primaryIds = $request->primary_channel_ids ?? [];
+
+            // Enforce is_primary integrity: only one primary bot per channel
+            if (!empty($primaryIds)) {
+                \DB::table('bot_channels')
+                    ->whereIn('channel_id', $primaryIds)
+                    ->where('bot_id', '!=', $bot->id)
+                    ->update(['is_primary' => false]);
+            }
+
             $syncData = [];
             foreach ($validChannelIds as $chId) {
                 $syncData[$chId] = ['is_primary' => in_array($chId, $primaryIds)];

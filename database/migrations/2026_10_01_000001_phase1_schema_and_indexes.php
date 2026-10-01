@@ -43,9 +43,46 @@ return new class extends Migration
             $table->index(['assigned_agent_id', 'assigned_at'], 'conversations_assigned_agent_index');
         });
 
-        // ── Primary Bot DB Partial Unique Constraint ────────────────────────
-        // Ensure only one primary bot per channel at the database level
-        DB::statement('CREATE UNIQUE INDEX bot_channels_channel_primary_unique ON bot_channels (channel_id) WHERE is_primary = true;');
+        // ── Primary Bot DB Constraint (MySQL-compatible) ─────────────────────
+        // MySQL does not support partial unique indexes (WHERE clause).
+        // Use a BEFORE INSERT trigger to enforce single primary bot per channel.
+        DB::unprepared('
+            CREATE TRIGGER bot_channels_single_primary_insert
+            BEFORE INSERT ON bot_channels
+            FOR EACH ROW
+            BEGIN
+                IF NEW.is_primary = true THEN
+                    IF EXISTS (
+                        SELECT 1 FROM bot_channels
+                        WHERE channel_id = NEW.channel_id
+                        AND is_primary = true
+                        AND bot_id != NEW.bot_id
+                    ) THEN
+                        SIGNAL SQLSTATE "45000"
+                        SET MESSAGE_TEXT = "Only one primary bot is allowed per channel";
+                    END IF;
+                END IF;
+            END
+        ');
+
+        DB::unprepared('
+            CREATE TRIGGER bot_channels_single_primary_update
+            BEFORE UPDATE ON bot_channels
+            FOR EACH ROW
+            BEGIN
+                IF NEW.is_primary = true THEN
+                    IF EXISTS (
+                        SELECT 1 FROM bot_channels
+                        WHERE channel_id = NEW.channel_id
+                        AND is_primary = true
+                        AND bot_id != NEW.bot_id
+                    ) THEN
+                        SIGNAL SQLSTATE "45000"
+                        SET MESSAGE_TEXT = "Only one primary bot is allowed per channel";
+                    END IF;
+                END IF;
+            END
+        ');
     }
 
     /**
@@ -53,8 +90,9 @@ return new class extends Migration
      */
     public function down(): void
     {
-        // Drop partial unique index
-        DB::statement('DROP INDEX IF EXISTS bot_channels_channel_primary_unique;');
+        // Drop triggers
+        DB::unprepared('DROP TRIGGER IF EXISTS bot_channels_single_primary_insert;');
+        DB::unprepared('DROP TRIGGER IF EXISTS bot_channels_single_primary_update;');
 
         // Drop performance indexes
         Schema::table('conversations', function (Blueprint $table) {

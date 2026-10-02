@@ -52,7 +52,7 @@ class OrderCheckoutService
             $words = array_filter(explode(' ', trim($incomingText)));
             if (count($words) >= 1 && count($words) <= 4 && !preg_match('/[0-9]/', $incomingText)) {
                 $textLower = mb_strtolower(trim($incomingText));
-                if (!preg_match('/(?:hi|hello|yes|no|ok|sure|thanks|order|buy|address|confirm|مرحبا|سلام|نعم|شكرا|اريد|طلب|تأكيد|تم|اكد)/ui', $textLower)) {
+                if (!preg_match('/(?:hi|hello|hey|yes|no|ok|sure|thanks?|great|good|perfect|nice|cool|awesome|excellent|wonderful|fine|please|order|buy|address|confirm|products?|items?|images?|pictures?|photos?|the dress|this one|that one|dress|see|view|show|list|help|catalogue|catalog|مرحبا|سلام|نعم|شكرا|اريد|طلب|تأكيد|تم|اكد|الفستان|هذا|هذه)/ui', $textLower)) {
                     $extractedName = trim($incomingText);
                 }
             }
@@ -89,13 +89,38 @@ class OrderCheckoutService
             'sku'              => $referencedProduct['sku']              ?? ($existingState['sku']              ?? null),
             'product_name'     => $referencedProduct['name']             ?? ($existingState['product_name']     ?? null),
             'product_price'    => $referencedProduct['price']            ?? ($existingState['product_price']    ?? null),
-            'product_currency' => $referencedProduct['currency']         ?? ($existingState['product_currency'] ?? 'SAR'),
+            'product_currency' => $referencedProduct['currency']         ?? ($existingState['product_currency'] ?? null),
             'full_name'        => $extractedName                     ?? $existingName,
             'phone'            => $extractedPhone                    ?? $existingPhone,
             'customer_phone'   => $extractedPhone                    ?? $existingPhone, // Alias for backward compatibility
             'address'          => $extractedAddress                  ?? ($existingState['address']          ?? null),
             'updated_at'       => now()->toISOString(),
         ], fn($v) => !is_null($v) && $v !== ''));
+
+        // A plain greeting ("Hi") or catalogue request ("Can i see the images")
+        // must NOT create a phantom order context. checkout_state only becomes
+        // meaningful once real order data exists (product selection or
+        // collected customer fields) — never from arbitrary chatter.
+        $hasOrderData = !empty($mergedState['salla_product_id'])
+            || !empty($mergedState['product_name'])
+            || !empty($mergedState['product_price'])
+            || !empty($mergedState['full_name'])
+            || !empty($mergedState['phone'])
+            || !empty($mergedState['address'])
+            || !empty($mergedState['order_id'])
+            || !empty($mergedState['status'])
+            || !empty($mergedState['confirmation_state'])
+            || !empty($mergedState['external_source']);
+
+        if (!$hasOrderData) {
+            return [];
+        }
+
+        // Default currency applies only once a product is actually in the order context
+        if (empty($mergedState['product_currency'])
+            && (!empty($mergedState['salla_product_id']) || !empty($mergedState['product_name']))) {
+            $mergedState['product_currency'] = 'SAR';
+        }
 
         return $mergedState;
     }

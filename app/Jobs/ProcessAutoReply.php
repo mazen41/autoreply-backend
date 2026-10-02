@@ -1269,7 +1269,13 @@ class ProcessAutoReply implements ShouldQueue
         // ── ORDER CHECKOUT STATE & FIELD EXTRACTION ─────────────────────────
         $checkoutService = app(\App\Services\OrderCheckoutService::class);
         $updatedCheckoutState = $checkoutService->extractAndMergeState($conversation, $message->content, $referencedProduct);
-        $conversation->update(['checkout_state' => $updatedCheckoutState]);
+        if (!empty($updatedCheckoutState)) {
+            $conversation->update(['checkout_state' => $updatedCheckoutState]);
+        } elseif (!is_null($conversation->checkout_state)) {
+            // Nothing meaningful extracted and nothing previously stored —
+            // keep checkout_state null so no phantom order context lingers.
+            $conversation->update(['checkout_state' => null]);
+        }
         $fieldStatus = $checkoutService->computeFieldStatus($updatedCheckoutState);
 
         Log::info('ORDER_INFO_CHECK', [

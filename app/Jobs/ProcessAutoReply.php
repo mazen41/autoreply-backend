@@ -353,6 +353,35 @@ class ProcessAutoReply implements ShouldQueue
             ])
             ->toArray();
 
+        // ── GREETING LOOP PREVENTION ────────────────────────────────────────
+        // Detect if this is a repeated greeting and inject context to prevent static loops
+        $greetingPattern = '/^(hi|hello|hey|مرحبا|السلام عليكم|صباح الخير|مساء الخير|اهلا|هلا)[\s\!\.\,]*$/i';
+        $isGreeting = preg_match($greetingPattern, trim($message->content));
+
+        if ($isGreeting) {
+            // Count previous greetings in this conversation
+            $previousGreetings = Message::where('conversation_id', $message->conversation_id)
+                ->where('direction', 'inbound')
+                ->whereRaw('LOWER(TRIM(content)) REGEXP ?', ['^(hi|hello|hey|مرحبا|السلام عليكم|صباح الخير|مساء الخير|اهلا|هلا)[\\s\\!\\.\\,]*$'])
+                ->count();
+
+            if ($previousGreetings > 0) {
+                // Add context to prevent repetitive welcome messages
+                $contextMessages[] = [
+                    'role'        => 'system',
+                    'direction'   => 'system',
+                    'content'     => "IMPORTANT: The customer has greeted {$previousGreetings} time(s) already in this conversation. Do NOT repeat the same welcome message. Instead, ask how you can help them today, or reference their previous inquiry if one exists. Vary your response naturally.",
+                    'is_ai'       => false,
+                    'send_status' => 'system',
+                ];
+
+                Log::info('ProcessAutoReply: repeated greeting detected, injecting loop prevention', [
+                    'conversation_id' => $conversation->id,
+                    'previous_greetings' => $previousGreetings,
+                ]);
+            }
+        }
+
         // Check business hours routing — guard against null business
         $businessHoursCheck = $channel->business
             ? AICapabilitiesService::checkBusinessHours($channel->business)

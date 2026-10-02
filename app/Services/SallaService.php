@@ -51,11 +51,11 @@ class SallaService
             'client_id'     => $clientId,
             'redirect_uri'  => $redirectUri,
             'response_type' => 'code',
-            'scope'         => 'offline_access settings.read orders.read orders.create customers.read customers.write products.read',
+            'scope'         => 'offline_access settings.read orders.read_write customers.read_write products.read',
             'state'         => $state,
         ];
 
-        return 'https://accounts.salla.sa/oauth2/authorize?' . http_build_query($params);
+        return 'https://accounts.salla.sa/oauth2/auth?' . http_build_query($params);
     }
 
     /**

@@ -56,8 +56,14 @@ return new class extends Migration
             $table->unsignedInteger('total_tokens')->default(0)->after('completion_tokens');
             $table->decimal('estimated_cost', 8, 6)->default(0)->after('total_tokens');
             $table->unsignedInteger('response_time_ms')->nullable()->after('estimated_cost');
-            $table->timestamp('created_at')->nullable();
-            $table->timestamp('updated_at')->nullable();
+
+            // Only add timestamps if they don't already exist
+            if (!Schema::hasColumn('ai_metrics', 'created_at')) {
+                $table->timestamp('created_at')->nullable();
+            }
+            if (!Schema::hasColumn('ai_metrics', 'updated_at')) {
+                $table->timestamp('updated_at')->nullable();
+            }
 
             // Indexes
             $table->index(['business_profile_id', 'created_at'], 'ai_metrics_business_created_index');

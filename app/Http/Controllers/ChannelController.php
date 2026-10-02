@@ -10,6 +10,143 @@ use Illuminate\Support\Facades\Log;
 
 class ChannelController extends Controller
 {
+    /**
+     * Salla-initiated install (portal "Install" button / Easy Mode). Salla supplies its own
+     * random `state`, so we can't tell which Naz user this is. Authorization codes are
+     * short-lived and single-use, so exchange it NOW, store the channel unclaimed
+     * (user_id = null), then redirect with a short-lived encrypted claim token that the
+     * logged-in frontend redeems via POST /api/channels/salla/claim.
+     */
+    protected function handleSallaInstallWithoutUser(string $code)
+    {
+        $frontend = env('FRONTEND_URL');
+
+        try {
+            $sallaService = new SallaService();
+            $tokenData    = $sallaService->exchangeCodeForToken($code);
+            $accessToken  = $tokenData['access_token'];
+            $refreshToken = $tokenData['refresh_token'] ?? null;
+            $expiresIn    = $tokenData['expires_in'] ?? 3600;
+
+            $userInfo   = $sallaService->getUserInfo($accessToken);
+            $merchantId = (string) ($userInfo['merchant']['id'] ?? $userInfo['id'] ?? '');
+            $storeInfo  = $sallaService->getStoreInfo($accessToken);
+            $storeId    = $merchantId ?: (string) ($storeInfo['id'] ?? '');
+            $storeName  = $storeInfo['name'] ?? $userInfo['name'] ?? 'Salla Store';
+
+            if (empty($storeId)) {
+                Log::error('Salla install: could not resolve store/merchant ID');
+                return redirect($frontend . '/dashboard/channels?error=store_info_failed');
+            }
+
+            $fields = [
+                'page_name'        => $storeName,
+                'access_token'     => $accessToken,
+                'refresh_token'    => $refreshToken,
+                'token_expires_at' => now()->addSeconds($expiresIn),
+                'status'           => 'connected',
+                'connected_at'     => now(),
+                'metadata'         => [
+                    'scopes'      => $tokenData['scope'] ?? null,
+                    'merchant_id' => $merchantId,
+                    'user_info'   => $userInfo,
+                    'store_info'  => $storeInfo,
+                ],
+            ];
+
+            // Re-install of a store that already belongs to a Naz user: refresh its tokens.
+            $claimed = Channel::where('type', 'salla')->where('page_id', $storeId)->whereNotNull('user_id')->first();
+            if ($claimed) {
+                $claimed->update($fields);
+                Log::info('Salla install: refreshed tokens on existing channel', ['channel_id' => $claimed->id]);
+                return redirect($frontend . '/dashboard/channels?success=salla_connected');
+            }
+
+            $channel = Channel::where('type', 'salla')->where('page_id', $storeId)->whereNull('user_id')->first();
+            if ($channel) {
+                $channel->update($fields);
+            } else {
+                $channel = Channel::create($fields + ['type' => 'salla', 'page_id' => $storeId, 'user_id' => null]);
+            }
+
+            Log::info('Salla install: unclaimed channel stored, awaiting claim', [
+                'channel_id' => $channel->id,
+                'store_id'   => $storeId,
+            ]);
+
+            $claimToken = \Illuminate\Support\Facades\Crypt::encryptString(json_encode([
+                'c' => $channel->id,
+                'e' => now()->addMinutes(15)->timestamp,
+            ]));
+
+            return redirect($frontend . '/dashboard/channels?salla_claim=' . urlencode($claimToken));
+        } catch (\Exception $e) {
+            Log::error('Salla install (no user state) failed', ['message' => $e->getMessage()]);
+            return redirect($frontend . '/dashboard/channels?error=salla_oauth_failed');
+        }
+    }
+
+    /**
+     * Attach an unclaimed Salla channel (created by handleSallaInstallWithoutUser) to the
+     * authenticated Naz user. Requires the short-lived claim token from the redirect.
+     */
+    public function claimSalla(Request $request)
+    {
+        $request->validate(['token' => 'required|string']);
+
+        try {
+            $payload = json_decode(\Illuminate\Support\Facades\Crypt::decryptString($request->input('token')), true);
+        } catch (\Throwable $e) {
+            return response()->json(['success' => false, 'error' => 'Invalid claim token'], 422);
+        }
+
+        if (!is_array($payload) || ($payload['e'] ?? 0) < now()->timestamp) {
+            return response()->json(['success' => false, 'error' => 'Claim token expired. Please reconnect Salla.'], 422);
+        }
+
+        $channel = Channel::where('id', $payload['c'] ?? 0)
+            ->where('type', 'salla')
+            ->whereNull('user_id')
+            ->first();
+
+        if (!$channel) {
+            return response()->json(['success' => false, 'error' => 'Salla store not found or already claimed'], 404);
+        }
+
+        $userId   = $request->user()->getAuthIdentifier();
+        $business = \App\Models\BusinessProfile::where('user_id', $userId)->first();
+
+        $existing = Channel::where('user_id', $userId)
+            ->where('type', 'salla')
+            ->where('page_id', $channel->page_id)
+            ->first();
+
+        if ($existing) {
+            $existing->update([
+                'page_name'        => $channel->page_name,
+                'access_token'     => $channel->access_token,
+                'refresh_token'    => $channel->refresh_token,
+                'token_expires_at' => $channel->token_expires_at,
+                'status'           => 'connected',
+                'connected_at'     => now(),
+                'metadata'         => $channel->metadata,
+            ]);
+            $channel->delete();
+            $channel = $existing;
+        } else {
+            $channel->update([
+                'user_id'      => $userId,
+                'business_id'  => $business?->id,
+                'status'       => 'connected',
+                'connected_at' => now(),
+            ]);
+        }
+
+        Log::info('Salla channel claimed', ['channel_id' => $channel->id, 'user_id' => $userId]);
+
+        return response()->json(['success' => true, 'channel_id' => $channel->id]);
+    }
+
     public function index(Request $request)
     {
         $user = $request->user();
@@ -353,7 +490,7 @@ class ChannelController extends Controller
     public function callbackSalla(Request $request)
     {
         Log::info('=== SALLA CALLBACK START ===');
-        Log::info('Request params', $request->all());
+        Log::info('Request params', $request->except(['code']));
 
         $code  = $request->get('code');
         $state = $request->get('state');
@@ -377,8 +514,8 @@ class ChannelController extends Controller
         // If no valid user ID in state, this is likely Salla Easy Mode installation
         // Redirect to frontend dashboard (authentication middleware will handle redirect to login if needed)
         if (!$userId || !is_numeric($userId)) {
-            Log::warning('No valid user ID in Salla OAuth state - redirecting to dashboard', ['state' => $state]);
-            return redirect(env('FRONTEND_URL') . '/dashboard?salla_code=' . $code . '&salla_state=' . $state);
+            Log::warning('No valid user ID in Salla OAuth state - Salla-initiated install, exchanging code and issuing claim token');
+            return $this->handleSallaInstallWithoutUser($code);
         }
 
         try {

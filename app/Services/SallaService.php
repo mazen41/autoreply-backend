@@ -83,7 +83,7 @@ class SallaService
 
         Log::info('[SALLA OAuth Token Response]', [
             'status'         => $response->status(),
-            'body'           => $tokenData,
+            'body'           => '[redacted]',
             'granted_scopes' => $tokenData['scope'] ?? 'none',
         ]);
 

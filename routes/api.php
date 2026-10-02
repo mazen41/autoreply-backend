@@ -172,6 +172,7 @@ Route::middleware('auth:sanctum')->group(function () {
     Route::patch('/channels/{id}',            [ChannelController::class, 'update']);
     Route::delete('/channels/{id}',           [ChannelController::class, 'disconnect']);
     
+    Route::post('/channels/salla/claim', [ChannelController::class, 'claimSalla']);
     // New channel endpoints (protected)
     Route::post('/channels/telegram/connect', [TelegramController::class, 'connect'])->middleware('plan.enforce:max_channels');
     Route::post('/channels/telegram/set-webhook', [TelegramController::class, 'setWebhook']);

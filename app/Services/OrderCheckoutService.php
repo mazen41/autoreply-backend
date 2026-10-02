@@ -58,33 +58,29 @@ class OrderCheckoutService
             }
         }
 
-        // 3. Extract address heuristics
+        // 3. Extract address heuristics — ONLY from explicit address statements
         $extractedAddress = null;
         $addressPatterns = [
             '/(?:my address is|address is|delivery address|live in|located at|العنوان|عنواني|حي|شارع|مدينة|محافظة|الرياض|جدة|مكة|الدمام|القاهرة|الإسكندرية)\s*[:\-]?\s*(.+)/ui',
         ];
         foreach ($addressPatterns as $pattern) {
             if (preg_match($pattern, $incomingText, $am)) {
-                $extractedAddress = trim($am[1]);
-                break;
+                $candidate = trim($am[1]);
+                // Validate: address must be meaningful (at least 4 chars, not just a product name or greeting)
+                if (strlen($candidate) >= 4
+                    && !preg_match('/^(?:hi|hello|hey|yes|no|ok|sure|thanks|the dress|this one|that one|مرحبا|سلام|نعم|لا|حسنا|شكرا|الفستان|هذا|هذه)$/ui', $candidate)) {
+                    $extractedAddress = $candidate;
+                    break;
+                }
             }
         }
 
-        // Fallback address if address is empty and text does not match explicit confirmation or standalone phone
-        if (!$extractedAddress && empty($existingState['address'])) {
-            $textLower = mb_strtolower(trim($incomingText));
-            $confirmKeywords = '/^(?:yes|yeah|sure|ok|okay|confirm|placed|thanks|نعم|تأكيد|تم|موافق|شكرا|اكد)$/ui';
-            $intentKeywords = '/(?:hi|hello|want|order|buy|product|place order|how much|price|مرحبا|سلام|اريد|طلب|شراء|منتج|بكم|سعر|تفاصيل)/ui';
-            
-            if (!preg_match($confirmKeywords, $textLower)
-                && !preg_match($intentKeywords, $textLower)
-                && strlen(trim($incomingText)) >= 4
-                && !preg_match('/^\+?[0-9]{8,15}$/', trim($incomingText))) {
-                $extractedAddress = trim($incomingText);
-            }
-        }
+        // NEVER infer address from arbitrary conversation text.
+        // Address must come from an explicit address statement or AI-validated extraction.
 
-        $existingPhone = $existingState['phone'] ?? ($conversation->sender_id ?: null);
+        // Phone: NEVER use sender_id (Instagram/Meta ID) as phone number.
+        // Only use explicitly extracted phone or previously stored phone.
+        $existingPhone = $existingState['phone'] ?? null;
         $existingName  = $existingState['full_name'] ?? ($conversation->sender_name !== $conversation->sender_id ? $conversation->sender_name : null);
 
         // Merge fields: preserve existing values if new extraction is null (NO OVERWRITING WITH NULL!)

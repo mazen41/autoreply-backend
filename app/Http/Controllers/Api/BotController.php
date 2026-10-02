@@ -50,7 +50,7 @@ class BotController extends Controller
 
     public function index(Request $request)
     {
-        $business = $this->getBusinessProfile($request);
+        $business = $this->getResolvedBusinessProfile($request);
         $bots = Bot::where('business_profile_id', $business->id)
             ->with(['channels:id,type,page_name,page_id', 'ecommerceChannel:id,type,page_name,page_id', 'knowledgeAssignments'])
             ->orderBy('created_at', 'desc')
@@ -63,7 +63,7 @@ class BotController extends Controller
 
     public function store(Request $request)
     {
-        $business = $this->getBusinessProfile($request);
+        $business = $this->getResolvedBusinessProfile($request);
 
         $request->validate([
             'name' => 'required|string|max:255',
@@ -140,7 +140,7 @@ class BotController extends Controller
 
     public function show(Request $request, $id)
     {
-        $business = $this->getBusinessProfile($request);
+        $business = $this->getResolvedBusinessProfile($request);
         $bot = Bot::where('business_profile_id', $business->id)
             ->with(['channels', 'ecommerceChannel', 'knowledgeAssignments.knowledgeFile', 'knowledgeAssignments.channel'])
             ->findOrFail($id);
@@ -150,7 +150,7 @@ class BotController extends Controller
 
     public function update(Request $request, $id)
     {
-        $business = $this->getBusinessProfile($request);
+        $business = $this->getResolvedBusinessProfile($request);
         $bot = Bot::where('business_profile_id', $business->id)->findOrFail($id);
 
         $request->validate([
@@ -223,7 +223,7 @@ class BotController extends Controller
 
     public function destroy(Request $request, $id)
     {
-        $business = $this->getBusinessProfile($request);
+        $business = $this->getResolvedBusinessProfile($request);
         $bot = Bot::where('business_profile_id', $business->id)->findOrFail($id);
         $bot->delete();
 

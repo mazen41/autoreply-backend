@@ -16,7 +16,7 @@ class ProductMessageMap extends Model
     protected $fillable = [
         'conversation_id',
         'channel_id',
-        'whatsapp_message_id',
+        'platform_message_id',
         'salla_product_id',
         'sku',
         'product_name',

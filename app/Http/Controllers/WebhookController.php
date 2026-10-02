@@ -178,6 +178,8 @@ class WebhookController extends Controller
 
                 $senderId    = $event['sender']['id'];
                 $messageText = $event['message']['text'];
+                $platformMessageId = $event['message']['mid'] ?? null;
+                $replyToMid = $event['message']['reply_to']['mid'] ?? null;
 
                 if (str_starts_with($senderId, 'TEST_')) continue;
 
@@ -185,6 +187,8 @@ class WebhookController extends Controller
                     'entry_id' => $entryId,
                     'sender'   => $senderId,
                     'message'  => $messageText,
+                    'platform_message_id' => $platformMessageId,
+                    'reply_to_mid' => $replyToMid,
                 ]);
 
                 // Strategy 1: entry ID is the Instagram account ID (object=instagram)
@@ -248,7 +252,7 @@ class WebhookController extends Controller
                     continue;
                 }
 
-                $this->processMessage($channel, $senderId, $messageText);
+                $this->processMessage($channel, $senderId, $messageText, $platformMessageId, $replyToMid);
             }
 
             // Handle Instagram comments
@@ -295,7 +299,7 @@ class WebhookController extends Controller
         }
     }
 
-    private function processMessage(Channel $channel, string $senderId, string $messageText): void
+    private function processMessage(Channel $channel, string $senderId, string $messageText, ?string $platformMessageId = null, ?string $replyToMid = null): void
     {
         Log::info('Processing message', [
             'channel_type' => $channel->type,
@@ -303,7 +307,25 @@ class WebhookController extends Controller
             'sender'       => $senderId,
             'message'      => $messageText,
             'business_id'  => $channel->business_id,
+            'platform_message_id' => $platformMessageId,
+            'reply_to_mid' => $replyToMid,
         ]);
+
+        // ── WEBHOOK IDEMPOTENCY ────────────────────────────────────────────
+        // Use platform message ID to detect duplicate webhook deliveries.
+        // Same ID arriving twice = duplicate, skip it.
+        // Different IDs = different customer messages, always process.
+        if ($platformMessageId) {
+            $idempotencyKey = "webhook:{$channel->type}:{$platformMessageId}";
+            if (Cache::has($idempotencyKey)) {
+                Log::info('Duplicate webhook delivery — skipping', [
+                    'channel_type' => $channel->type,
+                    'platform_message_id' => $platformMessageId,
+                ]);
+                return;
+            }
+            Cache::put($idempotencyKey, true, now()->addMinutes(5));
+        }
 
         $conversation = \App\Models\Conversation::firstOrCreate(
             ['channel_id' => $channel->id, 'sender_id' => $senderId],
@@ -318,30 +340,42 @@ class WebhookController extends Controller
         $conversation->last_message_at = now();
         $conversation->save();
 
+        // Build metadata with reply_to information for product resolution
+        $metadata = [];
+        if ($platformMessageId) {
+            $metadata['platform_message_id'] = $platformMessageId;
+        }
+        if ($replyToMid) {
+            $metadata['quoted_message_id'] = $replyToMid;
+            $metadata['reply_to_platform'] = $channel->type;
+        }
+
         $message = \App\Models\Message::create([
             'conversation_id' => $conversation->id,
             'content'         => $messageText,
             'direction'       => 'inbound',
             'is_ai'           => false,
             'status'          => 'received',
+            'metadata'         => !empty($metadata) ? $metadata : null,
         ]);
 
         if ($channel->user_id) {
             broadcast(new \App\Events\MessageReceived($message, $conversation, $channel->user_id));
         }
 
-        // Implement message debounce to prevent multiple AI replies
-        $debounceKey = "debounce:conversation:{$conversation->id}";
-        $debounceWindow = 10; // 10 seconds debounce window
-        
+        // ── DEBOUNCE FIX ───────────────────────────────────────────────────
+        // Only debounce if the SAME message is being processed again (retry/duplicate).
+        // Different customer messages are always dispatched — they will be handled
+        // sequentially by the queue worker.
+        $debounceKey = "debounce:message:{$message->id}";
         if (Cache::has($debounceKey)) {
-            Log::info('Message debounced - AI reply skipped', [
+            Log::info('Message already being processed — skipping duplicate job', [
                 'conversation_id' => $conversation->id,
                 'message_id' => $message->id
             ]);
         } else {
             \App\Jobs\ProcessAutoReply::dispatch($message->id);
-            Cache::put($debounceKey, true, $debounceWindow);
+            Cache::put($debounceKey, true, 30); // 30s — only prevents duplicate job dispatch
             Log::info('ProcessAutoReply job dispatched', ['message_id' => $message->id]);
         }
     }

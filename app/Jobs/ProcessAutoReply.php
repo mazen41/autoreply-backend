@@ -438,7 +438,7 @@ class ProcessAutoReply implements ShouldQueue
 
         if ($quotedMessageId) {
             $productMap = \App\Models\ProductMessageMap::where('conversation_id', $message->conversation_id)
-                ->where('whatsapp_message_id', $quotedMessageId)
+                ->where('platform_message_id', $quotedMessageId)
                 ->latest('id')
                 ->first();
 
@@ -1167,6 +1167,32 @@ class ProcessAutoReply implements ShouldQueue
         $effectiveConfidenceThreshold = !empty($bot?->ai_confidence_threshold) ? $bot->ai_confidence_threshold : ($business?->ai_confidence_threshold ?? 0.80);
         $effectiveEscalationConfig = !empty($bot?->escalation_config) ? $bot->escalation_config : ($business?->escalation_config ?? null);
 
+        // ── STRUCTURED CONVERSATION STATE ────────────────────────────────────
+        // Build authoritative structured state for the AI. The AI must NEVER
+        // invent or override these values — it may only interpret intent and
+        // propose responses. Application code validates all state transitions.
+        $structuredState = [
+            'customer' => [
+                'name' => $checkoutState['full_name'] ?? $checkoutState['customer_name'] ?? null,
+                'phone' => $checkoutState['phone'] ?? $checkoutState['customer_phone'] ?? null,
+                'address' => $checkoutState['address'] ?? $checkoutState['customer_address'] ?? null,
+            ],
+            'order' => [
+                'product_id' => $checkoutState['salla_product_id'] ?? $referencedProduct['salla_product_id'] ?? null,
+                'product_name' => $checkoutState['product_name'] ?? $referencedProduct['name'] ?? null,
+                'product_price' => $checkoutState['product_price'] ?? $referencedProduct['price'] ?? null,
+                'currency' => $checkoutState['product_currency'] ?? $referencedProduct['currency'] ?? 'SAR',
+                'quantity' => $checkoutState['quantity'] ?? 1,
+                'confirmation_state' => $checkoutState['confirmation_state'] ?? 'collecting_info',
+            ],
+            'reply_target' => [
+                'platform' => $message->metadata['reply_to_platform'] ?? null,
+                'message_id' => $quotedMessageId,
+                'resolved_product_id' => $referencedProduct['salla_product_id'] ?? null,
+            ],
+            'pending_action' => $this->determinePendingAction($checkoutState, $isPlaceOrder, $fieldStatus),
+        ];
+
         // Build business profile context separate from uploaded knowledge
         $businessProfileContext = '';
         if ($business) {
@@ -1394,6 +1420,8 @@ class ProcessAutoReply implements ShouldQueue
             'ai_tone_style'                => $effectiveToneStyle,
             'ai_confidence_threshold'      => $effectiveConfidenceThreshold,
             'escalation_config'            => $effectiveEscalationConfig,
+            // Structured conversation state — AI must NEVER invent or override these values
+            'structured_state'             => $structuredState,
         ];
 
         // Step 4: Single AI Call with JSON Output
@@ -1883,6 +1911,25 @@ class ProcessAutoReply implements ShouldQueue
                 ]);
             }
         }
+    }
+
+    /**
+     * Determine the current pending action based on conversation state.
+     */
+    private function determinePendingAction(array $checkoutState, bool $isPlaceOrder, array $fieldStatus): string
+    {
+        if ($isPlaceOrder && !empty($checkoutState['salla_product_id'])) {
+            if ($fieldStatus['is_complete']) {
+                return 'confirm_order';
+            }
+            return 'collect_customer_info';
+        }
+
+        if ($isPlaceOrder && empty($checkoutState['salla_product_id'])) {
+            return 'select_product';
+        }
+
+        return 'general_conversation';
     }
 
     // ── SEQUENCE INTEGRATION HELPERS ─────────────────────────────────────────

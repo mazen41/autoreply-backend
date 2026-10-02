@@ -10,54 +10,54 @@ return new class extends Migration
     {
         // Drop foreign key constraints first before dropping columns
         Schema::table('ai_metrics', function (Blueprint $table) {
-            // Drop foreign key on business_id if it exists
             if (Schema::hasColumn('ai_metrics', 'business_id')) {
                 $table->dropForeign(['business_id']);
             }
         });
 
+        // Drop old columns if they exist
         Schema::table('ai_metrics', function (Blueprint $table) {
-            // Drop old columns that are being replaced
-            if (Schema::hasColumn('ai_metrics', 'business_id')) {
-                $table->dropColumn('business_id');
+            $columnsToDrop = [
+                'business_id', 'date', 'total_ai_messages', 'successful_ai_messages',
+                'escalated_messages', 'avg_confidence_score', 'positive_feedback',
+                'negative_feedback', 'success_rate',
+            ];
+            foreach ($columnsToDrop as $column) {
+                if (Schema::hasColumn('ai_metrics', $column)) {
+                    $table->dropColumn($column);
+                }
             }
-            if (Schema::hasColumn('ai_metrics', 'date')) {
-                $table->dropColumn('date');
-            }
-            if (Schema::hasColumn('ai_metrics', 'total_ai_messages')) {
-                $table->dropColumn('total_ai_messages');
-            }
-            if (Schema::hasColumn('ai_metrics', 'successful_ai_messages')) {
-                $table->dropColumn('successful_ai_messages');
-            }
-            if (Schema::hasColumn('ai_metrics', 'escalated_messages')) {
-                $table->dropColumn('escalated_messages');
-            }
-            if (Schema::hasColumn('ai_metrics', 'avg_confidence_score')) {
-                $table->dropColumn('avg_confidence_score');
-            }
-            if (Schema::hasColumn('ai_metrics', 'positive_feedback')) {
-                $table->dropColumn('positive_feedback');
-            }
-            if (Schema::hasColumn('ai_metrics', 'negative_feedback')) {
-                $table->dropColumn('negative_feedback');
-            }
-            if (Schema::hasColumn('ai_metrics', 'success_rate')) {
-                $table->dropColumn('success_rate');
-            }
+        });
 
-            // Add new columns for detailed token tracking
-            $table->unsignedBigInteger('business_profile_id')->nullable()->after('id');
-            $table->unsignedBigInteger('bot_id')->nullable()->after('business_profile_id');
-            $table->string('provider')->nullable()->after('bot_id');
-            $table->string('model')->nullable()->after('provider');
-            $table->unsignedInteger('prompt_tokens')->default(0)->after('model');
-            $table->unsignedInteger('completion_tokens')->default(0)->after('prompt_tokens');
-            $table->unsignedInteger('total_tokens')->default(0)->after('completion_tokens');
-            $table->decimal('estimated_cost', 8, 6)->default(0)->after('total_tokens');
-            $table->unsignedInteger('response_time_ms')->nullable()->after('estimated_cost');
-
-            // Only add timestamps if they don't already exist
+        // Add new columns if they don't exist
+        Schema::table('ai_metrics', function (Blueprint $table) {
+            if (!Schema::hasColumn('ai_metrics', 'business_profile_id')) {
+                $table->unsignedBigInteger('business_profile_id')->nullable()->after('id');
+            }
+            if (!Schema::hasColumn('ai_metrics', 'bot_id')) {
+                $table->unsignedBigInteger('bot_id')->nullable()->after('business_profile_id');
+            }
+            if (!Schema::hasColumn('ai_metrics', 'provider')) {
+                $table->string('provider')->nullable()->after('bot_id');
+            }
+            if (!Schema::hasColumn('ai_metrics', 'model')) {
+                $table->string('model')->nullable()->after('provider');
+            }
+            if (!Schema::hasColumn('ai_metrics', 'prompt_tokens')) {
+                $table->unsignedInteger('prompt_tokens')->default(0)->after('model');
+            }
+            if (!Schema::hasColumn('ai_metrics', 'completion_tokens')) {
+                $table->unsignedInteger('completion_tokens')->default(0)->after('prompt_tokens');
+            }
+            if (!Schema::hasColumn('ai_metrics', 'total_tokens')) {
+                $table->unsignedInteger('total_tokens')->default(0)->after('completion_tokens');
+            }
+            if (!Schema::hasColumn('ai_metrics', 'estimated_cost')) {
+                $table->decimal('estimated_cost', 8, 6)->default(0)->after('total_tokens');
+            }
+            if (!Schema::hasColumn('ai_metrics', 'response_time_ms')) {
+                $table->unsignedInteger('response_time_ms')->nullable()->after('estimated_cost');
+            }
             if (!Schema::hasColumn('ai_metrics', 'created_at')) {
                 $table->timestamp('created_at')->nullable();
             }
@@ -65,10 +65,16 @@ return new class extends Migration
                 $table->timestamp('updated_at')->nullable();
             }
 
-            // Indexes
-            $table->index(['business_profile_id', 'created_at'], 'ai_metrics_business_created_index');
-            $table->index(['bot_id', 'created_at'], 'ai_metrics_bot_created_index');
-            $table->index(['provider', 'model'], 'ai_metrics_provider_model_index');
+            // Add indexes if they don't exist
+            if (!Schema::hasIndex('ai_metrics', 'ai_metrics_business_created_index')) {
+                $table->index(['business_profile_id', 'created_at'], 'ai_metrics_business_created_index');
+            }
+            if (!Schema::hasIndex('ai_metrics', 'ai_metrics_bot_created_index')) {
+                $table->index(['bot_id', 'created_at'], 'ai_metrics_bot_created_index');
+            }
+            if (!Schema::hasIndex('ai_metrics', 'ai_metrics_provider_model_index')) {
+                $table->index(['provider', 'model'], 'ai_metrics_provider_model_index');
+            }
         });
     }
 
@@ -80,17 +86,9 @@ return new class extends Migration
             $table->dropIndex('ai_metrics_provider_model_index');
 
             $table->dropColumn([
-                'business_profile_id',
-                'bot_id',
-                'provider',
-                'model',
-                'prompt_tokens',
-                'completion_tokens',
-                'total_tokens',
-                'estimated_cost',
-                'response_time_ms',
-                'created_at',
-                'updated_at',
+                'business_profile_id', 'bot_id', 'provider', 'model',
+                'prompt_tokens', 'completion_tokens', 'total_tokens',
+                'estimated_cost', 'response_time_ms', 'created_at', 'updated_at',
             ]);
 
             // Restore old columns

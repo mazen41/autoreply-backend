@@ -10,9 +10,15 @@ return new class extends Migration
     {
         // Drop indexes first before dropping columns
         Schema::table('ai_metrics', function (Blueprint $table) {
-            // Drop unique index on business_id + date if it exists
-            if (Schema::hasIndex('ai_metrics', 'ai_metrics_business_id_date_unique')) {
-                $table->dropUnique('ai_metrics_business_id_date_unique');
+            // Drop all indexes that reference columns we're about to drop
+            $indexesToDrop = [
+                'ai_metrics_business_id_date_unique',
+                'ai_metrics_date_index',
+            ];
+            foreach ($indexesToDrop as $index) {
+                if (Schema::hasIndex('ai_metrics', $index)) {
+                    $table->dropIndex($index);
+                }
             }
             // Drop foreign key on business_id if it exists
             if (Schema::hasColumn('ai_metrics', 'business_id')) {

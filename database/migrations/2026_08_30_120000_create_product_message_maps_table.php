@@ -5,15 +5,15 @@ use Illuminate\Database\Schema\Blueprint;
 use Illuminate\Support\Facades\Schema;
 
 /**
- * CRITICAL ISSUE — REPLY-TO-PRODUCT CONTEXT / PRODUCT SELECTION
+ * CRITICAL ISSUE - REPLY-TO-PRODUCT CONTEXT / PRODUCT SELECTION
  *
  * Persists a deterministic mapping between every outgoing WhatsApp
  * product-image message and the Salla product it depicts, so that when a
  * customer replies directly to one of those images ("I wanna place order
- * for this one"), the backend can resolve the EXACT product referenced —
+ * for this one"), the backend can resolve the EXACT product referenced -
  * without ever asking the AI to guess from text/position/name similarity.
  *
- * whatsapp_message_id is the Evolution `key.id` returned when the image
+ * platform_message_id is the Evolution `key.id` returned when the image
  * was sent (or the platform-native message id for Facebook/Instagram).
  * conversation_id scopes lookups so ids from different conversations can
  * never collide.
@@ -29,10 +29,10 @@ return new class extends Migration
 
             // The outgoing message id for the specific product image that was
             // sent (Evolution API key.id for WhatsApp, message_id for
-            // Facebook/Instagram Graph API).
-            $table->string('whatsapp_message_id')->index();
+            // Facebook/Instagram Graph API). Channel-neutral platform id.
+            $table->string('platform_message_id')->index();
 
-            // Salla product identity — kept as relational references rather
+            // Salla product identity - kept as relational references rather
             // than duplicating the full product JSON.
             $table->string('salla_product_id')->nullable()->index();
             $table->string('sku')->nullable();
@@ -43,7 +43,7 @@ return new class extends Migration
 
             $table->timestamps();
 
-            $table->unique(['conversation_id', 'whatsapp_message_id'], 'product_message_maps_conv_msg_unique');
+            $table->unique(['conversation_id', 'platform_message_id'], 'product_message_maps_conv_msg_unique');
         });
     }
 

@@ -8,21 +8,28 @@ return new class extends Migration
 {
     public function up(): void
     {
-        // Drop indexes first before dropping columns
+        // Drop ALL indexes that reference columns we're about to drop.
+        // SQLite requires indexes to be dropped before the columns they reference.
         Schema::table('ai_metrics', function (Blueprint $table) {
-            // Drop all indexes that reference columns we're about to drop
-            $indexesToDrop = [
-                'ai_metrics_business_id_date_unique',
-                'ai_metrics_date_index',
-            ];
-            foreach ($indexesToDrop as $index) {
-                if (Schema::hasIndex('ai_metrics', $index)) {
-                    $table->dropIndex($index);
+            $allIndexes = \DB::select("SELECT name FROM sqlite_master WHERE type='index' AND tbl_name='ai_metrics'");
+            foreach ($allIndexes as $index) {
+                // Skip auto-indexes (SQLite internal)
+                if (str_starts_with($index->name, 'sqlite_autoindex_')) {
+                    continue;
+                }
+                try {
+                    $table->dropIndex($index->name);
+                } catch (\Exception $e) {
+                    // Index may already be dropped or may not exist
                 }
             }
             // Drop foreign key on business_id if it exists
             if (Schema::hasColumn('ai_metrics', 'business_id')) {
-                $table->dropForeign(['business_id']);
+                try {
+                    $table->dropForeign(['business_id']);
+                } catch (\Exception $e) {
+                    // Foreign key may not exist
+                }
             }
         });
 

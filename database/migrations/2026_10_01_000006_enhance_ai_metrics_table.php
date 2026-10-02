@@ -8,6 +8,14 @@ return new class extends Migration
 {
     public function up(): void
     {
+        // Drop foreign key constraints first before dropping columns
+        Schema::table('ai_metrics', function (Blueprint $table) {
+            // Drop foreign key on business_id if it exists
+            if (Schema::hasColumn('ai_metrics', 'business_id')) {
+                $table->dropForeign(['business_id']);
+            }
+        });
+
         Schema::table('ai_metrics', function (Blueprint $table) {
             // Drop old columns that are being replaced
             if (Schema::hasColumn('ai_metrics', 'business_id')) {

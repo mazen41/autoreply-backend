@@ -46,6 +46,7 @@ class OrderFlowIntegrationTest extends TestCase
             'status' => 'connected',
             'ai_enabled' => true,
             'page_name' => 'Test Instagram',
+            'access_token' => 'test_token',
         ]);
 
         $this->bot = Bot::create([

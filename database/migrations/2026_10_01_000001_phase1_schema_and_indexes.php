@@ -55,46 +55,61 @@ return new class extends Migration
 
         // ── Primary Bot DB Constraint (MySQL-compatible) ─────────────────────
         // MySQL does not support partial unique indexes (WHERE clause).
-        // Use a BEFORE INSERT trigger to enforce single primary bot per channel.
-        DB::unprepared('DROP TRIGGER IF EXISTS bot_channels_single_primary_insert;');
-        DB::unprepared('
-            CREATE TRIGGER bot_channels_single_primary_insert
-            BEFORE INSERT ON bot_channels
-            FOR EACH ROW
-            BEGIN
-                IF NEW.is_primary = true THEN
-                    IF EXISTS (
-                        SELECT 1 FROM bot_channels
-                        WHERE channel_id = NEW.channel_id
-                        AND is_primary = true
-                        AND bot_id != NEW.bot_id
-                    ) THEN
-                        SIGNAL SQLSTATE "45000"
-                        SET MESSAGE_TEXT = "Only one primary bot is allowed per channel";
+        // Use triggers to enforce single primary bot per channel.
+        // These require SUPER privilege when binary logging is enabled.
+        // If triggers cannot be created, application-level enforcement in
+        // BotController::store/update() provides the same guarantee.
+        try {
+            DB::unprepared('DROP TRIGGER IF EXISTS bot_channels_single_primary_insert;');
+            DB::unprepared('
+                CREATE TRIGGER bot_channels_single_primary_insert
+                BEFORE INSERT ON bot_channels
+                FOR EACH ROW
+                BEGIN
+                    IF NEW.is_primary = true THEN
+                        IF EXISTS (
+                            SELECT 1 FROM bot_channels
+                            WHERE channel_id = NEW.channel_id
+                            AND is_primary = true
+                            AND bot_id != NEW.bot_id
+                        ) THEN
+                            SIGNAL SQLSTATE "45000"
+                            SET MESSAGE_TEXT = "Only one primary bot is allowed per channel";
+                        END IF;
                     END IF;
-                END IF;
-            END
-        ');
+                END
+            ');
+        } catch (\Exception $e) {
+            Log::warning('Could not create bot_channels_single_primary_insert trigger (SUPER privilege required). Application-level enforcement will be used instead.', [
+                'error' => $e->getMessage(),
+            ]);
+        }
 
-        DB::unprepared('DROP TRIGGER IF EXISTS bot_channels_single_primary_update;');
-        DB::unprepared('
-            CREATE TRIGGER bot_channels_single_primary_update
-            BEFORE UPDATE ON bot_channels
-            FOR EACH ROW
-            BEGIN
-                IF NEW.is_primary = true THEN
-                    IF EXISTS (
-                        SELECT 1 FROM bot_channels
-                        WHERE channel_id = NEW.channel_id
-                        AND is_primary = true
-                        AND bot_id != NEW.bot_id
-                    ) THEN
-                        SIGNAL SQLSTATE "45000"
-                        SET MESSAGE_TEXT = "Only one primary bot is allowed per channel";
+        try {
+            DB::unprepared('DROP TRIGGER IF EXISTS bot_channels_single_primary_update;');
+            DB::unprepared('
+                CREATE TRIGGER bot_channels_single_primary_update
+                BEFORE UPDATE ON bot_channels
+                FOR EACH ROW
+                BEGIN
+                    IF NEW.is_primary = true THEN
+                        IF EXISTS (
+                            SELECT 1 FROM bot_channels
+                            WHERE channel_id = NEW.channel_id
+                            AND is_primary = true
+                            AND bot_id != NEW.bot_id
+                        ) THEN
+                            SIGNAL SQLSTATE "45000"
+                            SET MESSAGE_TEXT = "Only one primary bot is allowed per channel";
+                        END IF;
                     END IF;
-                END IF;
-            END
-        ');
+                END
+            ');
+        } catch (\Exception $e) {
+            Log::warning('Could not create bot_channels_single_primary_update trigger (SUPER privilege required). Application-level enforcement will be used instead.', [
+                'error' => $e->getMessage(),
+            ]);
+        }
     }
 
     /**

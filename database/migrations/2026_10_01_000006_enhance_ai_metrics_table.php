@@ -8,8 +8,13 @@ return new class extends Migration
 {
     public function up(): void
     {
-        // Drop foreign key constraints first before dropping columns
+        // Drop indexes first before dropping columns
         Schema::table('ai_metrics', function (Blueprint $table) {
+            // Drop unique index on business_id + date if it exists
+            if (Schema::hasIndex('ai_metrics', 'ai_metrics_business_id_date_unique')) {
+                $table->dropUnique('ai_metrics_business_id_date_unique');
+            }
+            // Drop foreign key on business_id if it exists
             if (Schema::hasColumn('ai_metrics', 'business_id')) {
                 $table->dropForeign(['business_id']);
             }

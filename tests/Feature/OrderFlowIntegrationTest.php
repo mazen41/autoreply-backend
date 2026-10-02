@@ -27,17 +27,30 @@ class OrderFlowIntegrationTest extends TestCase
     {
         parent::setUp();
 
-        $this->user = User::factory()->create();
-        $this->business = BusinessProfile::factory()->create(['user_id' => $this->user->id]);
-        $this->channel = Channel::factory()->create([
+        $this->user = User::create([
+            'name' => 'Test User',
+            'email' => 'test@example.com',
+            'password' => bcrypt('password'),
+        ]);
+
+        $this->business = BusinessProfile::create([
+            'user_id' => $this->user->id,
+            'name' => 'Test Business',
+            'business_name' => 'Test Store',
+        ]);
+
+        $this->channel = Channel::create([
             'user_id' => $this->user->id,
             'business_id' => $this->business->id,
             'type' => 'instagram',
             'status' => 'connected',
             'ai_enabled' => true,
+            'page_name' => 'Test Instagram',
         ]);
-        $this->bot = Bot::factory()->create([
+
+        $this->bot = Bot::create([
             'business_profile_id' => $this->business->id,
+            'name' => 'Test Bot',
             'status' => 'active',
         ]);
 

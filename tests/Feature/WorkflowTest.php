@@ -9,6 +9,7 @@ use App\Models\Message;
 use App\Models\BusinessProfile;
 use App\Models\User;
 use App\Models\TeamMember;
+use App\Models\FeatureFlag;
 use App\Services\AutomationEngine;
 use Illuminate\Foundation\Testing\RefreshDatabase;
 use Tests\TestCase;
@@ -25,6 +26,13 @@ class WorkflowTest extends TestCase
     protected function setUp(): void
     {
         parent::setUp();
+
+        // Enable the gated advanced automation feature for workflow CRUD tests.
+        FeatureFlag::create([
+            'key' => 'advanced_automation',
+            'name' => 'Advanced Automation',
+            'is_globally_enabled' => true,
+        ]);
 
         $this->user = User::factory()->create();
         $this->business = BusinessProfile::factory()->create([

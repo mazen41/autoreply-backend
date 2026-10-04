@@ -2329,7 +2329,7 @@ class ProcessAutoReply implements ShouldQueue
                     \App\Models\ProductMessageMap::updateOrCreate(
                         [
                             'conversation_id'      => $conversation->id,
-                            'whatsapp_message_id'  => $sentMessageId,
+                            'platform_message_id'  => $sentMessageId,
                         ],
                         [
                             'channel_id'       => $channel->id,
@@ -2348,7 +2348,7 @@ class ProcessAutoReply implements ShouldQueue
                     // to tell whether the mapping was actually persisted).
                     Log::info('ProcessAutoReply: persisted product message map', [
                         'conversation_id'     => $conversation->id,
-                        'whatsapp_message_id' => $sentMessageId,
+                        'platform_message_id' => $sentMessageId,
                         'salla_product_id'    => isset($item['id']) ? (string) $item['id'] : null,
                     ]);
                 } catch (\Exception $e) {

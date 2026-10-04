@@ -47,7 +47,7 @@ return Application::configure(basePath: dirname(__DIR__))
         $schedule->command('email-campaigns:send-due')->everyMinute()->withoutOverlapping();
 
         // Every 5 minutes: monitor sequence queue health
-        $schedule->command('sequences:monitor-queue')->everyFiveMinutes()->withoutOverlapping();
+        $schedule->command('sequence:monitor-queue')->everyFiveMinutes()->withoutOverlapping();
 
         // Every 5 minutes: reset stuck sequence executions (worker crash recovery)
         $schedule->command('sequences:reset-stuck-executions')->everyFiveMinutes()->withoutOverlapping();

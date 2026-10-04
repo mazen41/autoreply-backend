@@ -19,13 +19,15 @@ use Illuminate\Support\Facades\Log;
 class ResetStuckSequenceExecutions extends Command
 {
     protected $signature = 'sequences:reset-stuck-executions
-                            {--minutes=10 : Minutes after which a processing execution is considered stuck}';
+                            {--minutes=10 : Minutes after which a processing execution is considered stuck}
+                            {--dry-run : Only report stuck executions without resetting them}';
 
     protected $description = 'Reset stuck sequence step executions from processing back to pending';
 
     public function handle(): int
     {
         $minutes = (int) $this->option('minutes');
+        $dryRun = (bool) $this->option('dry-run');
         $threshold = now()->subMinutes($minutes);
 
         $stuck = SequenceStepExecution::processing()
@@ -43,18 +45,23 @@ class ResetStuckSequenceExecutions extends Command
             $this->line("  - Execution #{$execution->id} (enrollment {$execution->sequence_enrollment_id}, step {$execution->sequence_step_id})");
         }
 
-        if ($this->confirm('Reset these executions to pending for retry?')) {
-            $count = SequenceStepExecution::processing()
-                ->where('updated_at', '<', $threshold)
-                ->update(['status' => 'pending']);
-
-            $this->info("Reset {$count} execution(s) to pending.");
-
-            Log::info('Reset stuck sequence executions', [
-                'count' => $count,
-                'threshold_minutes' => $minutes,
-            ]);
+        // Non-interactive by default: the scheduler runs this without a TTY,
+        // where confirm() always returns false and would silently no-op.
+        if ($dryRun) {
+            $this->info('Dry run — no changes made.');
+            return Command::SUCCESS;
         }
+
+        $count = SequenceStepExecution::processing()
+            ->where('updated_at', '<', $threshold)
+            ->update(['status' => 'pending']);
+
+        $this->info("Reset {$count} execution(s) to pending.");
+
+        Log::info('Reset stuck sequence executions', [
+            'count' => $count,
+            'threshold_minutes' => $minutes,
+        ]);
 
         return Command::SUCCESS;
     }

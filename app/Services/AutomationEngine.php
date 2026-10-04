@@ -23,6 +23,8 @@ class AutomationEngine
      */
     public const EVENT_MESSAGE_RECEIVED = 'message_received';
     public const EVENT_TAG_ADDED = 'tag_added';
+    public const EVENT_SEQUENCE_COMPLETED = 'sequence_completed';
+    public const EVENT_ORDER_STATUS_CHANGED = 'order_status_changed';
 
     /**
      * Which workflow trigger_config['type'] values are compatible with each
@@ -34,7 +36,15 @@ class AutomationEngine
     private const EVENT_TRIGGER_TYPES = [
         self::EVENT_MESSAGE_RECEIVED => ['keyword', 'keyword_matched', 'message_received', 'first_contact', 'time'],
         self::EVENT_TAG_ADDED        => ['tag_added'],
+        self::EVENT_SEQUENCE_COMPLETED => ['sequence_completed'],
+        self::EVENT_ORDER_STATUS_CHANGED => ['order_status_changed'],
     ];
+
+    /**
+     * Idempotency window in seconds. Prevents duplicate workflow executions
+     * for the same workflow + conversation + event within this time window.
+     */
+    private const IDEMPOTENCY_WINDOW_SECONDS = 300; // 5 minutes
 
     /**
      * Execute every active workflow for a business that is compatible with
@@ -142,6 +152,27 @@ class AutomationEngine
                 return $results;
             }
 
+            // Deduplication: prevent duplicate execution for same workflow +
+            // conversation + event within idempotency window.
+            if (!$testMode && $eventType !== null) {
+                $recentExecution = WorkflowExecution::where('workflow_id', $workflow->id)
+                    ->where('conversation_id', $conversation->id)
+                    ->where('status', 'completed')
+                    ->where('created_at', '>=', now()->subSeconds(self::IDEMPOTENCY_WINDOW_SECONDS))
+                    ->whereJsonContains('trigger_data->event_type', $eventType)
+                    ->first();
+
+                if ($recentExecution) {
+                    Log::info('AutomationEngine: duplicate execution skipped (idempotency window)', [
+                        'workflow_id' => $workflow->id,
+                        'conversation_id' => $conversation->id,
+                        'event_type' => $eventType,
+                        'existing_execution_id' => $recentExecution->id,
+                    ]);
+                    return $results;
+                }
+            }
+
             $results['triggered'] = true;
 
             $execution = WorkflowExecution::create([
@@ -230,7 +261,7 @@ class AutomationEngine
             case 'message_received':
                 return $this->checkMessageReceivedTrigger($conditions, $conversation);
             case 'order_status_changed':
-                return $this->checkOrderStatusTrigger($conditions, $conversation);
+                return $this->checkOrderStatusTrigger($conditions, $conversation, $eventContext);
             case 'escalation_triggered':
                 return $this->checkEscalationTrigger($conditions, $conversation);
             case 'sequence_completed':
@@ -242,8 +273,8 @@ class AutomationEngine
 
     /**
      * Check keyword trigger conditions against the message that fired the
-     * event. Falls back to the conversation's most recent inbound message
-     * when no explicit message is in context (e.g. the test endpoint).
+     * event. Only evaluates the current inbound message — never historical
+     * messages. Returns false when no message is in context (e.g. test endpoint).
      */
     private function checkKeywordTrigger(array $conditions, Conversation $conversation, ?Message $message = null): bool
     {
@@ -253,12 +284,13 @@ class AutomationEngine
         if ($message !== null) {
             $messageText = (string) $message->content;
         } else {
+            // Legacy/test path (no event context): fall back to the
+            // conversation's most recent inbound message.
             $messageText = (string) ($conversation->messages()
                 ->where('direction', 'inbound')
                 ->orderBy('id', 'desc')
                 ->value('content') ?? '');
         }
-
         $messageTextLower = mb_strtolower($messageText);
 
         $matchedKeywords = [];
@@ -382,12 +414,22 @@ class AutomationEngine
 
     /**
      * Check order status changed trigger
+     *
+     * The event payload's status takes precedence (the order_status_changed
+     * event carries the new status); without payload context we fall back
+     * to the conversation's persisted checkout_state.
      */
-    private function checkOrderStatusTrigger(array $conditions, Conversation $conversation): bool
+    private function checkOrderStatusTrigger(array $conditions, Conversation $conversation, array $eventContext = []): bool
     {
         $orderStatus = $conditions['order_status'] ?? null;
         if (!$orderStatus) {
             return false;
+        }
+
+        // Prefer the event payload — the status that fired the event.
+        $eventStatus = $eventContext['status'] ?? null;
+        if ($eventStatus !== null) {
+            return $eventStatus === $orderStatus;
         }
 
         // Check conversation checkout_state for order status

@@ -52,6 +52,9 @@ return Application::configure(basePath: dirname(__DIR__))
         // Every 5 minutes: reset stuck sequence executions (worker crash recovery)
         $schedule->command('sequences:reset-stuck-executions')->everyFiveMinutes()->withoutOverlapping();
 
+        // Every 5 minutes: reset stuck workflow executions (worker crash recovery)
+        $schedule->command('workflows:reset-stuck-executions')->everyFiveMinutes()->withoutOverlapping();
+
         // Every 10 minutes: check for stuck no-reply sequences
         $schedule->command('sequences:check-no-reply')->everyTenMinutes()->withoutOverlapping();
 

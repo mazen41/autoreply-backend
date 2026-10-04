@@ -1861,6 +1861,21 @@ class ProcessAutoReply implements ShouldQueue
                     $conversation->update(['checkout_state' => $completedState]);
                     $checkoutState = []; // prevent the persistence block below from re-saving it
 
+                    // Fire order_status_changed event for workflow automation
+                    try {
+                        $engine = app(\App\Services\AutomationEngine::class);
+                        $engine->executeWorkflowsForEvent(
+                            \App\Services\AutomationEngine::EVENT_ORDER_STATUS_CHANGED,
+                            $conversation,
+                            ['order_id' => $realOrderId, 'status' => 'completed']
+                        );
+                    } catch (\Throwable $e) {
+                        Log::error('ProcessAutoReply: failed to fire order_status_changed event', [
+                            'conversation_id' => $conversation->id,
+                            'error' => $e->getMessage(),
+                        ]);
+                    }
+
                     Log::info('ProcessAutoReply: Salla order created and reply overridden with real order ID', [
                         'conversation_id' => $conversation->id,
                         'order_id'        => $realOrderId,

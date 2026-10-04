@@ -221,6 +221,7 @@ class SequenceExecutionService
 
         if (!$targetStep) {
             $enrollment->complete();
+            $this->fireSequenceCompletedEvent($enrollment);
             return;
         }
 
@@ -499,6 +500,7 @@ class SequenceExecutionService
         if (!$nextStep) {
             // No next step, complete the enrollment
             $enrollment->complete();
+            $this->fireSequenceCompletedEvent($enrollment);
             return;
         }
         
@@ -625,6 +627,7 @@ class SequenceExecutionService
         if (!$nextStep) {
             // No next step, complete the enrollment
             $enrollment->complete();
+            $this->fireSequenceCompletedEvent($enrollment);
             return;
         }
         
@@ -688,5 +691,31 @@ class SequenceExecutionService
         ]);
 
         ExecuteSequenceStep::dispatch($execution->id);
+    }
+
+    /**
+     * Fire sequence_completed event to AutomationEngine.
+     * Called when a sequence enrollment completes all steps.
+     */
+    private function fireSequenceCompletedEvent(SequenceEnrollment $enrollment): void
+    {
+        try {
+            $conversation = $enrollment->conversation;
+            if (!$conversation) {
+                return;
+            }
+
+            $engine = app(\App\Services\AutomationEngine::class);
+            $engine->executeWorkflowsForEvent(
+                \App\Services\AutomationEngine::EVENT_SEQUENCE_COMPLETED,
+                $conversation,
+                ['sequence_id' => $enrollment->sequence_id]
+            );
+        } catch (\Throwable $e) {
+            Log::error('SequenceExecutionService: failed to fire sequence_completed event', [
+                'enrollment_id' => $enrollment->id,
+                'error' => $e->getMessage(),
+            ]);
+        }
     }
 }

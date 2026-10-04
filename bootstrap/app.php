@@ -82,6 +82,6 @@ return Application::configure(basePath: dirname(__DIR__))
         // Every 6 hours: renew Gmail watch
         $schedule->command('gmail:renew-watch')->everySixHours()->withoutOverlapping();
 
-        // Every 12 hours: resync Telegram webhooks
-        $schedule->command('telegram:resync-webhooks')->everyTwelveHours()->withoutOverlapping();
+        // Every 12 hours: resync Telegram webhooks (00:00 + 12:00)
+        $schedule->command('telegram:resync-webhooks')->twiceDaily(0, 12)->withoutOverlapping();
     })->create();

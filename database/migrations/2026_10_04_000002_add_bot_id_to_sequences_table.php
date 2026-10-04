@@ -17,14 +17,23 @@ return new class extends Migration
      */
     public function up(): void
     {
-        Schema::table('sequences', function (Blueprint $table) {
-            $table->foreignId('bot_id')
-                ->nullable()
-                ->after('business_id')
-                ->constrained('bots')
-                ->nullOnDelete();
-            $table->index(['business_id', 'bot_id']);
-        });
+        // The Phase 1 schema migration may already have added bot_id for
+        // fresh installs — guard so both paths converge to the same state.
+        if (!Schema::hasColumn('sequences', 'bot_id')) {
+            Schema::table('sequences', function (Blueprint $table) {
+                $table->foreignId('bot_id')
+                    ->nullable()
+                    ->after('business_id')
+                    ->constrained('bots')
+                    ->nullOnDelete();
+            });
+        }
+
+        if (!Schema::hasIndex('sequences', 'sequences_business_id_bot_id_index')) {
+            Schema::table('sequences', function (Blueprint $table) {
+                $table->index(['business_id', 'bot_id']);
+            });
+        }
     }
 
     public function down(): void

@@ -9,29 +9,54 @@ return new class extends Migration
     public function up(): void
     {
         // Drop ALL indexes that reference columns we're about to drop.
-        // SQLite requires indexes to be dropped before the columns they reference.
-        Schema::table('ai_metrics', function (Blueprint $table) {
-            $allIndexes = \DB::select("SELECT name FROM sqlite_master WHERE type='index' AND tbl_name='ai_metrics'");
-            foreach ($allIndexes as $index) {
-                // Skip auto-indexes (SQLite internal)
-                if (str_starts_with($index->name, 'sqlite_autoindex_')) {
-                    continue;
-                }
-                try {
-                    $table->dropIndex($index->name);
-                } catch (\Exception $e) {
-                    // Index may already be dropped or may not exist
-                }
-            }
-            // Drop foreign key on business_id if it exists
-            if (Schema::hasColumn('ai_metrics', 'business_id')) {
+        $driver = Schema::getConnection()->getDriverName();
+
+        if ($driver === 'mysql') {
+            // MySQL: drop the FK first — its supporting composite unique
+            // index (business_id, date) cannot be dropped while it backs
+            // the FK (error 1553).
+            Schema::table('ai_metrics', function (Blueprint $table) {
                 try {
                     $table->dropForeign(['business_id']);
                 } catch (\Exception $e) {
                     // Foreign key may not exist
                 }
-            }
-        });
+            });
+
+            Schema::table('ai_metrics', function (Blueprint $table) {
+                foreach (['ai_metrics_business_id_date_unique', 'ai_metrics_date_unique', 'ai_metrics_date_index'] as $indexName) {
+                    try {
+                        $table->dropIndex($indexName);
+                    } catch (\Exception $e) {
+                        // Index may not exist
+                    }
+                }
+            });
+        } else {
+            // SQLite: indexes must be dropped before the columns they reference.
+            Schema::table('ai_metrics', function (Blueprint $table) {
+                $allIndexes = \DB::select("SELECT name FROM sqlite_master WHERE type='index' AND tbl_name='ai_metrics'");
+                foreach ($allIndexes as $index) {
+                    // Skip auto-indexes (SQLite internal)
+                    if (str_starts_with($index->name, 'sqlite_autoindex_')) {
+                        continue;
+                    }
+                    try {
+                        $table->dropIndex($index->name);
+                    } catch (\Exception $e) {
+                        // Index may already be dropped or may not exist
+                    }
+                }
+                // Drop foreign key on business_id if it exists
+                if (Schema::hasColumn('ai_metrics', 'business_id')) {
+                    try {
+                        $table->dropForeign(['business_id']);
+                    } catch (\Exception $e) {
+                        // Foreign key may not exist
+                    }
+                }
+            });
+        }
 
         // Drop old columns if they exist
         Schema::table('ai_metrics', function (Blueprint $table) {

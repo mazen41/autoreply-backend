@@ -101,6 +101,7 @@ class SequenceController extends Controller
             'channel' => 'nullable|in:whatsapp,telegram,email',
             'settings' => 'nullable|array',
             'steps' => 'nullable|array',
+            'bot_id' => 'nullable|integer|exists:bots,id',
         ]);
 
         try {

@@ -229,4 +229,166 @@ class BotController extends Controller
 
         return response()->json(['message' => 'Bot deleted successfully']);
     }
+
+    // ── BOT-CHANNEL MANAGEMENT ───────────────────────────────────────────────
+
+    /**
+     * GET /api/bots/{id}/channels — list channels assigned to this bot
+     */
+    public function channels(Request $request, $id)
+    {
+        $business = $this->getResolvedBusinessProfile($request);
+        $bot = Bot::where('business_profile_id', $business->id)
+            ->with(['channels:id,type,page_name,page_id,status'])
+            ->findOrFail($id);
+
+        return response()->json([
+            'bot_id' => $bot->id,
+            'channels' => $bot->channels->map(fn ($ch) => [
+                'id' => $ch->id,
+                'type' => $ch->type,
+                'page_name' => $ch->page_name,
+                'page_id' => $ch->page_id,
+                'status' => $ch->status,
+                'is_primary' => $ch->pivot->is_primary ?? false,
+            ]),
+        ]);
+    }
+
+    /**
+     * POST /api/bots/{id}/channels — attach channels to this bot
+     */
+    public function attachChannels(Request $request, $id)
+    {
+        $business = $this->getResolvedBusinessProfile($request);
+        $bot = Bot::where('business_profile_id', $business->id)->findOrFail($id);
+
+        $request->validate([
+            'channel_ids' => 'required|array|min:1',
+            'channel_ids.*' => 'integer',
+            'primary_channel_ids' => 'nullable|array',
+            'primary_channel_ids.*' => 'integer',
+        ]);
+
+        $validChannelIds = Channel::whereIn('id', $request->channel_ids)
+            ->where('user_id', $request->user()->id)
+            ->pluck('id')
+            ->toArray();
+
+        if (empty($validChannelIds)) {
+            return response()->json(['error' => 'No valid channels found'], 422);
+        }
+
+        $primaryIds = $request->primary_channel_ids ?? [];
+
+        // Enforce is_primary integrity: only one primary bot per channel
+        if (!empty($primaryIds)) {
+            \DB::table('bot_channels')
+                ->whereIn('channel_id', $primaryIds)
+                ->where('bot_id', '!=', $bot->id)
+                ->update(['is_primary' => false]);
+        }
+
+        $syncData = [];
+        foreach ($validChannelIds as $chId) {
+            $syncData[$chId] = ['is_primary' => in_array($chId, $primaryIds)];
+        }
+        $bot->channels()->syncWithoutDetaching($syncData);
+
+        return response()->json([
+            'message' => 'Channels attached successfully',
+            'bot' => $bot->load(['channels:id,type,page_name,page_id']),
+        ]);
+    }
+
+    /**
+     * DELETE /api/bots/{id}/channels/{channelId} — detach a channel from this bot
+     */
+    public function detachChannel(Request $request, $id, $channelId)
+    {
+        $business = $this->getResolvedBusinessProfile($request);
+        $bot = Bot::where('business_profile_id', $business->id)->findOrFail($id);
+
+        $channel = Channel::where('id', $channelId)
+            ->where('user_id', $request->user()->id)
+            ->firstOrFail();
+
+        $bot->channels()->detach($channel->id);
+
+        return response()->json(['message' => 'Channel detached successfully']);
+    }
+
+    // ── BOT-KNOWLEDGE ASSIGNMENT MANAGEMENT ──────────────────────────────────
+
+    /**
+     * GET /api/bots/{id}/knowledge — list knowledge files assigned to this bot
+     */
+    public function knowledge(Request $request, $id)
+    {
+        $business = $this->getResolvedBusinessProfile($request);
+        $bot = Bot::where('business_profile_id', $business->id)
+            ->with(['knowledgeAssignments.knowledgeFile', 'knowledgeAssignments.channel'])
+            ->findOrFail($id);
+
+        return response()->json([
+            'bot_id' => $bot->id,
+            'knowledge_assignments' => $bot->knowledgeAssignments->map(fn ($a) => [
+                'id' => $a->id,
+                'file_id' => $a->business_knowledge_file_id,
+                'file_name' => $a->knowledgeFile?->file_name,
+                'channel_id' => $a->channel_id,
+                'channel_type' => $a->channel?->type,
+            ]),
+        ]);
+    }
+
+    /**
+     * POST /api/bots/{id}/knowledge — assign knowledge files to this bot
+     */
+    public function assignKnowledge(Request $request, $id)
+    {
+        $business = $this->getResolvedBusinessProfile($request);
+        $bot = Bot::where('business_profile_id', $business->id)->findOrFail($id);
+
+        $request->validate([
+            'assignments' => 'required|array|min:1',
+            'assignments.*.file_id' => 'required|integer|exists:business_knowledge_files,id',
+            'assignments.*.channel_id' => 'nullable|integer|exists:channels,id',
+        ]);
+
+        foreach ($request->assignments as $assign) {
+            // Verify the file belongs to the user's business
+            $file = \App\Models\BusinessKnowledgeFile::where('id', $assign['file_id'])
+                ->where('business_id', $business->id)
+                ->firstOrFail();
+
+            BotKnowledgeAssignment::create([
+                'bot_id' => $bot->id,
+                'business_knowledge_file_id' => $file->id,
+                'channel_id' => $assign['channel_id'] ?? null,
+            ]);
+        }
+
+        return response()->json([
+            'message' => 'Knowledge assigned successfully',
+            'bot' => $bot->load(['knowledgeAssignments.knowledgeFile']),
+        ]);
+    }
+
+    /**
+     * DELETE /api/bots/{id}/knowledge/{fileId} — remove a knowledge assignment
+     */
+    public function removeKnowledge(Request $request, $id, $fileId)
+    {
+        $business = $this->getResolvedBusinessProfile($request);
+        $bot = Bot::where('business_profile_id', $business->id)->findOrFail($id);
+
+        $assignment = BotKnowledgeAssignment::where('bot_id', $bot->id)
+            ->where('business_knowledge_file_id', $fileId)
+            ->firstOrFail();
+
+        $assignment->delete();
+
+        return response()->json(['message' => 'Knowledge assignment removed successfully']);
+    }
 }

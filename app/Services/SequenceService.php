@@ -34,6 +34,7 @@ class SequenceService
                 'settings' => $data['settings'] ?? null,
                 'timezone' => $data['timezone'] ?? 'UTC',
                 'business_hours' => $data['business_hours'] ?? null,
+                'bot_id' => $data['bot_id'] ?? null,
             ]);
 
             if (isset($data['steps']) && is_array($data['steps'])) {
@@ -68,6 +69,7 @@ class SequenceService
                 'settings' => $data['settings'] ?? $sequence->settings,
                 'timezone' => $data['timezone'] ?? $sequence->timezone,
                 'business_hours' => $data['business_hours'] ?? $sequence->business_hours,
+                'bot_id' => $data['bot_id'] ?? $sequence->bot_id,
             ]);
 
             if (isset($data['steps']) && is_array($data['steps'])) {

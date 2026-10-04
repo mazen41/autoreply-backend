@@ -158,6 +158,14 @@ Route::middleware('auth:sanctum')->group(function () {
 
     // Bot Management
     Route::apiResource('bots', \App\Http\Controllers\Api\BotController::class)->middleware('plan.enforce:max_bots');
+    // Bot-Channel management
+    Route::get('/bots/{id}/channels', [\App\Http\Controllers\Api\BotController::class, 'channels']);
+    Route::post('/bots/{id}/channels', [\App\Http\Controllers\Api\BotController::class, 'attachChannels']);
+    Route::delete('/bots/{id}/channels/{channelId}', [\App\Http\Controllers\Api\BotController::class, 'detachChannel']);
+    // Bot-Knowledge assignment management
+    Route::get('/bots/{id}/knowledge', [\App\Http\Controllers\Api\BotController::class, 'knowledge']);
+    Route::post('/bots/{id}/knowledge', [\App\Http\Controllers\Api\BotController::class, 'assignKnowledge']);
+    Route::delete('/bots/{id}/knowledge/{fileId}', [\App\Http\Controllers\Api\BotController::class, 'removeKnowledge']);
 
     // Customer / CRM
     Route::get('/customers', [\App\Http\Controllers\Api\CustomerController::class, 'index']);

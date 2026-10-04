@@ -38,4 +38,44 @@ return Application::configure(basePath: dirname(__DIR__))
         $exceptions->shouldRenderJsonWhen(
             fn (Request $request) => $request->is('api/*'),
         );
+    })
+    ->withSchedule(function (\Illuminate\Console\Scheduling\Schedule $schedule): void {
+        // Every minute: process due campaign messages
+        $schedule->command('campaigns:send-due')->everyMinute()->withoutOverlapping();
+
+        // Every minute: send due email campaigns
+        $schedule->command('email-campaigns:send-due')->everyMinute()->withoutOverlapping();
+
+        // Every 5 minutes: monitor sequence queue health
+        $schedule->command('sequences:monitor-queue')->everyFiveMinutes()->withoutOverlapping();
+
+        // Every 10 minutes: check for stuck no-reply sequences
+        $schedule->command('sequences:check-no-reply')->everyTenMinutes()->withoutOverlapping();
+
+        // Every 15 minutes: sync Salla orders
+        $schedule->command('salla:sync-orders')->everyFifteenMinutes()->withoutOverlapping();
+
+        // Every 30 minutes: sync Salla customers
+        $schedule->command('salla:sync-customers')->everyThirtyMinutes()->withoutOverlapping();
+
+        // Every hour: check system health
+        $schedule->command('system:health-check')->hourly()->withoutOverlapping();
+
+        // Every hour: check usage limits
+        $schedule->command('billing:check-usage-limits')->hourly()->withoutOverlapping();
+
+        // Daily at midnight: generate analytics
+        $schedule->command('analytics:daily')->dailyAt('00:00')->withoutOverlapping();
+
+        // Daily at 2 AM: backup database
+        $schedule->command('backup:database')->dailyAt('02:00')->withoutOverlapping();
+
+        // Daily at 3 AM: create performance indexes
+        $schedule->command('db:create-performance-indexes')->dailyAt('03:00')->withoutOverlapping();
+
+        // Every 6 hours: renew Gmail watch
+        $schedule->command('gmail:renew-watch')->everySixHours()->withoutOverlapping();
+
+        // Every 12 hours: resync Telegram webhooks
+        $schedule->command('telegram:resync-webhooks')->everyTwelveHours()->withoutOverlapping();
     })->create();

@@ -227,12 +227,23 @@ class SequenceExecutionService
         $enrollment->current_step = $targetStep->step_order;
         $enrollment->save();
 
+        $scheduledAt = now();
+        $executionKey = SequenceStepExecution::generateKey($enrollment->id, $targetStep->id, $scheduledAt->toDateTimeString());
+
+        // Idempotent: skip if already exists
+        $existing = SequenceStepExecution::where('execution_key', $executionKey)->first();
+        if ($existing) {
+            ExecuteSequenceStep::dispatch($existing->id);
+            return;
+        }
+
         $execution = SequenceStepExecution::create([
             'sequence_id' => $enrollment->sequence_id,
             'sequence_enrollment_id' => $enrollment->id,
             'sequence_step_id' => $targetStep->id,
+            'execution_key' => $executionKey,
             'status' => 'pending',
-            'scheduled_at' => now(),
+            'scheduled_at' => $scheduledAt,
         ]);
 
         ExecuteSequenceStep::dispatch($execution->id);
@@ -529,10 +540,26 @@ class SequenceExecutionService
         ]);
         
         // Queue next step execution
+        $scheduledAt = $scheduledAt->toDateTimeString();
+        $executionKey = SequenceStepExecution::generateKey($enrollment->id, $nextStep->id, $scheduledAt);
+
+        // Idempotent: skip if already exists
+        $existing = SequenceStepExecution::where('execution_key', $executionKey)->first();
+        if ($existing) {
+            $jobDelay = (int) round(now()->diffInSeconds($scheduledAt, false));
+            if ($jobDelay <= 0) {
+                ExecuteSequenceStep::dispatch($existing->id)->delay(1);
+            } else {
+                ExecuteSequenceStep::dispatch($existing->id)->delay($jobDelay);
+            }
+            return;
+        }
+
         $execution = SequenceStepExecution::create([
             'sequence_id' => $enrollment->sequence_id,
             'sequence_enrollment_id' => $enrollment->id,
             'sequence_step_id' => $nextStep->id,
+            'execution_key' => $executionKey,
             'status' => 'pending',
             'scheduled_at' => $scheduledAt,
         ]);
@@ -608,28 +635,50 @@ class SequenceExecutionService
                 'enrollment_id' => $enrollment->id,
                 'next_step_id' => $nextStep->id,
             ]);
-            
+
             // Create execution record for delay step (immediate)
+            $scheduledAt = now();
+            $executionKey = SequenceStepExecution::generateKey($enrollment->id, $nextStep->id, $scheduledAt->toDateTimeString());
+
+            // Idempotent: skip if already exists
+            $existing = SequenceStepExecution::where('execution_key', $executionKey)->first();
+            if ($existing) {
+                ExecuteSequenceStep::dispatch($existing->id);
+                return;
+            }
+
             $execution = SequenceStepExecution::create([
                 'sequence_id' => $enrollment->sequence_id,
                 'sequence_enrollment_id' => $enrollment->id,
                 'sequence_step_id' => $nextStep->id,
+                'execution_key' => $executionKey,
                 'status' => 'pending',
-                'scheduled_at' => now(),
+                'scheduled_at' => $scheduledAt,
             ]);
-            
+
             // Dispatch immediately - delay step will handle scheduling the next step
             ExecuteSequenceStep::dispatch($execution->id);
             return;
         }
-        
+
         // For non-delay steps, execute immediately
+        $scheduledAt = now();
+        $executionKey = SequenceStepExecution::generateKey($enrollment->id, $nextStep->id, $scheduledAt->toDateTimeString());
+
+        // Idempotent: skip if already exists
+        $existing = SequenceStepExecution::where('execution_key', $executionKey)->first();
+        if ($existing) {
+            ExecuteSequenceStep::dispatch($existing->id);
+            return;
+        }
+
         $execution = SequenceStepExecution::create([
             'sequence_id' => $enrollment->sequence_id,
             'sequence_enrollment_id' => $enrollment->id,
             'sequence_step_id' => $nextStep->id,
+            'execution_key' => $executionKey,
             'status' => 'pending',
-            'scheduled_at' => now(),
+            'scheduled_at' => $scheduledAt,
         ]);
 
         Log::info("moveToNextStep: Executing next step immediately", [

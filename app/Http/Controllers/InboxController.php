@@ -736,6 +736,19 @@ class InboxController extends Controller
 
         $conversation->update(['status' => $request->status]);
 
+        // Cancel active sequence enrollments when conversation is closed
+        if ($request->status === 'closed') {
+            try {
+                $enrollmentService = app(\App\Services\SequenceEnrollmentService::class);
+                $enrollmentService->stopEnrollmentsForConversation($conversation, 'conversation_closed');
+            } catch (\Exception $e) {
+                \Illuminate\Support\Facades\Log::error('Failed to stop sequences on conversation close', [
+                    'conversation_id' => $conversation->id,
+                    'error' => $e->getMessage(),
+                ]);
+            }
+        }
+
         return response()->json([
             'success' => true,
             'conversation' => $conversation->fresh('channel:id,type,page_name', 'latestMessage'),

@@ -13,6 +13,7 @@ class SequenceStepExecution extends Model
         'sequence_id',
         'sequence_enrollment_id',
         'sequence_step_id',
+        'execution_key',
         'status',
         'executed_at',
         'scheduled_at',
@@ -112,5 +113,16 @@ class SequenceStepExecution extends Model
     {
         $this->scheduled_at = now()->addSeconds($delayInSeconds);
         $this->save();
+    }
+
+    /**
+     * Generate a deterministic execution key for idempotent dispatch.
+     * Hash of (enrollment_id, step_id, scheduled_at) — same inputs always
+     * produce the same key, so duplicate dispatches are caught by the
+     * unique index.
+     */
+    public static function generateKey(int $enrollmentId, int $stepId, string $scheduledAt): string
+    {
+        return hash('sha256', implode('|', [$enrollmentId, $stepId, $scheduledAt]));
     }
 }

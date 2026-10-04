@@ -234,12 +234,23 @@ class SequenceEnrollmentService
             return;
         }
 
+        $scheduledAt = now();
+        $executionKey = SequenceStepExecution::generateKey($enrollment->id, $currentStep->id, $scheduledAt->toDateTimeString());
+
+        // Idempotent: if a record with this key already exists, skip creation
+        $existing = SequenceStepExecution::where('execution_key', $executionKey)->first();
+        if ($existing) {
+            $enrollment->_pendingExecutionId = $existing->id;
+            return;
+        }
+
         $execution = SequenceStepExecution::create([
             'sequence_id' => $enrollment->sequence_id,
             'sequence_enrollment_id' => $enrollment->id,
             'sequence_step_id' => $currentStep->id,
+            'execution_key' => $executionKey,
             'status' => 'pending',
-            'scheduled_at' => now(),
+            'scheduled_at' => $scheduledAt,
         ]);
 
         Log::info("QueueStepExecution: Created execution record", [
@@ -247,6 +258,7 @@ class SequenceEnrollmentService
             'enrollment_id' => $enrollment->id,
             'step_id' => $currentStep->id,
             'step_type' => $currentStep->step_type,
+            'execution_key' => $executionKey,
         ]);
 
         $enrollment->scheduleNextExecution(0);

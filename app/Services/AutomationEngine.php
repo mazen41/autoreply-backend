@@ -17,23 +17,107 @@ use Illuminate\Support\Facades\Log;
 class AutomationEngine
 {
     /**
-     * Execute a workflow on a conversation
+     * Automation event types. Each event carries its own context
+     * ($eventContext) and can only fire a subset of workflow trigger types —
+     * see EVENT_TRIGGER_TYPES.
      */
-    public function executeWorkflow(AutomationWorkflow $workflow, Conversation $conversation, bool $testMode = false): array
-    {
-        $execution = WorkflowExecution::create([
-            'workflow_id' => $workflow->id,
-            'conversation_id' => $conversation->id,
-            'business_id' => $conversation->business_id,
-            'status' => 'running',
-            'test_mode' => $testMode,
-            'trigger_data' => [
-                'trigger_config' => $workflow->trigger_config,
-                'conversation_id' => $conversation->id,
-            ],
-            'started_at' => now(),
-        ]);
+    public const EVENT_MESSAGE_RECEIVED = 'message_received';
+    public const EVENT_TAG_ADDED = 'tag_added';
 
+    /**
+     * Which workflow trigger_config['type'] values are compatible with each
+     * automation event. Workflows whose trigger type is not listed for an
+     * event are never evaluated for that event (e.g. a tag_added workflow is
+     * not re-checked on every inbound message — tag_added events fire from
+     * InboxController::addTag() instead).
+     */
+    private const EVENT_TRIGGER_TYPES = [
+        self::EVENT_MESSAGE_RECEIVED => ['keyword', 'keyword_matched', 'message_received', 'first_contact', 'time'],
+        self::EVENT_TAG_ADDED        => ['tag_added'],
+    ];
+
+    /**
+     * Execute every active workflow for a business that is compatible with
+     * the given automation event.
+     *
+     * This is the single entry point used by event sources
+     * (ProcessAutoReply for message_received, InboxController::addTag for
+     * tag_added). Event compatibility is filtered here, BEFORE
+     * executeWorkflow, so incompatible workflows are never touched.
+     *
+     * Bot scope: only business-global workflows (bot_id NULL — all
+     * pre-existing rows) plus workflows bound to the conversation's resolved
+     * bot are eligible. A bot-specific workflow never fires on another
+     * bot's conversation, and never fires when no bot is resolved.
+     */
+    public function executeWorkflowsForEvent(string $eventType, Conversation $conversation, array $eventContext = [], bool $testMode = false): array
+    {
+        $businessId = $conversation->business_id;
+        if (!$businessId) {
+            return [];
+        }
+
+        $botId = $conversation->bot_id ? (int) $conversation->bot_id : null;
+        $compatibleTypes = self::EVENT_TRIGGER_TYPES[$eventType] ?? [];
+
+        $workflows = AutomationWorkflow::forBusiness($businessId)
+            ->active()
+            ->forBotScope($botId)
+            ->get()
+            ->filter(function (AutomationWorkflow $workflow) use ($compatibleTypes) {
+                $triggerType = self::triggerTypeOf($workflow);
+
+                return $triggerType !== '' && in_array($triggerType, $compatibleTypes, true);
+            });
+
+        if ($workflows->isEmpty()) {
+            return [];
+        }
+
+        $results = [];
+
+        foreach ($workflows as $workflow) {
+            try {
+                $results[] = $this->executeWorkflow(
+                    $workflow,
+                    $conversation,
+                    testMode: $testMode,
+                    eventType: $eventType,
+                    eventContext: $eventContext
+                );
+            } catch (\Throwable $e) {
+                Log::error('AutomationEngine: workflow execution failed', [
+                    'workflow_id'     => $workflow->id,
+                    'conversation_id' => $conversation->id,
+                    'event_type'      => $eventType,
+                    'error'           => $e->getMessage(),
+                ]);
+            }
+        }
+
+        return $results;
+    }
+
+    public static function triggerTypeOf(AutomationWorkflow $workflow): string
+    {
+        return (string) ($workflow->trigger_config['type'] ?? '');
+    }
+
+    public static function triggerMatchesEvent(string $triggerType, string $eventType): bool
+    {
+        return in_array($triggerType, self::EVENT_TRIGGER_TYPES[$eventType] ?? [], true);
+    }
+
+    /**
+     * Execute a workflow on a conversation
+     *
+     * $eventType restricts evaluation to triggers compatible with the firing
+     * event (null = unrestricted, used by the explicit test endpoint).
+     * $eventContext carries event data: ['message' => Message|null,
+     * 'tag' => string|null].
+     */
+    public function executeWorkflow(AutomationWorkflow $workflow, Conversation $conversation, bool $testMode = false, ?string $eventType = null, array $eventContext = []): array
+    {
         $results = [
             'triggered' => false,
             'actions_executed' => [],
@@ -41,17 +125,38 @@ class AutomationEngine
         ];
 
         try {
-            // Check if trigger conditions are met
-            if (!$this->checkTriggerConditions($workflow->trigger_config, $conversation)) {
-                $execution->update([
-                    'status' => 'completed',
-                    'results' => ['triggered' => false],
-                    'completed_at' => now(),
-                ]);
+            // Event compatibility gate — never run a workflow whose trigger
+            // type cannot fire on this event.
+            if ($eventType !== null) {
+                $triggerType = self::triggerTypeOf($workflow);
+
+                if ($triggerType === '' || !self::triggerMatchesEvent($triggerType, $eventType)) {
+                    return $results;
+                }
+            }
+
+            // Check if trigger conditions are met BEFORE creating any record —
+            // a WorkflowExecution row only exists for workflows that actually
+            // matched.
+            if (!$this->checkTriggerConditions($workflow->trigger_config, $conversation, $eventContext)) {
                 return $results;
             }
 
             $results['triggered'] = true;
+
+            $execution = WorkflowExecution::create([
+                'workflow_id' => $workflow->id,
+                'conversation_id' => $conversation->id,
+                'business_id' => $conversation->business_id,
+                'status' => 'running',
+                'test_mode' => $testMode,
+                'trigger_data' => [
+                    'trigger_config' => $workflow->trigger_config,
+                    'conversation_id' => $conversation->id,
+                    'event_type' => $eventType ?? self::triggerTypeOf($workflow),
+                ],
+                'started_at' => now(),
+            ]);
 
             // Execute each action
             foreach ($workflow->actions_config as $action) {
@@ -89,12 +194,14 @@ class AutomationEngine
                 'error' => $e->getMessage()
             ]);
 
-            $execution->update([
-                'status' => 'failed',
-                'error_message' => $e->getMessage(),
-                'results' => $results,
-                'completed_at' => now(),
-            ]);
+            if (isset($execution)) {
+                $execution->update([
+                    'status' => 'failed',
+                    'error_message' => $e->getMessage(),
+                    'results' => $results,
+                    'completed_at' => now(),
+                ]);
+            }
 
             $results['errors'][] = $e->getMessage();
         }
@@ -105,7 +212,7 @@ class AutomationEngine
     /**
      * Check if trigger conditions are met
      */
-    private function checkTriggerConditions(array $triggerConfig, Conversation $conversation): bool
+    private function checkTriggerConditions(array $triggerConfig, Conversation $conversation, array $eventContext = []): bool
     {
         $triggerType = $triggerConfig['type'];
         $conditions = $triggerConfig['conditions'] ?? [];
@@ -113,13 +220,13 @@ class AutomationEngine
         switch ($triggerType) {
             case 'keyword':
             case 'keyword_matched':
-                return $this->checkKeywordTrigger($conditions, $conversation);
+                return $this->checkKeywordTrigger($conditions, $conversation, $eventContext['message'] ?? null);
             case 'time':
                 return $this->checkTimeTrigger($conditions, $conversation);
             case 'first_contact':
-                return $this->checkFirstContactTrigger($conditions, $conversation);
+                return $this->checkFirstContactTrigger($conditions, $conversation, $eventContext['message'] ?? null);
             case 'tag_added':
-                return $this->checkTagTrigger($conditions, $conversation);
+                return $this->checkTagTrigger($conditions, $conversation, $eventContext['tag'] ?? null);
             case 'message_received':
                 return $this->checkMessageReceivedTrigger($conditions, $conversation);
             case 'order_status_changed':
@@ -134,26 +241,29 @@ class AutomationEngine
     }
 
     /**
-     * Check keyword trigger conditions
+     * Check keyword trigger conditions against the message that fired the
+     * event. Falls back to the conversation's most recent inbound message
+     * when no explicit message is in context (e.g. the test endpoint).
      */
-    private function checkKeywordTrigger(array $conditions, Conversation $conversation): bool
+    private function checkKeywordTrigger(array $conditions, Conversation $conversation, ?Message $message = null): bool
     {
         $keywords = $conditions['keywords'] ?? [];
         $matchType = $conditions['match_type'] ?? 'any'; // 'any' or 'all'
 
-        // Get recent messages
-        $recentMessages = $conversation->messages()
-            ->where('direction', 'inbound')
-            ->orderBy('created_at', 'desc')
-            ->take(5)
-            ->get();
+        if ($message !== null) {
+            $messageText = (string) $message->content;
+        } else {
+            $messageText = (string) ($conversation->messages()
+                ->where('direction', 'inbound')
+                ->orderBy('id', 'desc')
+                ->value('content') ?? '');
+        }
 
-        $messageText = $recentMessages->pluck('content')->implode(' ');
-        $messageTextLower = strtolower($messageText);
+        $messageTextLower = mb_strtolower($messageText);
 
         $matchedKeywords = [];
         foreach ($keywords as $keyword) {
-            if (str_contains($messageTextLower, strtolower($keyword))) {
+            if (str_contains($messageTextLower, mb_strtolower((string) $keyword))) {
                 $matchedKeywords[] = $keyword;
             }
         }
@@ -196,19 +306,50 @@ class AutomationEngine
 
     /**
      * Check first contact trigger
+     *
+     * Matches only when the message that fired the event IS the first
+     * inbound message on the conversation (id <= comparison handles
+     * concurrent workers). Evaluation happens after the AI reply is sent, so
+     * a plain inbound count would be wrong for conversations where a second
+     * customer message arrived meanwhile — the current message's identity is
+     * what matters, not the post-reply message count.
      */
-    private function checkFirstContactTrigger(array $conditions, Conversation $conversation): bool
+    private function checkFirstContactTrigger(array $conditions, Conversation $conversation, ?Message $message = null): bool
     {
-        $messageCount = $conversation->messages()->where('direction', 'inbound')->count();
-        return $messageCount === 1;
+        if ($message !== null) {
+            $inboundCount = Message::where('conversation_id', $conversation->id)
+                ->where('direction', 'inbound')
+                ->where('id', '<=', $message->id)
+                ->count();
+        } else {
+            // No message in context (test endpoint): fall back to "the
+            // conversation has exactly one inbound message".
+            $inboundCount = $conversation->messages()->where('direction', 'inbound')->count();
+        }
+
+        return $inboundCount === 1;
     }
 
     /**
      * Check tag trigger
+     *
+     * For tag_added events the tag that was just added is matched against
+     * the configured tags. Without event context (test endpoint), falls back
+     * to "conversation currently has any of the configured tags".
      */
-    private function checkTagTrigger(array $conditions, Conversation $conversation): bool
+    private function checkTagTrigger(array $conditions, Conversation $conversation, ?string $eventTag = null): bool
     {
         $tags = $conditions['tags'] ?? [];
+
+        // Single-tag configs: accept both {tags: [...]} and {tag: 'x'}.
+        if (!empty($conditions['tag'])) {
+            $tags = array_merge($tags, [$conditions['tag']]);
+        }
+
+        if ($eventTag !== null) {
+            return in_array($eventTag, $tags, true);
+        }
+
         $conversationTags = $conversation->tags()->pluck('tag')->toArray();
 
         foreach ($tags as $tag) {
@@ -797,25 +938,23 @@ class AutomationEngine
             ];
         }
 
-        // Update or create customer record
-        $customer = \App\Models\Customer::firstOrCreate(
-            ['business_profile_id' => $conversation->business_id],
-            [
-                'name' => $conversation->sender_name,
-                'phone' => $conversation->sender_id,
-                'email' => $conversation->sender_email,
-                'custom_fields' => [],
-            ]
-        );
+        // Update or create the customer record via the shared resolver.
+        // (The previous Customer::firstOrCreate() here matched on
+        // business_profile_id ALONE, collapsing every customer of the business
+        // into one shared record — CustomerService matches per-sender identity.)
+        $customer = app(\App\Services\CustomerService::class)->attachToConversation($conversation);
+
+        if (!$customer) {
+            return [
+                'type' => 'update_custom_field',
+                'success' => false,
+                'error' => 'No business profile associated with this conversation'
+            ];
+        }
 
         $customFields = $customer->custom_fields ?? [];
         $customFields[$field] = $value;
         $customer->update(['custom_fields' => $customFields]);
-
-        // Link conversation to customer
-        if (!$conversation->customer_id) {
-            $conversation->update(['customer_id' => $customer->id]);
-        }
 
         return [
             'type' => 'update_custom_field',

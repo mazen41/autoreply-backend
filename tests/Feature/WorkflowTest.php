@@ -343,9 +343,10 @@ class WorkflowTest extends TestCase
         $results = $engine->executeWorkflow($workflow, $conversation, testMode: false);
 
         $this->assertFalse($results['triggered']);
-        $this->assertDatabaseHas('workflow_executions', [
+        // A WorkflowExecution record is created only after the trigger
+        // actually matches — non-matching evaluations leave no record.
+        $this->assertDatabaseMissing('workflow_executions', [
             'workflow_id' => $workflow->id,
-            'status' => 'completed',
         ]);
     }
 

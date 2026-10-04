@@ -85,6 +85,16 @@ class FetchSenderName implements ShouldQueue
                 $conversation->sender_name = $name;
                 $conversation->save();
 
+                // Backfill the linked customer's name if it was created before
+                // the platform identity revealed one.
+                if ($conversation->customer) {
+                    $customer = $conversation->customer;
+                    if (empty($customer->name)) {
+                        $customer->name = $name;
+                        $customer->save();
+                    }
+                }
+
                 Log::info('FetchSenderName: successfully updated sender name', [
                     'conversation_id' => $this->conversationId,
                     'sender_name' => $name,

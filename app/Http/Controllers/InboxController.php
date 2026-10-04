@@ -626,6 +626,30 @@ class InboxController extends Controller
             ]);
         }
 
+        // Evaluate tag_added automation workflows for this event.
+        // Only fire when the tag was actually created by this request —
+        // re-POSTing an existing tag is a no-op, not a tag_added event.
+        // The event carries the specific tag that was just added; the engine
+        // only runs workflows whose trigger type is compatible with the
+        // tag_added event, so message-triggered workflows are not re-checked
+        // here (and tag workflows are not re-checked per message).
+        if ($tag->wasRecentlyCreated) {
+            try {
+                app(\App\Services\AutomationEngine::class)
+                    ->executeWorkflowsForEvent(
+                        \App\Services\AutomationEngine::EVENT_TAG_ADDED,
+                        $conversation,
+                        ['tag' => $request->tag]
+                    );
+            } catch (\Exception $e) {
+                \Log::error('Failed to evaluate tag_added workflows', [
+                    'conversation_id' => $conversationId,
+                    'tag' => $request->tag,
+                    'error' => $e->getMessage(),
+                ]);
+            }
+        }
+
         return response()->json($tag);
     }
 

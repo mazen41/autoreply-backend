@@ -28,31 +28,44 @@ class WebhookController extends Controller
     public function handle(Request $request)
     {
         try {
-            // Verify webhook signature for security
-            $signature = $request->header('X-Hub-Signature-256');
+            // Verify webhook signature for security.
+            //
+            // The HMAC must be computed over the EXACT raw request body.
+            // $request->getContent() returns the untouched php://input stream
+            // — Laravel's TrimStrings / ConvertEmptyStringsToNull middleware
+            // mutate only the parsed parameter bags ($request->query/json/
+            // request), never the raw body, so this value is safe to sign.
+            // (Historical note: a "soft mode" here blamed middleware mutation
+            // for signature mismatches — that premise was wrong; see
+            // Illuminate\Foundation\Http\Middleware\TransformsRequest::clean().)
+            $signature = trim((string) $request->header('X-Hub-Signature-256', ''));
             $payload = $request->getContent();
             $appSecret = config('services.meta.app_secret');
 
-            if ($signature && $appSecret) {
-                $expectedSignature = 'sha256=' . hash_hmac('sha256', $payload, $appSecret);
-                
-                if (!hash_equals($expectedSignature, $signature)) {
-                    // Bug 7 fix: Soft-mode webhook verification.
-                    // The payload is likely being mutated by a middleware (e.g. TrimStrings or ConvertEmptyStringsToNull)
-                    // before this controller receives it, causing the HMAC to fail.
-                    // Instead of dropping the data silently with a 403, we log the mismatch and continue processing.
-                    // TODO: Once the middleware issue is fixed, revert to returning 403.
-                    Log::warning('Invalid Meta webhook signature (SOFT MODE - allowing request)', [
-                        'received' => $signature,
-                        'expected' => $expectedSignature,
-                        'payload_length' => strlen($payload)
-                    ]);
-                    // return response('Invalid signature', 403);
-                } else {
-                    Log::info('Meta webhook signature verified successfully');
+            if ($appSecret) {
+                if ($signature === '') {
+                    // Meta always signs webhook deliveries; a payload without
+                    // a signature while a secret is configured is not ours.
+                    Log::warning('Meta webhook rejected: missing X-Hub-Signature-256 header');
+                    return response('Invalid signature', 403);
                 }
+
+                $expectedSignature = 'sha256=' . hash_hmac('sha256', $payload, $appSecret);
+
+                if (!hash_equals($expectedSignature, $signature)) {
+                    Log::warning('Invalid Meta webhook signature', [
+                        'received' => $signature,
+                        'payload_length' => strlen($payload),
+                    ]);
+                    return response('Invalid signature', 403);
+                }
+
+                Log::info('Meta webhook signature verified successfully');
             } else {
-                Log::warning('Meta webhook received without signature or app secret not configured');
+                // Secret not configured — verification is impossible. Allow
+                // (misconfiguration must not silently drop all intake) but
+                // make it loud.
+                Log::warning('Meta webhook received without app secret configured — signature NOT verified');
             }
 
             $body = $request->all();
@@ -332,6 +345,17 @@ class WebhookController extends Controller
             ['business_id' => $channel->business_id, 'status' => 'open', 'last_message_at' => now()]
         );
 
+        // Resolve/link the business-scoped Customer for this sender (Instagram/
+        // Facebook sender ids have no phone/email — platform-identity matching).
+        try {
+            app(\App\Services\CustomerService::class)->attachToConversation($conversation);
+        } catch (\Throwable $e) {
+            Log::warning('Customer resolution failed for Meta sender', [
+                'conversation_id' => $conversation->id,
+                'error'           => $e->getMessage(),
+            ]);
+        }
+
         // If we don't have a name for this sender yet, queue a job to fetch it from the Graph API
         if ($conversation->wasRecentlyCreated || empty($conversation->sender_name)) {
             \App\Jobs\FetchSenderName::dispatch($conversation->id, $channel->id, $senderId);
@@ -517,6 +541,17 @@ Reply:";
             ['channel_id' => $channel->id, 'sender_id' => $senderId],
             ['business_id' => $channel->business_id, 'status' => 'open', 'last_message_at' => now()]
         );
+
+        // Resolve/link the business-scoped Customer for this sender (Instagram/
+        // Facebook sender ids have no phone/email — platform-identity matching).
+        try {
+            app(\App\Services\CustomerService::class)->attachToConversation($conversation);
+        } catch (\Throwable $e) {
+            Log::warning('Customer resolution failed for Meta sender', [
+                'conversation_id' => $conversation->id,
+                'error'           => $e->getMessage(),
+            ]);
+        }
 
         // If we don't have a name for this sender yet, queue a job to fetch it from the Graph API
         if ($conversation->wasRecentlyCreated || empty($conversation->sender_name)) {
@@ -726,6 +761,16 @@ Reply:";
             );
 
             $conversation->update(['last_message_at' => now()]);
+
+            // Resolve/link the business-scoped Customer (email is the strong key here)
+            try {
+                app(\App\Services\CustomerService::class)->attachToConversation($conversation);
+            } catch (\Throwable $e) {
+                Log::warning('Customer resolution failed for Gmail message', [
+                    'conversation_id' => $conversation->id,
+                    'error'           => $e->getMessage(),
+                ]);
+            }
 
             // Check if message already exists (deduplication)
             $existingMessage = \App\Models\Message::where('gmail_message_id', $messageId)->first();

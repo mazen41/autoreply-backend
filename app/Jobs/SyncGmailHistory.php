@@ -101,6 +101,16 @@ class SyncGmailHistory implements ShouldQueue
                     $conversation->update(['last_message_at' => $sentAt]);
                 }
 
+                // Resolve/link the business-scoped Customer (email is the strong key here)
+                try {
+                    app(\App\Services\CustomerService::class)->attachToConversation($conversation);
+                } catch (\Throwable $e) {
+                    Log::warning('Gmail history sync: customer resolution failed', [
+                        'conversation_id' => $conversation->id,
+                        'error'           => $e->getMessage(),
+                    ]);
+                }
+
                 // Create message without auto-reply dispatch
                 Message::create([
                     'conversation_id'  => $conversation->id,

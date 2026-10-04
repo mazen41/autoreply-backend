@@ -185,6 +185,16 @@ class TelegramController extends Controller
 
             $conversation->update(['last_message_at' => now()]);
 
+            // Resolve/link the business-scoped Customer (platform-identity matching)
+            try {
+                app(\App\Services\CustomerService::class)->attachToConversation($conversation);
+            } catch (\Throwable $e) {
+                Log::warning('Telegram webhook: customer resolution failed', [
+                    'conversation_id' => $conversation->id,
+                    'error'           => $e->getMessage(),
+                ]);
+            }
+
             // Create message
             $messageModel = Message::create([
                 'conversation_id' => $conversation->id,

@@ -40,8 +40,10 @@ class SequenceTriggerService
             return;
         }
 
+        // Bot scope: global sequences plus the conversation's bot's sequences.
         $noReplySequences = Sequence::forBusiness($businessId)
             ->active()
+            ->forBotScope($conversation->bot_id ? (int) $conversation->bot_id : null)
             ->where('trigger_type', 'no_reply')
             ->get();
 
@@ -173,9 +175,11 @@ class SequenceTriggerService
             return;
         }
 
-        // Find active sequences with manual or new_user triggers
+        // Find active sequences with manual or new_user triggers, scoped to
+        // the conversation's bot (global sequences always eligible).
         $autoEnrollSequences = Sequence::forBusiness($businessId)
             ->active()
+            ->forBotScope($conversation->bot_id ? (int) $conversation->bot_id : null)
             ->whereIn('trigger_type', ['new_user', 'manual'])
             ->get();
 
@@ -244,9 +248,11 @@ class SequenceTriggerService
             return;
         }
 
-        // Find active sequences with tag_added trigger matching this tag
+        // Find active sequences with tag_added trigger matching this tag,
+        // scoped to the conversation's bot (global sequences always eligible).
         $tagSequences = Sequence::forBusiness($businessId)
             ->active()
+            ->forBotScope($conversation->bot_id ? (int) $conversation->bot_id : null)
             ->where('trigger_type', 'tag_added')
             ->whereJsonContains('trigger_config->tags', $tag)
             ->get();
@@ -276,9 +282,11 @@ class SequenceTriggerService
             return;
         }
 
-        // Find active sequences with no_reply trigger
+        // Find active sequences with no_reply trigger, scoped to the
+        // conversation's bot (global sequences always eligible).
         $noReplySequences = Sequence::forBusiness($businessId)
             ->active()
+            ->forBotScope($conversation->bot_id ? (int) $conversation->bot_id : null)
             ->where('trigger_type', 'no_reply')
             ->get();
 
@@ -335,9 +343,11 @@ class SequenceTriggerService
             'order_id'        => $orderData['id'] ?? $orderData['order_id'] ?? null,
         ]);
 
-        // Find active sequences with order_created trigger
+        // Find active sequences with order_created trigger, scoped to the
+        // conversation's bot (global sequences always eligible).
         $orderSequences = Sequence::forBusiness($businessId)
             ->active()
+            ->forBotScope($conversation->bot_id ? (int) $conversation->bot_id : null)
             ->where('trigger_type', 'order_created')
             ->get();
 

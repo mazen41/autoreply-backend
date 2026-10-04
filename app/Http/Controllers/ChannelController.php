@@ -151,10 +151,29 @@ class ChannelController extends Controller
     {
         $user = $request->user();
 
+        // Phase 4 audit: explicit per-channel integration capabilities, so the
+        // UI can show what each connection can actually do instead of letting
+        // the product silently fail. TikTok is connected-but-not-automatable:
+        //   • TikTok's public Webhooks API defines NO comment-created event, so
+        //     there is no real inbound message source (the legacy `comment`
+        //     payload handler in TikTokController is unreachable in practice).
+        //   • TikTok's public API has no comment-reply/DM endpoint —
+        //     ProcessAutoReply::sendTikTokReply() is an honest placeholder that
+        //     always fails (never fakes a send).
+        // Real automation would require TikTok's invite-only Comment Kit.
+        $capabilities = [
+            'tiktok' => [
+                'inbound_webhook' => false,
+                'inbound_ai_reply' => false,
+                'outbound_send' => false,
+                'limitations' => 'TikTok automation is not available: the public API provides no comment-created webhook and no comment-reply/DM endpoint. Inbound AI replies and automated sequences cannot operate on this channel.',
+            ],
+        ];
+
         $channels = Channel::where('user_id', $user->getAuthIdentifier())
             ->latest('connected_at')
             ->get()
-            ->map(function ($channel) {
+            ->map(function ($channel) use ($capabilities) {
             return [
                 'id'                   => $channel->id,
                 'type'                 => $channel->type,
@@ -164,6 +183,12 @@ class ChannelController extends Controller
                 'status'               => $channel->status,
                 'connected_at'         => $channel->connected_at,
                 'ai_enabled'           => $channel->ai_enabled,
+                'capabilities'         => $capabilities[$channel->type] ?? [
+                    'inbound_webhook'  => true,
+                    'inbound_ai_reply' => true,
+                    'outbound_send'    => true,
+                    'limitations'      => null,
+                ],
             ];
         });
 

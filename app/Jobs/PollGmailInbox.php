@@ -131,6 +131,16 @@ class PollGmailInbox implements ShouldQueue
             'sender_email'    => $senderEmail,
         ]);
 
+        // Resolve/link the business-scoped Customer (email is the strong key here)
+        try {
+            app(\App\Services\CustomerService::class)->attachToConversation($conversation);
+        } catch (\Throwable $e) {
+            Log::warning('Gmail: customer resolution failed', [
+                'conversation_id' => $conversation->id,
+                'error'           => $e->getMessage(),
+            ]);
+        }
+
         $message = Message::create([
             'conversation_id'  => $conversation->id,
             'content'          => $body,

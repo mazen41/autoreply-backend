@@ -1167,6 +1167,10 @@ class ProcessAutoReply implements ShouldQueue
         $effectiveConfidenceThreshold = !empty($bot?->ai_confidence_threshold) ? $bot->ai_confidence_threshold : ($business?->ai_confidence_threshold ?? 0.80);
         $effectiveEscalationConfig = !empty($bot?->escalation_config) ? $bot->escalation_config : ($business?->escalation_config ?? null);
 
+        // ── COMPUTE EXISTING CHECKOUT FIELD STATUS FOR STRUCTURED STATE ──────
+        $checkoutService = app(\App\Services\OrderCheckoutService::class);
+        $fieldStatus = $checkoutService->computeFieldStatus(is_array($checkoutState) ? $checkoutState : []);
+
         // ── STRUCTURED CONVERSATION STATE ────────────────────────────────────
         // Build authoritative structured state for the AI. The AI must NEVER
         // invent or override these values — it may only interpret intent and
@@ -1190,7 +1194,7 @@ class ProcessAutoReply implements ShouldQueue
                 'message_id' => $quotedMessageId,
                 'resolved_product_id' => $referencedProduct['salla_product_id'] ?? null,
             ],
-            'pending_action' => $this->determinePendingAction($checkoutState, $isPlaceOrder, $fieldStatus),
+            'pending_action' => $this->determinePendingAction(is_array($checkoutState) ? $checkoutState : [], $isPlaceOrder, $fieldStatus),
         ];
 
         // Build business profile context separate from uploaded knowledge
@@ -1330,12 +1334,56 @@ class ProcessAutoReply implements ShouldQueue
             }
         }
 
+        // ── CUSTOMER RESOLUTION & CONTEXT (Phase 2) ──────────────────────────
+        // Link the conversation to its business-scoped Customer, using the
+        // checkout flow's collected phone to unify phone-less channels
+        // (e.g. Instagram) with the customer's WhatsApp/Salla record.
+        try {
+            $customer = app(\App\Services\CustomerService::class)->enrichFromCheckoutState($conversation);
+        } catch (\Throwable $e) {
+            Log::warning('ProcessAutoReply: customer resolution failed', [
+                'conversation_id' => $conversation->id,
+                'error'           => $e->getMessage(),
+            ]);
+            $customer = null;
+        }
+
+        // AI-facing customer context — name and tags ONLY. Internal identifiers,
+        // scores, and platform secrets are deliberately excluded.
+        $customerContext = null;
+        if ($customer) {
+            $customerContext = array_filter([
+                'name' => $customer->name,
+                'tags' => is_array($customer->tags) ? array_values(array_filter($customer->tags, 'is_string')) : null,
+            ], fn ($v) => $v !== null && $v !== []);
+
+            // Customer linked but nothing displayable yet — still emit the
+            // section so the AI knows the name is unknown and must not invent one.
+            if (empty($customerContext)) {
+                $customerContext = ['name' => null];
+            }
+        }
+
         $context = [
             'business_name'  => $channel->business?->business_name ?? 'our business',
             'platform'       => $channel->type,
             'language'       => $detectedLanguage,
             'salla_exclusive_mode' => $isSallaFlow,
             'business_profile' => $isSallaFlow ? '' : $businessProfileContext,
+            // ── CHANNEL & ACCOUNT CONTEXT ──
+            // Explicitly grounds the AI in the account it is speaking from —
+            // prevents cross-account/store confusion when a business runs
+            // several channels of the same type.
+            'channel'        => [
+                'type' => $channel->type,
+                'name' => $channel->page_name ?? null,
+            ],
+            // The specific store whose live data (if any) was injected below.
+            'store'          => $sallaChannel ? [
+                'type' => 'salla',
+                'name' => $sallaChannel->page_name ?? null,
+            ] : null,
+            'customer'       => $customerContext,
             'knowledge_base' => (function() use ($business, $bot, $channel, $message, $isSallaFlow) {
                 if (!$business || $isSallaFlow) {
                     return '';
@@ -1350,7 +1398,12 @@ class ProcessAutoReply implements ShouldQueue
                     return ''; // Fallback if embedding fails
                 }
 
-                // 2. Determine allowed knowledge file IDs for the Bot + Channel
+                // 2. Determine allowed knowledge file IDs for the Bot + Channel.
+                // $allowedFileIds = null means "no bot resolved → unrestricted
+                // business knowledge" (intentionally global). When a bot IS
+                // resolved, retrieval is STRICTLY bot-scoped — a bot with no
+                // (channel-matching) assignments gets NO knowledge, never a
+                // silent fallback to the whole business knowledge base.
                 $allowedFileIds = null;
                 if ($bot) {
                     try {
@@ -1362,13 +1415,16 @@ class ProcessAutoReply implements ShouldQueue
                             })
                             ->pluck('business_knowledge_file_id')
                             ->unique()
+                            ->values()
                             ->toArray();
                     } catch (\Throwable $e) {
-                        Log::warning('ProcessAutoReply: BotKnowledgeAssignment query failed (legacy fallback)', [
+                        // Fail CLOSED: on infra failure deny bot knowledge rather
+                        // than leaking unassigned business files into its context.
+                        Log::error('ProcessAutoReply: BotKnowledgeAssignment query failed — denying bot knowledge (fail-closed)', [
                             'error' => $e->getMessage(),
                             'bot_id' => $bot->id,
                         ]);
-                        $allowedFileIds = null;
+                        return '';
                     }
                 }
 
@@ -2001,12 +2057,15 @@ class ProcessAutoReply implements ShouldQueue
             'business_id'     => $businessId,
         ]);
 
-        // Find all active sequences with new_user trigger for this business.
-        // We take the first matching one. If a business has multiple new-user
-        // sequences, the one with the lowest id (oldest/first created) wins.
+        // Find all active new-user sequences for this business, scoped to the
+        // conversation's resolved bot (bot_id NULL = business-global, always
+        // eligible; a bot-specific sequence only enrolls that bot's
+        // conversations). We take the first matching one. If multiple match,
+        // the one with the lowest id (oldest/first created) wins.
         $sequences = \App\Models\Sequence::where('business_id', $businessId)
             ->where('status', 'active')
             ->where('trigger_type', 'new_user')
+            ->forBotScope($conversation->bot_id ? (int) $conversation->bot_id : null)
             ->orderBy('id')
             ->get();
 
@@ -2082,44 +2141,26 @@ class ProcessAutoReply implements ShouldQueue
     }
 
     /**
-     * Evaluate and execute active workflows for this conversation's business.
+     * Evaluate active workflows for this conversation's business against the
+     * message_received event.
      *
-     * Workflows are evaluated after the AI reply is sent successfully. Each workflow
-     * checks its trigger configuration against the conversation/message context. If the
-     * trigger matches, the workflow's actions are executed.
+     * Delegates to AutomationEngine::executeWorkflowsForEvent(), which only
+     * evaluates workflows whose trigger type is compatible with the event
+     * (keyword, first_contact, message_received, time). The current inbound
+     * message is passed through so trigger evaluation sees exactly the
+     * message that fired the event — not arbitrary historical messages.
      *
-     * This is intentionally fire-and-forget: errors are logged but do not affect the
-     * main AI reply flow.
+     * This is intentionally fire-and-forget: errors are logged but do not
+     * affect the main AI reply flow.
      */
     private function evaluateWorkflows(Conversation $conversation, Message $message): void
     {
-        $businessId = $conversation->business_id;
-        if (!$businessId) {
-            return;
-        }
-
-        // Load active workflows for this business
-        $workflows = \App\Models\AutomationWorkflow::forBusiness($businessId)
-            ->active()
-            ->get();
-
-        if ($workflows->isEmpty()) {
-            return;
-        }
-
-        $automationEngine = app(\App\Services\AutomationEngine::class);
-
-        foreach ($workflows as $workflow) {
-            try {
-                $automationEngine->executeWorkflow($workflow, $conversation, testMode: false);
-            } catch (\Exception $e) {
-                Log::error('ProcessAutoReply: workflow execution failed', [
-                    'workflow_id' => $workflow->id,
-                    'conversation_id' => $conversation->id,
-                    'error' => $e->getMessage(),
-                ]);
-            }
-        }
+        app(\App\Services\AutomationEngine::class)->executeWorkflowsForEvent(
+            \App\Services\AutomationEngine::EVENT_MESSAGE_RECEIVED,
+            $conversation,
+            ['message' => $message],
+            testMode: false
+        );
     }
 
     // ── END SEQUENCE INTEGRATION HELPERS ─────────────────────────────────────
@@ -2369,43 +2410,11 @@ class ProcessAutoReply implements ShouldQueue
 
     private function sendFacebookReply(Channel $channel, string $recipientId, string $message, array $images = []): bool
     {
-        // The Channel model's accessor already decrypts access_token — do NOT
-        // call decrypt() again or the token will be double-decrypted and corrupted.
-        $accessToken = $channel->access_token;
-        $baseUrl = "https://graph.facebook.com/v19.0/me/messages?access_token={$accessToken}";
-
-        // Send images first
-        foreach ($images as $imageUrl) {
-            Http::timeout(10)->post($baseUrl, [
-                'recipient' => ['id' => $recipientId],
-                'message' => [
-                    'attachment' => [
-                        'type' => 'image',
-                        'payload' => [
-                            'url' => $imageUrl,
-                            'is_reusable' => true
-                        ]
-                    ]
-                ],
-            ]);
-        }
-
-        // Send text message
-        $response = Http::timeout(10)
-            ->post($baseUrl, [
-                'recipient' => ['id' => $recipientId],
-                'message' => ['text' => $message],
-            ]);
-
-        if (!$response->successful()) {
-            Log::error('ProcessAutoReply: Facebook send failed', [
-                'status' => $response->status(),
-                'body' => $response->json(),
-                'recipient' => $recipientId,
-            ]);
-        }
-
-        return $response->successful();
+        // Phase 4: the Meta Send API wire format was extracted to
+        // MetaMessengerService so sequence messages (and any future outbound
+        // flow) reuse the EXACT same implementation as AI auto-replies
+        // (images first, then text; same token handling; same timeouts).
+        return app(\App\Services\MetaMessengerService::class)->sendText($channel, $recipientId, $message, $images);
     }
 
     /**

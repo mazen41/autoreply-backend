@@ -66,6 +66,16 @@ class WebChatController extends Controller
             ]);
         }
 
+        // Resolve/link the business-scoped Customer (web-chat session identity)
+        try {
+            app(\App\Services\CustomerService::class)->attachToConversation($conversation);
+        } catch (\Throwable $e) {
+            \Illuminate\Support\Facades\Log::warning('Web chat: customer resolution failed', [
+                'conversation_id' => $conversation->id,
+                'error'           => $e->getMessage(),
+            ]);
+        }
+
         // Broadcast new session event
         broadcast(new \App\Events\WebChatSessionCreated($session));
 

@@ -12,6 +12,7 @@ class Conversation extends Model
         'channel_id',
         'business_id',
         'bot_id',
+        'customer_id',
         'sender_id',
         'sender_name',
         'sender_email',
@@ -51,6 +52,11 @@ class Conversation extends Model
     public function bot()
     {
         return $this->belongsTo(Bot::class, 'bot_id');
+    }
+
+    public function customer()
+    {
+        return $this->belongsTo(Customer::class, 'customer_id');
     }
 
     public function messages()

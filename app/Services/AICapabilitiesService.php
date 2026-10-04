@@ -113,10 +113,44 @@ ROLE;
             $p .= "• This is static profile text about {$businessName} — it is NEVER a source for live product/order counts or lists. See STORE AGGREGATE QUERIES below for that; do not answer count/list questions from this section even if it happens to mention products or orders.\n\n";
         }
 
+        // ── Channel & Account Context (prevents cross-account/store confusion) ──
+        if (!empty($context['channel']) && is_array($context['channel'])) {
+            $ch = $context['channel'];
+            $p .= "\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n";
+            $p .= "CHANNEL & ACCOUNT CONTEXT\n";
+            $p .= "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n";
+            $p .= "• You are speaking from the " . ucfirst((string)($ch['type'] ?? 'unknown')) . " channel";
+            if (!empty($ch['name'])) {
+                $p .= " — account: \"{$ch['name']}\"";
+            }
+            $p .= ".\n";
+            if (!empty($context['store']) && is_array($context['store'])) {
+                $storeName = $context['store']['name'] ?? null;
+                $p .= $storeName
+                    ? "• All live product/order data below belongs to the \"{$storeName}\" store — never attribute it to a different account or store.\n"
+                    : "• All live product/order data below belongs to this business's connected store — never attribute it to a different account or store.\n";
+            }
+            $p .= "• If the business runs multiple accounts on the same platform, the account above is the ONLY one you are speaking from.\n\n";
+        }
+
+        // ── Customer Profile (name/tags only — no internal identifiers) ───────
+        if (!empty($context['customer']) && is_array($context['customer'])) {
+            $cu = $context['customer'];
+            $p .= "\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n";
+            $p .= "CUSTOMER PROFILE\n";
+            $p .= "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n";
+            $p .= !empty($cu['name'])
+                ? "• Customer name: {$cu['name']} — you may address them by name naturally.\n"
+                : "• Customer name: not provided yet — do NOT invent a name.\n";
+            if (!empty($cu['tags']) && is_array($cu['tags'])) {
+                $p .= "• Tags: " . implode(', ', $cu['tags']) . "\n";
+            }
+            $p .= "• Use this profile for personalization context only. Never mention internal records, IDs, tags systems, or scores.\n\n";
+        }
+
         // ── Uploaded Knowledge Base ───────────────────────────────────────────
         $hasKnowledgeBase = !empty($context['knowledge_base']);
-        if ($hasKnowledgeBase && empty($context['salla_exclusive_mode'])) {
-            $p .= "\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n";
+        if ($hasKnowledgeBase && empty($context['salla_exclusive_mode'])) {            $p .= "\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n";
             $p .= "UPLOADED KNOWLEDGE BASE\n";
             $p .= "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n";
             $p .= $context['knowledge_base'] . "\n\n";

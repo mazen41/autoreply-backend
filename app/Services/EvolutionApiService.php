@@ -612,6 +612,18 @@ class EvolutionApiService
                 $conversation->update($updateData);
             }
 
+            // Resolve/link the business-scoped Customer — WhatsApp sender_id IS
+            // the customer's phone number, so this unifies with Salla customers
+            // and any other phone-bearing channel of the same business.
+            try {
+                app(\App\Services\CustomerService::class)->attachToConversation($conversation);
+            } catch (\Throwable $e) {
+                Log::warning('WhatsApp: customer resolution failed', [
+                    'conversation_id' => $conversation->id,
+                    'error'           => $e->getMessage(),
+                ]);
+            }
+
             // Create message in unified inbox
             $message = Message::create([
                 'conversation_id' => $conversation->id,

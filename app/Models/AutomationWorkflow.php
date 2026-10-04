@@ -13,6 +13,7 @@ class AutomationWorkflow extends Model
     protected $fillable = [
         'user_id',
         'business_id',
+        'bot_id',
         'name',
         'description',
         'active',
@@ -41,6 +42,11 @@ class AutomationWorkflow extends Model
         return $this->belongsTo(BusinessProfile::class, 'business_id');
     }
 
+    public function bot(): BelongsTo
+    {
+        return $this->belongsTo(Bot::class);
+    }
+
     public function executions(): HasMany
     {
         return $this->hasMany(WorkflowExecution::class, 'workflow_id');
@@ -49,6 +55,26 @@ class AutomationWorkflow extends Model
     public function scopeForBusiness($query, $businessId)
     {
         return $query->where('business_id', $businessId);
+    }
+
+    /**
+     * Bot-scope filter for execution eligibility.
+     *
+     * Backward-compatible semantics:
+     *   - $botId null  → only business-global workflows (bot_id IS NULL):
+     *     a bot-specific workflow never fires for a bot-less conversation.
+     *   - $botId set   → global workflows plus that bot's workflows:
+     *     existing (bot_id NULL) rows keep running everywhere.
+     */
+    public function scopeForBotScope($query, ?int $botId)
+    {
+        if ($botId === null) {
+            return $query->whereNull('bot_id');
+        }
+
+        return $query->where(function ($q) use ($botId) {
+            $q->whereNull('bot_id')->orWhere('bot_id', $botId);
+        });
     }
 
     public function scopeActive($query)

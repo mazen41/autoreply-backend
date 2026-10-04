@@ -305,6 +305,7 @@ class AutomationController extends Controller
             'trigger.type' => 'required|string',
             'conditions' => 'nullable|array',
             'actions' => 'required|array|min:1',
+            'bot_id' => 'nullable|integer|exists:bots,id',
         ]);
 
         $user = Auth::user();
@@ -342,6 +343,7 @@ class AutomationController extends Controller
             'conditions' => $request->conditions,
             'actions_config' => $request->actions,
             'executions_count' => 0,
+            'bot_id' => $request->bot_id,
         ]);
 
         return response()->json([

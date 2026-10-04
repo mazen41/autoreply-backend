@@ -273,6 +273,17 @@ class SequenceExecutionService
                 case 'whatsapp':
                     $this->sendWhatsAppMessage($conversation, $message, $channel, $messageRecord);
                     break;
+                case 'facebook':
+                case 'instagram':
+                    // Phase 4: Facebook/Instagram sequence support — routes
+                    // through the SAME MetaMessengerService implementation the
+                    // AI auto-reply path uses (Meta Graph Send API), so sequence
+                    // messages behave identically to AI replies on these
+                    // channels. Failures throw → the ExecuteSequenceStep job
+                    // retries (3 attempts, 30/60/120s backoff) and records the
+                    // error on both the execution and the Message row.
+                    $this->sendMetaMessage($conversation, $message, $channel, $messageRecord);
+                    break;
                 case 'telegram':
                     $this->sendTelegramMessage($conversation, $message, $channel, $messageRecord);
                     break;
@@ -280,8 +291,11 @@ class SequenceExecutionService
                     $this->sendEmailMessage($conversation, $message, $channel, $messageRecord);
                     break;
                 default:
+                    // Hard, honest limitation — e.g. TikTok has no public
+                    // outbound comment-reply/DM API (see sendTikTokReply in
+                    // ProcessAutoReply). Never fake a send.
                     Log::warning("Unsupported channel type for sequence: {$channel->type}");
-                    throw new \Exception("Channel type {$channel->type} is not supported");
+                    throw new \Exception("Channel type {$channel->type} is not supported for sequence messages");
             }
 
             // Provider succeeded - update delivery status
@@ -301,6 +315,25 @@ class SequenceExecutionService
             ]);
             throw $e; // Re-throw to trigger retry logic
         }
+    }
+
+    protected function sendMetaMessage(Conversation $conversation, string $message, Channel $channel, Message $messageRecord): void
+    {
+        // Facebook and Instagram both use the Meta Graph Send API with the
+        // page/account access token — identical wire behavior to AI replies.
+        $success = app(\App\Services\MetaMessengerService::class)->sendText(
+            $channel,
+            (string) $conversation->sender_id,
+            $message
+        );
+
+        if (!$success) {
+            throw new \Exception("Meta {$channel->type} send failed (recipient {$conversation->sender_id})");
+        }
+
+        $messageRecord->update([
+            'send_status' => 'sent',
+        ]);
     }
 
     protected function sendWhatsAppMessage(Conversation $conversation, string $message, Channel $channel, Message $messageRecord): void

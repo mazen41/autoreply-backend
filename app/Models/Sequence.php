@@ -11,6 +11,7 @@ class Sequence extends Model
     use HasFactory;
     protected $fillable = [
         'business_id',
+        'bot_id',
         'name',
         'description',
         'trigger_type',
@@ -57,6 +58,11 @@ class Sequence extends Model
         return $this->belongsTo(BusinessProfile::class, 'business_id');
     }
 
+    public function bot()
+    {
+        return $this->belongsTo(Bot::class);
+    }
+
     public function steps()
     {
         return $this->hasMany(SequenceStep::class)->orderBy('step_order');
@@ -100,6 +106,26 @@ class Sequence extends Model
     public function scopeForBusiness($query, $businessId)
     {
         return $query->where('business_id', $businessId);
+    }
+
+    /**
+     * Bot-scope filter for enrollment eligibility.
+     *
+     * Backward-compatible semantics:
+     *   - $botId null  → only business-global sequences (bot_id IS NULL):
+     *     a bot-specific sequence never enrolls a bot-less conversation.
+     *   - $botId set   → global sequences plus that bot's sequences:
+     *     existing (bot_id NULL) rows keep enrolling everywhere.
+     */
+    public function scopeForBotScope($query, ?int $botId)
+    {
+        if ($botId === null) {
+            return $query->whereNull('bot_id');
+        }
+
+        return $query->where(function ($q) use ($botId) {
+            $q->whereNull('bot_id')->orWhere('bot_id', $botId);
+        });
     }
 
     public function scopeWithTrigger($query, $triggerType)

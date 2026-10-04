@@ -24,37 +24,89 @@ class SallaWebhookController extends Controller
         ]);
 
         // Get webhook signature from different possible headers
-        $signature = $request->header('X-Salla-Signature') 
+        $signature = $request->header('X-Salla-Signature')
                     ?? $request->header('X-Salla-Hmac-Sha256')
                     ?? $request->header('Signature')
                     ?? null;
-        
+
         // Check for Token-based authentication (Salla's Token strategy)
         $authToken = $request->header('authorization');
         $securityStrategy = $request->header('x-salla-security-strategy');
-        
-        $payload = $request->getContent();
 
-        // Verify webhook signature if present
+        $payload = $request->getContent();
+        $webhookSecret = env('SALLA_WEBHOOK_SECRET');
+
+        // Phase 4: every response now carries an EXPLICIT verification/
+        // configuration status. The previous version returned a plain
+        // {"message": "Webhook received"} even when the payload was accepted
+        // with NO verification at all — a silent success that made an
+        // unconfigured webhook look healthy in monitoring.
+        $verified = false;
+        $verificationMode = 'none';
+        $warning = null;
+
         if ($signature) {
+            if (empty($webhookSecret)) {
+                // A signature was SENT but we cannot verify it — this is a
+                // configuration error, not an invalid signature. Fail loudly.
+                Log::error('Salla webhook: signature present but SALLA_WEBHOOK_SECRET not configured');
+                return response()->json([
+                    'status'            => 'rejected',
+                    'verified'          => false,
+                    'verification_mode' => 'signature',
+                    'error'             => 'webhook_secret_not_configured',
+                ], 500);
+            }
+
             $sallaService = new SallaService();
             if (!$sallaService->verifyWebhookSignature($payload, $signature)) {
                 Log::error('Invalid Salla webhook signature');
-                return response()->json(['error' => 'Invalid signature'], 401);
+                return response()->json([
+                    'status'            => 'rejected',
+                    'verified'          => false,
+                    'verification_mode' => 'signature',
+                    'error'             => 'invalid_signature',
+                ], 401);
             }
+            $verified = true;
+            $verificationMode = 'signature';
         } elseif ($securityStrategy === 'Token' && $authToken) {
-            // Verify token for Token-based authentication
-            $webhookSecret = env('SALLA_WEBHOOK_SECRET');
+            // Token strategy REQUIRES the secret to be configured — if it is
+            // missing this is a configuration error, not an auth failure.
+            if (empty($webhookSecret)) {
+                Log::error('Salla webhook: Token strategy selected but SALLA_WEBHOOK_SECRET not configured');
+                return response()->json([
+                    'status'            => 'rejected',
+                    'verified'          => false,
+                    'verification_mode' => 'token',
+                    'error'             => 'webhook_secret_not_configured',
+                ], 500);
+            }
             if ($authToken !== $webhookSecret) {
                 Log::error('Invalid Salla webhook token', [
                     'provided' => substr($authToken, 0, 10) . '...',
-                    'expected' => substr($webhookSecret, 0, 10) . '...',
                 ]);
-                return response()->json(['error' => 'Invalid token'], 401);
+                return response()->json([
+                    'status'            => 'rejected',
+                    'verified'          => false,
+                    'verification_mode' => 'token',
+                    'error'             => 'invalid_token',
+                ], 401);
             }
             Log::info('Salla webhook token verified successfully');
+            $verified = true;
+            $verificationMode = 'token';
         } else {
-            Log::warning('No webhook signature or token found, proceeding without verification');
+            // Fail-open (an unconfigured secret must not silently drop ALL
+            // intake — mirrors the Meta webhook controller's posture), but the
+            // acceptance is now EXPLICITLY marked unverified in both the log
+            // stream and the response body.
+            $warning = 'Payload accepted UNVERIFIED: no signature header and no security strategy token. '
+                . 'Configure SALLA_WEBHOOK_SECRET and the Salla webhook signing secret to enforce verification.';
+            Log::warning('Salla webhook accepted WITHOUT verification (secret not configured / no signature header)', [
+                'event' => $request->input('event') ?? $request->input('type'),
+                'has_signature_header' => false,
+            ]);
         }
 
         // Get event data - Salla might send different formats
@@ -75,14 +127,27 @@ class SallaWebhookController extends Controller
         // Dispatch job for async processing
         try {
             SallaWebhookJob::dispatch($event, $fullData);
-            Log::info('SallaWebhookJob dispatched successfully');
+            Log::info('SallaWebhookJob dispatched successfully', [
+                'verified' => $verified,
+                'verification_mode' => $verificationMode,
+            ]);
         } catch (\Exception $e) {
             Log::error('Failed to dispatch SallaWebhookJob', [
                 'error' => $e->getMessage(),
             ]);
-            return response()->json(['error' => 'Failed to process webhook'], 500);
+            return response()->json([
+                'status' => 'error',
+                'verified' => $verified,
+                'verification_mode' => $verificationMode,
+                'error' => 'failed_to_process_webhook',
+            ], 500);
         }
 
-        return response()->json(['message' => 'Webhook received']);
+        return response()->json([
+            'status'            => 'accepted',
+            'verified'          => $verified,
+            'verification_mode' => $verificationMode,
+            'warning'           => $warning,
+        ]);
     }
 }

@@ -142,6 +142,18 @@ class SallaWebhookJob implements ShouldQueue
                 ]);
             }
 
+            // Resolve/link the business-scoped Customer — sender_id IS the
+            // customer's mobile, so Salla conversations match (and unify with
+            // WhatsApp) by phone automatically.
+            try {
+                app(\App\Services\CustomerService::class)->attachToConversation($conversation);
+            } catch (\Throwable $e) {
+                Log::warning('Salla webhook: customer resolution failed', [
+                    'conversation_id' => $conversation->id,
+                    'error'           => $e->getMessage(),
+                ]);
+            }
+
             // Trigger sequences with order-based triggers
             $sequenceTriggerService = new SequenceTriggerService();
             $sequenceTriggerService->checkAndEnrollForOrderCreated($conversation, $data);

@@ -196,6 +196,10 @@ class TeamController extends Controller
             'assigned_at' => now(),
         ]);
 
+        // Broadcast the assignment change so every agent viewing the
+        // inbox sees the new assignee immediately — no refresh.
+        broadcast(new \App\Events\ConversationUpdated($conversation->fresh()));
+
         Log::info('Conversation assigned', [
             'conversation_id' => $conversationId,
             'agent_id' => $request->agent_id,

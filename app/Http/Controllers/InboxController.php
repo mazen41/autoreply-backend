@@ -31,6 +31,13 @@ class InboxController extends Controller
                 'bot:id,name',
                 'latestMessage',
             ])
+            // Unread count within the 24h unread window — matches the
+            // `unread` filter below and the realtime contract's
+            // unread_count (InboxBroadcastPayload::unreadCount).
+            ->withCount(['messages as unread_count' => function ($q) {
+                $q->where('direction', 'inbound')
+                  ->where('created_at', '>=', now()->subHours(24));
+            }])
             ->select(['id', 'channel_id', 'business_id', 'bot_id', 'sender_id', 'sender_name', 'sender_email', 'subject', 'status', 'ai_enabled', 'requires_human', 'escalated_at', 'escalation_reason', 'last_message_at', 'assigned_agent_id', 'assigned_at']);
 
         // Agent-specific filter
@@ -650,6 +657,10 @@ class InboxController extends Controller
             }
         }
 
+        // Broadcast the tag change so tags reflect in every
+        // agent's view of this conversation without a refresh.
+        broadcast(new \App\Events\ConversationUpdated($conversation->fresh()));
+
         return response()->json($tag);
     }
 
@@ -668,6 +679,9 @@ class InboxController extends Controller
             ->firstOrFail();
 
         $tag->delete();
+
+        // Broadcast the tag removal in realtime.
+        broadcast(new \App\Events\ConversationUpdated($conversation->fresh()));
 
         return response()->json(['success' => true]);
     }
@@ -748,6 +762,10 @@ class InboxController extends Controller
                 ]);
             }
         }
+
+        // Broadcast the status change so all agents' inboxes update
+        // immediately (list ordering, escalation styling, etc.).
+        broadcast(new \App\Events\ConversationUpdated($conversation->fresh()));
 
         return response()->json([
             'success' => true,
@@ -832,6 +850,10 @@ class InboxController extends Controller
             'ai_enabled' => $newValue
         ]);
 
+        // Broadcast the AI state change so every agent viewing the
+        // inbox sees the toggle immediately — no refresh required.
+        broadcast(new \App\Events\ConversationUpdated($conversation->fresh()));
+
         // Re-read from DB to ensure response reflects the persisted value,
         // not the stale in-memory attribute (update() writes to DB but does
         // not automatically refresh the model's attribute cache).
@@ -912,6 +934,10 @@ class InboxController extends Controller
         }
 
         $conversation->update(['bot_id' => $botId]);
+
+        // Broadcast the bot switch so the conversation header shows the
+        // correct bot identity for every agent without a refresh.
+        broadcast(new \App\Events\ConversationUpdated($conversation->fresh('bot:id,name')));
 
         return response()->json([
             'message' => 'Bot updated successfully',

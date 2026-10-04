@@ -38,30 +38,37 @@ class SequenceExecutionService
         $execution->status = 'executed';
         $execution->executed_at = now();
 
-        switch ($step->step_type) {
-            case 'message':
-                $this->executeMessageStep($execution, $enrollment, $step);
-                // After message, move to next step
-                $this->moveToNextStep($enrollment);
-                break;
-            case 'delay':
-                $this->executeDelayStep($execution, $enrollment, $step);
-                // Delay step should schedule the next step with the delay
-                $this->scheduleNextStepAfterDelay($enrollment, $step);
-                break;
-            case 'condition':
-                $this->executeConditionStep($execution, $enrollment, $step);
-                // Condition step handles moving to next step, jumping, or stopping internally
-                break;
-            case 'action':
-                $this->executeActionStep($execution, $enrollment, $step);
-                // Only move to next step if action didn't stop sequence
-                if (($execution->metadata['action_type'] ?? '') !== 'stop_sequence') {
+        try {
+            switch ($step->step_type) {
+                case 'message':
+                    $this->executeMessageStep($execution, $enrollment, $step);
+                    // After message, move to next step
                     $this->moveToNextStep($enrollment);
-                }
-                break;
-            default:
-                $execution->markAsSkipped('unknown_step_type');
+                    break;
+                case 'delay':
+                    $this->executeDelayStep($execution, $enrollment, $step);
+                    // Delay step should schedule the next step with the delay
+                    $this->scheduleNextStepAfterDelay($enrollment, $step);
+                    break;
+                case 'condition':
+                    $this->executeConditionStep($execution, $enrollment, $step);
+                    // Condition step handles moving to next step, jumping, or stopping internally
+                    break;
+                case 'action':
+                    $this->executeActionStep($execution, $enrollment, $step);
+                    // Only move to next step if action didn't stop sequence
+                    if (($execution->metadata['action_type'] ?? '') !== 'stop_sequence') {
+                        $this->moveToNextStep($enrollment);
+                    }
+                    break;
+                default:
+                    $execution->markAsSkipped('unknown_step_type');
+            }
+        } catch (\Exception $e) {
+            // Record the failure on the execution record even when the
+            // caller doesn't route through the job's catch (retry) layer.
+            $execution->markAsFailed($e->getMessage());
+            throw $e;
         }
 
         $execution->save();
@@ -541,9 +548,9 @@ class SequenceExecutionService
             'diff_seconds' => $scheduledAt->diffInSeconds($currentTime),
         ]);
         
-        // Queue next step execution
-        $scheduledAt = $scheduledAt->toDateTimeString();
-        $executionKey = SequenceStepExecution::generateKey($enrollment->id, $nextStep->id, $scheduledAt);
+        // Keep $scheduledAt as a Carbon instance for the delay math below —
+        // convert to string only for the execution key / DB columns.
+        $executionKey = SequenceStepExecution::generateKey($enrollment->id, $nextStep->id, $scheduledAt->toDateTimeString());
 
         // Idempotent: skip if already exists
         $existing = SequenceStepExecution::where('execution_key', $executionKey)->first();

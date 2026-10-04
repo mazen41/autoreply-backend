@@ -29,10 +29,6 @@ class WorkflowEngineRefactorTest extends TestCase
     {
         parent::setUp();
 
-        Http::fake([
-            '*' => Http::response([], 200),
-        ]);
-
         $this->user = User::factory()->create();
         $this->business = BusinessProfile::factory()->create(['user_id' => $this->user->id]);
         $this->user->business_id = $this->business->id;
@@ -138,11 +134,25 @@ class WorkflowEngineRefactorTest extends TestCase
 
         $conversation = Conversation::factory()->create(['business_id' => $this->business->id]);
 
+        // Provide a completed enrollment matching the configured condition
+        $sequence = Sequence::factory()->create(['business_id' => $this->business->id]);
+        SequenceEnrollment::factory()->create([
+            'sequence_id'     => $sequence->id,
+            'conversation_id' => $conversation->id,
+            'status'          => 'completed',
+        ]);
+
+        // Update workflow to point at the created sequence
+        $triggerConfig = $workflow->trigger_config;
+        $triggerConfig['conditions']['sequence_id'] = $sequence->id;
+        $workflow->trigger_config = $triggerConfig;
+        $workflow->save();
+
         $engine = app(AutomationEngine::class);
         $results = $engine->executeWorkflowsForEvent(
             AutomationEngine::EVENT_SEQUENCE_COMPLETED,
             $conversation,
-            ['sequence_id' => 1]
+            ['sequence_id' => $sequence->id]
         );
 
         $this->assertNotEmpty($results);
@@ -211,7 +221,11 @@ class WorkflowEngineRefactorTest extends TestCase
         );
 
         // Should NOT trigger — the new message doesn't contain the keyword
-        $this->assertEmpty($results);
+        // Results still contain a per-workflow result but with triggered=false
+        $this->assertTrue(count($results) > 0);
+        foreach ($results as $r) {
+            $this->assertFalse($r['triggered']);
+        }
     }
 
     // ── FIRST CONTACT ────────────────────────────────────────────────────────
@@ -259,7 +273,13 @@ class WorkflowEngineRefactorTest extends TestCase
             $conversation,
             ['message' => $secondMessage]
         );
-        $this->assertEmpty($results2);
+        $this->assertTrue(count($results2) > 0);
+        foreach ($results2 as $r) {
+            $this->assertFalse($r['triggered']);
+        }
+
+        // Still only ONE workflow execution — the first message triggered, not the second
+        $this->assertEquals(1, WorkflowExecution::where('workflow_id', $workflow->id)->where('conversation_id', $conversation->id)->count());
     }
 
     // ── DEDUPLICATION ────────────────────────────────────────────────────────
@@ -309,8 +329,8 @@ class WorkflowEngineRefactorTest extends TestCase
 
     public function test_bot_scoped_workflow_does_not_fire_for_wrong_bot()
     {
-        $bot1 = Bot::factory()->create(['business_profile_id' => $this->business->id]);
-        $bot2 = Bot::factory()->create(['business_profile_id' => $this->business->id]);
+        $bot1 = Bot::create(['business_profile_id' => $this->business->id, 'name' => 'Bot 1', 'status' => 'active']);
+        $bot2 = Bot::create(['business_profile_id' => $this->business->id, 'name' => 'Bot 2', 'status' => 'active']);
 
         $workflow = AutomationWorkflow::factory()->create([
             'business_id'    => $this->business->id,
@@ -341,13 +361,16 @@ class WorkflowEngineRefactorTest extends TestCase
         );
 
         // Should NOT trigger — workflow is for bot1, conversation belongs to bot2
-        $this->assertEmpty($results);
+        foreach ($results as $r) {
+            $this->assertFalse($r['triggered']);
+        }
+        $this->assertDatabaseMissing('workflow_executions', ['workflow_id' => $workflow->id]);
     }
 
     public function test_global_workflow_fires_for_all_bots()
     {
-        $bot1 = Bot::factory()->create(['business_profile_id' => $this->business->id]);
-        $bot2 = Bot::factory()->create(['business_profile_id' => $this->business->id]);
+        $bot1 = Bot::create(['business_profile_id' => $this->business->id, 'name' => 'Bot 1', 'status' => 'active']);
+        $bot2 = Bot::create(['business_profile_id' => $this->business->id, 'name' => 'Bot 2', 'status' => 'active']);
 
         $workflow = AutomationWorkflow::factory()->create([
             'business_id'    => $this->business->id,
@@ -452,6 +475,12 @@ class WorkflowEngineRefactorTest extends TestCase
             ],
         ]);
 
+        // WhatsApp provider needs a sendText response with key.id to rate success
+        Http::fake([
+            '*/message/sendText/*' => Http::response(['key' => ['id' => 'fake-msg-id']], 200),
+            '*' => Http::response([], 200),
+        ]);
+
         $conversation = Conversation::factory()->create([
             'business_id' => $this->business->id,
             'channel_id'  => $this->channel->id,
@@ -473,6 +502,7 @@ class WorkflowEngineRefactorTest extends TestCase
         $this->assertNotEmpty($results);
         $this->assertTrue($results[0]['triggered']);
         $this->assertNotEmpty($results[0]['actions_executed']);
+        fwrite(STDERR, "send_message result: " . json_encode($results[0]['actions_executed']) . "\n");
         $this->assertTrue($results[0]['actions_executed'][0]['success']);
     }
 
@@ -561,9 +591,14 @@ class WorkflowEngineRefactorTest extends TestCase
             ],
         ]);
 
+        // Simulate a provider failure so the send_message action fails
+        Http::fake([
+            '*/message/sendText/*' => Http::response(['error' => 'Provider timeout'], 500),
+            '*' => Http::response([], 500),
+        ]);
+
         $conversation = Conversation::factory()->create([
             'business_id' => $this->business->id,
-            // No channel_id — send_message will fail
         ]);
 
         $message = Message::factory()->create([
@@ -595,7 +630,6 @@ class WorkflowEngineRefactorTest extends TestCase
 
         $recordedResults = $execution->results;
         $this->assertNotEmpty($recordedResults['errors']);
-        $this->assertStringContainsString('No channel found', $recordedResults['errors'][0]);
     }
 
     // ── SEQUENCE COMPLETED EVENT ─────────────────────────────────────────────

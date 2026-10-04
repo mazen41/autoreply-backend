@@ -36,15 +36,6 @@ class SequenceHardeningTest extends TestCase
     {
         parent::setUp();
 
-        Http::fake([
-            '*/message/sendText/*' => Http::response([
-                'key'     => ['id' => 'fake-msg-id'],
-                'message' => ['conversation' => 'faked'],
-                'status'  => 'PENDING',
-            ], 200),
-            '*' => Http::response([], 200),
-        ]);
-
         $this->user = User::factory()->create();
         $this->business = BusinessProfile::factory()->create();
         $this->user->business_id = $this->business->id;
@@ -52,6 +43,7 @@ class SequenceHardeningTest extends TestCase
 
         $this->channel = Channel::factory()->create([
             'business_id'  => $this->business->id,
+            'user_id'      => $this->user->id,
             'type'         => 'whatsapp',
             'status'       => 'connected',
             'connected_at' => now(),
@@ -68,8 +60,6 @@ class SequenceHardeningTest extends TestCase
             'channel_id'  => $this->channel->id,
         ]);
     }
-
-    // ── IDEMPOTENT STEP EXECUTION ─────────────────────────────────────────────
 
     public function test_duplicate_job_dispatch_only_sends_message_once()
     {
@@ -106,6 +96,15 @@ class SequenceHardeningTest extends TestCase
 
     public function test_worker_retry_without_duplicate_message_send()
     {
+        Http::fake([
+            '*/message/sendText/*' => Http::response([
+                'key'     => ['id' => 'fake-msg-id'],
+                'message' => ['conversation' => 'faked'],
+                'status'  => 'PENDING',
+            ], 200),
+            '*' => Http::response([], 200),
+        ]);
+
         $step = SequenceStep::factory()->create([
             'sequence_id' => $this->sequence->id,
             'step_order'  => 1,
@@ -307,6 +306,15 @@ class SequenceHardeningTest extends TestCase
         $this->assertEquals('active', $enrollment->status);
         $this->assertEquals(1, $enrollment->current_step);
 
+        Http::fake([
+            '*/message/sendText/*' => Http::response([
+                'key'     => ['id' => 'fake-msg-id'],
+                'message' => ['conversation' => 'faked'],
+                'status'  => 'PENDING',
+            ], 200),
+            '*' => Http::response([], 200),
+        ]);
+
         // Execute step 1 (message)
         $execution1 = SequenceStepExecution::where('sequence_enrollment_id', $enrollment->id)
             ->where('sequence_step_id', $this->sequence->steps()->where('step_order', 1)->first()->id)
@@ -382,6 +390,15 @@ class SequenceHardeningTest extends TestCase
             'trigger_config' => ['min_order_value' => 100],
         ]);
 
+        // Enrollment is NOT auto-completed when the sequence has no steps,
+        // so give it a step that can enroll into an active state
+        SequenceStep::factory()->create([
+            'sequence_id' => $orderSequence->id,
+            'step_order'  => 1,
+            'step_type'   => 'message',
+            'message'     => 'Order received',
+        ]);
+
         $orderData = [
             'id'    => 'ORD-12345',
             'total' => 150,
@@ -432,8 +449,8 @@ class SequenceHardeningTest extends TestCase
         Queue::fake();
 
         // Create two bots
-        $bot1 = Bot::factory()->create(['business_profile_id' => $this->business->id]);
-        $bot2 = Bot::factory()->create(['business_profile_id' => $this->business->id]);
+        $bot1 = Bot::create(['business_profile_id' => $this->business->id, 'name' => 'Bot 1', 'status' => 'active']);
+        $bot2 = Bot::create(['business_profile_id' => $this->business->id, 'name' => 'Bot 2', 'status' => 'active']);
 
         // Create a bot-scoped sequence for bot1
         $botSequence = Sequence::factory()->create([
@@ -442,6 +459,14 @@ class SequenceHardeningTest extends TestCase
             'channel'      => 'whatsapp',
             'trigger_type' => 'new_user',
             'bot_id'       => $bot1->id,
+        ]);
+
+        // Give the sequence a step so enrollments enter an active state
+        SequenceStep::factory()->create([
+            'sequence_id' => $botSequence->id,
+            'step_order'  => 1,
+            'step_type'   => 'message',
+            'message'     => 'Hello from bot',
         ]);
 
         // Conversation belongs to bot2
@@ -467,8 +492,8 @@ class SequenceHardeningTest extends TestCase
         Queue::fake();
 
         // Create two bots
-        $bot1 = Bot::factory()->create(['business_profile_id' => $this->business->id]);
-        $bot2 = Bot::factory()->create(['business_profile_id' => $this->business->id]);
+        $bot1 = Bot::create(['business_profile_id' => $this->business->id, 'name' => 'Bot 1', 'status' => 'active']);
+        $bot2 = Bot::create(['business_profile_id' => $this->business->id, 'name' => 'Bot 2', 'status' => 'active']);
 
         // Create a bot-scoped sequence for bot1
         $botSequence = Sequence::factory()->create([
@@ -477,6 +502,14 @@ class SequenceHardeningTest extends TestCase
             'channel'      => 'whatsapp',
             'trigger_type' => 'new_user',
             'bot_id'       => $bot1->id,
+        ]);
+
+        // Give the sequence a step so enrollments enter an active state
+        SequenceStep::factory()->create([
+            'sequence_id' => $botSequence->id,
+            'step_order'  => 1,
+            'step_type'   => 'message',
+            'message'     => 'Hello from bot',
         ]);
 
         // Conversation belongs to bot1

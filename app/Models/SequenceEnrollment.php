@@ -12,7 +12,12 @@ class SequenceEnrollment extends Model
     use HasFactory;
     
     protected $table = 'sequence_enrollments';
-    
+
+    // In-memory only — NOT a database column. Used during dispatch
+    // coordination; without the declaration it would be routed through
+    // Eloquent's attribute magic and break on save().
+    public $_pendingExecutionId;
+
     protected $fillable = [
         'sequence_id',
         'conversation_id',

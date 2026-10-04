@@ -57,6 +57,15 @@ class InboxRealtimeTest extends TestCase
             'type' => 'whatsapp',
             'status' => 'connected',
         ]);
+
+        \App\Models\WhatsAppInstance::create([
+            'user_id' => $this->user->id,
+            'instance_name' => $this->channel->page_id,
+            'phone_number' => '201234567890',
+            'status' => 'connected',
+            'connected_at' => now(),
+        ]);
+
         $this->bot = Bot::create([
             'business_profile_id' => $this->business->id,
             'name' => 'Support Bot',
@@ -94,8 +103,8 @@ class InboxRealtimeTest extends TestCase
 
         // Routed to the channel owner's private inbox channel
         $this->assertEquals(
-            ['inbox.' . $this->user->id],
-            array_map(fn ($c) => $c->getName(), $event->broadcastOn())
+            ['private-inbox.' . $this->user->id],
+            array_map(fn ($c) => $c->name, $event->broadcastOn())
         );
         $this->assertEquals('message.received', $event->broadcastAs());
 
@@ -205,8 +214,8 @@ class InboxRealtimeTest extends TestCase
 
         Event::assertDispatched(ConversationUpdated::class, function ($event) use ($conversation, $agent) {
             $this->assertEquals(
-                ['inbox.' . $this->user->id],
-                array_map(fn ($c) => $c->getName(), $event->broadcastOn())
+                ['private-inbox.' . $this->user->id],
+                array_map(fn ($c) => $c->name, $event->broadcastOn())
             );
             $this->assertEquals('conversation.updated', $event->broadcastAs());
 
@@ -295,8 +304,10 @@ class InboxRealtimeTest extends TestCase
 
         Event::fake();
 
-        $this->actingAs($this->user, 'sanctum')
+        $id = $this->actingAs($this->user, 'sanctum')
             ->postJson("/api/inbox/{$conversation->id}/tags", ['tag' => 'vip']);
+
+        fwrite(STDERR, "TAG STATUS: " . $id->status() . " BODY: " . $id->getContent() . "\n");
 
         Event::assertDispatched(ConversationUpdated::class, function ($event) use ($conversation) {
             $payload = $event->broadcastWith();

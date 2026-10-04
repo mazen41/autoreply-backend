@@ -31,14 +31,14 @@ class InboxController extends Controller
                 'bot:id,name',
                 'latestMessage',
             ])
+            ->select(['id', 'channel_id', 'business_id', 'bot_id', 'sender_id', 'sender_name', 'sender_email', 'subject', 'status', 'ai_enabled', 'requires_human', 'escalated_at', 'escalation_reason', 'last_message_at', 'assigned_agent_id', 'assigned_at'])
             // Unread count within the 24h unread window — matches the
             // `unread` filter below and the realtime contract's
             // unread_count (InboxBroadcastPayload::unreadCount).
             ->withCount(['messages as unread_count' => function ($q) {
                 $q->where('direction', 'inbound')
                   ->where('created_at', '>=', now()->subHours(24));
-            }])
-            ->select(['id', 'channel_id', 'business_id', 'bot_id', 'sender_id', 'sender_name', 'sender_email', 'subject', 'status', 'ai_enabled', 'requires_human', 'escalated_at', 'escalation_reason', 'last_message_at', 'assigned_agent_id', 'assigned_at']);
+            }]);
 
         // Agent-specific filter
         if ($request->has('assigned_to_me')) {
@@ -485,22 +485,26 @@ class InboxController extends Controller
             $conversation->update(['last_message_at' => now()]);
 
             // Also save to WhatsApp messages table for legacy compatibility
-            \App\Models\WhatsAppMessage::create([
-                'whatsapp_instance_id' => \App\Models\WhatsAppInstance::where('instance_name', $instanceName)->first()?->id,
-                'user_id' => $channel->user_id,
-                'message_id' => $response['key']['id'] ?? null,
-                'remote_message_id' => $response['key']['id'] ?? null,
-                'direction' => 'outgoing',
-                'from_phone' => null, // Business number
-                'from_name' => null,
-                'to_phone' => $conversation->sender_id,
-                'body' => $request->message,
-                'message_type' => 'text',
-                'media' => null,
-                'metadata' => ['evolution_response' => $response, 'unified_message_id' => $message->id],
-                'status' => 'sent',
-                'sent_at' => now(),
-            ]);
+            $instance = \App\Models\WhatsAppInstance::where('instance_name', $instanceName)->first();
+
+            if ($instance) {
+                \App\Models\WhatsAppMessage::create([
+                    'whatsapp_instance_id' => $instance->id,
+                    'user_id' => $channel->user_id,
+                    'message_id' => $response['key']['id'] ?? null,
+                    'remote_message_id' => $response['key']['id'] ?? null,
+                    'direction' => 'outgoing',
+                    'from_phone' => null,
+                    'from_name' => null,
+                    'to_phone' => null,
+                    'body' => $request->message,
+                    'message_type' => 'text',
+                    'media' => null,
+                    'metadata' => ['evolution_response' => $response, 'unified_message_id' => $message->id],
+                    'status' => 'sent',
+                    'sent_at' => now(),
+                ]);
+            }
 
             if ($channel->user_id) {
                 broadcast(new \App\Events\MessageReceived($message, $conversation, $channel->user_id));
@@ -623,7 +627,9 @@ class InboxController extends Controller
 
         // Trigger sequence enrollment for tag-based sequences
         try {
-            $sequenceTriggerService = new \App\Services\SequenceTriggerService();
+            $sequenceTriggerService = new \App\Services\SequenceTriggerService(
+                app(\App\Services\SequenceEnrollmentService::class)
+            );
             $sequenceTriggerService->checkAndEnrollForTagAdded($conversation, $request->tag);
         } catch (\Exception $e) {
             \Log::error('Failed to check sequence enrollment for tag', [

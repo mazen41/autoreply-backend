@@ -24,6 +24,7 @@ class SequenceStepExecutionFactory extends Factory
             'message_id' => null,
             'error' => null,
             'metadata' => null,
+            'execution_key' => fake()->sha256(),
         ];
     }
 }

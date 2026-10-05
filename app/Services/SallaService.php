@@ -573,6 +573,38 @@ class SallaService
         return null;
     }
 
+    /** Fetch a Salla API response while treating cache failures as non-fatal. */
+    protected function cachedSallaResponse(string $cacheKey, string $endpoint, callable $fetch): array
+    {
+        try {
+            $cached = \Illuminate\Support\Facades\Cache::get($cacheKey);
+            if (is_array($cached)) {
+                return $cached;
+            }
+        } catch (\Throwable $e) {
+            Log::warning('SallaService: cache read failed; fetching API response without cache', [
+                'cache_key' => $cacheKey,
+                'error' => $e->getMessage(),
+            ]);
+        }
+
+        // The API result is required for checkout. A local cache write failure
+        // (for example, a missing file-cache shard directory) must not discard it.
+        $response = $fetch();
+
+        try {
+            \Illuminate\Support\Facades\Cache::put($cacheKey, $response, 43200);
+        } catch (\Throwable $e) {
+            Log::warning('SallaService: cache write failed; continuing with live API response', [
+                'cache_key' => $cacheKey,
+                'endpoint' => $endpoint,
+                'error' => $e->getMessage(),
+            ]);
+        }
+
+        return $response;
+    }
+
     /**
      * Dynamically resolve Salla shipping address fields against the merchant's Salla account data.
      * Returns null if city_id or required address components cannot be confidently resolved.
@@ -596,9 +628,11 @@ class SallaService
         };
 
         try {
-            $countriesRes = \Illuminate\Support\Facades\Cache::remember("salla_countries_ch_{$channel->id}", 43200, function () use ($channel) {
-                return $this->apiCallForChannel($channel, 'GET', '/countries');
-            });
+            $countriesRes = $this->cachedSallaResponse(
+                "salla_countries_ch_{$channel->id}",
+                "/countries",
+                fn () => $this->apiCallForChannel($channel, 'GET', '/countries')
+            );
             $country = collect($countriesRes['data'] ?? [])->first(
                 fn ($candidate) => strtoupper((string) ($candidate['code'] ?? '')) === $countryCode
             );
@@ -622,9 +656,12 @@ class SallaService
         // Fetch cities using the country-specific route documented by Salla.
         $matchedCityId = null;
         try {
-            $citiesRes = \Illuminate\Support\Facades\Cache::remember("salla_cities_ch_{$channel->id}_{$countryId}", 43200, function () use ($channel, $countryId) {
-                return $this->apiCallForChannel($channel, 'GET', "/countries/{$countryId}/cities");
-            });
+            $citiesEndpoint = "/countries/{$countryId}/cities";
+            $citiesRes = $this->cachedSallaResponse(
+                "salla_cities_ch_{$channel->id}_{$countryId}",
+                $citiesEndpoint,
+                fn () => $this->apiCallForChannel($channel, 'GET', $citiesEndpoint)
+            );
             $cities = $citiesRes['data'] ?? [];
 
             $addressLower = mb_strtolower($freeformAddress);

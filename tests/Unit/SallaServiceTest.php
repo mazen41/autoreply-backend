@@ -5,6 +5,7 @@ namespace Tests\Unit;
 use App\Models\Channel;
 use App\Services\SallaService;
 use Illuminate\Foundation\Testing\RefreshDatabase;
+use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\Http;
 use Tests\TestCase;
 
@@ -174,5 +175,23 @@ class SallaServiceTest extends TestCase
         $this->assertSame('connected', $channel->status);
         $this->assertSame('new-access-token', $channel->access_token);
         $this->assertSame('new-refresh-token', $channel->refresh_token);
+    }
+
+    public function test_salla_api_response_is_used_when_cache_write_fails(): void
+    {
+        Cache::shouldReceive('get')->once()->andReturn(null);
+        Cache::shouldReceive('put')->once()->andThrow(new \RuntimeException('cache shard directory missing'));
+
+        $service = new class extends SallaService {
+            public function cachedResponse(callable $fetch): array
+            {
+                return $this->cachedSallaResponse('salla_test_key', '/countries', $fetch);
+            }
+        };
+
+        $apiResponse = ['data' => [['id' => 123, 'code' => 'EG']]];
+        $response = $service->cachedResponse(fn () => $apiResponse);
+
+        $this->assertSame($apiResponse, $response);
     }
 }

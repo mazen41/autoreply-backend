@@ -194,4 +194,42 @@ class SallaServiceTest extends TestCase
 
         $this->assertSame($apiResponse, $response);
     }
+
+    public function test_shipping_city_lookup_checks_later_salla_pagination_pages(): void
+    {
+        $channel = Channel::factory()->create([
+            'type' => 'salla',
+            'status' => 'connected',
+            'access_token' => 'access-token',
+        ]);
+
+        Http::fake([
+            'https://api.salla.dev/admin/v2/countries' => Http::response([
+                'data' => [['id' => 1723506348, 'code' => 'EG']],
+            ], 200),
+            'https://api.salla.dev/admin/v2/countries/1723506348/cities*' => Http::sequence()
+                ->push([
+                    'data' => [['id' => 1, 'name' => 'Cairo', 'name_en' => 'Cairo']],
+                    'pagination' => [
+                        'totalPages' => 2,
+                        'currentPage' => 1,
+                        'links' => ['next' => 'https://api.salla.dev/admin/v2/countries/1723506348/cities?page=2'],
+                    ],
+                ], 200)
+                ->push([
+                    'data' => [['id' => 778, 'name' => 'Giza', 'name_en' => 'Giza']],
+                    'pagination' => ['totalPages' => 2, 'currentPage' => 2, 'links' => []],
+                ], 200),
+        ]);
+
+        $shippingAddress = $this->sallaService->resolveShippingAddressForChannel(
+            $channel,
+            '36 Sayed Abdelrahman Mohamed, Giza Faisal Street',
+            '01152879755'
+        );
+
+        $this->assertSame(778, $shippingAddress['city_id'] ?? null);
+        Http::assertSentCount(3);
+        Http::assertSent(fn ($request) => str_contains($request->url(), 'cities?page=2'));
+    }
 }

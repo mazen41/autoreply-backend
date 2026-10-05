@@ -606,6 +606,68 @@ class SallaService
     }
 
     /**
+     * Search paginated Salla city results. The API returns only one page by default,
+     * so scanning just `data` can miss valid cities outside the first 15 entries.
+     *
+     * @return array{id: ?int, names: array<int, string>}
+     */
+    protected function findCityInPaginatedSallaResponse(
+        Channel $channel,
+        int|string $countryId,
+        string $endpoint,
+        string $address
+    ): array {
+        $addressLower = mb_strtolower($address);
+        $availableCityNames = [];
+        $matchedCityId = null;
+        $maxPages = 200;
+
+        for ($page = 1; $page <= $maxPages; $page++) {
+            $response = $this->cachedSallaResponse(
+                "salla_cities_v2_ch_{$channel->id}_{$countryId}_page_{$page}",
+                $endpoint,
+                fn () => $this->apiCallForChannel($channel, 'GET', $endpoint, ['page' => $page])
+            );
+
+            foreach ($response['data'] ?? [] as $city) {
+                $cityNames = array_filter([
+                    $city['name'] ?? null,
+                    $city['name_en'] ?? null,
+                    $city['name_ar'] ?? null,
+                ], fn ($name) => is_scalar($name));
+
+                foreach ($cityNames as $cityName) {
+                    $cityName = trim((string) $cityName);
+                    if ($cityName === '') {
+                        continue;
+                    }
+
+                    $availableCityNames[] = $cityName;
+                    if (str_contains($addressLower, mb_strtolower($cityName))) {
+                        $matchedCityId = (int) ($city['id'] ?? 0) ?: null;
+                    }
+                }
+
+                if ($matchedCityId) {
+                    break 2;
+                }
+            }
+
+            $pagination = $response['pagination'] ?? [];
+            $totalPages = (int) ($pagination['totalPages'] ?? $pagination['total_pages'] ?? 1);
+            $hasNextPage = $page < $totalPages || !empty($pagination['links']['next']);
+            if (!$hasNextPage) {
+                break;
+            }
+        }
+
+        return [
+            'id' => $matchedCityId,
+            'names' => array_values(array_unique($availableCityNames)),
+        ];
+    }
+
+    /**
      * Dynamically resolve Salla shipping address fields against the merchant's Salla account data.
      * Returns null if city_id or required address components cannot be confidently resolved.
      */
@@ -655,37 +717,17 @@ class SallaService
 
         // Fetch cities using the country-specific route documented by Salla.
         $matchedCityId = null;
+        $availableCityNames = [];
         try {
             $citiesEndpoint = "/countries/{$countryId}/cities";
-            $citiesRes = $this->cachedSallaResponse(
-                "salla_cities_ch_{$channel->id}_{$countryId}",
+            $cityMatch = $this->findCityInPaginatedSallaResponse(
+                $channel,
+                $countryId,
                 $citiesEndpoint,
-                fn () => $this->apiCallForChannel($channel, 'GET', $citiesEndpoint)
+                $freeformAddress
             );
-            $cities = $citiesRes['data'] ?? [];
-
-            $addressLower = mb_strtolower($freeformAddress);
-
-            foreach ($cities as $c) {
-                $cityNames = array_filter([
-                    $c['name'] ?? null,
-                    $c['name_en'] ?? null,
-                    $c['name_ar'] ?? null,
-                ]);
-                $cityMatches = false;
-                foreach ($cityNames as $cityName) {
-                    $cityName = mb_strtolower(trim((string) $cityName));
-                    if ($cityName !== '' && str_contains($addressLower, $cityName)) {
-                        $cityMatches = true;
-                        break;
-                    }
-                }
-
-                if ($cityMatches) {
-                    $matchedCityId = (int)$c['id'];
-                    break;
-                }
-            }
+            $matchedCityId = $cityMatch['id'];
+            $availableCityNames = $cityMatch['names'];
         } catch (\Exception $e) {
             Log::warning('SallaService: GET /cities lookup failed for channel', [
                 'channel_id' => $channel->id,
@@ -697,7 +739,11 @@ class SallaService
         if (!$matchedCityId) {
             Log::info('SallaService: could not match city in address against merchant Salla cities', [
                 'channel_id' => $channel->id,
+                'country_id' => (int) $countryId,
+                'country_code' => $countryCode,
                 'address'    => $freeformAddress,
+                'cities_checked' => count($availableCityNames),
+                'available_city_names_sample' => array_slice($availableCityNames, 0, 30),
             ]);
             return null;
         }

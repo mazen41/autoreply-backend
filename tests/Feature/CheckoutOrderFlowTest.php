@@ -263,6 +263,86 @@ class CheckoutOrderFlowTest extends TestCase
     }
 
     /** @test */
+    public function it_does_not_claim_an_order_was_placed_when_no_salla_store_is_connected()
+    {
+        $user = User::factory()->create();
+        $business = BusinessProfile::factory()->create([
+            'user_id' => $user->id,
+            'name' => 'NazBiz Store',
+            'ai_provider' => 'groq',
+        ]);
+        try { Redis::del("rate_limit:{$business->id}:{$user->id}"); } catch (\Throwable) {}
+
+        $instagramChannel = Channel::factory()->create([
+            'user_id' => $user->id,
+            'business_id' => $business->id,
+            'type' => 'instagram',
+            'status' => 'connected',
+            'access_token' => 'instagram-token',
+            'ai_enabled' => true,
+        ]);
+        Channel::factory()->create([
+            'user_id' => $user->id,
+            'business_id' => $business->id,
+            'type' => 'salla',
+            'status' => 'token_expired',
+            'access_token' => 'expired-token',
+        ]);
+
+        $conversation = Conversation::factory()->create([
+            'channel_id' => $instagramChannel->id,
+            'business_id' => $business->id,
+            'sender_id' => 'instagram-customer-123',
+            'ai_enabled' => true,
+            'checkout_state' => [
+                'salla_product_id' => '987654',
+                'product_name' => 'Smart Watch',
+                'product_price' => 350,
+                'product_currency' => 'SAR',
+                'full_name' => 'Ahmed Ali',
+                'phone' => '+966501234567',
+                'customer_phone' => '+966501234567',
+                'address' => 'Riyadh, Saudi Arabia',
+            ],
+        ]);
+        $message = Message::create([
+            'conversation_id' => $conversation->id,
+            'content' => 'yes please confirm',
+            'direction' => 'inbound',
+            'is_ai' => false,
+        ]);
+
+        Http::fake([
+            'api.groq.com/*' => Http::response([
+                'choices' => [[
+                    'message' => ['content' => json_encode([
+                        'success' => true,
+                        'reply' => 'Your order has been placed successfully!',
+                        'intent' => 'place_order',
+                        'needs_escalation' => false,
+                        'confidence' => 1.0,
+                        'escalation_reason' => 'none',
+                        'needs_images' => false,
+                    ])],
+                ]],
+            ], 200),
+            '*' => Http::response([], 200),
+        ]);
+
+        (new ProcessAutoReply($message->id))->handle();
+
+        $reply = Message::where('conversation_id', $conversation->id)
+            ->where('direction', 'outbound')
+            ->latest('id')
+            ->first();
+
+        $this->assertNotNull($reply);
+        $this->assertStringNotContainsString('placed successfully', mb_strtolower($reply->content));
+        $this->assertNotEquals('completed', $conversation->fresh()->checkout_state['status'] ?? null);
+        Http::assertNotSent(fn ($request) => str_contains($request->url(), 'api.salla.dev'));
+    }
+
+    /** @test */
     public function it_allows_retry_after_salla_failure_and_succeeds_when_api_returns_2xx()
     {
         $user = User::factory()->create();

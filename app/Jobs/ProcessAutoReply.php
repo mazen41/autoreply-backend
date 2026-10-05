@@ -1592,6 +1592,22 @@ class ProcessAutoReply implements ShouldQueue
             }
         }
 
+        // A missing OAuth grant can leave this conversation without a connected
+        // Salla store. Never claim a confirmed checkout was submitted in that case.
+        if (
+            $intent === 'place_order'
+            && $containsConfirmPhrase
+            && !empty($fieldStatus['is_complete'])
+            && !$sallaChannel
+            && !empty($checkoutState['salla_product_id'])
+        ) {
+            $orderCreationFailedReason = 'salla_store_not_connected';
+            Log::warning('ProcessAutoReply: confirmed checkout has no connected Salla store; blocking order success claim', [
+                'conversation_id' => $conversation->id,
+                'product_id' => $checkoutState['salla_product_id'],
+            ]);
+        }
+
         // Reasons that should ALWAYS trigger escalation
         $hardEscalationReasons = [
             'customer_requested_human',
@@ -1792,8 +1808,15 @@ class ProcessAutoReply implements ShouldQueue
                 : "I'm sorry, I'm not able to send product photos right now. Let me connect you with a team member who can send them directly 🙏";
         }
 
+        if ($orderCreationFailedReason === 'salla_store_not_connected') {
+            Log::warning('ProcessAutoReply: blocking order confirmation because no connected Salla store is available', [
+                'conversation_id' => $conversation->id,
+            ]);
+            $aiResponse = "I'm sorry, your order was not submitted because the store connection needs attention. A team member will help you complete it.";
+        }
+
         // STRICT GUARDRAIL: Prevent AI from hallucinating order confirmation if order creation failed
-        if ($orderCreationFailedReason === 'address_city_unresolved') {
+        if (in_array($orderCreationFailedReason, ['address_city_unresolved', 'salla_store_not_connected'], true)) {
             $lowerAiResponse = mb_strtolower($aiResponse);
             $hallucinationKeywords = ['placed', 'confirmed', 'تم تأكيد', 'تم طلب', 'successfully', 'will be placed'];
             $hallucinated = false;

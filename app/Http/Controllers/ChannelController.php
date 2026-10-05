@@ -180,9 +180,21 @@ class ChannelController extends Controller
                 'page_id'              => $channel->page_id,
                 'page_name'            => $channel->page_name,
                 'instagram_account_id' => $channel->instagram_account_id,
-                'status'               => $channel->status,
+                'status'               => in_array($channel->type, ['shopify', 'woocommerce'], true)
+                    && ($channel->metadata['sync_status'] ?? '') === 'error'
+                        ? 'error'
+                        : (in_array($channel->type, ['shopify', 'woocommerce'], true)
+                            && in_array(($channel->metadata['sync_status'] ?? ''), ['queued', 'syncing'], true)
+                                ? 'syncing'
+                                : $channel->status),
                 'connected_at'         => $channel->connected_at,
                 'ai_enabled'           => $channel->ai_enabled,
+                'integration'          => in_array($channel->type, ['shopify', 'woocommerce'], true) ? [
+                    'store_url' => $channel->metadata['store_url'] ?? $channel->page_id,
+                    'sync_status' => $channel->metadata['sync_status'] ?? 'connected',
+                    'sync_counts' => $channel->metadata['sync_counts'] ?? ['products' => 0, 'orders' => 0, 'customers' => 0],
+                    'last_synced_at' => $channel->metadata['last_synced_at'] ?? null,
+                ] : null,
                 'capabilities'         => $capabilities[$channel->type] ?? [
                     'inbound_webhook'  => true,
                     'inbound_ai_reply' => true,

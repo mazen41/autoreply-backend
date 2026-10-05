@@ -2,224 +2,213 @@
 
 namespace App\Http\Controllers;
 
+use App\Jobs\SyncCommerceStore;
 use App\Models\Channel;
-use App\Models\Conversation;
-use App\Models\Message;
+use App\Models\CommerceOrder;
 use Illuminate\Http\Request;
+use Illuminate\Support\Facades\Cache;
+use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Http;
 use Illuminate\Support\Facades\Log;
+use Illuminate\Support\Str;
 
 class WooCommerceController extends Controller
 {
+    /** Start the WooCommerce REST API key authorization flow. */
     public function connect(Request $request)
     {
-        $request->validate([
-            'store_url' => 'required|url',
-            'consumer_key' => 'required|string',
-            'consumer_secret' => 'required|string',
-        ]);
-
-        $storeUrl = rtrim($request->store_url, '/');
-        if (!str_starts_with($storeUrl, 'https://')) {
-            $storeUrl = 'https://' . $storeUrl;
+        $validated = $request->validate(['store_url' => ['required', 'url', 'max:255']]);
+        $storeUrl = $this->normalizeStoreUrl($validated['store_url']);
+        if (!$storeUrl) {
+            return response()->json(['error' => 'Enter a public HTTPS WooCommerce store URL.'], 422);
         }
-        
-        $consumerKey = $request->consumer_key;
-        $consumerSecret = $request->consumer_secret;
-        $userId = auth()->id();
 
+        $state = Str::random(48);
+        Cache::put('woocommerce_oauth_state:' . hash('sha256', $state), [
+            'user_id' => (int) $request->user()->id,
+            'store_url' => $storeUrl,
+            'created_at' => now()->timestamp,
+        ], now()->addMinutes(15));
+
+        $params = [
+            'app_name' => config('app.name', 'NazBiz'),
+            'scope' => 'read_write',
+            'user_id' => $state,
+            'return_url' => rtrim((string) config('app.frontend_url', env('FRONTEND_URL', '')), '/') . '/dashboard/channels?success=woocommerce_connected',
+            'callback_url' => rtrim((string) config('app.url'), '/') . '/api/channels/woocommerce/callback',
+        ];
+
+        return response()->json([
+            'authorization_url' => $storeUrl . '/wc-auth/v1/authorize?' . http_build_query($params),
+        ]);
+    }
+
+    /** Receives WooCommerce's server-to-server API key callback. */
+    public function authorizationCallback(Request $request)
+    {
+        $payload = $request->json()->all();
+        if (!$payload) {
+            $payload = $request->all();
+        }
+        $state = (string) ($payload['user_id'] ?? '');
+        $stateData = $state !== '' ? Cache::pull('woocommerce_oauth_state:' . hash('sha256', $state)) : null;
+        if (!$stateData || now()->timestamp - (int) ($stateData['created_at'] ?? 0) > 900) {
+            return response()->json(['error' => 'Authorization request expired or invalid.'], 401);
+        }
+        if (empty($payload['consumer_key']) || empty($payload['consumer_secret'])
+            || ($payload['key_permissions'] ?? '') !== 'read_write') {
+            return response()->json(['error' => 'WooCommerce did not grant the required read/write API access.'], 422);
+        }
+
+        $storeUrl = $stateData['store_url'];
+        $consumerKey = (string) $payload['consumer_key'];
+        $consumerSecret = (string) $payload['consumer_secret'];
         try {
-            // Verify credentials by calling WooCommerce API with Basic Auth
-            $response = Http::timeout(10)->withBasicAuth($consumerKey, $consumerSecret)
-                ->get("{$storeUrl}/wp-json/wc/v3/system_status");
-
+            $response = Http::withBasicAuth($consumerKey, $consumerSecret)->timeout(20)
+                ->get($storeUrl . '/wp-json/wc/v3/system_status');
             if (!$response->successful()) {
-                Log::error('WooCommerce credentials verification failed', [
-                    'user_id' => $userId,
-                    'store_url' => $storeUrl,
-                    'status' => $response->status(),
-                    'body' => $response->json(),
+                Log::warning('WooCommerce authorization credentials failed verification', [
+                    'status' => $response->status(), 'store_url' => $storeUrl,
                 ]);
-                return response()->json(['error' => 'Invalid WooCommerce credentials'], 422);
+                return response()->json(['error' => 'WooCommerce could not verify the approved API key.'], 422);
             }
 
-            $systemStatus = $response->json();
-            $storeName = $systemStatus['settings']['store_name'] ?? $storeUrl;
-            $environment = $systemStatus['environment']['version'] ?? 'Unknown';
-
-            // Save channel with encrypted credentials in metadata
-            $businessProfile = \App\Models\BusinessProfile::where('user_id', $userId)->first();
-
+            $business = \App\Models\BusinessProfile::firstOrCreate(['user_id' => $stateData['user_id']]);
+            $status = $response->json();
             $channel = Channel::updateOrCreate(
+                ['user_id' => $stateData['user_id'], 'type' => 'woocommerce', 'page_id' => $storeUrl],
                 [
-                    'user_id' => $userId,
-                    'type' => 'woocommerce',
-                    'page_id' => $storeUrl,
-                ],
-                [
-                    'page_name' => $storeName,
+                    'business_id' => $business->id,
+                    'page_name' => $status['settings']['store_name'] ?? parse_url($storeUrl, PHP_URL_HOST),
                     'status' => 'connected',
                     'connected_at' => now(),
-                    'business_id' => $businessProfile ? $businessProfile->id : null,
                     'metadata' => [
                         'store_url' => $storeUrl,
                         'consumer_key' => encrypt($consumerKey),
                         'consumer_secret' => encrypt($consumerSecret),
-                        'environment' => $environment,
+                        'webhook_secret' => encrypt(Str::random(64)),
+                        'sync_status' => 'queued',
+                        'sync_counts' => ['products' => 0, 'orders' => 0, 'customers' => 0],
                     ],
                 ]
             );
 
-            // Register webhooks for real-time synchronization
-            $this->registerWebhooks($storeUrl, $consumerKey, $consumerSecret);
-
-            Log::info('WooCommerce channel connected', [
-                'user_id' => $userId,
-                'store_url' => $storeUrl,
-                'store_name' => $storeName,
-                'channel_id' => $channel->id,
+            $this->registerWebhooks($channel);
+            SyncCommerceStore::dispatch($channel->id);
+            return response()->json(['success' => true]);
+        } catch (\Throwable $e) {
+            Log::error('WooCommerce authorization callback failed', [
+                'store_url' => $storeUrl, 'error' => $e->getMessage(),
             ]);
-
-            return response()->json([
-                'success' => true,
-                'channel' => [
-                    'id' => $channel->id,
-                    'name' => $storeName,
-                    'type' => 'woocommerce',
-                    'status' => 'connected',
-                ],
-            ]);
-
-        } catch (\Exception $e) {
-            Log::error('WooCommerce connection error', [
-                'user_id' => $userId,
-                'error' => $e->getMessage(),
-            ]);
-            return response()->json(['error' => 'Failed to connect WooCommerce store'], 500);
+            return response()->json(['error' => 'Could not finish connecting WooCommerce.'], 500);
         }
+    }
+
+    public function sync(Request $request, int $channelId)
+    {
+        $channel = Channel::where('id', $channelId)->where('type', 'woocommerce')
+            ->where('user_id', $request->user()->id)->where('status', 'connected')->firstOrFail();
+        $metadata = $channel->metadata ?? [];
+        $metadata['sync_status'] = 'queued';
+        $channel->forceFill(['metadata' => $metadata])->save();
+        SyncCommerceStore::dispatch($channel->id);
+        return response()->json(['success' => true, 'status' => 'queued']);
     }
 
     public function getOrders(Request $request)
     {
-        $phone = $request->query('phone');
-        if (!$phone) {
-            return response()->json(['error' => 'Phone number is required'], 400);
+        $request->validate(['phone' => 'required|string|max:40', 'channel_id' => 'nullable|integer']);
+        $query = Channel::where('type', 'woocommerce')->where('user_id', $request->user()->id)->where('status', 'connected');
+        if ($request->filled('channel_id')) {
+            $query->whereKey($request->integer('channel_id'));
+        }
+        $channels = $query->get();
+        if ($channels->count() !== 1) {
+            return response()->json(['error' => $channels->isEmpty() ? 'WooCommerce channel not connected' : 'Specify channel_id'], $channels->isEmpty() ? 404 : 409);
+        }
+        $order = CommerceOrder::where('channel_id', $channels->first()->id)
+            ->where('customer_phone', $request->query('phone'))->latest('ordered_at')->first();
+        return $order ? response()->json(['success' => true, 'order' => $order]) : response()->json(['order' => null]);
+    }
+
+    public function webhook(Request $request)
+    {
+        $raw = $request->getContent();
+        $storeUrl = $this->normalizeStoreUrl((string) $request->header('X-WC-Webhook-Source', ''));
+        $deliveryId = (string) $request->header('X-WC-Webhook-ID', '');
+        $topic = (string) $request->header('X-WC-Webhook-Topic', '');
+        $channel = $storeUrl ? Channel::where('type', 'woocommerce')->where('page_id', $storeUrl)->where('status', 'connected')->first() : null;
+        if (!$channel || $deliveryId === '') {
+            return response('Unknown store or delivery', 404);
         }
 
-        // Same exact-resolution pattern as ShopifyController::getOrders() —
-        // an explicit channel_id wins; otherwise only auto-resolve when the
-        // account has exactly one connected WooCommerce store.
-        $channelId = $request->query('channel_id');
-        if ($channelId) {
-            $channel = Channel::where('type', 'woocommerce')
-                ->where('id', $channelId)
-                ->where('user_id', auth()->id())
-                ->where('status', 'connected')
-                ->first();
-
-            if (!$channel) {
-                return response()->json(['error' => 'WooCommerce channel not connected'], 404);
-            }
-        } else {
-            $candidates = Channel::where('type', 'woocommerce')
-                ->where('user_id', auth()->id())
-                ->where('status', 'connected')
-                ->get();
-
-            if ($candidates->count() === 0) {
-                return response()->json(['error' => 'WooCommerce channel not connected'], 404);
-            }
-
-            if ($candidates->count() > 1) {
-                return response()->json([
-                    'error' => 'Multiple WooCommerce stores are connected — specify channel_id',
-                    'channels' => $candidates->map(fn ($c) => ['id' => $c->id, 'name' => $c->page_name])->values(),
-                ], 409);
-            }
-
-            $channel = $candidates->first();
-        }
-
+        $metadata = $channel->metadata ?? [];
         try {
-            $metadata = $channel->metadata;
-            $storeUrl = $metadata['store_url'] ?? $channel->page_id;
-            $consumerKey = decrypt($metadata['consumer_key']);
-            $consumerSecret = decrypt($metadata['consumer_secret']);
+            $webhookSecret = decrypt($metadata['webhook_secret'] ?? '');
+        } catch (\Throwable) {
+            return response('Invalid webhook configuration', 401);
+        }
+        $signature = base64_encode(hash_hmac('sha256', $raw, $webhookSecret, true));
+        if (!hash_equals($signature, (string) $request->header('X-WC-Webhook-Signature', ''))) {
+            return response('Invalid signature', 401);
+        }
 
-            // Search for orders by billing phone directly
-            $ordersResponse = Http::withBasicAuth($consumerKey, $consumerSecret)
-                ->get("{$storeUrl}/wp-json/wc/v3/orders", [
-                    'billing_phone' => $phone,
-                    'orderby' => 'date',
-                    'order' => 'desc',
-                    'per_page' => 1,
+        $inserted = DB::table('commerce_webhook_deliveries')->insertOrIgnore([
+            'channel_id' => $channel->id, 'provider' => 'woocommerce', 'event_id' => $deliveryId,
+            'topic' => $topic, 'processed_at' => now(), 'created_at' => now(), 'updated_at' => now(),
+        ]);
+        if ($inserted) {
+            SyncCommerceStore::dispatch($channel->id);
+        }
+        return response('OK', 200);
+    }
+
+    private function registerWebhooks(Channel $channel): void
+    {
+        $metadata = $channel->metadata ?? [];
+        $storeUrl = rtrim($metadata['store_url'] ?? $channel->page_id, '/');
+        $consumerKey = decrypt($metadata['consumer_key'] ?? '');
+        $consumerSecret = decrypt($metadata['consumer_secret'] ?? '');
+        $webhookSecret = decrypt($metadata['webhook_secret'] ?? '');
+        $deliveryUrl = rtrim((string) config('app.url'), '/') . '/api/woocommerce/webhook';
+        foreach (['order.created', 'order.updated', 'product.created', 'product.updated', 'customer.created', 'customer.updated'] as $topic) {
+            try {
+                $response = Http::withBasicAuth($consumerKey, $consumerSecret)->timeout(20)
+                    ->post($storeUrl . '/wp-json/wc/v3/webhooks', [
+                        'name' => 'NazBiz ' . $topic,
+                        'topic' => $topic,
+                        'delivery_url' => $deliveryUrl,
+                        'secret' => $webhookSecret,
+                        'status' => 'active',
+                    ]);
+                if (!$response->successful()) {
+                    Log::warning('WooCommerce webhook registration failed', [
+                        'channel_id' => $channel->id, 'topic' => $topic, 'status' => $response->status(),
+                    ]);
+                }
+            } catch (\Throwable $e) {
+                Log::warning('WooCommerce webhook registration error', [
+                    'channel_id' => $channel->id, 'topic' => $topic, 'error' => $e->getMessage(),
                 ]);
-
-            if (!$ordersResponse->successful() || empty($ordersResponse->json())) {
-                return response()->json(['order' => null]);
             }
-
-            $order = $ordersResponse->json()[0];
-
-            // Format order data for AI
-            $formattedOrder = $this->formatOrderForAI($order);
-
-            return response()->json([
-                'success' => true,
-                'order' => $formattedOrder,
-            ]);
-
-        } catch (\Exception $e) {
-            Log::error('WooCommerce order lookup error', [
-                'error' => $e->getMessage(),
-                'phone' => $phone,
-            ]);
-            return response()->json(['error' => 'Failed to fetch orders'], 500);
         }
     }
 
-    private function formatOrderForAI(array $order): array
+    private function normalizeStoreUrl(string $value): ?string
     {
-        $statusTranslations = [
-            'pending' => 'قيد الانتظار',
-            'processing' => 'قيد المعالجة',
-            'completed' => 'مكتمل',
-            'cancelled' => 'ملغى',
-            'refunded' => 'مسترجع',
-            'failed' => 'فشل',
-        ];
-
-        $status = $order['status'] ?? 'Unknown';
-        $displayStatus = $statusTranslations[$status] ?? $status;
-
-        $items = [];
-        foreach ($order['line_items'] ?? [] as $item) {
-            $items[] = [
-                'name' => $item['name'] ?? 'Unknown',
-                'quantity' => $item['quantity'] ?? 1,
-                'price' => ($item['price'] ?? '0') . ' ' . ($order['currency'] ?? 'USD'),
-            ];
+        $parts = parse_url(trim($value));
+        if (!$parts || strtolower($parts['scheme'] ?? '') !== 'https' || empty($parts['host'])
+            || isset($parts['user']) || isset($parts['pass']) || isset($parts['query']) || isset($parts['fragment'])) {
+            return null;
         }
-
-        $billing = $order['billing'] ?? [];
-        $shipping = $order['shipping'] ?? [];
-        
-        $shippingAddress = trim(($billing['address_1'] ?? '') . ' ' . 
-                             ($billing['address_2'] ?? '') . ' ' . 
-                             ($billing['city'] ?? '') . ' ' . 
-                             ($billing['state'] ?? '') . ' ' . 
-                             ($billing['postcode'] ?? '') . ' ' . 
-                             ($billing['country'] ?? ''));
-
-        return [
-            'order_id' => $order['number'] ?? $order['id'] ?? 'N/A',
-            'status' => $displayStatus,
-            'total' => ($order['total'] ?? '0') . ' ' . ($order['currency'] ?? 'USD'),
-            'items' => $items,
-            'customer_name' => trim(($billing['first_name'] ?? '') . ' ' . ($billing['last_name'] ?? '')),
-            'shipping_address' => $shippingAddress ?: 'Not specified',
-            'created_at' => $order['date_created'] ?? 'Not specified',
-            'tracking_number' => null,
-        ];
+        $host = strtolower($parts['host']);
+        if (!filter_var($host, FILTER_VALIDATE_DOMAIN, FILTER_FLAG_HOSTNAME)
+            || in_array($host, ['localhost', 'localhost.localdomain'], true)
+            || filter_var($host, FILTER_VALIDATE_IP, FILTER_FLAG_NO_PRIV_RANGE | FILTER_FLAG_NO_RES_RANGE) === false
+                && filter_var($host, FILTER_VALIDATE_IP)) {
+            return null;
+        }
+        $path = rtrim($parts['path'] ?? '', '/');
+        return 'https://' . $host . (isset($parts['port']) ? ':' . $parts['port'] : '') . $path;
     }
 }

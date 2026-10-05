@@ -13,6 +13,8 @@ class Customer extends Model
 
     protected $fillable = [
         'business_profile_id',
+        'commerce_channel_id',
+        'commerce_external_id',
         'name',
         'phone',
         'email',

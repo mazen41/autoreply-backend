@@ -18,6 +18,8 @@ class ProductMessageMap extends Model
         'channel_id',
         'platform_message_id',
         'salla_product_id',
+        'commerce_channel_id',
+        'commerce_external_id',
         'sku',
         'product_name',
         'product_price',

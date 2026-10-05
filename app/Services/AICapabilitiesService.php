@@ -265,14 +265,15 @@ ROLE;
         // ── Store aggregate data (pre-fetched by ProcessAutoReply from the live Salla API) ──
         $hasProductsAggregate = !empty($context['salla_products_aggregate']);
         $hasOrdersAggregate   = !empty($context['salla_orders_aggregate']);
-        $sallaConnected       = !empty($context['salla_connected']);
+        $storeConnected       = !empty($context['salla_connected']) || !empty($context['commerce_store_connected']);
+        $storeProvider        = ucfirst($context['store']['type'] ?? 'Salla');
 
         $p .= "INTENT 0 — STORE AGGREGATE QUERIES (live product/order counts and lists)\n";
         $p .= "------------------------------------------------------------\n";
         $p .= "Trigger: \"how many products/orders do you have\", \"list your products\", \"show me my orders\",\n";
         $p .= "         \"كم عدد المنتجات\", \"كم عدد الطلبات\"\n";
         $p .= "This is a store-inventory/order-count question. Answer it EXCLUSIVELY from the LIVE\n";
-        $p .= "DATA below (fetched directly from the merchant's connected Salla store for this message).\n";
+        $p .= "DATA below (fetched from the merchant's connected {$storeProvider} store for this message).\n";
         $p .= "NEVER answer it from Business Profile Information or Uploaded Knowledge Base — those describe\n";
         $p .= "the business in general terms and are NOT live inventory data, even if they happen to mention products or subscriptions.\n\n";
 
@@ -283,7 +284,7 @@ ROLE;
                 $p .= "Reply honestly that you couldn't retrieve the live product count right now (do NOT invent a number) and offer a human follow-up.\n";
                 $p .= "needs_escalation = true, escalation_reason = business_rule, intent = question\n\n";
             } else {
-                $p .= "LIVE PRODUCT DATA (fetched just now from the connected Salla store):\n";
+                $p .= "LIVE PRODUCT DATA (fetched from the connected store):\n";
                 $p .= "Total products in store: {$pa['total_count']}\n";
                 foreach (($pa['items'] ?? []) as $i => $item) {
                     $p .= ($i + 1) . ". {$item['name']} — {$item['price']} {$item['currency']}\n";
@@ -299,7 +300,7 @@ ROLE;
                 $p .= "Reply honestly that you couldn't retrieve the live order count right now (do NOT invent a number) and offer a human follow-up.\n";
                 $p .= "needs_escalation = true, escalation_reason = business_rule, intent = question\n\n";
             } else {
-                $p .= "LIVE ORDER DATA (fetched just now from the connected Salla store):\n";
+                $p .= "LIVE ORDER DATA (fetched from the connected store):\n";
                 $p .= "Total orders in store: {$oa['total_count']}\n";
                 foreach (($oa['items'] ?? []) as $i => $item) {
                     $p .= ($i + 1) . ". Order #{$item['reference_id']} — {$item['status']} — {$item['total']} {$item['currency']}\n";
@@ -309,9 +310,9 @@ ROLE;
         }
 
         if (!$hasProductsAggregate && !$hasOrdersAggregate) {
-            $p .= $sallaConnected
+            $p .= $storeConnected
                 ? "No live store data was pre-loaded for this specific message (it wasn't detected as a count/list request). If the customer is in fact asking for a product/order count or list, ask them to rephrase (e.g. \"how many products do you have?\") so the system can fetch it, rather than guessing or saying you have no access.\n\n"
-                : "No Salla store is connected for this business. If asked about live product/order counts, say the store integration isn't connected yet — do NOT guess a number.\n\n";
+                : "No commerce store is connected for this business. If asked about live product/order counts, say the store integration isn't connected yet — do NOT guess a number.\n\n";
         }
 
         $p .= "INTENT 1 — GREETING\n";
@@ -337,7 +338,7 @@ ROLE;
         $p .= "       like \"show me products\", \"i wanna see the products with images please\",\n";
         $p .= "       \"show me images\", \"show products\", \"i want to see products\".\n";
         $p .= "Classification: Always classify these as product_inquiry intent.\n";
-        $p .= "AI Response: Show the available product catalogue from the live Salla data below.\n";
+        $p .= "AI Response: Show the available product catalogue from the connected store data below.\n";
         $p .= "NEVER escalate for product inquiries — always auto-reply with the product list.\n";
         $p .= "intent = question, needs_escalation = false\n\n";
 

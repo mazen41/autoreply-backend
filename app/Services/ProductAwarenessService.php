@@ -48,6 +48,10 @@ class ProductAwarenessService
                     'stock' => $product->stock_quantity,
                     'available' => $product->stock_quantity > 0,
                     'sku' => $product->sku,
+                    'image_url' => $product->metadata['image_url'] ?? null,
+                    'url' => $product->metadata['url'] ?? null,
+                    'currency' => $product->metadata['currency'] ?? 'SAR',
+                    'variants' => $product->metadata['variants'] ?? [],
                 ];
             })->toArray();
         });
@@ -177,6 +181,8 @@ class ProductAwarenessService
                 'currency'  => $product['currency'] ?? 'SAR',
                 'available' => $product['available'] ?? true,
                 'url'       => $product['url'] ?? null,
+                'image_url' => $product['image_url'] ?? null,
+                'variants'  => $product['variants'] ?? [],
             ];
         }, $products);
     }

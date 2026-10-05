@@ -41,6 +41,14 @@ return [
         'redirect' => env('GOOGLE_LOGIN_REDIRECT_URI', env('GOOGLE_REDIRECT_URI')),
     ],
 
+    'shopify' => [
+        'client_id' => env('SHOPIFY_CLIENT_ID', env('SHOPIFY_API_KEY')),
+        'client_secret' => env('SHOPIFY_CLIENT_SECRET', env('SHOPIFY_API_SECRET')),
+        'redirect' => env('SHOPIFY_REDIRECT_URI'),
+        'scopes' => env('SHOPIFY_SCOPES', 'read_products,read_inventory,read_orders,read_customers,write_orders,write_customers,write_webhooks'),
+        'api_version' => env('SHOPIFY_API_VERSION', '2026-07'),
+    ],
+
     'facebook' => [
         'client_id' => env('FACEBOOK_CLIENT_ID'),
         'client_secret' => env('FACEBOOK_CLIENT_SECRET'),

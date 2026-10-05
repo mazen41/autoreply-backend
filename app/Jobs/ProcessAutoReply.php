@@ -445,6 +445,8 @@ class ProcessAutoReply implements ShouldQueue
             if ($productMap) {
                 $referencedProduct = [
                     'salla_product_id' => $productMap->salla_product_id,
+                    'commerce_channel_id' => $productMap->commerce_channel_id,
+                    'commerce_external_id' => $productMap->commerce_external_id,
                     'sku'              => $productMap->sku,
                     'name'             => $productMap->product_name,
                     'price'            => $productMap->product_price,
@@ -874,6 +876,62 @@ class ProcessAutoReply implements ShouldQueue
 
         $productsAggregateContext = null;
         $ordersAggregateContext   = null;
+
+        // Shopify and WooCommerce catalogs are synced into the local product
+        // table. Feed the selected store's products into the same aggregate
+        // and image-send path used by Salla, so browsing requests do not fall
+        // back to an empty list just because the store is not Salla.
+        $commerceChannel = null;
+        if ($bot && !empty($bot->ecommerce_channel_id)) {
+            $commerceChannel = Channel::where('id', $bot->ecommerce_channel_id)
+                ->where('user_id', $user->id)
+                ->whereIn('type', ['shopify', 'woocommerce'])
+                ->where('status', 'connected')->first();
+        }
+        if (!$commerceChannel && in_array($channel->type, ['shopify', 'woocommerce'], true) && $channel->status === 'connected') {
+            $commerceChannel = $channel;
+        }
+        if (!$commerceChannel && !$sallaChannel) {
+            $commerceStores = Channel::where('user_id', $user->id)
+                ->whereIn('type', ['shopify', 'woocommerce'])->where('status', 'connected')->get();
+            if ($commerceStores->count() === 1) {
+                $commerceChannel = $commerceStores->first();
+            }
+        }
+        if (!$sallaChannel && $commerceChannel && $isProductAggregate) {
+            $commerceProducts = \App\Models\Product::where('business_id', $commerceChannel->business_id)
+                ->where('commerce_channel_id', $commerceChannel->id)
+                ->where('is_active', true)
+                ->orderBy('name')->limit(10)->get();
+            $productsAggregateContext = [
+                'total_count' => \App\Models\Product::where('commerce_channel_id', $commerceChannel->id)->where('is_active', true)->count(),
+                'items' => $commerceProducts->map(function ($product) use ($commerceChannel) {
+                    $metadata = $product->metadata ?? [];
+                    return [
+                        'id' => (string) $product->commerce_external_id,
+                        'name' => $product->name,
+                        'price' => (float) $product->price,
+                        'currency' => $metadata['currency'] ?? 'SAR',
+                        'quantity' => (int) $product->stock_quantity,
+                        'sku' => $product->sku,
+                        'image_url' => $metadata['image_url'] ?? null,
+                        'url' => $metadata['url'] ?? null,
+                        'commerce_channel_id' => $commerceChannel->id,
+                        'commerce_external_id' => (string) $product->commerce_external_id,
+                    ];
+                })->values()->all(),
+            ];
+            $productsContext = array_map(fn ($item) => [
+                'id' => $item['id'], 'name' => $item['name'], 'price' => $item['price'],
+                'currency' => $item['currency'], 'available' => $item['quantity'] > 0,
+                'url' => $item['url'], 'image_url' => $item['image_url'],
+            ], $productsAggregateContext['items']);
+            Log::info('ProcessAutoReply: commerce products aggregate loaded from synced catalog', [
+                'channel_id' => $commerceChannel->id,
+                'provider' => $commerceChannel->type,
+                'total_count' => $productsAggregateContext['total_count'],
+            ]);
+        }
 
         if ($sallaChannel) {
 
@@ -1463,9 +1521,10 @@ class ProcessAutoReply implements ShouldQueue
             ],
             // The specific store whose live data (if any) was injected below.
             'store'          => $sallaChannel ? [
-                'type' => 'salla',
-                'name' => $sallaChannel->page_name ?? null,
-            ] : null,
+                'type' => 'salla', 'name' => $sallaChannel->page_name ?? null,
+            ] : ($commerceChannel ? [
+                'type' => $commerceChannel->type, 'name' => $commerceChannel->page_name ?? null,
+            ] : null),
             'customer'       => $customerContext,
             'knowledge_base' => (function() use ($business, $bot, $channel, $message, $isSallaFlow) {
                 if (!$business || $isSallaFlow) {
@@ -1543,6 +1602,7 @@ class ProcessAutoReply implements ShouldQueue
             'salla_products_aggregate' => $productsAggregateContext,
             'salla_orders_aggregate'   => $ordersAggregateContext,
             'salla_connected'          => (bool) $sallaChannel,
+            'commerce_store_connected' => (bool) $commerceChannel,
             // CRITICAL ISSUE — REPLY-TO-PRODUCT CONTEXT: the product the
             // customer deterministically referenced by replying to its image,
             // if any. See getUltimateSystemPrompt() — when present, the AI
@@ -2620,7 +2680,9 @@ class ProcessAutoReply implements ShouldQueue
                         ],
                         [
                             'channel_id'       => $channel->id,
-                            'salla_product_id' => isset($item['id']) ? (string) $item['id'] : null,
+                            'salla_product_id' => empty($item['commerce_channel_id']) && isset($item['id']) ? (string) $item['id'] : null,
+                            'commerce_channel_id' => $item['commerce_channel_id'] ?? null,
+                            'commerce_external_id' => $item['commerce_external_id'] ?? null,
                             'sku'              => $item['sku'] ?? null,
                             'product_name'     => $item['name'] ?? null,
                             'product_price'    => isset($item['price']) ? (string) $item['price'] : null,
@@ -2637,6 +2699,8 @@ class ProcessAutoReply implements ShouldQueue
                         'conversation_id'     => $conversation->id,
                         'platform_message_id' => $sentMessageId,
                         'salla_product_id'    => isset($item['id']) ? (string) $item['id'] : null,
+                        'commerce_channel_id' => $item['commerce_channel_id'] ?? null,
+                        'commerce_external_id' => $item['commerce_external_id'] ?? null,
                     ]);
                 } catch (\Exception $e) {
                     Log::error('ProcessAutoReply: failed to persist product message map', [

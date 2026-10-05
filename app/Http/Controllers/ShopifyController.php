@@ -2,353 +2,251 @@
 
 namespace App\Http\Controllers;
 
+use App\Jobs\SyncCommerceStore;
 use App\Models\Channel;
-use App\Models\Conversation;
-use App\Models\Message;
+use App\Models\CommerceOrder;
 use Illuminate\Http\Request;
+use Illuminate\Support\Facades\Cache;
+use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Http;
 use Illuminate\Support\Facades\Log;
+use Illuminate\Support\Str;
 
 class ShopifyController extends Controller
 {
     public function connect(Request $request)
     {
-        $shopDomain = $request->query('shop');
-        if (!$shopDomain) {
-            return response()->json(['error' => 'Shop domain is required'], 400);
+        $validated = $request->validate(['shop_domain' => ['required', 'string', 'max:255']]);
+        $shop = $this->normalizeShop($validated['shop_domain']);
+        if (!$shop) {
+            return response()->json(['error' => 'Enter a valid myshopify.com store domain.'], 422);
         }
 
-        $token = $request->query('token');
-        $accessToken = \Laravel\Sanctum\PersonalAccessToken::findToken($token);
-        if (!$accessToken) {
-            return redirect(env('FRONTEND_URL') . '/dashboard/channels?error=unauthorized');
+        $clientId = config('services.shopify.client_id');
+        $redirect = config('services.shopify.redirect');
+        if (!$clientId || !$redirect || !config('services.shopify.client_secret')) {
+            return response()->json(['error' => 'Shopify is not configured on the server.'], 503);
         }
-        $user = $accessToken->tokenable;
-        $state = $user->id . ':' . $request->query('redirect', 'dashboard');
 
-        $apiKey = env('SHOPIFY_API_KEY');
-        $redirectUri = env('SHOPIFY_REDIRECT_URI');
+        // The Shopify details supplied for this app specify managed installation
+        // (use_legacy_install_flow=false). This backend implements authorization-code
+        // OAuth, which Shopify will not invoke for managed installations.
+        if (!filter_var(env('SHOPIFY_USE_LEGACY_INSTALL_FLOW', false), FILTER_VALIDATE_BOOLEAN)) {
+            return response()->json([
+                'error' => 'Shopify is configured for managed installation. Enable the legacy install flow for this OAuth callback, or implement App Bridge token exchange for the embedded app.',
+            ], 409);
+        }
 
-        $scopes = implode(',', [
-            'read_products',
-            'read_orders',
-            'read_customers',
-            'read_content',
-        ]);
+        $state = Str::random(48);
+        Cache::put('shopify_oauth_state:' . hash('sha256', $state), [
+            'user_id' => (int) $request->user()->id,
+            'shop' => $shop,
+            'created_at' => now()->timestamp,
+        ], now()->addMinutes(10));
 
-        $installUrl = "https://{$shopDomain}/admin/oauth/authorize?" . http_build_query([
-            'client_id' => $apiKey,
-            'scope' => $scopes,
-            'redirect_uri' => $redirectUri,
+        $params = [
+            'client_id' => $clientId,
+            'redirect_uri' => $redirect,
             'response_type' => 'code',
             'state' => $state,
-        ]);
+        ];
+        $params['scope'] = config('services.shopify.scopes');
 
-        return redirect($installUrl);
+        return response()->json([
+            'authorization_url' => 'https://' . $shop . '/admin/oauth/authorize?' . http_build_query($params),
+        ]);
     }
 
     public function callback(Request $request)
     {
-        Log::info('=== SHOPIFY CALLBACK START ===');
-        Log::info('All request params', $request->all());
-
-        $code = $request->get('code');
-        $shop = $request->get('shop');
-        $stateParts = explode(':', $request->get('state') ?? '');
-        $userId = $stateParts[0] ?? null;
-        $error = $request->get('error');
-
-        if ($error || !$code) {
-            Log::error('Shopify OAuth denied or no code', ['error' => $error]);
-            return redirect(env('FRONTEND_URL') . '/dashboard/channels?error=shopify_denied');
+        $secret = config('services.shopify.client_secret');
+        $shop = $this->normalizeShop((string) $request->query('shop', ''));
+        if (!$secret || !$shop || !$this->validCallbackHmac($request, $secret)) {
+            return redirect($this->frontendUrl() . '/dashboard/channels?error=shopify_invalid_callback');
         }
 
-        if (!$userId) {
-            Log::error('No user ID in Shopify state');
-            return redirect(env('FRONTEND_URL') . '/dashboard/channels?error=session_expired');
+        $timestamp = filter_var($request->query('timestamp'), FILTER_VALIDATE_INT);
+        if (!$timestamp || abs(now()->timestamp - $timestamp) > 600) {
+            return redirect($this->frontendUrl() . '/dashboard/channels?error=shopify_expired_callback');
         }
 
-        $apiKey = env('SHOPIFY_API_KEY');
-        $apiSecret = env('SHOPIFY_API_SECRET');
-        $redirectUri = env('SHOPIFY_REDIRECT_URI');
+        $state = (string) $request->query('state', '');
+        $stateData = $state !== '' ? Cache::pull('shopify_oauth_state:' . hash('sha256', $state)) : null;
+        if (!$stateData || ($stateData['shop'] ?? null) !== $shop || empty($stateData['user_id'])
+            || now()->timestamp - (int) ($stateData['created_at'] ?? 0) > 600) {
+            return redirect($this->frontendUrl() . '/dashboard/channels?error=shopify_invalid_state');
+        }
+
+        $code = $request->query('code');
+        if (!$code || $request->query('error')) {
+            return redirect($this->frontendUrl() . '/dashboard/channels?error=shopify_cancelled');
+        }
 
         try {
-            // Exchange code for access token
-            $tokenResponse = Http::asForm()->post("https://{$shop}/admin/oauth/access_token", [
-                'client_id' => $apiKey,
-                'client_secret' => $apiSecret,
+            $tokenResponse = Http::asForm()->timeout(20)->post("https://{$shop}/admin/oauth/access_token", [
+                'client_id' => config('services.shopify.client_id'),
+                'client_secret' => $secret,
                 'code' => $code,
-                'grant_type' => 'authorization_code',
-                'redirect_uri' => $redirectUri,
             ]);
-
-            if (!$tokenResponse->successful()) {
-                Log::error('Shopify token exchange failed', [
-                    'status' => $tokenResponse->status(),
-                    'body' => $tokenResponse->json(),
+            if (!$tokenResponse->successful() || !$tokenResponse->json('access_token')) {
+                Log::warning('Shopify OAuth token exchange failed', ['status' => $tokenResponse->status(), 'shop' => $shop]);
+                return redirect($this->frontendUrl() . '/dashboard/channels?error=shopify_authorization_failed');
+            }
+            $token = $tokenResponse->json('access_token');
+            $shopResponse = Http::withHeaders(['X-Shopify-Access-Token' => $token, 'Accept' => 'application/json'])
+                ->timeout(20)->post("https://{$shop}/admin/api/" . config('services.shopify.api_version', '2026-07') . '/graphql.json', [
+                    'query' => 'query { shop { id name myshopifyDomain } }',
                 ]);
-                return redirect(env('FRONTEND_URL') . '/dashboard/channels?error=token_failed');
+            $shopInfo = $shopResponse->json('data.shop');
+            if (!$shopResponse->successful() || !$shopInfo || strtolower($shopInfo['myshopifyDomain'] ?? '') !== $shop) {
+                Log::warning('Shopify shop verification failed', ['status' => $shopResponse->status(), 'shop' => $shop]);
+                return redirect($this->frontendUrl() . '/dashboard/channels?error=shopify_verification_failed');
             }
 
-            $tokenData = $tokenResponse->json();
-            $accessToken = $tokenData['access_token'] ?? null;
-
-            if (!$accessToken) {
-                Log::error('No access token in Shopify response');
-                return redirect(env('FRONTEND_URL') . '/dashboard/channels?error=token_failed');
-            }
-
-            // Get shop info
-            $shopResponse = Http::withToken($accessToken)
-                ->get("https://{$shop}/admin/api/2024-01/shop.json");
-
-            if (!$shopResponse->successful()) {
-                Log::error('Failed to get Shopify shop info', [
-                    'status' => $shopResponse->status(),
-                    'body' => $shopResponse->json(),
-                ]);
-                return redirect(env('FRONTEND_URL') . '/dashboard/channels?error=shop_info_failed');
-            }
-
-            $shopInfo = $shopResponse->json();
-            $shopName = $shopInfo['shop']['name'] ?? $shop;
-
-            // Save channel
-            $businessProfile = \App\Models\BusinessProfile::where('user_id', $userId)->first();
-
+            $business = \App\Models\BusinessProfile::firstOrCreate(['user_id' => $stateData['user_id']]);
             $channel = Channel::updateOrCreate(
+                ['user_id' => $stateData['user_id'], 'type' => 'shopify', 'page_id' => $shop],
                 [
-                    'user_id' => $userId,
-                    'type' => 'shopify',
-                    'page_id' => $shop,
-                ],
-                [
-                    'page_name' => $shopName,
-                    'access_token' => $accessToken,
+                    'business_id' => $business->id,
+                    'page_name' => $shopInfo['name'] ?? $shop,
+                    'access_token' => $token,
                     'status' => 'connected',
                     'connected_at' => now(),
-                    'business_id' => $businessProfile ? $businessProfile->id : null,
                     'metadata' => [
                         'shop_domain' => $shop,
-                        'shop_name' => $shopName,
+                        'shop_gid' => $shopInfo['id'] ?? null,
+                        'sync_status' => 'queued',
+                        'sync_counts' => ['products' => 0, 'orders' => 0, 'customers' => 0],
+                        'granted_scopes' => $tokenResponse->json('scope'),
                     ],
                 ]
             );
 
-            // Register webhook for order updates
-            $this->registerWebhook($shop, $accessToken);
+            $this->registerWebhooks($channel);
+            SyncCommerceStore::dispatch($channel->id);
 
-            Log::info('Shopify channel connected', [
-                'user_id' => $userId,
-                'shop' => $shop,
-                'shop_name' => $shopName,
-                'channel_id' => $channel->id,
-            ]);
-
-            return redirect(env('FRONTEND_URL') . '/dashboard/channels?success=shopify_connected');
-
-        } catch (\Exception $e) {
-            Log::error('Shopify connection error', [
-                'user_id' => $userId,
-                'error' => $e->getMessage(),
-                'trace' => $e->getTraceAsString(),
-            ]);
-            return redirect(env('FRONTEND_URL') . '/dashboard/channels?error=connection_failed');
+            return redirect($this->frontendUrl() . '/dashboard/channels?success=shopify_connected');
+        } catch (\Throwable $e) {
+            Log::error('Shopify connection failed', ['shop' => $shop, 'error' => $e->getMessage()]);
+            return redirect($this->frontendUrl() . '/dashboard/channels?error=shopify_connection_failed');
         }
     }
 
-    public function getOrders(Request $request)
+    public function sync(Request $request, int $channelId)
     {
-        $phone = $request->query('phone');
-        if (!$phone) {
-            return response()->json(['error' => 'Phone number is required'], 400);
-        }
-
-        // Exact resolution: if a specific channel_id is provided (e.g. the
-        // dashboard already knows which store the user is viewing), use it.
-        // Otherwise, only auto-resolve when the account has exactly ONE
-        // connected Shopify store — with multiple stores there is no
-        // "first" that's safe to guess; the caller must specify which one.
-        $channelId = $request->query('channel_id');
-        if ($channelId) {
-            $channel = Channel::where('type', 'shopify')
-                ->where('id', $channelId)
-                ->where('user_id', auth()->id())
-                ->where('status', 'connected')
-                ->first();
-
-            if (!$channel) {
-                return response()->json(['error' => 'Shopify channel not connected'], 404);
-            }
-        } else {
-            $candidates = Channel::where('type', 'shopify')
-                ->where('user_id', auth()->id())
-                ->where('status', 'connected')
-                ->get();
-
-            if ($candidates->count() === 0) {
-                return response()->json(['error' => 'Shopify channel not connected'], 404);
-            }
-
-            if ($candidates->count() > 1) {
-                return response()->json([
-                    'error' => 'Multiple Shopify stores are connected — specify channel_id',
-                    'channels' => $candidates->map(fn ($c) => ['id' => $c->id, 'name' => $c->page_name])->values(),
-                ], 409);
-            }
-
-            $channel = $candidates->first();
-        }
-
-        try {
-            $shop = $channel->page_id;
-            $accessToken = $channel->access_token;
-
-            // Search for customer by phone
-            $customerResponse = Http::withToken($accessToken)
-                ->get("https://{$shop}/admin/api/2024-01/customers/search.json?query={$phone}");
-
-            if (!$customerResponse->successful() || empty($customerResponse->json()['customers'])) {
-                return response()->json(['error' => 'No customer found with this phone'], 404);
-            }
-
-            $customer = $customerResponse->json()['customers'][0];
-            $customerId = $customer['id'];
-
-            // Get customer orders
-            $ordersResponse = Http::withToken($accessToken)
-                ->get("https://{$shop}/admin/api/2024-01/orders.json?customer_id={$customerId}&status=any&limit=1&sort_by=created_at&sort_order=desc");
-
-            if (!$ordersResponse->successful() || empty($ordersResponse->json()['orders'])) {
-                return response()->json(['error' => 'No orders found for this customer'], 404);
-            }
-
-            $order = $ordersResponse->json()['orders'][0];
-
-            // Format order data for AI (same pattern as Salla)
-            $formattedOrder = $this->formatOrderForAI($order);
-
-            return response()->json([
-                'success' => true,
-                'order' => $formattedOrder,
-                'raw_order' => $order,
-            ]);
-
-        } catch (\Exception $e) {
-            Log::error('Shopify order lookup error', [
-                'error' => $e->getMessage(),
-                'phone' => $phone,
-            ]);
-            return response()->json(['error' => 'Failed to fetch orders'], 500);
-        }
-    }
-
-    private function formatOrderForAI(array $order): string
-    {
-        $orderNumber = $order['order_number'] ?? $order['id'] ?? 'N/A';
-        $status = $order['financial_status'] ?? 'Unknown';
-        $total = $order['total_price'] ?? '0';
-        $currency = $order['currency'] ?? 'USD';
-        $processedAt = $order['processed_at'] ?? 'Not specified';
-
-        $products = [];
-        foreach ($order['line_items'] ?? [] as $item) {
-            $products[] = ($item['title'] ?? 'Unknown') . ' x' . ($item['quantity'] ?? 1);
-        }
-
-        return "Order #{$orderNumber}\nStatus: {$status}\nTotal: {$total} {$currency}\n" .
-               "Products: " . implode(', ', $products) . "\n" .
-               "Processed At: {$processedAt}";
-    }
-
-    private function registerWebhook(string $shop, string $accessToken)
-    {
-        try {
-            $webhookUrl = env('APP_URL') . '/api/shopify/webhook';
-            $topic = 'orders/create';
-
-            $response = Http::withToken($accessToken)
-                ->post("https://{$shop}/admin/api/2024-01/webhooks.json", [
-                    'webhook' => [
-                        'topic' => $topic,
-                        'address' => $webhookUrl,
-                        'format' => 'json',
-                    ],
-                ]);
-
-            if ($response->successful()) {
-                Log::info('Shopify webhook registered', [
-                    'shop' => $shop,
-                    'webhook_url' => $webhookUrl,
-                    'topic' => $topic,
-                ]);
-            } else {
-                Log::error('Failed to register Shopify webhook', [
-                    'shop' => $shop,
-                    'response' => $response->json(),
-                ]);
-            }
-        } catch (\Exception $e) {
-            Log::error('Shopify webhook registration error', [
-                'shop' => $shop,
-                'error' => $e->getMessage(),
-            ]);
-        }
+        $channel = Channel::where('id', $channelId)->where('type', 'shopify')
+            ->where('user_id', $request->user()->id)->where('status', 'connected')->firstOrFail();
+        $metadata = $channel->metadata ?? [];
+        $metadata['sync_status'] = 'queued';
+        $channel->forceFill(['metadata' => $metadata])->save();
+        SyncCommerceStore::dispatch($channel->id);
+        return response()->json(['success' => true, 'status' => 'queued']);
     }
 
     public function webhook(Request $request)
     {
-        try {
-            $topic = $request->header('X-Shopify-Topic');
-            $shop = $request->header('X-Shopify-Shop-Domain');
-            $payload = $request->all();
+        $raw = $request->getContent();
+        $provided = (string) $request->header('X-Shopify-Hmac-Sha256', '');
+        $expected = base64_encode(hash_hmac('sha256', $raw, (string) config('services.shopify.client_secret'), true));
+        if ($provided === '' || !hash_equals($expected, $provided)) {
+            return response('Invalid signature', 401);
+        }
 
-            Log::info('Shopify webhook received', [
-                'topic' => $topic,
-                'shop' => $shop,
-            ]);
+        $shop = $this->normalizeShop((string) $request->header('X-Shopify-Shop-Domain', ''));
+        $eventId = (string) $request->header('X-Shopify-Webhook-Id', '');
+        $topic = (string) $request->header('X-Shopify-Topic', '');
+        $channel = $shop ? Channel::where('type', 'shopify')->where('page_id', $shop)->where('status', 'connected')->first() : null;
+        if (!$channel || $eventId === '') {
+            return response('Unknown store or delivery', 404);
+        }
 
-            // Handle order creation
-            if ($topic === 'orders/create') {
-                $order = $payload;
-                $customerPhone = $order['customer']['phone'] ?? '';
-
-                if (!empty($customerPhone)) {
-                    // Find channel by shop domain
-                    $channel = Channel::where('type', 'shopify')
-                        ->where('page_id', $shop)
-                        ->where('status', 'connected')
-                        ->first();
-
-                    if ($channel) {
-                        // Check if conversation exists for this customer
-                        $conversation = Conversation::where('channel_id', $channel->id)
-                            ->where('sender_id', $customerPhone)
-                            ->first();
-
-                        if ($conversation) {
-                            // Send order info as system message
-                            $formattedOrder = $this->formatOrderForAI($order);
-                            Message::create([
-                                'conversation_id' => $conversation->id,
-                                'content' => "New order received:\n\n{$formattedOrder}",
-                                'direction' => 'inbound',
-                                'is_ai' => false,
-                                'status' => 'received',
-                            ]);
-                        }
-                    }
-                }
-            }
-
-            return response('OK', 200);
-
-        } catch (\Exception $e) {
-            Log::error('Shopify webhook error', [
-                'error' => $e->getMessage(),
-                'trace' => $e->getTraceAsString(),
-            ]);
+        $inserted = DB::table('commerce_webhook_deliveries')->insertOrIgnore([
+            'channel_id' => $channel->id, 'provider' => 'shopify', 'event_id' => $eventId,
+            'topic' => $topic, 'processed_at' => now(), 'created_at' => now(), 'updated_at' => now(),
+        ]);
+        if (!$inserted) {
             return response('OK', 200);
         }
+
+        if ($topic === 'app/uninstalled') {
+            $channel->delete();
+            return response('OK', 200);
+        }
+
+        SyncCommerceStore::dispatch($channel->id);
+        return response('OK', 200);
+    }
+
+    public function getOrders(Request $request)
+    {
+        $request->validate(['phone' => 'required|string|max:40', 'channel_id' => 'nullable|integer']);
+        $query = Channel::where('type', 'shopify')->where('user_id', $request->user()->id)->where('status', 'connected');
+        if ($request->filled('channel_id')) {
+            $query->whereKey($request->integer('channel_id'));
+        }
+        $channels = $query->get();
+        if ($channels->count() !== 1) {
+            return response()->json(['error' => $channels->isEmpty() ? 'Shopify channel not connected' : 'Specify channel_id'], $channels->isEmpty() ? 404 : 409);
+        }
+
+        $orders = CommerceOrder::where('channel_id', $channels->first()->id)
+            ->where('customer_phone', $request->query('phone'))->latest('ordered_at')->limit(1)->get();
+        if ($orders->isEmpty()) {
+            return response()->json(['error' => 'No order found for this phone'], 404);
+        }
+        return response()->json(['success' => true, 'order' => $orders->first()]);
+    }
+
+    private function registerWebhooks(Channel $channel): void
+    {
+        $domain = $channel->page_id;
+        $version = config('services.shopify.api_version', '2026-07');
+        $callback = rtrim((string) config('app.url'), '/') . '/api/shopify/webhook';
+        $topics = [
+            'PRODUCTS_CREATE', 'PRODUCTS_UPDATE', 'INVENTORY_LEVELS_UPDATE',
+            'ORDERS_CREATE', 'ORDERS_UPDATED', 'ORDERS_CANCELLED',
+            'FULFILLMENTS_CREATE', 'FULFILLMENTS_UPDATE', 'CUSTOMERS_CREATE', 'CUSTOMERS_UPDATE',
+            'APP_UNINSTALLED',
+        ];
+        foreach ($topics as $topic) {
+            try {
+                $response = Http::withHeaders(['X-Shopify-Access-Token' => $channel->access_token])
+                    ->timeout(20)->post("https://{$domain}/admin/api/{$version}/graphql.json", [
+                        'query' => 'mutation CreateWebhook($topic: WebhookSubscriptionTopic!, $webhookSubscription: WebhookSubscriptionInput!) { webhookSubscriptionCreate(topic: $topic, webhookSubscription: $webhookSubscription) { userErrors { field message } webhookSubscription { id uri } } }',
+                        'variables' => ['topic' => $topic, 'webhookSubscription' => ['uri' => $callback, 'format' => 'JSON']],
+                    ]);
+                if (!$response->successful() || !empty($response->json('errors')) || !empty($response->json('data.webhookSubscriptionCreate.userErrors'))) {
+                    Log::warning('Shopify webhook subscription was not created', ['channel_id' => $channel->id, 'topic' => $topic]);
+                }
+            } catch (\Throwable $e) {
+                Log::warning('Shopify webhook subscription failed', ['channel_id' => $channel->id, 'topic' => $topic, 'error' => $e->getMessage()]);
+            }
+        }
+    }
+
+    private function validCallbackHmac(Request $request, string $secret): bool
+    {
+        $params = $request->query();
+        $given = (string) ($params['hmac'] ?? '');
+        unset($params['hmac'], $params['signature']);
+        if ($given === '') {
+            return false;
+        }
+        ksort($params, SORT_STRING);
+        $message = http_build_query($params, '', '&', PHP_QUERY_RFC3986);
+        return hash_equals(hash_hmac('sha256', $message, $secret), $given);
+    }
+
+    private function normalizeShop(string $shop): ?string
+    {
+        $shop = strtolower(trim($shop));
+        $shop = preg_replace('#^https?://#', '', $shop);
+        $shop = rtrim($shop, '/');
+        return preg_match('/\A[a-z0-9][a-z0-9-]*\.myshopify\.com\z/D', $shop) ? $shop : null;
+    }
+
+    private function frontendUrl(): string
+    {
+        return rtrim((string) config('app.frontend_url', env('FRONTEND_URL', '')), '/');
     }
 }

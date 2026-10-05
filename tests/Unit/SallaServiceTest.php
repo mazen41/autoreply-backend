@@ -222,6 +222,8 @@ class SallaServiceTest extends TestCase
                 ], 200),
         ]);
 
+        $this->sallaService->syncCityCatalog($channel, 'EG');
+
         $shippingAddress = $this->sallaService->resolveShippingAddressForChannel(
             $channel,
             '36 Sayed Abdelrahman Mohamed, Giza Faisal Street',

@@ -4,6 +4,7 @@ namespace App\Services;
 
 use Illuminate\Support\Facades\Http;
 use Illuminate\Support\Facades\Log;
+use Illuminate\Support\Facades\DB;
 use App\Models\Channel;
 
 class SallaService
@@ -606,53 +607,66 @@ class SallaService
     }
 
     /**
-     * Search paginated Salla city results. Salla defaults to 15 records per page,
-     * but supports up to 60. Use the maximum to keep checkout lookups bounded.
-     *
-     * @return array{id: ?int, names: array<int, string>}
+     * Download one country's Salla city list into the local catalog.
+     * Salla permits at most 60 cities per page; checkout reads this catalog
+     * locally so it never performs a multi-page network scan while placing an order.
      */
-    protected function findCityInPaginatedSallaResponse(
-        Channel $channel,
-        int|string $countryId,
-        string $endpoint,
-        string $address
-    ): array {
-        $addressLower = mb_strtolower($address);
-        $availableCityNames = [];
-        $matchedCityId = null;
-        $maxPages = 200;
+    public function syncCityCatalog(Channel $channel, string $countryCode): int
+    {
+        $countryCode = strtoupper(trim($countryCode));
+        $countriesResponse = $this->apiCallForChannel($channel, 'GET', '/countries');
+        $country = collect($countriesResponse['data'] ?? [])->first(
+            fn ($candidate) => strtoupper((string) ($candidate['code'] ?? '')) === $countryCode
+        );
+        $countryId = $country['id'] ?? null;
 
-        for ($page = 1; $page <= $maxPages; $page++) {
-            $response = $this->cachedSallaResponse(
-                "salla_cities_v3_ch_{$channel->id}_{$countryId}_page_{$page}",
-                $endpoint,
-                fn () => $this->apiCallForChannel($channel, 'GET', $endpoint, [
-                    'page' => $page,
-                    'per_page' => 60,
-                ])
-            );
+        if (!$countryId) {
+            throw new \RuntimeException("Salla country {$countryCode} was not found in the country catalog.");
+        }
 
-            foreach ($response['data'] ?? [] as $city) {
-                $cityNames = array_filter([
-                    $city['name'] ?? null,
-                    $city['name_en'] ?? null,
-                    $city['name_ar'] ?? null,
-                ], fn ($name) => is_scalar($name));
+        $endpoint = "/countries/{$countryId}/cities";
+        $totalSynced = 0;
+        $now = now();
 
-                foreach ($cityNames as $cityName) {
-                    $cityName = trim((string) $cityName);
-                    if ($cityName === '') {
+        for ($page = 1; $page <= 500; $page++) {
+            $response = $this->apiCallForChannel($channel, 'GET', $endpoint, [
+                'page' => $page,
+                'per_page' => 60,
+            ]);
+            $cities = $response['data'] ?? [];
+
+            if ($page === 1 && empty($cities)) {
+                throw new \RuntimeException("Salla returned no cities for {$countryCode}; local catalog was not updated.");
+            }
+
+            if ($cities) {
+                $rows = [];
+                foreach ($cities as $city) {
+                    if (empty($city['id'])) {
                         continue;
                     }
 
-                    $availableCityNames[] = $cityName;
-                    if (str_contains($addressLower, mb_strtolower($cityName))) {
-                        $matchedCityId = (int) ($city['id'] ?? 0) ?: null;
-                    }
+                    $rows[] = [
+                        'channel_id' => $channel->id,
+                        'country_code' => $countryCode,
+                        'country_id' => (int) $countryId,
+                        'salla_city_id' => (int) $city['id'],
+                        'name' => (string) ($city['name'] ?? $city['name_en'] ?? $city['name_ar'] ?? ''),
+                        'name_en' => isset($city['name_en']) ? (string) $city['name_en'] : null,
+                        'name_ar' => isset($city['name_ar']) ? (string) $city['name_ar'] : null,
+                        'synced_at' => $now,
+                        'created_at' => $now,
+                        'updated_at' => $now,
+                    ];
                 }
 
-                if ($matchedCityId) {
-                    break 2;
+                if ($rows) {
+                    DB::table('salla_cities')->upsert(
+                        $rows,
+                        ['channel_id', 'country_code', 'salla_city_id'],
+                        ['country_id', 'name', 'name_en', 'name_ar', 'synced_at', 'updated_at']
+                    );
+                    $totalSynced += count($rows);
                 }
             }
 
@@ -662,12 +676,31 @@ class SallaService
             if (!$hasNextPage) {
                 break;
             }
+
+            if ($page === 500) {
+                throw new \RuntimeException('Salla city pagination exceeded the 500-page safety limit.');
+            }
         }
 
-        return [
-            'id' => $matchedCityId,
-            'names' => array_values(array_unique($availableCityNames)),
-        ];
+        DB::table('salla_cities')
+            ->where('channel_id', $channel->id)
+            ->where('country_code', $countryCode)
+            ->where('synced_at', '<', $now)
+            ->delete();
+
+        return $totalSynced;
+    }
+
+    protected function normalizeCitySearchText(string $value): string
+    {
+        $value = mb_strtolower(trim($value));
+        $value = preg_replace('/[^\\p{L}\\p{N}\\s]/u', ' ', $value) ?? $value;
+        $value = preg_replace('/\\s+/u', ' ', $value) ?? $value;
+        $value = trim($value);
+
+        // Salla names may include the common transliterated prefixes "Al"/"El"
+        // while customers usually write the shorter city name (e.g. "Giza").
+        return preg_replace('/^(?:al|el)\\s+/u', '', $value) ?? $value;
     }
 
     /**
@@ -680,9 +713,8 @@ class SallaService
             return null;
         }
 
-        // Salla exposes cities under /countries/{country}/cities; /cities is not
-        // a valid Admin API endpoint. Resolve the country ID from Salla's country
-        // catalog using the same normalized calling code used for the customer.
+        // Match the phone's country to the locally synced Salla catalog, keeping
+        // network pagination out of the checkout/order-creation path.
         $phoneData = $this->normalizePhoneForCustomer($phone);
         $countryCode = match ($phoneData['mobile_code_country']) {
             '+20' => 'EG', '+966' => 'SA', '+971' => 'AE', '+965' => 'KW',
@@ -692,50 +724,34 @@ class SallaService
             '+49' => 'DE', default => 'SA',
         };
 
-        try {
-            $countriesRes = $this->cachedSallaResponse(
-                "salla_countries_ch_{$channel->id}",
-                "/countries",
-                fn () => $this->apiCallForChannel($channel, 'GET', '/countries')
-            );
-            $country = collect($countriesRes['data'] ?? [])->first(
-                fn ($candidate) => strtoupper((string) ($candidate['code'] ?? '')) === $countryCode
-            );
-            $countryId = $country['id'] ?? null;
-
-            if (!$countryId) {
-                Log::warning('SallaService: country code not found in Salla country catalog', [
-                    'channel_id' => $channel->id,
-                    'country_code' => $countryCode,
-                ]);
-                return null;
-            }
-        } catch (\Exception $e) {
-            Log::warning('SallaService: GET /countries lookup failed for channel', [
-                'channel_id' => $channel->id,
-                'error' => $e->getMessage(),
-            ]);
-            return null;
-        }
-
-        // Fetch cities using the country-specific route documented by Salla.
+        $cities = DB::table('salla_cities')
+            ->where('channel_id', $channel->id)
+            ->where('country_code', $countryCode)
+            ->get();
+        $countryId = $cities->first()->country_id ?? null;
         $matchedCityId = null;
+        $matchedCityNameLength = 0;
         $availableCityNames = [];
-        try {
-            $citiesEndpoint = "/countries/{$countryId}/cities";
-            $cityMatch = $this->findCityInPaginatedSallaResponse(
-                $channel,
-                $countryId,
-                $citiesEndpoint,
-                $freeformAddress
-            );
-            $matchedCityId = $cityMatch['id'];
-            $availableCityNames = $cityMatch['names'];
-        } catch (\Exception $e) {
-            Log::warning('SallaService: GET /cities lookup failed for channel', [
-                'channel_id' => $channel->id,
-                'error'      => $e->getMessage(),
-            ]);
+
+        $normalizedAddress = $this->normalizeCitySearchText($freeformAddress);
+        foreach ($cities as $city) {
+            foreach ([$city->name, $city->name_en, $city->name_ar] as $cityName) {
+                $cityName = trim((string) $cityName);
+                if ($cityName === '') {
+                    continue;
+                }
+
+                $availableCityNames[] = $cityName;
+                $normalizedCityName = $this->normalizeCitySearchText($cityName);
+                $cityNameLength = mb_strlen($normalizedCityName);
+                if (
+                    $cityNameLength > $matchedCityNameLength
+                    && str_contains($normalizedAddress, $normalizedCityName)
+                ) {
+                    $matchedCityId = (int) $city->salla_city_id;
+                    $matchedCityNameLength = $cityNameLength;
+                }
+            }
         }
 
         // STRICT RULE 1: If city cannot be matched against merchant's Salla city list, DO NOT fake city_id = 1! Return null.
@@ -745,6 +761,7 @@ class SallaService
                 'country_id' => (int) $countryId,
                 'country_code' => $countryCode,
                 'address'    => $freeformAddress,
+                'catalog_synced' => $cities->isNotEmpty(),
                 'cities_checked' => count($availableCityNames),
                 'available_city_names_sample' => array_slice($availableCityNames, 0, 30),
             ]);

@@ -6,6 +6,7 @@ use Illuminate\Foundation\Testing\RefreshDatabase;
 use Illuminate\Support\Facades\Http;
 use Illuminate\Support\Facades\Log;
 use Illuminate\Support\Facades\Cache;
+use Illuminate\Support\Facades\Redis;
 use Tests\TestCase;
 use App\Models\User;
 use App\Models\BusinessProfile;
@@ -14,6 +15,7 @@ use App\Models\Conversation;
 use App\Models\Message;
 use App\Models\Sequence;
 use App\Models\SequenceEnrollment;
+use App\Models\Package;
 use App\Jobs\ProcessAutoReply;
 
 class CheckoutOrderFlowTest extends TestCase
@@ -23,9 +25,19 @@ class CheckoutOrderFlowTest extends TestCase
     protected function setUp(): void
     {
         parent::setUp();
+        Cache::flush();
         Log::shouldReceive('info')->zeroOrMoreTimes();
         Log::shouldReceive('error')->zeroOrMoreTimes();
         Log::shouldReceive('warning')->zeroOrMoreTimes();
+
+        Package::create([
+            'name' => 'Free',
+            'name_ar' => 'Free',
+            'price_monthly' => 0,
+            'price_yearly' => 0,
+            'ai_replies_limit' => -1,
+            'is_active' => true,
+        ]);
     }
 
     /** @test */
@@ -35,7 +47,9 @@ class CheckoutOrderFlowTest extends TestCase
         $business = BusinessProfile::factory()->create([
             'user_id' => $user->id,
             'name' => 'NazBiz Store',
+            'ai_provider' => 'groq',
         ]);
+        try { Redis::del("rate_limit:{$business->id}:{$user->id}"); } catch (\Throwable) {}
 
         $channel = Channel::factory()->create([
             'user_id' => $user->id,
@@ -43,6 +57,7 @@ class CheckoutOrderFlowTest extends TestCase
             'type' => 'salla',
             'status' => 'connected',
             'access_token' => 'test_token',
+            'ai_enabled' => true,
             'ai_enabled' => true,
         ]);
 
@@ -71,7 +86,7 @@ class CheckoutOrderFlowTest extends TestCase
         ]);
 
         Http::fake([
-            'api.openai.com/*' => Http::response([
+            'api.groq.com/*' => Http::response([
                 'choices' => [
                     [
                         'message' => [
@@ -148,13 +163,15 @@ class CheckoutOrderFlowTest extends TestCase
     public function it_handles_salla_422_failure_and_does_not_create_order_or_trigger_sequence()
     {
         $user = User::factory()->create();
-        $business = BusinessProfile::factory()->create(['user_id' => $user->id]);
+        $business = BusinessProfile::factory()->create(['user_id' => $user->id, 'ai_provider' => 'groq']);
+        try { Redis::del("rate_limit:{$business->id}:{$user->id}"); } catch (\Throwable) {}
         $channel = Channel::factory()->create([
             'user_id' => $user->id,
             'business_id' => $business->id,
             'type' => 'salla',
             'status' => 'connected',
             'access_token' => 'test_token',
+            'ai_enabled' => true,
         ]);
 
         $sequence = Sequence::create([
@@ -188,7 +205,7 @@ class CheckoutOrderFlowTest extends TestCase
         ]);
 
         Http::fake([
-            'api.openai.com/*' => Http::response([
+            'api.groq.com/*' => Http::response([
                 'choices' => [['message' => ['content' => json_encode([
                     'success' => true,
                     'reply' => 'Processing your order.',
@@ -233,7 +250,8 @@ class CheckoutOrderFlowTest extends TestCase
     public function it_allows_retry_after_salla_failure_and_succeeds_when_api_returns_2xx()
     {
         $user = User::factory()->create();
-        $business = BusinessProfile::factory()->create(['user_id' => $user->id]);
+        $business = BusinessProfile::factory()->create(['user_id' => $user->id, 'ai_provider' => 'groq']);
+        try { Redis::del("rate_limit:{$business->id}:{$user->id}"); } catch (\Throwable) {}
         $channel = Channel::factory()->create([
             'user_id' => $user->id,
             'business_id' => $business->id,
@@ -266,7 +284,7 @@ class CheckoutOrderFlowTest extends TestCase
         ]);
 
         Http::fake([
-            'api.openai.com/*' => Http::response([
+            'api.groq.com/*' => Http::response([
                 'choices' => [['message' => ['content' => json_encode([
                     'success' => true,
                     'reply' => 'Processing.',
@@ -302,7 +320,7 @@ class CheckoutOrderFlowTest extends TestCase
         ]);
 
         Http::fake([
-            'api.openai.com/*' => Http::response([
+            'api.groq.com/*' => Http::response([
                 'choices' => [['message' => ['content' => json_encode([
                     'success' => true,
                     'reply' => 'Order placed successfully! 🎉',

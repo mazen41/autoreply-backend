@@ -11,6 +11,8 @@ use App\Models\Package;
 use App\Models\User;
 use Illuminate\Foundation\Testing\RefreshDatabase;
 use Illuminate\Support\Facades\Http;
+use Illuminate\Support\Facades\Cache;
+use Illuminate\Support\Facades\Redis;
 use Tests\TestCase;
 
 /**
@@ -26,6 +28,12 @@ use Tests\TestCase;
 class SallaProductBrowseIntentTest extends TestCase
 {
     use RefreshDatabase;
+
+    protected function setUp(): void
+    {
+        parent::setUp();
+        Cache::flush();
+    }
 
     private function makeFreePackage(): Package
     {
@@ -53,7 +61,9 @@ class SallaProductBrowseIntentTest extends TestCase
             'user_id'       => $user->id,
             'business_name' => 'Test Store',
             'knowledge_base' => 'We are a great store.',
+            'ai_provider'   => 'gemini',
         ]);
+        try { Redis::del("rate_limit:{$business->id}:{$user->id}"); } catch (\Throwable) {}
 
         $whatsappChannel = Channel::create([
             'user_id'      => $user->id,
@@ -219,7 +229,7 @@ class SallaProductBrowseIntentTest extends TestCase
     /** Arabic variant: "????? ????????" must trigger aggregate */
     public function test_arabic_show_me_products_triggers_aggregate(): void
     {
-        $fixture = $this->makeFixture('????? ????????');
+        $fixture = $this->makeFixture("\u{0627}\u{0639}\u{0631}\u{0636} \u{0627}\u{0644}\u{0645}\u{0646}\u{062A}\u{062C}\u{0627}\u{062A}");
         Http::fake([
             'generativelanguage.googleapis.com/*embedContent*'    => Http::response(['embedding' => ['values' => []]], 200),
             'generativelanguage.googleapis.com/*generateContent*' => Http::response($this->fakeGemini('???? ????????: ?????? ? (50 ????).'), 200),

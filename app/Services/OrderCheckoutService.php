@@ -75,6 +75,19 @@ class OrderCheckoutService
             }
         }
 
+        // When a product is already in checkout and the customer still owes an
+        // address, they often answer with only the address (without repeating
+        // "my address is"). Accept recognizable street/city formats in that
+        // narrow context; never treat arbitrary chat as a delivery address.
+        if (!$extractedAddress
+            && !empty($existingState['salla_product_id'])
+            && empty($existingState['address'])
+            && empty($existingState['customer_address'])
+            && mb_strlen(trim($incomingText)) >= 8
+            && preg_match('/(?:\b\d{1,5}\s+\p{L}|\b(?:street|st\.?|road|rd\.?|avenue|ave\.?|district|city|giza|cairo|riyadh|jeddah|mecca|dammam)\b|Ø´Ø§Ø±Ø¹|Ù…Ø¯ÙŠÙ†Ø©|Ø­ÙŠ)/iu', $incomingText)) {
+            $extractedAddress = trim($incomingText);
+        }
+
         // NEVER infer address from arbitrary conversation text.
         // Address must come from an explicit address statement or AI-validated extraction.
 

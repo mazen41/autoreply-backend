@@ -591,7 +591,19 @@ class ProcessAutoReply implements ShouldQueue
 
         $isProductAggregate = $isProductBrowseMessage
             || (bool) preg_match($productAggregatePattern, $message->content)
-            || (bool) preg_match($productAggregatePatternAr, $message->content);
+            || (bool) preg_match($productAggregatePatternAr, $message->content)
+            || (bool) preg_match('/(?:\x{0627}\x{0639}\x{0631}\x{0636}|\x{0634}\x{0648}\x{0641}|\x{0648}\x{0631}\x{064A}\x{0646}\x{064A}|\x{0627}\x{0631}\x{0633}\x{0644}|\x{0627}\x{0628}\x{0639}\x{062B}).{0,40}(?:\x{0627}\x{0644}\x{0645}\x{0646}\x{062A}\x{062C}\x{0627}\x{062A}?|\x{0627}\x{0644}\x{0628}\x{0636}\x{0627}\x{064A}\x{0639})/u', $message->content);
+
+        // Aggregate detection also recognizes natural and Arabic browse
+        // phrases that the narrower English phrase matcher cannot cover.
+        // Treat those as browse intent before checkout state or escalation
+        // can interpret a stale product as an order confirmation.
+        if ($isProductAggregate) {
+            $isProductBrowseMessage = true;
+            $referencedProduct = null;
+            $checkoutState = null;
+            $conversation->update(['checkout_state' => null]);
+        }
 
         $isOrderAggregate = (bool) preg_match($orderAggregatePattern, $message->content)
             || (bool) preg_match($orderAggregatePatternAr, $message->content);
@@ -1500,23 +1512,47 @@ class ProcessAutoReply implements ShouldQueue
                 'fallback_used' => true
             ]);
 
+            // A failed AI call must not turn a successful product lookup into
+            // silence. Give browse requests a useful, data-backed reply from
+            // the Salla results already fetched for this turn.
+            $productBrowseFallback = null;
+            if ($isProductAggregate && !empty($productsAggregateContext['items'])) {
+                $lines = [];
+                foreach ($productsAggregateContext['items'] as $item) {
+                    $name = trim((string) ($item['name'] ?? 'Product'));
+                    $price = $item['price'] ?? null;
+                    $currency = $item['currency'] ?? 'SAR';
+                    $lines[] = $price !== null
+                        ? "• {$name} — {$price} {$currency}"
+                        : "• {$name}";
+                }
+                $total = (int) ($productsAggregateContext['total_count'] ?? count($lines));
+                $productBrowseFallback = "Here are the products I found ({$total} total):\n" . implode("\n", $lines);
+                if (count($lines) < $total) {
+                    $productBrowseFallback .= "\nWould you like to see more?";
+                }
+            }
+
             // Fallback + Escalate
-            $conversation->update([
-                'requires_human' => true,
-                'escalated_at' => now(),
-                'escalation_reason' => 'ai_failure_fallback'
-            ]);
+            if (!$productBrowseFallback) {
+                $conversation->update([
+                    'requires_human' => true,
+                    'escalated_at' => now(),
+                    'escalation_reason' => 'ai_failure_fallback'
+                ]);
+            }
 
             // Provide a user-friendly fallback message
-            $fallbackMessage = $aiResult['reply'] ?? "I apologize, but I'm having technical difficulties right now. A human agent will be with you shortly to help with your request.";
+            $fallbackMessage = $productBrowseFallback
+                ?? ($aiResult['reply'] ?? "I apologize, but I'm having technical difficulties right now. A human agent will be with you shortly to help with your request.");
             
             $replyMessage = Message::create([
                 'conversation_id' => $message->conversation_id,
                 'content' => $fallbackMessage,
                 'direction' => 'outbound',
                 'status' => 'auto',
-                'is_ai' => false,
-                'source' => 'fallback',
+                'is_ai' => (bool) $productBrowseFallback,
+                'source' => $productBrowseFallback ? 'salla_product_browse' : 'fallback',
                 'send_status' => 'pending',
             ]);
 
@@ -1616,6 +1652,23 @@ class ProcessAutoReply implements ShouldQueue
                     break;
                 }
             }
+        }
+
+        // A live order-collection conversation should stay in the checkout
+        // flow while the assistant asks for missing fields or handles an
+        // explicit confirmation. Generic confidence/intent escalation here
+        // disables AI and strands the customer mid-order. Keep explicit human
+        // requests, complaints, sensitive issues, and business rules intact.
+        $checkoutHardEscalations = ['customer_requested_human', 'complaint', 'sensitive_issue', 'business_rule'];
+        if (
+            $shouldEscalate
+            && $intent === 'place_order'
+            && $sallaChannel
+            && !empty($updatedCheckoutState['salla_product_id'])
+            && !in_array($escalationReason, $checkoutHardEscalations, true)
+        ) {
+            $shouldEscalate = false;
+            $decisionReason = 'active_checkout_collecting_or_confirming';
         }
 
         if ($isProductBrowseMessage) {

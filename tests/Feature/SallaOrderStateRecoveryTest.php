@@ -6,6 +6,7 @@ use Illuminate\Foundation\Testing\RefreshDatabase;
 use Illuminate\Support\Facades\Http;
 use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\Log;
+use Illuminate\Support\Facades\Redis;
 use Tests\TestCase;
 use App\Models\User;
 use App\Models\BusinessProfile;
@@ -13,6 +14,7 @@ use App\Models\Channel;
 use App\Models\Conversation;
 use App\Models\Message;
 use App\Models\ProductMessageMap;
+use App\Models\Package;
 use App\Jobs\ProcessAutoReply;
 
 class SallaOrderStateRecoveryTest extends TestCase
@@ -22,11 +24,21 @@ class SallaOrderStateRecoveryTest extends TestCase
     protected function setUp(): void
     {
         parent::setUp();
+        Cache::flush();
         
         // Suppress expected logs during test to keep output clean
         Log::shouldReceive('info')->zeroOrMoreTimes();
         Log::shouldReceive('error')->zeroOrMoreTimes();
         Log::shouldReceive('warning')->zeroOrMoreTimes();
+
+        Package::create([
+            'name' => 'Free',
+            'name_ar' => 'Free',
+            'price_monthly' => 0,
+            'price_yearly' => 0,
+            'ai_replies_limit' => -1,
+            'is_active' => true,
+        ]);
     }
 
     /** @test */
@@ -38,13 +50,16 @@ class SallaOrderStateRecoveryTest extends TestCase
         $business = BusinessProfile::factory()->create([
             'user_id' => $user->id,
             'name' => 'NazBiz Clothes',
+            'ai_provider' => 'groq',
         ]);
+        try { Redis::del("rate_limit:{$business->id}:{$user->id}"); } catch (\Throwable) {}
         
         $channel = Channel::factory()->create([
             'user_id' => $user->id,
             'type' => 'salla',
             'status' => 'connected',
             'access_token' => 'valid_token',
+            'ai_enabled' => true,
         ]);
         $channel->business_id = $business->id;
         $channel->save();
@@ -61,7 +76,7 @@ class SallaOrderStateRecoveryTest extends TestCase
         ProductMessageMap::create([
             'conversation_id' => $conversation->id,
             'channel_id' => $channel->id,
-            'whatsapp_message_id' => $quotedMessageId,
+            'platform_message_id' => $quotedMessageId,
             'salla_product_id' => '523147668',
             'product_name' => 'Fancy Dress',
             'product_price' => 174,
@@ -80,7 +95,7 @@ class SallaOrderStateRecoveryTest extends TestCase
 
         // Mock LLM call for Turn 1
         Http::fake([
-            'api.openai.com/*' => Http::response([
+            'api.groq.com/*' => Http::response([
                 'choices' => [
                     [
                         'message' => [
@@ -130,7 +145,7 @@ class SallaOrderStateRecoveryTest extends TestCase
 
         // Mock LLM call for Turn 2
         Http::fake([
-            'api.openai.com/*' => Http::response([
+            'api.groq.com/*' => Http::response([
                 'choices' => [
                     [
                         'message' => [
@@ -181,7 +196,7 @@ class SallaOrderStateRecoveryTest extends TestCase
 
         // Mock LLM call for Turn 3
         Http::fake([
-            'api.openai.com/*' => Http::response([
+            'api.groq.com/*' => Http::response([
                 'choices' => [
                     [
                         'message' => [

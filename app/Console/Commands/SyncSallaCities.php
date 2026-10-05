@@ -38,8 +38,31 @@ class SyncSallaCities extends Command
         $failed = false;
         foreach ($channels as $channel) {
             try {
-                $count = $sallaService->syncCityCatalog($channel, $countryCode);
-                $this->info("Channel {$channel->id}: synced {$count} {$countryCode} cities.");
+                $this->info("Channel {$channel->id}: starting {$countryCode} city sync (up to 60 cities per page).");
+                $count = $sallaService->syncCityCatalog($channel, $countryCode, function (array $progress) use ($channel): void {
+                    if ($progress['stage'] === 'countries_request') {
+                        $this->line("Channel {$channel->id}: fetching Salla country catalog...");
+                        return;
+                    }
+
+                    if ($progress['stage'] === 'page_request') {
+                        $this->line("Channel {$channel->id}: requesting {$progress['country_code']} cities page {$progress['page']}...");
+                        return;
+                    }
+
+                    if ($progress['stage'] === 'page_complete') {
+                        $totalPages = max(1, (int) $progress['total_pages']);
+                        $this->info(sprintf(
+                            'Channel %d: page %d/%d complete; received %d cities (%d saved so far).',
+                            $channel->id,
+                            $progress['page'],
+                            $totalPages,
+                            $progress['page_count'],
+                            $progress['total_synced']
+                        ));
+                    }
+                });
+                $this->info("Channel {$channel->id}: synced {$count} {$countryCode} cities successfully.");
             } catch (Throwable $exception) {
                 $failed = true;
                 $this->error("Channel {$channel->id}: {$exception->getMessage()}");

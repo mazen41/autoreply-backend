@@ -611,9 +611,12 @@ class SallaService
      * Salla permits at most 60 cities per page; checkout reads this catalog
      * locally so it never performs a multi-page network scan while placing an order.
      */
-    public function syncCityCatalog(Channel $channel, string $countryCode): int
+    public function syncCityCatalog(Channel $channel, string $countryCode, ?callable $onProgress = null): int
     {
         $countryCode = strtoupper(trim($countryCode));
+        if ($onProgress) {
+            $onProgress(['stage' => 'countries_request', 'country_code' => $countryCode]);
+        }
         $countriesResponse = $this->apiCallForChannel($channel, 'GET', '/countries');
         $country = collect($countriesResponse['data'] ?? [])->first(
             fn ($candidate) => strtoupper((string) ($candidate['code'] ?? '')) === $countryCode
@@ -629,6 +632,14 @@ class SallaService
         $now = now();
 
         for ($page = 1; $page <= 500; $page++) {
+            if ($onProgress) {
+                $onProgress([
+                    'stage' => 'page_request',
+                    'country_code' => $countryCode,
+                    'page' => $page,
+                ]);
+            }
+
             $response = $this->apiCallForChannel($channel, 'GET', $endpoint, [
                 'page' => $page,
                 'per_page' => 60,
@@ -672,6 +683,17 @@ class SallaService
 
             $pagination = $response['pagination'] ?? [];
             $totalPages = (int) ($pagination['totalPages'] ?? $pagination['total_pages'] ?? 1);
+            if ($onProgress) {
+                $onProgress([
+                    'stage' => 'page_complete',
+                    'country_code' => $countryCode,
+                    'page' => $page,
+                    'total_pages' => $totalPages,
+                    'page_count' => count($cities),
+                    'total_synced' => $totalSynced,
+                ]);
+            }
+
             $hasNextPage = $page < $totalPages || !empty($pagination['links']['next']);
             if (!$hasNextPage) {
                 break;

@@ -3,6 +3,7 @@
 namespace App\Services;
 
 use App\Models\Conversation;
+use Illuminate\Support\Facades\Http;
 
 class OrderCheckoutService
 {
@@ -57,10 +58,17 @@ class OrderCheckoutService
         $extractedCoordinates = null;
         $decodedText = rawurldecode($incomingText);
         $hasLocationContext = (bool) preg_match('/\b(?:map|maps|pin|coordinates?|latitude|longitude)\b/i', $decodedText);
-        if (
-            ($hasLocationContext && preg_match('/(?:@|q=|[?&]|coordinates?\s*[:=]?|pin\s*[:=]?)\s*(-?\d{1,2}(?:\.\d+)?)\s*[,;]\s*(-?\d{1,3}(?:\.\d+)?)/i', $decodedText, $coordinateMatch))
-            || preg_match('/\b(-?\d{1,2}\.\d{3,})\s*,\s*(-?\d{1,3}\.\d{3,})\b/', $decodedText, $coordinateMatch)
-        ) {
+        $hasCoordinates = preg_match('/!3d(-?\d{1,2}(?:\.\d+)?)!4d(-?\d{1,3}(?:\.\d+)?)/i', $decodedText, $coordinateMatch)
+            || ($hasLocationContext && preg_match('/(?:@|q=|[?&]|coordinates?\s*[:=]?|pin\s*[:=]?)\s*(-?\d{1,2}(?:\.\d+)?)\s*[,;]\s*(-?\d{1,3}(?:\.\d+)?)/i', $decodedText, $coordinateMatch))
+            || preg_match('/\b(-?\d{1,2}\.\d{3,})\s*,\s*(-?\d{1,3}\.\d{3,})\b/', $decodedText, $coordinateMatch);
+
+        // Google Maps short links hide coordinates behind redirects.
+        if (!$hasCoordinates && ($expandedMapsUrl = $this->expandGoogleMapsShortLink($incomingText))) {
+            $hasCoordinates = preg_match('/!3d(-?\d{1,2}(?:\.\d+)?)!4d(-?\d{1,3}(?:\.\d+)?)/i', $expandedMapsUrl, $coordinateMatch)
+                || preg_match('/(?:@|q=|[?&])\s*(-?\d{1,2}(?:\.\d+)?)\s*[,;]\s*(-?\d{1,3}(?:\.\d+)?)/i', $expandedMapsUrl, $coordinateMatch);
+        }
+
+        if ($hasCoordinates) {
             $latitude = (float) $coordinateMatch[1];
             $longitude = (float) $coordinateMatch[2];
             if ($latitude >= -90 && $latitude <= 90 && $longitude >= -180 && $longitude <= 180) {
@@ -199,6 +207,84 @@ class OrderCheckoutService
         }
 
         return $mergedState;
+    }
+
+    /** Resolve only Google Maps short links; return the final URL without logging it. */
+    private function expandGoogleMapsShortLink(string $text): ?string
+    {
+        if (!preg_match('/https?:\/\/[^\s<>]+/i', $text, $match)) {
+            return null;
+        }
+
+        $url = rtrim($match[0], '.,);]');
+        $host = strtolower((string) parse_url($url, PHP_URL_HOST));
+        if (!in_array($host, ['maps.app.goo.gl', 'goo.gl'], true)) {
+            return null;
+        }
+
+        for ($redirects = 0; $redirects < 6; $redirects++) {
+            if (!$this->isAllowedMapsRedirectHost($host)) {
+                return null;
+            }
+
+            try {
+                $response = Http::timeout(4)
+                    ->connectTimeout(2)
+                    ->withOptions(['allow_redirects' => false])
+                    ->get($url);
+            } catch (\Throwable) {
+                return null;
+            }
+
+            if (!in_array($response->status(), [301, 302, 303, 307, 308], true)) {
+                return $url;
+            }
+
+            $location = $response->header('Location');
+            if (!is_string($location) || trim($location) === '') {
+                return null;
+            }
+
+            $url = $this->resolveRedirectUrl($url, trim($location));
+            if (!$url) {
+                return null;
+            }
+            $host = strtolower((string) parse_url($url, PHP_URL_HOST));
+        }
+
+        return null;
+    }
+
+    private function isAllowedMapsRedirectHost(string $host): bool
+    {
+        return in_array($host, ['maps.app.goo.gl', 'goo.gl', 'google.com', 'www.google.com', 'maps.google.com'], true);
+    }
+
+    private function resolveRedirectUrl(string $baseUrl, string $location): ?string
+    {
+        if (preg_match('/^https?:\/\//i', $location)) {
+            return $location;
+        }
+
+        $base = parse_url($baseUrl);
+        if (empty($base['scheme']) || empty($base['host'])) {
+            return null;
+        }
+
+        $origin = $base['scheme'] . '://' . $base['host']
+            . (isset($base['port']) ? ':' . $base['port'] : '');
+        if (str_starts_with($location, '//')) {
+            return $base['scheme'] . ':' . $location;
+        }
+        if (str_starts_with($location, '/')) {
+            return $origin . $location;
+        }
+        if (str_starts_with($location, '?')) {
+            return $origin . ($base['path'] ?? '/') . $location;
+        }
+
+        $directory = rtrim(dirname($base['path'] ?? '/'), '/');
+        return $origin . ($directory !== '' ? $directory : '') . '/' . $location;
     }
 
     /**

@@ -456,7 +456,7 @@ ROLE;
                 'address' => 'Complete Delivery Address',
                 'email' => 'Email Address',
                 'postal_code' => 'Postal / ZIP Code',
-                'geo_coordinates' => 'Google Maps location pin or latitude and longitude',
+                'geo_coordinates' => 'delivery coordinates resolved by the application; do not request a map pin or coordinates from the customer',
                 'building_number' => 'Building or house number',
                 'short_address' => 'Short / national address code',
                 'additional_number' => 'Additional address number',
@@ -484,7 +484,7 @@ ROLE;
                 $p .= "\n⚠️ CRITICAL RULE: ASK FOR ALL CURRENTLY MISSING REQUIRED FIELDS TOGETHER IN ONE SINGLE MESSAGE!\n";
                 $p .= "Do NOT ask for fields one-by-one in separate turns. Do NOT re-ask for any field listed under ALREADY KNOWN FIELDS.\n\n";
                 if (!empty($context['salla_exclusive_mode'])) {
-                    $p .= "Use any delivery details already present in the customer's message or saved Salla profile before asking follow-up questions. If coordinates are missing, ask for a Google Maps pin/link or latitude and longitude. Never invent coordinates, postal codes, email addresses, or address values. The customer does not need to provide a courier ID; the application selects from the store's Salla shipping options.\n\n";
+                    $p .= "Use any delivery details already present in the customer's message or saved Salla profile before asking follow-up questions. Do not ask the customer to send a Google Maps pin/link or latitude and longitude; ask for a complete written delivery address (street, district, building number, and postal code) instead. Never invent coordinates, postal codes, email addresses, or address values. The customer does not need to provide a courier ID; the application selects from the store's Salla shipping options.\n\n";
                 }
             }
 

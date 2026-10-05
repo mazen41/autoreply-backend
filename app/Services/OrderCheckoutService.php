@@ -3,7 +3,9 @@
 namespace App\Services;
 
 use App\Models\Conversation;
+use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\Http;
+use Illuminate\Support\Facades\Log;
 
 class OrderCheckoutService
 {
@@ -11,6 +13,86 @@ class OrderCheckoutService
      * Required fields for order completion.
      */
     public const REQUIRED_FIELDS = ['full_name', 'phone', 'address'];
+
+    /** Resolve a Saudi delivery address to coordinates without asking the customer for a pin. */
+    public function geocodeSaudiAddress(string $address): array
+    {
+        $normalizedAddress = trim(preg_replace('/\s+/', ' ', $address));
+        $endpoint = rtrim((string) config('services.nominatim.endpoint'), '/');
+        if ($normalizedAddress === '') {
+            return ['status' => 'unavailable', 'coordinates' => null];
+        }
+        if ($endpoint === '') {
+            Log::warning('Nominatim address lookup skipped because no private endpoint is configured');
+            return ['status' => 'unavailable', 'coordinates' => null];
+        }
+
+        $query = $normalizedAddress . ', Saudi Arabia';
+        $cacheKey = 'nominatim:sa:' . hash('sha256', mb_strtolower($query));
+        $cached = Cache::get($cacheKey);
+        if (is_array($cached)) {
+            return $cached;
+        }
+
+        try {
+            // Nominatim's public service has a one-request-per-second limit.
+            // Keep the same limit for configured instances and across workers.
+            $response = Cache::lock('nominatim:request-throttle', 15)->block(10, function () use ($endpoint, $query) {
+                $lastRequestAt = (float) Cache::get('nominatim:last-request-at', 0);
+                $waitMicroseconds = (int) max(0, (1 - (microtime(true) - $lastRequestAt)) * 1_000_000);
+                if ($waitMicroseconds > 0) {
+                    usleep($waitMicroseconds);
+                }
+
+                $response = Http::acceptJson()
+                    ->withUserAgent('AutoReply/1.0')
+                    ->connectTimeout(3)
+                    ->timeout(10)
+                    ->get($endpoint . '/search', [
+                        'q' => $query,
+                        'format' => 'json',
+                        'limit' => 1,
+                        'countrycodes' => 'sa',
+                    ]);
+
+                Cache::put('nominatim:last-request-at', microtime(true), now()->addMinute());
+                return $response;
+            });
+
+            if (!$response->successful()) {
+                Log::warning('Nominatim address lookup failed', ['http_status' => $response->status()]);
+                return ['status' => 'unavailable', 'coordinates' => null];
+            }
+
+            $results = $response->json();
+            if (!is_array($results)) {
+                return ['status' => 'unavailable', 'coordinates' => null];
+            }
+            if ($results === []) {
+                $result = ['status' => 'not_found', 'coordinates' => null];
+                Cache::put($cacheKey, $result, now()->addMinutes(15));
+                return $result;
+            }
+
+            $lat = $results[0]['lat'] ?? null;
+            $lng = $results[0]['lon'] ?? null;
+            if (!is_numeric($lat) || !is_numeric($lng)
+                || (float) $lat < -90 || (float) $lat > 90
+                || (float) $lng < -180 || (float) $lng > 180) {
+                return ['status' => 'unavailable', 'coordinates' => null];
+            }
+
+            $result = [
+                'status' => 'found',
+                'coordinates' => ['lat' => (float) $lat, 'lng' => (float) $lng],
+            ];
+            Cache::put($cacheKey, $result, now()->addDays(30));
+            return $result;
+        } catch (\Throwable $e) {
+            Log::warning('Nominatim address lookup unavailable', ['error' => $e->getMessage()]);
+            return ['status' => 'unavailable', 'coordinates' => null];
+        }
+    }
 
     /**
      * Extract order fields from incoming message text and merge with existing checkout_state.

@@ -1322,6 +1322,7 @@ class ProcessAutoReply implements ShouldQueue
             $conversation->update(['checkout_state' => null]);
         }
         $sallaCheckoutActive = (bool) $sallaChannel && !empty($updatedCheckoutState['salla_product_id']);
+        $addressGeocodingStatus = null;
 
         // Reuse a saved Salla customer profile when the phone matches. This
         // avoids asking returning customers for an email already on file.
@@ -1351,6 +1352,21 @@ class ProcessAutoReply implements ShouldQueue
                     'conversation_id' => $conversation->id,
                     'error' => $e->getMessage(),
                 ]);
+            }
+        }
+
+        // Resolve coordinates from the written Saudi address in the background;
+        // customers should never be asked to provide coordinates or a map link.
+        if (
+            $sallaCheckoutActive
+            && empty($updatedCheckoutState['geo_coordinates'])
+            && !empty($updatedCheckoutState['address'])
+        ) {
+            $geocodingResult = $checkoutService->geocodeSaudiAddress((string) $updatedCheckoutState['address']);
+            $addressGeocodingStatus = $geocodingResult['status'] ?? 'unavailable';
+            if ($addressGeocodingStatus === 'found' && !empty($geocodingResult['coordinates'])) {
+                $updatedCheckoutState['geo_coordinates'] = $geocodingResult['coordinates'];
+                $conversation->update(['checkout_state' => $updatedCheckoutState]);
             }
         }
 
@@ -1650,8 +1666,49 @@ class ProcessAutoReply implements ShouldQueue
         if ($isCheckoutMapsLink) {
             $intent = 'place_order';
             $aiResult['intent'] = 'place_order';
-            if (empty($updatedCheckoutState['geo_coordinates'])) {
-                $aiResponse = "I received your Google Maps link, but couldn't read its coordinates. Please send the full Google Maps link or paste the latitude and longitude.";
+
+            $missingLabels = $detectedLanguage === 'arabic' ? [
+                'full_name' => 'الاسم الكامل',
+                'phone' => 'رقم الهاتف',
+                'address' => 'عنوان التوصيل الكامل',
+                'email' => 'البريد الإلكتروني',
+                'postal_code' => 'الرمز البريدي',
+                'geo_coordinates' => 'عنوان التوصيل المكتوب كاملًا مع الشارع ورقم المبنى والحي والرمز البريدي',
+                'building_number' => 'رقم المبنى',
+                'short_address' => 'العنوان الوطني المختصر',
+                'additional_number' => 'الرقم الإضافي',
+            ] : [
+                'full_name' => 'full name',
+                'phone' => 'phone number',
+                'address' => 'complete delivery address',
+                'email' => 'email address',
+                'postal_code' => 'postal / ZIP code',
+                'geo_coordinates' => 'complete written delivery address with street, building number, district, and postal code',
+                'building_number' => 'building or house number',
+                'short_address' => 'short / national address code',
+                'additional_number' => 'additional address number',
+            ];
+            $missingDetails = array_map(
+                fn ($field) => $missingLabels[$field] ?? str_replace('_', ' ', $field),
+                $fieldStatus['missing_fields']
+            );
+            $hasCoordinates = !empty($updatedCheckoutState['geo_coordinates']);
+
+            if ($missingDetails) {
+                if ($detectedLanguage === 'arabic') {
+                    $locationNote = 'شكرًا على تفاصيل التوصيل. ';
+                    $aiResponse = $locationNote . 'لإتمام الطلب، أرسل البيانات الناقصة كلها في رسالة واحدة: ' . implode('، ', $missingDetails) . '.';
+                } else {
+                    $locationNote = 'Thanks for the delivery details. ';
+                    $aiResponse = $locationNote . 'To complete your order, please send all remaining details in one message: ' . implode(', ', $missingDetails) . '.';
+                }
+            } else {
+                $aiResponse = $detectedLanguage === 'arabic'
+                    ? 'تم استلام موقع التوصيل. أرسل «تأكيد الطلب» عندما تكون جاهزًا لإتمام الطلب.'
+                    : 'Thanks, I received your delivery location. Reply “confirm order” when you are ready to place the order.';
+            }
+
+            if (!$hasCoordinates) {
                 Log::info('ProcessAutoReply: Maps link received during checkout but coordinates remain unavailable', [
                     'conversation_id' => $conversation->id,
                 ]);
@@ -1832,6 +1889,12 @@ class ProcessAutoReply implements ShouldQueue
 
         // Step 6: Send AI Response
         $aiResponse = $aiResult['reply'];
+
+        if ($sallaCheckoutActive && $addressGeocodingStatus === 'not_found') {
+            $aiResponse = $detectedLanguage === 'arabic'
+                ? 'لم أتمكن من تحديد عنوان التوصيل. من فضلك وضّح المدينة والحي والشارع ورقم المبنى والرمز البريدي. لا تحتاج إلى إرسال رابط خرائط أو إحداثيات.'
+                : "I couldn't match that address to a Saudi delivery location. Please clarify the city, district, street, building number, and postal code. You don't need to send a map link or coordinates.";
+        }
 
         // ── IMAGE SEND VERIFICATION (fixes: bot claiming "here are the photos"
         // while sending zero actual media) ────────────────────────────────────
@@ -2106,7 +2169,7 @@ class ProcessAutoReply implements ShouldQueue
                 'address' => 'complete delivery address',
                 'email' => 'email address',
                 'postal_code' => 'postal / ZIP code',
-                'geo_coordinates' => 'Google Maps pin with coordinates',
+                'geo_coordinates' => 'complete written delivery address with street, building number, district, and postal code',
                 'building_number' => 'building or house number',
                 'short_address' => 'short / national address code',
                 'additional_number' => 'additional address number',

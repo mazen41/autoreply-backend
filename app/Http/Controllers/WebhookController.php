@@ -208,7 +208,7 @@ class WebhookController extends Controller
                         'payload_key_paths' => $this->summarizeMetaAttachmentStructure($attachments),
                     ]);
                     $typeLabel = $attachmentTypes ? implode(', ', $attachmentTypes) : 'unknown';
-                    $messageText = "Customer shared an Instagram attachment (type: {$typeLabel}) without readable text or coordinates. If delivery location is still needed, ask for a Google Maps link or latitude and longitude.";
+                    $messageText = "Customer shared an Instagram attachment (type: {$typeLabel}) without readable text or coordinates. If delivery details are still needed, ask for the complete written street address, district, building number, and postal code; do not ask for a map link or coordinates.";
                 }
                 if ($messageText === '') continue;
 

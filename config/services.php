@@ -52,6 +52,12 @@ return [
         'webhook_verify_token' => env('META_WEBHOOK_VERIFY_TOKEN'),
     ],
 
+    'nominatim' => [
+        // Configure a private/self-hosted Nominatim endpoint. Do not send
+        // customer delivery addresses to the public Nominatim service.
+        'endpoint' => env('NOMINATIM_BASE_URL'),
+    ],
+
     'evolution' => [
         'base_url' => env('EVOLUTION_BASE_URL', 'http://localhost:8080'),
         'api_key' => env('EVOLUTION_API_KEY', ''),

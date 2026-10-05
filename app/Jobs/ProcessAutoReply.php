@@ -1639,6 +1639,25 @@ class ProcessAutoReply implements ShouldQueue
             }
         }
 
+        // A Maps URL is a delivery-detail answer during an active checkout,
+        // even if the model labels the bare link as an unclear question.
+        $isCheckoutMapsLink = !$isProductBrowseMessage
+            && !empty($updatedCheckoutState['salla_product_id'])
+            && (bool) preg_match(
+                '~https?://(?:maps\.app\.goo\.gl|goo\.gl/maps|(?:www\.)?google\.com/maps|maps\.google\.com/maps)[^\s<>\]\)]*~i',
+                $message->content
+            );
+        if ($isCheckoutMapsLink) {
+            $intent = 'place_order';
+            $aiResult['intent'] = 'place_order';
+            if (empty($updatedCheckoutState['geo_coordinates'])) {
+                $aiResponse = "I received your Google Maps link, but couldn't read its coordinates. Please send the full Google Maps link or paste the latitude and longitude.";
+                Log::info('ProcessAutoReply: Maps link received during checkout but coordinates remain unavailable', [
+                    'conversation_id' => $conversation->id,
+                ]);
+            }
+        }
+
         // A missing OAuth grant can leave this conversation without a connected
         // Salla store. Never claim a confirmed checkout was submitted in that case.
         if (

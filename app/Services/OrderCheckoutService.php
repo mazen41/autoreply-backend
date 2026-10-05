@@ -212,7 +212,9 @@ class OrderCheckoutService
     /** Resolve only Google Maps short links; return the final URL without logging it. */
     private function expandGoogleMapsShortLink(string $text): ?string
     {
-        if (!preg_match('/https?:\/\/[^\s<>]+/i', $text, $match)) {
+        // Stop at Markdown link delimiters as well as whitespace; otherwise a
+        // pasted [URL](URL) can turn into an invalid combined redirect target.
+        if (!preg_match('/https?:\/\/[^\s<>\]\)]+/i', $text, $match)) {
             return null;
         }
 

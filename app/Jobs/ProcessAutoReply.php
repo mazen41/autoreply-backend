@@ -477,8 +477,20 @@ class ProcessAutoReply implements ShouldQueue
         // product is confirmed during place_order, then load it back here so the
         // product identity is never lost between turns.
         $checkoutState = $conversation->checkout_state ?? null;
+        $isProductBrowseMessage = (bool) preg_match(
+            '/(?:\b(?:show|see|view|browse|list|display|send)\b.{0,60}\b(?:products?|items?|catalog(?:ue)?|images?|photos?|pictures?)\b|\b(?:products?|items?|catalog(?:ue)?)\b.{0,60}\b(?:images?|photos?|pictures?|show|see|view|browse|list|all)\b|i\s+wanna\s+see\s+products?)/iu',
+            $message->content
+        );
 
-        if (!$referencedProduct && !empty($checkoutState['salla_product_id'])) {
+        // A browse request starts a product inquiry, even if it quotes an old
+        // product image or a stale checkout_state still contains a product.
+        if ($isProductBrowseMessage) {
+            $referencedProduct = null;
+            $checkoutState = null;
+            $conversation->update(['checkout_state' => null]);
+        }
+
+        if (!$isProductBrowseMessage && !$referencedProduct && !empty($checkoutState['salla_product_id'])) {
             $referencedProduct = [
                 'salla_product_id' => $checkoutState['salla_product_id'],
                 'sku'              => $checkoutState['sku']              ?? null,
@@ -577,7 +589,8 @@ class ProcessAutoReply implements ShouldQueue
             '|طلباتي' .
         ')/iu';
 
-        $isProductAggregate = (bool) preg_match($productAggregatePattern, $message->content)
+        $isProductAggregate = $isProductBrowseMessage
+            || (bool) preg_match($productAggregatePattern, $message->content)
             || (bool) preg_match($productAggregatePatternAr, $message->content);
 
         $isOrderAggregate = (bool) preg_match($orderAggregatePattern, $message->content)
@@ -1126,7 +1139,8 @@ class ProcessAutoReply implements ShouldQueue
             $conversation->update([
                 'requires_human' => true,
                 'escalated_at' => now(),
-                'escalation_reason' => "hard_keyword_override: {$hardEscalation['matched_keyword']}"
+                'escalation_reason' => "hard_keyword_override: {$hardEscalation['matched_keyword']}",
+                'ai_enabled' => false,
             ]);
 
             $escalationMessage = "Sure 👍 I'm connecting you with a human agent now. Please wait a moment.";
@@ -1272,12 +1286,24 @@ class ProcessAutoReply implements ShouldQueue
 
         // ── ORDER CHECKOUT STATE & FIELD EXTRACTION ─────────────────────────
         $checkoutService = app(\App\Services\OrderCheckoutService::class);
-        $updatedCheckoutState = $checkoutService->extractAndMergeState($conversation, $message->content, $referencedProduct);
+        $updatedCheckoutState = $isProductBrowseMessage
+            ? []
+            : $checkoutService->extractAndMergeState($conversation, $message->content, $referencedProduct);
         if (!empty($updatedCheckoutState)) {
-            $conversation->update(['checkout_state' => $updatedCheckoutState]);
+            // Merge new extraction into existing checkout_state so fields
+            // (full_name, phone, address) accumulate across messages rather than
+            // being overwritten.  Use array_merge so previously stored values
+            // are never lost when the new message contains different data.
+            $merged = array_merge(
+                is_array($conversation->checkout_state) ? $conversation->checkout_state : [],
+                $updatedCheckoutState
+            );
+            $conversation->update(['checkout_state' => $merged]);
         } elseif (!is_null($conversation->checkout_state)) {
-            // Nothing meaningful extracted and nothing previously stored —
-            // keep checkout_state null so no phantom order context lingers.
+            // Previously stored checkout_state exists but new extraction yielded
+            // nothing meaningful — preserve the existing state rather than
+            // wiping out collected customer fields (full_name, phone, address).
+            // Only clear it if there is genuinely no prior data.
             $conversation->update(['checkout_state' => null]);
         }
         $fieldStatus = $checkoutService->computeFieldStatus($updatedCheckoutState);
@@ -1289,15 +1315,15 @@ class ProcessAutoReply implements ShouldQueue
             'is_complete'     => $fieldStatus['is_complete'],
         ]);
 
-        // Check for explicit customer confirmation turn
+        // Explicit confirmation is necessary; complete checkout fields alone never authorize an order.
         $incomingLower = mb_strtolower(trim($message->content));
-        $confirmKeywords = '/(?:yes|yeah|yep|sure|ok|okay|confirm|please confirm|place order|نعم|أكد|اكد|تأكيد|تم|موافق|تم التأكيد|اعتمد|اشتري|اطلب|شراء|توكل|اعتمدوا|اعتمدلي|اطلبلي|اكدلي|ابي|ابغا|اريد|ارغب|باشر)/ui';
-        $containsConfirmPhrase = (bool)preg_match($confirmKeywords, $incomingLower)
-            || ($fieldStatus['is_complete'] && !empty($updatedCheckoutState['product_name']));
-
+        $containsConfirmPhrase = (bool) preg_match(
+            '/(?:\\b(?:yes|yeah|yep|sure|ok|okay|confirm|order\\s+this|i\\s+want\\s+(?:to\\s+order\\s+)?this|i\\s+wanna\\s+order\\s+this|place\\s+(?:the\\s+)?order)\\b|نعم|أكد|اكد|تأكيد|موافق|تأكيد الطلب|اعتمد الطلب)/ui',
+            $incomingLower
+        );
         $realOrderId = $updatedCheckoutState['order_id'] ?? null;
 
-        // Purge/ignore legacy fake ORD-* IDs from pre-fix database records
+        // Ignore legacy internal/fake order IDs left by earlier checkout runs.
         if ($realOrderId && (str_starts_with($realOrderId, 'ORD-') || ($updatedCheckoutState['external_source'] ?? '') === 'internal')) {
             Log::info('ProcessAutoReply: ignoring legacy fake order ID from pre-fix checkout state', [
                 'conversation_id' => $conversation->id,
@@ -1311,28 +1337,7 @@ class ProcessAutoReply implements ShouldQueue
             $conversation->update(['checkout_state' => $updatedCheckoutState]);
         }
 
-        $orderCreationFailedReason = null; // Reason why order couldn't be created (unmapped city, API error, etc.)
-
-        // Create order ONLY when required fields are complete AND customer explicitly confirms
-        if ($fieldStatus['is_complete'] && $containsConfirmPhrase && empty($realOrderId) && !empty($updatedCheckoutState['product_name'])) {
-            Log::info('ProcessAutoReply: customer confirmed order — attempting external order creation', [
-                'conversation_id' => $conversation->id,
-            ]);
-            $orderData = $this->createRealExternalOrder($conversation, $updatedCheckoutState, $channel);
-            if ($orderData) {
-                $updatedCheckoutState = array_merge($updatedCheckoutState, $orderData);
-                $conversation->update(['checkout_state' => $updatedCheckoutState]);
-                $realOrderId = $orderData['order_id'] ?? null;
-            } else {
-                // Order creation failed — capture reason so AI can ask customer for missing info
-                // (most common: city name in address doesn't match any Salla city)
-                $orderCreationFailedReason = 'address_city_unresolved';
-                Log::warning('ProcessAutoReply: order creation returned null — will prompt customer for missing/invalid info', [
-                    'conversation_id' => $conversation->id,
-                    'checkout_state'  => $updatedCheckoutState,
-                ]);
-            }
-        }
+        $orderCreationFailedReason = null;
 
         // ── CUSTOMER RESOLUTION & CONTEXT (Phase 2) ──────────────────────────
         // Link the conversation to its business-scoped Customer, using the
@@ -1543,6 +1548,14 @@ class ProcessAutoReply implements ShouldQueue
         $intent              = $aiResult['intent'] ?? 'unknown';
         $confidenceScore     = $aiResult['confidence'] ?? 1.0;
 
+        if ($isProductBrowseMessage) {
+            $intent = 'question';
+            $aiResult['intent'] = 'question';
+            if (preg_match('/\b(images?|photos?|pictures?|pics?)\b/i', $message->content)) {
+                $aiResult['needs_images'] = true;
+            }
+        }
+
         // Reasons that should ALWAYS trigger escalation
         $hardEscalationReasons = [
             'customer_requested_human',
@@ -1603,6 +1616,11 @@ class ProcessAutoReply implements ShouldQueue
                     break;
                 }
             }
+        }
+
+        if ($isProductBrowseMessage) {
+            $shouldEscalate = false;
+            $decisionReason = 'product_browse_auto_reply';
         }
 
         // Log full AI decision for diagnostics
@@ -1790,10 +1808,12 @@ class ProcessAutoReply implements ShouldQueue
         //   4. The AI reply is NOT still collecting info (no trailing question)
         //
         // This block runs BEFORE the checkout-state-persistence block so that
-        // when the order succeeds we clear checkout_state there, and when it
-        // fails we escalate rather than silently persisting a dead state.
+        // when the order succeeds we persist its real ID; repeated failures
+        // clear the checkout state and escalate after the second attempt.
         if (
             $intent === 'place_order'
+            && $containsConfirmPhrase
+            && !$isProductBrowseMessage
             && $sallaChannel
             && !empty($checkoutState['salla_product_id'])
             && !empty($checkoutState['customer_phone'] ?? $checkoutState['phone'] ?? '')
@@ -1895,12 +1915,24 @@ class ProcessAutoReply implements ShouldQueue
                             "A team member will contact you shortly to complete your order manually. We apologize for the inconvenience.";
                     }
 
-                    // Escalate to human since Salla failed
-                    $conversation->update([
-                        'requires_human'    => true,
-                        'escalated_at'      => now(),
-                        'escalation_reason' => 'salla_order_creation_failed',
-                    ]);
+                    $failedAttempts = (int) ($updatedCheckoutState['failed_order_attempts'] ?? 0) + 1;
+                    if ($failedAttempts >= 2) {
+                        $conversation->update([
+                            'checkout_state' => null,
+                            'requires_human' => true,
+                            'escalated_at' => now(),
+                            'escalation_reason' => 'salla_order_creation_failed',
+                        ]);
+                        $updatedCheckoutState = [];
+                        $checkoutState = [];
+                        Log::warning('ProcessAutoReply: cleared checkout state after repeated order creation failures', [
+                            'conversation_id' => $conversation->id,
+                            'failed_attempts' => $failedAttempts,
+                        ]);
+                    } else {
+                        $updatedCheckoutState['failed_order_attempts'] = $failedAttempts;
+                        $conversation->update(['checkout_state' => $updatedCheckoutState]);
+                    }
                 }
             } else {
                 Log::info('ProcessAutoReply: place_order intent but AI still collecting info — skipping Salla API call', [

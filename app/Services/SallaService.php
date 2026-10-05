@@ -502,13 +502,20 @@ class SallaService
 
         // 2. Create customer via POST /customers if not found
         try {
-            $mobileCode = str_starts_with($cleanPhone, '966') ? '+966' : '+20';
-            $phoneWithoutCode = substr($cleanPhone, -9);
+            // Split full name into first_name and last_name deterministically
+            $nameParts = $this->splitFullName($fullName ?? '');
+            $firstName = $nameParts['first'];
+            $lastName  = $nameParts['last'] ?: 'Customer';
+
+            // Salla expects the calling code in mobile_code_country and the
+            // national number (without the calling code) in mobile.
+            $phoneData = $this->normalizePhoneForCustomer($phone);
 
             $payload = [
-                'first_name'  => $fullName ?: 'Customer',
-                'mobile'      => $phoneWithoutCode,
-                'mobile_code' => $mobileCode,
+                'first_name'          => $firstName,
+                'last_name'           => $lastName,
+                'mobile'              => $phoneData['mobile'],
+                'mobile_code_country' => $phoneData['mobile_code_country'],
             ];
             if ($email) {
                 $payload['email'] = $email;
@@ -680,15 +687,21 @@ class SallaService
             return null;
         }
 
-        $price = (float)($checkoutState['product_price'] ?? 0);
+        $phoneData = $this->normalizePhoneForCustomer($phone);
+        $internationalMobile = $phoneData['mobile_code_country'] . $phoneData['mobile'];
+        $countryCode = match ($phoneData['mobile_code_country']) {
+            '+20' => 'EG', '+966' => 'SA', '+971' => 'AE', '+965' => 'KW',
+            '+974' => 'QA', '+973' => 'BH', '+968' => 'OM', '+967' => 'YE',
+            '+962' => 'JO', '+961' => 'LB', '+964' => 'IQ', '+1' => 'US',
+            '+44' => 'GB', '+90' => 'TR', '+91' => 'IN', '+33' => 'FR',
+            '+49' => 'DE', default => 'SA',
+        };
 
-        $products = [
-            [
-                'id'       => $productId,
-                'quantity' => 1,
-                'price'    => $price,
-            ]
-        ];
+        $products = [[
+            'identifier_type' => 'id',
+            'identifier'      => $productId,
+            'quantity'        => 1,
+        ]];
 
         $payment = [
             'method' => 'cod',
@@ -696,10 +709,31 @@ class SallaService
         ];
 
         return [
-            'customer_id'      => $customerId,
-            'products'         => $products,
-            'shipping_address' => $shippingAddress,
-            'payment'          => $payment,
+            'customer' => array_filter([
+                'id'     => $customerId,
+                'name'   => $fullName,
+                'mobile' => $internationalMobile,
+                'email'  => $email,
+            ], fn ($value) => !is_null($value) && $value !== ''),
+            'receiver' => array_filter([
+                'name'         => $fullName,
+                'country_code' => $countryCode,
+                'phone'        => ltrim($internationalMobile, '+'),
+                'email'        => $email,
+                'notify'       => false,
+            ], fn ($value) => !is_null($value) && $value !== ''),
+            'delivery_method' => 'shipping',
+            'ship_to' => array_filter([
+                'country'       => $shippingAddress['country_id'] ?? null,
+                'city'          => $shippingAddress['city_id'] ?? null,
+                'street_number' => $shippingAddress['street_number'] ?? null,
+                'block'         => $shippingAddress['block'] ?? null,
+                'address'       => $shippingAddress['address'] ?? $freeformAddress,
+                'address_line'  => $shippingAddress['address'] ?? $freeformAddress,
+                'postal_code'   => $shippingAddress['postal_code'] ?? null,
+            ], fn ($value) => !is_null($value) && $value !== ''),
+            'products' => $products,
+            'payment'  => $payment,
         ];
     }
 
@@ -794,6 +828,7 @@ class SallaService
                 
                 return [
                     'id'       => $p['id']   ?? null,
+                    'sku'      => $p['sku']  ?? null,
                     'name'     => $p['name'] ?? 'Unknown',
                     'price'    => $p['price']['amount']       ?? $p['price'] ?? null,
                     'currency' => $p['price']['currency_code'] ?? 'SAR',
@@ -809,27 +844,42 @@ class SallaService
      */
     public function extractImageUrl(array $p): ?string
     {
-        $candidates = [
-            $p['thumbnail'] ?? null,
-            $p['main_image'] ?? null,
-            $p['images'][0] ?? null,
-            $p['urls']['image'] ?? null,
-            $p['image'] ?? null,
-            $p['image_url'] ?? null,
-        ];
+        // Salla product responses expose `thumbnail` and `main_image` as URL
+        // strings, and `images` as an array of objects with a `url` field.
+        // Some API versions wrap image URLs in nested original/thumbnail data.
+        foreach (['thumbnail', 'main_image', 'images', 'image', 'image_url'] as $key) {
+            $url = $this->findImageUrl($p[$key] ?? null);
+            if ($url) {
+                return $url;
+            }
+        }
 
-        foreach ($candidates as $cand) {
-            if (empty($cand)) {
-                continue;
-            }
-            if (is_string($cand) && str_starts_with($cand, 'http')) {
-                return $cand;
-            }
-            if (is_array($cand)) {
-                $url = $cand['url'] ?? $cand['link'] ?? $cand['src'] ?? null;
-                if (is_string($url) && str_starts_with($url, 'http')) {
+        return $this->findImageUrl($p['urls']['image'] ?? null);
+    }
+
+    private function findImageUrl(mixed $value): ?string
+    {
+        if (is_string($value) && preg_match('/^https?:\/\//i', $value)) {
+            return $value;
+        }
+
+        if (!is_array($value)) {
+            return null;
+        }
+
+        foreach (['url', 'src', 'link', 'original', 'standard_resolution', 'low_resolution', 'thumbnail'] as $key) {
+            if (array_key_exists($key, $value)) {
+                $url = $this->findImageUrl($value[$key]);
+                if ($url) {
                     return $url;
                 }
+            }
+        }
+
+        foreach ($value as $nested) {
+            $url = $this->findImageUrl($nested);
+            if ($url) {
+                return $url;
             }
         }
 
@@ -892,5 +942,83 @@ class SallaService
             return false;
         }
         return hash_equals(hash_hmac('sha256', $payload, $webhookSecret), $signature);
+    }
+
+    /**
+     * Normalize a phone into Salla's national mobile number and calling-code fields.
+     */
+    protected function normalizePhoneForCustomer(string $phone): array
+    {
+        $phone = trim($phone);
+        if (str_starts_with($phone, '00')) {
+            $phone = '+' . substr($phone, 2);
+        }
+        $digits = preg_replace('/[^0-9]/', '', $phone);
+
+        $callingCodes = [
+            '966' => '+966', '971' => '+971', '965' => '+965', '974' => '+974',
+            '973' => '+973', '968' => '+968', '967' => '+967', '962' => '+962',
+            '961' => '+961', '964' => '+964', '20' => '+20', '1' => '+1',
+            '44' => '+44', '90' => '+90', '91' => '+91', '33' => '+33', '49' => '+49',
+        ];
+
+        if (str_starts_with($phone, '+')) {
+            foreach ($callingCodes as $digitsCode => $formattedCode) {
+                if (str_starts_with($digits, $digitsCode)) {
+                    return [
+                        'mobile_code_country' => $formattedCode,
+                        'mobile' => substr($digits, strlen($digitsCode)),
+                    ];
+                }
+            }
+
+            // Unknown international prefix: use the longest plausible 1-3 digit code.
+            $codeLength = strlen($digits) >= 12 ? 3 : (strlen($digits) >= 11 ? 2 : 1);
+            return [
+                'mobile_code_country' => '+' . substr($digits, 0, $codeLength),
+                'mobile' => substr($digits, $codeLength),
+            ];
+        }
+
+        if (str_starts_with($digits, '9665')) {
+            return ['mobile_code_country' => '+966', 'mobile' => substr($digits, 3)];
+        }
+        if (str_starts_with($digits, '20') && strlen($digits) >= 12) {
+            return ['mobile_code_country' => '+20', 'mobile' => substr($digits, 2)];
+        }
+        if (preg_match('/^05[0-9]{8}$/', $digits)) {
+            return ['mobile_code_country' => '+966', 'mobile' => substr($digits, 1)];
+        }
+        if (preg_match('/^01[0-9]{9}$/', $digits)) {
+            return ['mobile_code_country' => '+20', 'mobile' => substr($digits, 1)];
+        }
+
+        // Default to Saudi calling code because Salla is Saudi-based.
+        return ['mobile_code_country' => '+966', 'mobile' => $digits];
+    }
+
+    /**
+     * Split a full name into first_name and last_name.
+     * Handles Arabic names, multiple words, single names, and whitespace.
+     */
+    protected function splitFullName(string $fullName): array
+    {
+        $fullName = trim($fullName);
+        if (empty($fullName)) {
+            return ['first' => 'Customer', 'last' => ''];
+        }
+
+        $words = array_filter(explode(' ', $fullName));
+        $count = count($words);
+
+        if ($count === 1) {
+            return ['first' => $words[0], 'last' => $words[0]];
+        }
+
+        // Multiple words: first word is first name, rest is last name
+        $firstName = $words[0];
+        $lastName = implode(' ', array_slice($words, 1));
+
+        return ['first' => $firstName, 'last' => $lastName];
     }
 }

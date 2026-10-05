@@ -329,7 +329,19 @@ ROLE;
         $p .= "• If partially answered → combine information from both sources + reasoning, then offer to follow up.\n";
         $p .= "• If not found in either source → reply honestly: \"I don't have information about that. Would you like me to connect you with a human agent who can help?\" → needs_escalation = false (let customer decide)\n\n";
 
-        // ── ORDER STATUS ──────────────────────────────────────────────────────
+        // ── Product Inquiry Intent (never escalate) ───────────────────────────────
+        $p .= "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n";
+        $p .= "INTENT 2b — PRODUCT INQUIRY (show products, request product images)\n";
+        $p .= "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n";
+        $p .= "Trigger: customer asks to see products, requests product images, or says phrases\n";
+        $p .= "       like \"show me products\", \"i wanna see the products with images please\",\n";
+        $p .= "       \"show me images\", \"show products\", \"i want to see products\".\n";
+        $p .= "Classification: Always classify these as product_inquiry intent.\n";
+        $p .= "AI Response: Show the available product catalogue from the live Salla data below.\n";
+        $p .= "NEVER escalate for product inquiries — always auto-reply with the product list.\n";
+        $p .= "intent = question, needs_escalation = false\n\n";
+
+        // ── ORDER STATUS ────────────────────────────────────────────────────────
         $p .= "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n";
         $p .= "INTENT 3 — ORDER STATUS & SHIPPING\n";
         $p .= "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n";

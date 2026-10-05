@@ -611,9 +611,18 @@ class SallaService
      * Salla permits at most 60 cities per page; checkout reads this catalog
      * locally so it never performs a multi-page network scan while placing an order.
      */
-    public function syncCityCatalog(Channel $channel, string $countryCode, ?callable $onProgress = null): int
+    public function syncCityCatalog(
+        Channel $channel,
+        string $countryCode,
+        ?callable $onProgress = null,
+        int $startPage = 1
+    ): int
     {
         $countryCode = strtoupper(trim($countryCode));
+        if ($startPage < 1 || $startPage > 2000) {
+            throw new \InvalidArgumentException('The resume page must be between 1 and 2000.');
+        }
+
         if ($onProgress) {
             $onProgress(['stage' => 'countries_request', 'country_code' => $countryCode]);
         }
@@ -628,10 +637,18 @@ class SallaService
         }
 
         $endpoint = "/countries/{$countryId}/cities";
-        $totalSynced = 0;
+        $existingCount = DB::table('salla_cities')
+            ->where('channel_id', $channel->id)
+            ->where('country_code', $countryCode)
+            ->count();
+        if ($startPage > 1 && $existingCount === 0) {
+            throw new \RuntimeException('Cannot resume: no previously synced city pages exist for this channel and country.');
+        }
+
+        $totalSynced = $startPage > 1 ? $existingCount : 0;
         $now = now();
 
-        for ($page = 1; $page <= 500; $page++) {
+        for ($page = $startPage; $page <= 2000; $page++) {
             if ($onProgress) {
                 $onProgress([
                     'stage' => 'page_request',
@@ -647,7 +664,7 @@ class SallaService
             ]);
             $cities = $response['data'] ?? [];
 
-            if ($page === 1 && empty($cities)) {
+            if ($page === $startPage && empty($cities)) {
                 throw new \RuntimeException("Salla returned no cities for {$countryCode}; local catalog was not updated.");
             }
 
@@ -701,18 +718,23 @@ class SallaService
                 break;
             }
 
-            if ($page === 500) {
-                throw new \RuntimeException('Salla city pagination exceeded the 500-page safety limit.');
+            if ($page === 2000) {
+                throw new \RuntimeException('Salla city pagination exceeded the 2000-page safety limit.');
             }
         }
 
-        DB::table('salla_cities')
+        if ($startPage === 1) {
+            DB::table('salla_cities')
+                ->where('channel_id', $channel->id)
+                ->where('country_code', $countryCode)
+                ->where('synced_at', '<', $now)
+                ->delete();
+        }
+
+        return (int) DB::table('salla_cities')
             ->where('channel_id', $channel->id)
             ->where('country_code', $countryCode)
-            ->where('synced_at', '<', $now)
-            ->delete();
-
-        return $totalSynced;
+            ->count();
     }
 
     protected function normalizeCitySearchText(string $value): string

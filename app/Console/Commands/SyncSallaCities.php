@@ -9,7 +9,7 @@ use Throwable;
 
 class SyncSallaCities extends Command
 {
-    protected $signature = 'salla:cities:sync {countryCode : ISO country code, for example EG} {channelId? : Connected Salla channel ID; defaults to all connected stores}';
+    protected $signature = 'salla:cities:sync {countryCode : ISO country code, for example EG} {channelId? : Connected Salla channel ID; defaults to all connected stores} {--from-page=1 : Resume from this page using the already saved earlier pages}';
 
     protected $description = 'Sync a Salla country city catalog into the local database';
 
@@ -22,6 +22,12 @@ class SyncSallaCities extends Command
         }
 
         $channelId = $this->argument('channelId');
+        $startPage = (int) $this->option('from-page');
+        if ($startPage < 1 || $startPage > 2000) {
+            $this->error('--from-page must be between 1 and 2000.');
+            return self::FAILURE;
+        }
+
         $channels = Channel::query()
             ->where('type', 'salla')
             ->where('status', 'connected')
@@ -38,7 +44,7 @@ class SyncSallaCities extends Command
         $failed = false;
         foreach ($channels as $channel) {
             try {
-                $this->info("Channel {$channel->id}: starting {$countryCode} city sync (up to 60 cities per page).");
+                $this->info("Channel {$channel->id}: starting {$countryCode} city sync at page {$startPage} (up to 60 cities per page).");
                 $count = $sallaService->syncCityCatalog($channel, $countryCode, function (array $progress) use ($channel): void {
                     if ($progress['stage'] === 'countries_request') {
                         $this->line("Channel {$channel->id}: fetching Salla country catalog...");
@@ -62,8 +68,8 @@ class SyncSallaCities extends Command
                             $progress['total_synced']
                         ));
                     }
-                });
-                $this->info("Channel {$channel->id}: synced {$count} {$countryCode} cities successfully.");
+                }, $startPage);
+                $this->info("Channel {$channel->id}: {$countryCode} catalog now contains {$count} cities.");
             } catch (Throwable $exception) {
                 $failed = true;
                 $this->error("Channel {$channel->id}: {$exception->getMessage()}");

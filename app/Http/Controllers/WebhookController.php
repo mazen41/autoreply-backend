@@ -191,15 +191,20 @@ class WebhookController extends Controller
 
                 $location = $this->extractMetaLocation($incomingMessage);
                 $messageText = trim((string) ($incomingMessage['text'] ?? ''));
+                $attachments = $incomingMessage['attachments'] ?? [];
                 if ($location) {
                     $locationText = 'Shared delivery location coordinates: '
                         . $location['lat'] . ', ' . $location['lng'];
                     $messageText = trim($messageText . ($messageText !== '' ? "\n" : '') . $locationText);
-                } elseif ($this->hasMetaLocationAttachment($incomingMessage)) {
-                    // Keep attachment-only location turns so checkout can ask for a
-                    // usable pin if Meta omitted its coordinates from the payload.
-                    $locationText = 'Customer shared a location pin, but its coordinates were not included in the message payload.';
-                    $messageText = trim($messageText . ($messageText !== '' ? "\n" : '') . $locationText);
+                } elseif ($messageText === '' && !empty($attachments)) {
+                    // Meta may send shared locations as a structured template, not
+                    // an attachment whose type is literally "location".
+                    $attachmentTypes = array_values(array_filter(array_map(
+                        fn ($attachment) => is_array($attachment) ? ($attachment['type'] ?? null) : null,
+                        $attachments
+                    )));
+                    $typeLabel = $attachmentTypes ? implode(', ', $attachmentTypes) : 'unknown';
+                    $messageText = "Customer shared an Instagram attachment (type: {$typeLabel}) without readable text or coordinates. If delivery location is still needed, ask for a Google Maps link or latitude and longitude.";
                 }
                 if ($messageText === '') continue;
 
@@ -421,42 +426,40 @@ class WebhookController extends Controller
     private function extractMetaLocation(array $message): ?array
     {
         foreach (($message['attachments'] ?? []) as $attachment) {
-            if (strtolower((string) ($attachment['type'] ?? '')) !== 'location') {
-                continue;
+            $coordinates = $this->findMetaCoordinates($attachment);
+            if ($coordinates) {
+                return $coordinates;
             }
-
-            $payload = $attachment['payload'] ?? [];
-            $coordinates = $payload['coordinates'] ?? $payload;
-            $latitude = $coordinates['lat'] ?? $coordinates['latitude'] ?? null;
-            $longitude = $coordinates['long'] ?? $coordinates['lng'] ?? $coordinates['longitude'] ?? null;
-
-            if (!is_numeric($latitude) || !is_numeric($longitude)) {
-                Log::warning('Meta location attachment did not include numeric coordinates');
-                continue;
-            }
-
-            $latitude = (float) $latitude;
-            $longitude = (float) $longitude;
-            if ($latitude < -90 || $latitude > 90 || $longitude < -180 || $longitude > 180) {
-                Log::warning('Meta location attachment coordinates are out of range');
-                continue;
-            }
-
-            return ['lat' => $latitude, 'lng' => $longitude];
         }
 
         return null;
     }
 
-    private function hasMetaLocationAttachment(array $message): bool
+    /** Search nested template/location payloads without logging customer coordinates. */
+    private function findMetaCoordinates(mixed $data, int $depth = 0): ?array
     {
-        foreach (($message['attachments'] ?? []) as $attachment) {
-            if (strtolower((string) ($attachment['type'] ?? '')) === 'location') {
-                return true;
+        if (!is_array($data) || $depth > 8) {
+            return null;
+        }
+
+        $latitude = $data['lat'] ?? $data['latitude'] ?? null;
+        $longitude = $data['long'] ?? $data['lng'] ?? $data['longitude'] ?? null;
+        if (is_numeric($latitude) && is_numeric($longitude)) {
+            $latitude = (float) $latitude;
+            $longitude = (float) $longitude;
+            if ($latitude >= -90 && $latitude <= 90 && $longitude >= -180 && $longitude <= 180) {
+                return ['lat' => $latitude, 'lng' => $longitude];
             }
         }
 
-        return false;
+        foreach ($data as $value) {
+            $coordinates = $this->findMetaCoordinates($value, $depth + 1);
+            if ($coordinates) {
+                return $coordinates;
+            }
+        }
+
+        return null;
     }
 
     /** File-cache errors must not discard a verified customer webhook. */

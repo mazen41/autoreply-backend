@@ -643,6 +643,7 @@ class SallaService
             $response = $this->apiCallForChannel($channel, 'GET', $endpoint, [
                 'page' => $page,
                 'per_page' => 60,
+                'count' => 60,
             ]);
             $cities = $response['data'] ?? [];
 
@@ -689,6 +690,7 @@ class SallaService
                     'country_code' => $countryCode,
                     'page' => $page,
                     'total_pages' => $totalPages,
+                    'response_per_page' => (int) ($pagination['perPage'] ?? $pagination['per_page'] ?? 0),
                     'page_count' => count($cities),
                     'total_synced' => $totalSynced,
                 ]);

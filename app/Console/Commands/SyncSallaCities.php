@@ -53,11 +53,12 @@ class SyncSallaCities extends Command
                     if ($progress['stage'] === 'page_complete') {
                         $totalPages = max(1, (int) $progress['total_pages']);
                         $this->info(sprintf(
-                            'Channel %d: page %d/%d complete; received %d cities (%d saved so far).',
+                            'Channel %d: page %d/%d complete; received %d cities (API perPage=%d, %d saved so far).',
                             $channel->id,
                             $progress['page'],
                             $totalPages,
                             $progress['page_count'],
+                            $progress['response_per_page'],
                             $progress['total_synced']
                         ));
                     }

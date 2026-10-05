@@ -236,6 +236,7 @@ class SallaServiceTest extends TestCase
         Http::assertSent(fn ($request) =>
             str_contains($request->url(), '/cities')
             && str_contains($request->url(), 'per_page=60')
+            && str_contains($request->url(), 'count=60')
         );
     }
 }

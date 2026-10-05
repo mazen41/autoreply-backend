@@ -14,8 +14,8 @@ class OrderCheckoutService
      */
     public const REQUIRED_FIELDS = ['full_name', 'phone', 'address'];
 
-    /** Resolve a Saudi delivery address to coordinates without asking the customer for a pin. */
-    public function geocodeSaudiAddress(string $address): array
+    /** Resolve a delivery address to coordinates without asking for a pin. */
+    public function geocodeDeliveryAddress(string $address, ?string $phone = null): array
     {
         $normalizedAddress = trim(preg_replace('/\s+/', ' ', $address));
         $endpoint = rtrim((string) config('services.nominatim.endpoint'), '/');
@@ -27,44 +27,66 @@ class OrderCheckoutService
             return ['status' => 'unavailable', 'coordinates' => null];
         }
 
-        $query = $normalizedAddress . ', Saudi Arabia';
-        $cacheKey = 'nominatim:sa:' . hash('sha256', mb_strtolower($query));
+        $country = $this->deliveryCountryForAddress($normalizedAddress, $phone);
+        $query = $normalizedAddress . ', ' . $country['name'];
+        $countryCodes = 'sa,ae,kw,qa,bh,om,ye,iq,sy,jo,lb,ps,eg,ly,tn,dz,ma,sd,so,dj,km,mr,eh';
+        $cacheKey = 'nominatim:delivery:' . hash('sha256', mb_strtolower($query));
         $cached = Cache::get($cacheKey);
         if (is_array($cached)) {
             return $cached;
         }
 
         try {
-            // Nominatim's public service has a one-request-per-second limit.
-            // Keep the same limit for configured instances and across workers.
-            $response = Cache::lock('nominatim:request-throttle', 15)->block(10, function () use ($endpoint, $query) {
-                $lastRequestAt = (float) Cache::get('nominatim:last-request-at', 0);
-                $waitMicroseconds = (int) max(0, (1 - (microtime(true) - $lastRequestAt)) * 1_000_000);
-                if ($waitMicroseconds > 0) {
-                    usleep($waitMicroseconds);
-                }
+            $search = function (?string $allowedCountries) use ($endpoint, $query) {
+                // Nominatim limits public usage to one request per second.
+                // Share a throttle across queue workers and cache query results.
+                return Cache::lock('nominatim:request-throttle', 15)->block(10, function () use ($endpoint, $query, $allowedCountries) {
+                    $lastRequestAt = (float) Cache::get('nominatim:last-request-at', 0);
+                    $waitMicroseconds = (int) max(0, (1 - (microtime(true) - $lastRequestAt)) * 1_000_000);
+                    if ($waitMicroseconds > 0) {
+                        usleep($waitMicroseconds);
+                    }
 
-                $response = Http::acceptJson()
-                    ->withUserAgent('AutoReply/1.0')
-                    ->connectTimeout(3)
-                    ->timeout(10)
-                    ->get($endpoint . '/search', [
+                    $parameters = [
                         'q' => $query,
                         'format' => 'json',
                         'limit' => 1,
-                        'countrycodes' => 'sa',
-                    ]);
+                    ];
+                    if ($allowedCountries !== null) {
+                        $parameters['countrycodes'] = $allowedCountries;
+                    }
 
-                Cache::put('nominatim:last-request-at', microtime(true), now()->addMinute());
-                return $response;
-            });
+                    $response = Http::acceptJson()
+                        ->withUserAgent('AutoReply/1.0')
+                        ->connectTimeout(3)
+                        ->timeout(10)
+                        ->get($endpoint . '/search', $parameters);
 
+                    Cache::put('nominatim:last-request-at', microtime(true), now()->addMinute());
+                    return $response;
+                });
+            };
+
+            $response = $search($countryCodes);
             if (!$response->successful()) {
                 Log::warning('Nominatim address lookup failed', ['http_status' => $response->status()]);
                 return ['status' => 'unavailable', 'coordinates' => null];
             }
 
             $results = $response->json();
+            if (!is_array($results)) {
+                return ['status' => 'unavailable', 'coordinates' => null];
+            }
+            if ($results === []) {
+                // Retry unrestricted only after a successful but empty regional search.
+                $response = $search(null);
+                if (!$response->successful()) {
+                    Log::warning('Nominatim global address lookup failed', ['http_status' => $response->status()]);
+                    return ['status' => 'unavailable', 'coordinates' => null];
+                }
+                $results = $response->json();
+            }
+
             if (!is_array($results)) {
                 return ['status' => 'unavailable', 'coordinates' => null];
             }
@@ -92,6 +114,63 @@ class OrderCheckoutService
             Log::warning('Nominatim address lookup unavailable', ['error' => $e->getMessage()]);
             return ['status' => 'unavailable', 'coordinates' => null];
         }
+    }
+
+    /** Determine the English country name to append to the geocoding query. */
+    private function deliveryCountryForAddress(string $address, ?string $phone): array
+    {
+        $countries = [
+            'sa' => ['name' => 'Saudi Arabia', 'aliases' => ['saudi arabia', 'ksa', 'السعودية'], 'dial' => '966'],
+            'ae' => ['name' => 'United Arab Emirates', 'aliases' => ['united arab emirates', 'uae', 'الإمارات'], 'dial' => '971'],
+            'kw' => ['name' => 'Kuwait', 'aliases' => ['kuwait', 'الكويت'], 'dial' => '965'],
+            'qa' => ['name' => 'Qatar', 'aliases' => ['qatar', 'قطر'], 'dial' => '974'],
+            'bh' => ['name' => 'Bahrain', 'aliases' => ['bahrain', 'البحرين'], 'dial' => '973'],
+            'om' => ['name' => 'Oman', 'aliases' => ['oman', 'عمان'], 'dial' => '968'],
+            'ye' => ['name' => 'Yemen', 'aliases' => ['yemen', 'اليمن'], 'dial' => '967'],
+            'iq' => ['name' => 'Iraq', 'aliases' => ['iraq', 'العراق'], 'dial' => '964'],
+            'sy' => ['name' => 'Syria', 'aliases' => ['syria', 'سوريا'], 'dial' => '963'],
+            'jo' => ['name' => 'Jordan', 'aliases' => ['jordan', 'الأردن'], 'dial' => '962'],
+            'lb' => ['name' => 'Lebanon', 'aliases' => ['lebanon', 'لبنان'], 'dial' => '961'],
+            'ps' => ['name' => 'Palestine', 'aliases' => ['palestine', 'فلسطين'], 'dial' => '970'],
+            'eg' => ['name' => 'Egypt', 'aliases' => ['egypt', 'مصر'], 'dial' => '20'],
+            'ly' => ['name' => 'Libya', 'aliases' => ['libya', 'ليبيا'], 'dial' => '218'],
+            'tn' => ['name' => 'Tunisia', 'aliases' => ['tunisia', 'تونس'], 'dial' => '216'],
+            'dz' => ['name' => 'Algeria', 'aliases' => ['algeria', 'الجزائر'], 'dial' => '213'],
+            'ma' => ['name' => 'Morocco', 'aliases' => ['morocco', 'المغرب'], 'dial' => '212'],
+            'sd' => ['name' => 'Sudan', 'aliases' => ['sudan', 'السودان'], 'dial' => '249'],
+            'so' => ['name' => 'Somalia', 'aliases' => ['somalia', 'الصومال'], 'dial' => '252'],
+            'dj' => ['name' => 'Djibouti', 'aliases' => ['djibouti', 'جيبوتي'], 'dial' => '253'],
+            'km' => ['name' => 'Comoros', 'aliases' => ['comoros', 'جزر القمر'], 'dial' => '269'],
+            'mr' => ['name' => 'Mauritania', 'aliases' => ['mauritania', 'موريتانيا'], 'dial' => '222'],
+            'eh' => ['name' => 'Western Sahara', 'aliases' => ['western sahara', 'الصحراء الغربية'], 'dial' => null],
+        ];
+
+        $addressLower = mb_strtolower($address);
+        foreach ($countries as $country) {
+            foreach ($country['aliases'] as $alias) {
+                if (mb_stripos($addressLower, mb_strtolower($alias)) !== false) {
+                    return $country;
+                }
+            }
+        }
+
+        $phoneDigits = preg_replace('/\D+/', '', (string) $phone);
+        if (str_starts_with($phoneDigits, '00')) {
+            $phoneDigits = substr($phoneDigits, 2);
+        }
+        if (preg_match('/^01[0125]\d{8}$/', $phoneDigits)) {
+            return $countries['eg'];
+        }
+        if (preg_match('/^05\d{8}$/', $phoneDigits)) {
+            return $countries['sa'];
+        }
+        foreach ($countries as $country) {
+            if ($country['dial'] && str_starts_with($phoneDigits, $country['dial'])) {
+                return $country;
+            }
+        }
+
+        return $countries['sa'];
     }
 
     /**

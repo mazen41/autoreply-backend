@@ -1362,7 +1362,10 @@ class ProcessAutoReply implements ShouldQueue
             && empty($updatedCheckoutState['geo_coordinates'])
             && !empty($updatedCheckoutState['address'])
         ) {
-            $geocodingResult = $checkoutService->geocodeSaudiAddress((string) $updatedCheckoutState['address']);
+            $geocodingResult = $checkoutService->geocodeDeliveryAddress(
+                (string) $updatedCheckoutState['address'],
+                (string) ($updatedCheckoutState['phone'] ?? $updatedCheckoutState['customer_phone'] ?? '')
+            );
             $addressGeocodingStatus = $geocodingResult['status'] ?? 'unavailable';
             if ($addressGeocodingStatus === 'found' && !empty($geocodingResult['coordinates'])) {
                 $updatedCheckoutState['geo_coordinates'] = $geocodingResult['coordinates'];

@@ -164,6 +164,12 @@ class SallaService
             }
 
             if ($response->status() === 401) {
+                $responseBody = $response->body();
+
+                if ($this->isMissingScopeError($responseBody)) {
+                    throw new \Exception('Salla API scope missing: ' . $responseBody);
+                }
+
                 throw new \Exception('Access token expired');
             }
 
@@ -186,6 +192,18 @@ class SallaService
         try {
             return $this->apiCall($method, $endpoint, $data, $accessToken);
         } catch (\Exception $e) {
+            if ($this->isMissingScopeError($e->getMessage())) {
+                Log::error('Salla API request denied because the connected store is missing a required scope; reconnect required', [
+                    'channel_id' => $channel->id,
+                    'endpoint' => $endpoint,
+                    'error' => $e->getMessage(),
+                ]);
+
+                // Refreshing a token cannot add scopes that were not granted during OAuth.
+                // Keep the channel connected so the dashboard does not misreport this as expiry.
+                throw $e;
+            }
+
             // If token expired, try to refresh once
             if (str_contains($e->getMessage(), 'Access token expired') || str_contains($e->getMessage(), '401')) {
                 $refreshToken = $channel->refresh_token;
@@ -216,6 +234,18 @@ class SallaService
                     return $this->apiCall($method, $endpoint, $data, $channel->access_token);
 
                 } catch (\Exception $refreshEx) {
+                    if ($this->isMissingScopeError($refreshEx->getMessage())) {
+                        Log::error('Salla API request still denied after token refresh because the store is missing a required scope; reconnect required', [
+                            'channel_id' => $channel->id,
+                            'endpoint' => $endpoint,
+                            'error' => $refreshEx->getMessage(),
+                        ]);
+
+                        // The token refresh succeeded, but its grant still lacks the needed scope.
+                        // Preserve the refreshed credentials and connected status.
+                        throw $refreshEx;
+                    }
+
                     Log::error('Salla: token refresh failed — marking channel as token_expired', [
                         'channel_id' => $channel->id,
                         'error'      => $refreshEx->getMessage(),
@@ -227,6 +257,15 @@ class SallaService
 
             throw $e;
         }
+    }
+
+    /**
+     * Salla uses 401 for both expired tokens and insufficient OAuth scopes.
+     * Missing scopes require reconnecting the store, not marking its token expired.
+     */
+    protected function isMissingScopeError(string $message): bool
+    {
+        return str_contains(strtolower($message), 'should have access to one of those scopes');
     }
 
     /**

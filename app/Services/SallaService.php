@@ -516,28 +516,10 @@ class SallaService
      */
     public function resolveOrCreateCustomerForChannel(Channel $channel, string $phone, ?string $fullName = null, ?string $email = null): ?int
     {
-        $cleanPhone = preg_replace('/[^0-9]/', '', $phone);
-        if (empty($cleanPhone)) {
-            return null;
-        }
-
-        // 1. Check if customer already exists in Salla by searching mobile
-        $last9 = substr($cleanPhone, -9);
-        $local = '0' . $last9;
-        foreach ([$cleanPhone, $local] as $searchPhone) {
-            try {
-                $res = $this->apiCallForChannel($channel, 'GET', '/customers', ['mobile' => $searchPhone]);
-                $candidates = $res['data'] ?? [];
-                foreach ($candidates as $cand) {
-                    $candRaw = preg_replace('/[^0-9]/', '', $cand['mobile'] ?? '');
-                    if (substr($candRaw, -9) === $last9 && !empty($cand['id'])) {
-                        Log::info('SallaService: found existing Salla customer_id', ['customer_id' => $cand['id']]);
-                        return (int)$cand['id'];
-                    }
-                }
-            } catch (\Exception $e) {
-                Log::warning('SallaService: GET /customers lookup failed', ['error' => $e->getMessage()]);
-            }
+        $existingCustomer = $this->findCustomerForChannel($channel, $phone);
+        if ($existingCustomer && !empty($existingCustomer['id'])) {
+            Log::info('SallaService: found existing Salla customer_id', ['customer_id' => $existingCustomer['id']]);
+            return (int) $existingCustomer['id'];
         }
 
         // 2. Create customer via POST /customers if not found
@@ -569,6 +551,40 @@ class SallaService
             }
         } catch (\Exception $e) {
             Log::warning('SallaService: POST /customers failed', ['error' => $e->getMessage()]);
+        }
+
+        return null;
+    }
+
+    /** Find the exact Salla customer matching a phone number and return its saved profile fields. */
+    public function findCustomerForChannel(Channel $channel, string $phone): ?array
+    {
+        $cleanPhone = preg_replace('/[^0-9]/', '', $phone);
+        if (empty($cleanPhone)) {
+            return null;
+        }
+
+        $last9 = substr($cleanPhone, -9);
+        $local = '0' . $last9;
+        foreach (array_unique([$cleanPhone, $local]) as $searchPhone) {
+            try {
+                $res = $this->apiCallForChannel($channel, 'GET', '/customers', ['keyword' => $searchPhone]);
+                foreach (($res['data'] ?? []) as $candidate) {
+                    $candidatePhone = preg_replace('/[^0-9]/', '', (string) ($candidate['mobile'] ?? ''));
+                    if (
+                        !empty($candidate['id'])
+                        && $candidatePhone !== ''
+                        && substr($candidatePhone, -9) === $last9
+                    ) {
+                        return $candidate;
+                    }
+                }
+            } catch (\Exception $e) {
+                Log::warning('SallaService: customer profile lookup failed', [
+                    'channel_id' => $channel->id,
+                    'error' => $e->getMessage(),
+                ]);
+            }
         }
 
         return null;
@@ -860,7 +876,20 @@ class SallaService
     {
         $phone    = $checkoutState['phone'] ?? $checkoutState['customer_phone'] ?? '';
         $fullName = $checkoutState['full_name'] ?? null;
-        $email    = $checkoutState['email'] ?? null;
+        $email    = $checkoutState['email'] ?? $checkoutState['customer_email'] ?? null;
+
+        $existingCustomer = $this->findCustomerForChannel($channel, $phone);
+        if (empty($email) && !empty($existingCustomer['email'])) {
+            $email = $existingCustomer['email'];
+        }
+
+        if (empty($email) || !filter_var($email, FILTER_VALIDATE_EMAIL)) {
+            Log::info('SallaService: order is waiting for a valid receiver email', [
+                'channel_id' => $channel->id,
+                'customer_found' => (bool) $existingCustomer,
+            ]);
+            return null;
+        }
 
         $customerId = $this->resolveOrCreateCustomerForChannel($channel, $phone, $fullName, $email);
         if (!$customerId) {
@@ -878,6 +907,21 @@ class SallaService
             Log::warning('SallaService: shipping address could not be confidently mapped to merchant Salla city/fields', [
                 'channel_id' => $channel->id,
                 'address'    => $freeformAddress,
+            ]);
+            return null;
+        }
+
+        $postalCode = $checkoutState['postal_code'] ?? $shippingAddress['postal_code'] ?? null;
+        $coordinates = $checkoutState['geo_coordinates'] ?? null;
+        if (
+            empty($postalCode)
+            || !is_array($coordinates)
+            || !isset($coordinates['lat'], $coordinates['lng'])
+        ) {
+            Log::info('SallaService: order is waiting for postal code and delivery coordinates', [
+                'channel_id' => $channel->id,
+                'has_postal_code' => !empty($postalCode),
+                'has_coordinates' => is_array($coordinates) && isset($coordinates['lat'], $coordinates['lng']),
             ]);
             return null;
         }
@@ -921,6 +965,39 @@ class SallaService
             return null;
         }
 
+        // Ask Salla for valid delivery options for the resolved city and the
+        // customer's actual postal/geographic location. courier_id is a store
+        // shipping company ID; the estimate's own ID is a shipping-details ID.
+        $ratesResponse = $this->apiCallForChannel($channel, 'GET', '/shipping/companies/estimate-rate', [
+            'city_id' => $shippingAddress['city_id'],
+            'country_id' => $shippingAddress['country_id'],
+            'geocode' => $coordinates['lat'] . ',' . $coordinates['lng'],
+            'postal_code' => $postalCode,
+        ]);
+        $rates = $ratesResponse['data'] ?? [];
+        $selectedRate = null;
+        foreach ($rates as $rate) {
+            if (empty($rate['company_id'])) {
+                continue;
+            }
+            $hasCod = collect($rate['services'] ?? [])->contains(function ($service) {
+                return strtolower((string) ($service['name'] ?? '')) === 'cod';
+            });
+            if ($hasCod) {
+                $selectedRate = $rate;
+                break;
+            }
+        }
+
+        if (!$selectedRate) {
+            Log::warning('SallaService: no COD shipping estimate available for the delivery address', [
+                'channel_id' => $channel->id,
+                'city_id' => $shippingAddress['city_id'],
+                'rate_count' => count($rates),
+            ]);
+            return null;
+        }
+
         $phoneData = $this->normalizePhoneForCustomer($phone);
         $internationalMobile = $phoneData['mobile_code_country'] . $phoneData['mobile'];
         $countryCode = match ($phoneData['mobile_code_country']) {
@@ -937,9 +1014,24 @@ class SallaService
             'quantity'        => 1,
         ]];
 
+        $currency = $checkoutState['product_currency'] ?? $selectedRate['total']['currency'] ?? 'SAR';
+        $productAmount = (float) ($checkoutState['product_price'] ?? 0);
+        $shippingAmount = (float) ($selectedRate['total']['amount'] ?? 0);
+        $codServiceAmount = 0.0;
+        foreach (($selectedRate['services'] ?? []) as $service) {
+            if (strtolower((string) ($service['name'] ?? '')) === 'cod') {
+                $codServiceAmount = (float) ($service['amount']['amount'] ?? 0);
+                break;
+            }
+        }
+
         $payment = [
             'method' => 'cod',
-            'status' => 'pending',
+            'status' => 'pending_payment',
+            'cash_on_delivery' => [
+                'amount' => $productAmount + $shippingAmount + $codServiceAmount,
+                'currency' => $currency,
+            ],
         ];
 
         return [
@@ -957,6 +1049,7 @@ class SallaService
                 'notify'       => false,
             ], fn ($value) => !is_null($value) && $value !== ''),
             'delivery_method' => 'shipping',
+            'courier_id' => (int) $selectedRate['company_id'],
             'ship_to' => array_filter([
                 'country'       => $shippingAddress['country_id'] ?? null,
                 'city'          => $shippingAddress['city_id'] ?? null,
@@ -964,7 +1057,14 @@ class SallaService
                 'block'         => $shippingAddress['block'] ?? null,
                 'address'       => $shippingAddress['address'] ?? $freeformAddress,
                 'address_line'  => $shippingAddress['address'] ?? $freeformAddress,
-                'postal_code'   => $shippingAddress['postal_code'] ?? null,
+                'postal_code'   => $postalCode,
+                'geo_coordinates' => [
+                    'lat' => (float) $coordinates['lat'],
+                    'lng' => (float) $coordinates['lng'],
+                ],
+                'building_number' => $checkoutState['building_number'] ?? null,
+                'short_address' => $checkoutState['short_address'] ?? null,
+                'additional_number' => $checkoutState['additional_number'] ?? null,
             ], fn ($value) => !is_null($value) && $value !== ''),
             'products' => $products,
             'payment'  => $payment,

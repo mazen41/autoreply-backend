@@ -1195,7 +1195,10 @@ class ProcessAutoReply implements ShouldQueue
 
         // ── COMPUTE EXISTING CHECKOUT FIELD STATUS FOR STRUCTURED STATE ──────
         $checkoutService = app(\App\Services\OrderCheckoutService::class);
-        $fieldStatus = $checkoutService->computeFieldStatus(is_array($checkoutState) ? $checkoutState : []);
+        $fieldStatus = $checkoutService->computeFieldStatus(
+            is_array($checkoutState) ? $checkoutState : [],
+            (bool) $sallaChannel && !empty($checkoutState['salla_product_id'])
+        );
 
         // ── STRUCTURED CONVERSATION STATE ────────────────────────────────────
         // Build authoritative structured state for the AI. The AI must NEVER
@@ -1318,7 +1321,51 @@ class ProcessAutoReply implements ShouldQueue
             // Only clear it if there is genuinely no prior data.
             $conversation->update(['checkout_state' => null]);
         }
-        $fieldStatus = $checkoutService->computeFieldStatus($updatedCheckoutState);
+        $sallaCheckoutActive = (bool) $sallaChannel && !empty($updatedCheckoutState['salla_product_id']);
+
+        // Reuse a saved Salla customer profile when the phone matches. This
+        // avoids asking returning customers for an email already on file.
+        if ($sallaCheckoutActive && !empty($updatedCheckoutState['phone'] ?? $updatedCheckoutState['customer_phone'] ?? '')) {
+            try {
+                $sallaProfile = app(SallaService::class)->findCustomerForChannel(
+                    $sallaChannel,
+                    (string) ($updatedCheckoutState['phone'] ?? $updatedCheckoutState['customer_phone'])
+                );
+                if (empty($updatedCheckoutState['email']) && !empty($sallaProfile['email'])) {
+                    $updatedCheckoutState['email'] = $sallaProfile['email'];
+                    $updatedCheckoutState['customer_email'] = $sallaProfile['email'];
+                }
+                if (empty($updatedCheckoutState['address']) && !empty($sallaProfile['location']) && $sallaProfile['location'] !== 'null') {
+                    $savedAddress = trim(implode(', ', array_filter([
+                        $sallaProfile['location'],
+                        $sallaProfile['city'] ?? null,
+                        $sallaProfile['country'] ?? null,
+                    ], fn ($value) => is_string($value) && trim($value) !== '' && strtolower(trim($value)) !== 'null')));
+                    if ($savedAddress !== '') {
+                        $updatedCheckoutState['address'] = $savedAddress;
+                    }
+                }
+                $conversation->update(['checkout_state' => $updatedCheckoutState]);
+            } catch (\Throwable $e) {
+                Log::warning('ProcessAutoReply: could not reuse saved Salla customer details', [
+                    'conversation_id' => $conversation->id,
+                    'error' => $e->getMessage(),
+                ]);
+            }
+        }
+
+        $checkoutState = $updatedCheckoutState;
+        $fieldStatus = $checkoutService->computeFieldStatus($updatedCheckoutState, $sallaCheckoutActive);
+
+        // The AI context was assembled before deterministic extraction; refresh
+        // its checkout facts so it asks only for information still missing.
+        $structuredState['customer']['email'] = $updatedCheckoutState['email'] ?? $updatedCheckoutState['customer_email'] ?? null;
+        $structuredState['customer']['postal_code'] = $updatedCheckoutState['postal_code'] ?? null;
+        $structuredState['customer']['geo_coordinates'] = $updatedCheckoutState['geo_coordinates'] ?? null;
+        $structuredState['customer']['building_number'] = $updatedCheckoutState['building_number'] ?? null;
+        $structuredState['customer']['short_address'] = $updatedCheckoutState['short_address'] ?? null;
+        $structuredState['customer']['additional_number'] = $updatedCheckoutState['additional_number'] ?? null;
+        $structuredState['pending_action'] = $this->determinePendingAction($updatedCheckoutState, $isPlaceOrder, $fieldStatus);
 
         Log::info('ORDER_INFO_CHECK', [
             'conversation_id' => $conversation->id,
@@ -1891,6 +1938,7 @@ class ProcessAutoReply implements ShouldQueue
             && $containsConfirmPhrase
             && !$isProductBrowseMessage
             && $sallaChannel
+            && !empty($fieldStatus['is_complete'])
             && !empty($checkoutState['salla_product_id'])
             && !empty($checkoutState['customer_phone'] ?? $checkoutState['phone'] ?? '')
             && !empty($checkoutState['address'] ?? $checkoutState['customer_address'] ?? '')
@@ -1921,7 +1969,12 @@ class ProcessAutoReply implements ShouldQueue
                     'full_name'        => $checkoutState['full_name']         ?? $checkoutState['customer_name']    ?? null,
                     'phone'            => $checkoutState['customer_phone']    ?? $checkoutState['phone']             ?? '',
                     'address'          => $checkoutState['address']           ?? $checkoutState['customer_address'] ?? '',
-                    'email'            => $checkoutState['customer_email']    ?? null,
+                    'email'            => $checkoutState['email']              ?? $checkoutState['customer_email'] ?? null,
+                    'postal_code'      => $checkoutState['postal_code']         ?? null,
+                    'geo_coordinates'  => $checkoutState['geo_coordinates']     ?? null,
+                    'building_number'  => $checkoutState['building_number']     ?? null,
+                    'short_address'    => $checkoutState['short_address']       ?? null,
+                    'additional_number'=> $checkoutState['additional_number']   ?? null,
                 ];
 
                 $orderData = $this->createRealExternalOrder($conversation, $orderInput, $channel);
@@ -2019,6 +2072,41 @@ class ProcessAutoReply implements ShouldQueue
         // ── END REAL SALLA ORDER CREATION ────────────────────────────────────
 
         // ── CHECKOUT STATE PERSISTENCE ─────────────────────────────────────
+        // Never let an AI success claim escape when a customer confirms before
+        // Salla's required receiver/shipping details have been collected.
+        if (
+            $intent === 'place_order'
+            && $containsConfirmPhrase
+            && $sallaChannel
+            && !empty($updatedCheckoutState['salla_product_id'])
+            && empty($fieldStatus['is_complete'])
+        ) {
+            $missingLabels = [
+                'full_name' => 'full name',
+                'phone' => 'phone number',
+                'address' => 'complete delivery address',
+                'email' => 'email address',
+                'postal_code' => 'postal / ZIP code',
+                'geo_coordinates' => 'Google Maps pin with coordinates',
+                'building_number' => 'building or house number',
+                'short_address' => 'short / national address code',
+                'additional_number' => 'additional address number',
+            ];
+            $missingDetails = array_map(
+                fn ($field) => $missingLabels[$field] ?? str_replace('_', ' ', $field),
+                $fieldStatus['missing_fields']
+            );
+            if ($detectedLanguage === 'arabic') {
+                $aiResponse = "لم يتم إرسال الطلب بعد. لإتمامه، أحتاج إلى: " . implode('، ', $missingDetails) . ". من فضلك أرسل البيانات الناقصة.";
+            } else {
+                $aiResponse = "I haven't submitted the order yet. To complete it, please send: " . implode(', ', $missingDetails) . ".";
+            }
+            Log::info('ProcessAutoReply: blocked Salla order confirmation while required details are missing', [
+                'conversation_id' => $conversation->id,
+                'missing_fields' => $fieldStatus['missing_fields'],
+            ]);
+        }
+
         // The checkout state is already saved by the pre-AI confirmation block above.
         // No post-AI order creation — orders are created BEFORE the AI reply so
         // the AI can correctly reference the real order ID in its response.

@@ -450,7 +450,22 @@ ROLE;
             $p .= "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n";
             $p .= "CHECKOUT FIELD COLLECTION STATE\n";
             $p .= "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n";
-            $p .= "Required Fields: [Full Name, Phone Number, Delivery Address]\n\n";
+            $requiredLabels = [
+                'full_name' => 'Full Name',
+                'phone' => 'Phone Number',
+                'address' => 'Complete Delivery Address',
+                'email' => 'Email Address',
+                'postal_code' => 'Postal / ZIP Code',
+                'geo_coordinates' => 'Google Maps location pin or latitude and longitude',
+                'building_number' => 'Building or house number',
+                'short_address' => 'Short / national address code',
+                'additional_number' => 'Additional address number',
+            ];
+            $p .= "Required Fields: [Full Name, Phone Number, Complete Delivery Address]";
+            if (!empty($context['salla_exclusive_mode'])) {
+                $p .= "; Salla also needs a valid email, postal code, exact map pin/coordinates, building number, short/national address code, and additional address number before submission";
+            }
+            $p .= "\n\n";
 
             if (!empty($knownFields)) {
                 $p .= "✅ ALREADY KNOWN FIELDS (CRITICAL: NEVER ASK FOR THESE AGAIN!):\n";
@@ -463,10 +478,14 @@ ROLE;
             if (!empty($missingFields)) {
                 $p .= "❌ CURRENTLY MISSING REQUIRED FIELDS:\n";
                 foreach ($missingFields as $mf) {
-                    $p .= "  • {$mf}\n";
+                    $label = $requiredLabels[$mf] ?? ucwords(str_replace('_', ' ', $mf));
+                    $p .= "  • {$label}\n";
                 }
                 $p .= "\n⚠️ CRITICAL RULE: ASK FOR ALL CURRENTLY MISSING REQUIRED FIELDS TOGETHER IN ONE SINGLE MESSAGE!\n";
                 $p .= "Do NOT ask for fields one-by-one in separate turns. Do NOT re-ask for any field listed under ALREADY KNOWN FIELDS.\n\n";
+                if (!empty($context['salla_exclusive_mode'])) {
+                    $p .= "For Google Maps location, ask the customer to share a pin/link that includes coordinates; never invent coordinates, postal codes, email addresses, or national-address values. The customer does not need to provide a courier ID; the application selects from the store's Salla shipping options.\n\n";
+                }
             }
 
             if ($isComplete && $realOrderId) {

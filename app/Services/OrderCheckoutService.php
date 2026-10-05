@@ -25,11 +25,61 @@ class OrderCheckoutService
         if (empty($existingState['full_name']) && !empty($existingState['customer_name'])) {
             $existingState['full_name'] = $existingState['customer_name'];
         }
+        if (empty($existingState['email']) && !empty($existingState['customer_email'])) {
+            $existingState['email'] = $existingState['customer_email'];
+        }
 
         // 1. Extract phone number
         $extractedPhone = null;
-        if (preg_match('/(?:\+?[0-9]{8,15})/', preg_replace('/\s+/', '', $incomingText), $pm)) {
+        $phoneSearchText = preg_replace('/(?:postal|zip)\s*(?:code)?\s*[:#-]?\s*[A-Z0-9-]{3,12}/i', '', $incomingText);
+        $hasKnownPhone = !empty($existingState['phone'] ?? $existingState['customer_phone'] ?? null);
+        $explicitPhoneContext = preg_match('/\b(?:phone|mobile|telephone|tel)\b/i', $incomingText)
+            || preg_match('/(?:رقم الهاتف|رقم الجوال|رقمي)/u', $incomingText)
+            || preg_match('/^\s*(?:\+|00)/', $incomingText);
+        if ((!$hasKnownPhone || $explicitPhoneContext) && preg_match('/(?:\+?[0-9]{8,15})/', preg_replace('/\s+/', '', $phoneSearchText), $pm)) {
             $extractedPhone = $pm[0];
+        }
+
+        // Contact and delivery data that Salla requires at order submission.
+        $extractedEmail = null;
+        if (preg_match('/[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/i', $incomingText, $em)) {
+            $extractedEmail = strtolower($em[0]);
+        }
+
+        $extractedPostalCode = null;
+        if (preg_match('/(?:postal|zip)\s*(?:code)?\s*[:#-]?\s*([A-Z0-9-]{3,12})/i', $incomingText, $postalMatch)) {
+            $extractedPostalCode = trim($postalMatch[1]);
+        } elseif (empty($existingState['postal_code']) && preg_match('/^\s*([0-9]{4,10})\s*$/', $incomingText, $postalMatch)) {
+            // A bare numeric reply is accepted only while Salla is missing a postal code.
+            $extractedPostalCode = $postalMatch[1];
+        }
+
+        $extractedCoordinates = null;
+        $decodedText = rawurldecode($incomingText);
+        if (
+            preg_match('/(?:@|q=|[?&])\s*(-?\d{1,2}\.\d{3,})\s*[,;]\s*(-?\d{1,3}\.\d{3,})/i', $decodedText, $coordinateMatch)
+            || preg_match('/\b(-?\d{1,2}\.\d{3,})\s*,\s*(-?\d{1,3}\.\d{3,})\b/', $decodedText, $coordinateMatch)
+        ) {
+            $latitude = (float) $coordinateMatch[1];
+            $longitude = (float) $coordinateMatch[2];
+            if ($latitude >= -90 && $latitude <= 90 && $longitude >= -180 && $longitude <= 180) {
+                $extractedCoordinates = ['lat' => $latitude, 'lng' => $longitude];
+            }
+        }
+
+        $extractedBuildingNumber = null;
+        if (preg_match('/(?:building|house|villa)\s*(?:number|no\.?|#)?\s*[:#-]?\s*([A-Z0-9-]+)/i', $incomingText, $buildingMatch)) {
+            $extractedBuildingNumber = trim($buildingMatch[1]);
+        }
+
+        $extractedShortAddress = null;
+        if (preg_match('/(?:short address|national address|العنوان المختصر)\s*[:#-]?\s*([A-Z0-9]{4,12})/iu', $incomingText, $shortAddressMatch)) {
+            $extractedShortAddress = strtoupper($shortAddressMatch[1]);
+        }
+
+        $extractedAdditionalNumber = null;
+        if (preg_match('/(?:additional number|secondary number|الرقم الإضافي)\s*[:#-]?\s*([A-Z0-9-]{2,12})/iu', $incomingText, $additionalNumberMatch)) {
+            $extractedAdditionalNumber = trim($additionalNumberMatch[1]);
         }
 
         // 2. Extract full name heuristics (if message is a name response or contains name patterns)
@@ -50,7 +100,12 @@ class OrderCheckoutService
         // Fallback: If customer is answering a direct name query and message is short (1-4 words, no numbers/keywords)
         if (!$extractedName && empty($existingState['full_name'])) {
             $words = array_filter(explode(' ', trim($incomingText)));
-            if (count($words) >= 1 && count($words) <= 4 && !preg_match('/[0-9]/', $incomingText)) {
+            if (
+                count($words) >= 1
+                && count($words) <= 4
+                && !preg_match('/[0-9@]/', $incomingText)
+                && !preg_match('/https?:\/\/|maps\.app|maps\.google/i', $incomingText)
+            ) {
                 $textLower = mb_strtolower(trim($incomingText));
                 if (!preg_match('/(?:hi|hello|hey|yes|no|ok|sure|thanks?|great|good|perfect|nice|cool|awesome|excellent|wonderful|fine|please|order|buy|address|confirm|products?|items?|images?|pictures?|photos?|the dress|this one|that one|dress|see|view|show|list|help|catalogue|catalog|مرحبا|سلام|نعم|شكرا|اريد|طلب|تأكيد|تم|اكد|الفستان|هذا|هذه)/ui', $textLower)) {
                     $extractedName = trim($incomingText);
@@ -107,6 +162,13 @@ class OrderCheckoutService
             'phone'            => $extractedPhone                    ?? $existingPhone,
             'customer_phone'   => $extractedPhone                    ?? $existingPhone, // Alias for backward compatibility
             'address'          => $extractedAddress                  ?? ($existingState['address']          ?? null),
+            'email'            => $extractedEmail                    ?? ($existingState['email']             ?? null),
+            'customer_email'   => $extractedEmail                    ?? ($existingState['customer_email']    ?? $existingState['email'] ?? null),
+            'postal_code'      => $extractedPostalCode               ?? ($existingState['postal_code']       ?? null),
+            'geo_coordinates'  => $extractedCoordinates              ?? ($existingState['geo_coordinates']   ?? null),
+            'building_number'  => $extractedBuildingNumber           ?? ($existingState['building_number']   ?? null),
+            'short_address'    => $extractedShortAddress             ?? ($existingState['short_address']     ?? null),
+            'additional_number'=> $extractedAdditionalNumber         ?? ($existingState['additional_number'] ?? null),
             'updated_at'       => now()->toISOString(),
         ], fn($v) => !is_null($v) && $v !== ''));
 
@@ -141,7 +203,7 @@ class OrderCheckoutService
     /**
      * Compute known_fields and missing_fields maps.
      */
-    public function computeFieldStatus(array $state): array
+    public function computeFieldStatus(array $state, bool $requireSallaShippingDetails = false): array
     {
         // Normalize legacy field aliases
         $phoneValue = $state['phone'] ?? $state['customer_phone'] ?? null;
@@ -152,15 +214,43 @@ class OrderCheckoutService
             'full_name' => $nameValue,
         ]));
 
+        $requiredFields = self::REQUIRED_FIELDS;
+        if ($requireSallaShippingDetails) {
+            $requiredFields = array_merge($requiredFields, [
+                'email', 'postal_code', 'geo_coordinates', 'building_number',
+                'short_address', 'additional_number',
+            ]);
+        }
+
+        $fieldAliases = [
+            'email' => ['customer_email'],
+        ];
         $known = [];
-        foreach (self::REQUIRED_FIELDS as $field) {
-            if (!empty($normalizedState[$field])) {
-                $known[$field] = $normalizedState[$field];
+        foreach ($requiredFields as $field) {
+            $value = $normalizedState[$field] ?? null;
+            foreach ($fieldAliases[$field] ?? [] as $alias) {
+                $value = $value ?: ($normalizedState[$alias] ?? null);
+            }
+            if ($field === 'email' && $value && !filter_var($value, FILTER_VALIDATE_EMAIL)) {
+                $value = null;
+            }
+            if ($field === 'geo_coordinates' && is_array($value)) {
+                $validCoordinates = isset($value['lat'], $value['lng'])
+                    && is_numeric($value['lat'])
+                    && is_numeric($value['lng'])
+                    && (float) $value['lat'] >= -90
+                    && (float) $value['lat'] <= 90
+                    && (float) $value['lng'] >= -180
+                    && (float) $value['lng'] <= 180;
+                $value = $validCoordinates ? $value : null;
+            }
+            if (!empty($value)) {
+                $known[$field] = $value;
             }
         }
 
         $missing = [];
-        foreach (self::REQUIRED_FIELDS as $field) {
+        foreach ($requiredFields as $field) {
             if (empty($known[$field])) {
                 $missing[] = $field;
             }
@@ -170,6 +260,7 @@ class OrderCheckoutService
             'known_fields'   => $known,
             'missing_fields' => $missing,
             'is_complete'    => empty($missing),
+            'required_fields' => $requiredFields,
         ];
     }
 

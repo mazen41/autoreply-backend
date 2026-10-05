@@ -463,7 +463,7 @@ ROLE;
             ];
             $p .= "Required Fields: [Full Name, Phone Number, Complete Delivery Address]";
             if (!empty($context['salla_exclusive_mode'])) {
-                $p .= "; Salla also needs a valid email, postal code, exact map pin/coordinates, building number, short/national address code, and additional address number before submission";
+                $p .= "; for Salla, also collect only the email and delivery-address fields listed as missing below";
             }
             $p .= "\n\n";
 
@@ -484,7 +484,7 @@ ROLE;
                 $p .= "\n⚠️ CRITICAL RULE: ASK FOR ALL CURRENTLY MISSING REQUIRED FIELDS TOGETHER IN ONE SINGLE MESSAGE!\n";
                 $p .= "Do NOT ask for fields one-by-one in separate turns. Do NOT re-ask for any field listed under ALREADY KNOWN FIELDS.\n\n";
                 if (!empty($context['salla_exclusive_mode'])) {
-                    $p .= "For Google Maps location, ask the customer to share a pin/link that includes coordinates; never invent coordinates, postal codes, email addresses, or national-address values. The customer does not need to provide a courier ID; the application selects from the store's Salla shipping options.\n\n";
+                    $p .= "Use any delivery details already present in the customer's message or saved Salla profile before asking follow-up questions. If coordinates are missing, ask for a Google Maps pin/link or latitude and longitude. Never invent coordinates, postal codes, email addresses, or address values. The customer does not need to provide a courier ID; the application selects from the store's Salla shipping options.\n\n";
                 }
             }
 

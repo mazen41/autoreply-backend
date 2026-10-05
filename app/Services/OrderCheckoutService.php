@@ -47,7 +47,7 @@ class OrderCheckoutService
         }
 
         $extractedPostalCode = null;
-        if (preg_match('/(?:postal|zip)\s*(?:code)?\s*[:#-]?\s*([A-Z0-9-]{3,12})/i', $incomingText, $postalMatch)) {
+        if (preg_match('/(?:postal|zip)\s*(?:code)?\s*(?:(?:is|equals?)\s+|[:#-]\s*)?([A-Z0-9-]{3,12})/i', $incomingText, $postalMatch)) {
             $extractedPostalCode = trim($postalMatch[1]);
         } elseif (empty($existingState['postal_code']) && preg_match('/^\s*([0-9]{4,10})\s*$/', $incomingText, $postalMatch)) {
             // A bare numeric reply is accepted only while Salla is missing a postal code.
@@ -56,8 +56,9 @@ class OrderCheckoutService
 
         $extractedCoordinates = null;
         $decodedText = rawurldecode($incomingText);
+        $hasLocationContext = (bool) preg_match('/\b(?:map|maps|pin|coordinates?|latitude|longitude)\b/i', $decodedText);
         if (
-            preg_match('/(?:@|q=|[?&])\s*(-?\d{1,2}\.\d{3,})\s*[,;]\s*(-?\d{1,3}\.\d{3,})/i', $decodedText, $coordinateMatch)
+            ($hasLocationContext && preg_match('/(?:@|q=|[?&]|coordinates?\s*[:=]?|pin\s*[:=]?)\s*(-?\d{1,2}(?:\.\d+)?)\s*[,;]\s*(-?\d{1,3}(?:\.\d+)?)/i', $decodedText, $coordinateMatch))
             || preg_match('/\b(-?\d{1,2}\.\d{3,})\s*,\s*(-?\d{1,3}\.\d{3,})\b/', $decodedText, $coordinateMatch)
         ) {
             $latitude = (float) $coordinateMatch[1];
@@ -68,17 +69,17 @@ class OrderCheckoutService
         }
 
         $extractedBuildingNumber = null;
-        if (preg_match('/(?:building|house|villa)\s*(?:number|no\.?|#)?\s*[:#-]?\s*([A-Z0-9-]+)/i', $incomingText, $buildingMatch)) {
+        if (preg_match('/(?:building|house|villa)\s*(?:number|no\.?|#)?\s*(?:(?:is|equals?)\s+|[:#-]\s*)?([A-Z0-9-]+)/i', $incomingText, $buildingMatch)) {
             $extractedBuildingNumber = trim($buildingMatch[1]);
         }
 
         $extractedShortAddress = null;
-        if (preg_match('/(?:short address|national address|العنوان المختصر)\s*[:#-]?\s*([A-Z0-9]{4,12})/iu', $incomingText, $shortAddressMatch)) {
+        if (preg_match('/(?:short address|national address|العنوان المختصر)\s*(?:(?:is|equals?)\s+|[:#-]\s*)?([A-Z0-9]{4,12})/iu', $incomingText, $shortAddressMatch)) {
             $extractedShortAddress = strtoupper($shortAddressMatch[1]);
         }
 
         $extractedAdditionalNumber = null;
-        if (preg_match('/(?:additional number|secondary number|الرقم الإضافي)\s*[:#-]?\s*([A-Z0-9-]{2,12})/iu', $incomingText, $additionalNumberMatch)) {
+        if (preg_match('/(?:additional number|secondary number|الرقم الإضافي)\s*(?:(?:is|equals?)\s+|[:#-]\s*)?([A-Z0-9-]{2,12})/iu', $incomingText, $additionalNumberMatch)) {
             $extractedAdditionalNumber = trim($additionalNumberMatch[1]);
         }
 
@@ -218,8 +219,16 @@ class OrderCheckoutService
         if ($requireSallaShippingDetails) {
             $requiredFields = array_merge($requiredFields, [
                 'email', 'postal_code', 'geo_coordinates', 'building_number',
-                'short_address', 'additional_number',
             ]);
+
+            // Saudi National Address codes are not applicable to international
+            // delivery addresses. Require them only for Saudi phone/address flows.
+            $phoneDigits = preg_replace('/[^0-9]/', '', (string) ($state['phone'] ?? $state['customer_phone'] ?? ''));
+            $isSaudiNumber = str_starts_with($phoneDigits, '9665')
+                || (strlen($phoneDigits) === 10 && str_starts_with($phoneDigits, '05'));
+            if ($isSaudiNumber) {
+                $requiredFields = array_merge($requiredFields, ['short_address', 'additional_number']);
+            }
         }
 
         $fieldAliases = [

@@ -185,14 +185,27 @@ class WebhookController extends Controller
             Log::info('Instagram entry', ['id' => $entryId, 'keys' => array_keys($entry)]);
 
             foreach ($entry['messaging'] ?? [] as $event) {
-                if (isset($event['message']['is_echo'])) continue;
+                $incomingMessage = $event['message'] ?? [];
+                if (isset($incomingMessage['is_echo'])) continue;
                 if (isset($event['message_edit'])) continue;
-                if (!isset($event['message']['text'])) continue;
+
+                $location = $this->extractMetaLocation($incomingMessage);
+                $messageText = trim((string) ($incomingMessage['text'] ?? ''));
+                if ($location) {
+                    $locationText = 'Shared delivery location coordinates: '
+                        . $location['lat'] . ', ' . $location['lng'];
+                    $messageText = trim($messageText . ($messageText !== '' ? "\n" : '') . $locationText);
+                } elseif ($this->hasMetaLocationAttachment($incomingMessage)) {
+                    // Keep attachment-only location turns so checkout can ask for a
+                    // usable pin if Meta omitted its coordinates from the payload.
+                    $locationText = 'Customer shared a location pin, but its coordinates were not included in the message payload.';
+                    $messageText = trim($messageText . ($messageText !== '' ? "\n" : '') . $locationText);
+                }
+                if ($messageText === '') continue;
 
                 $senderId    = $event['sender']['id'];
-                $messageText = $event['message']['text'];
-                $platformMessageId = $event['message']['mid'] ?? null;
-                $replyToMid = $event['message']['reply_to']['mid'] ?? null;
+                $platformMessageId = $incomingMessage['mid'] ?? null;
+                $replyToMid = $incomingMessage['reply_to']['mid'] ?? null;
 
                 if (str_starts_with($senderId, 'TEST_')) continue;
 
@@ -330,14 +343,14 @@ class WebhookController extends Controller
         // Different IDs = different customer messages, always process.
         if ($platformMessageId) {
             $idempotencyKey = "webhook:{$channel->type}:{$platformMessageId}";
-            if (Cache::has($idempotencyKey)) {
+            if ($this->safeCacheHas($idempotencyKey)) {
                 Log::info('Duplicate webhook delivery — skipping', [
                     'channel_type' => $channel->type,
                     'platform_message_id' => $platformMessageId,
                 ]);
                 return;
             }
-            Cache::put($idempotencyKey, true, now()->addMinutes(5));
+            $this->safeCachePut($idempotencyKey, true, now()->addMinutes(5));
         }
 
         $conversation = \App\Models\Conversation::firstOrCreate(
@@ -392,15 +405,83 @@ class WebhookController extends Controller
         // Different customer messages are always dispatched — they will be handled
         // sequentially by the queue worker.
         $debounceKey = "debounce:message:{$message->id}";
-        if (Cache::has($debounceKey)) {
+        if ($this->safeCacheHas($debounceKey)) {
             Log::info('Message already being processed — skipping duplicate job', [
                 'conversation_id' => $conversation->id,
                 'message_id' => $message->id
             ]);
         } else {
             \App\Jobs\ProcessAutoReply::dispatch($message->id);
-            Cache::put($debounceKey, true, 30); // 30s — only prevents duplicate job dispatch
+            $this->safeCachePut($debounceKey, true, 30); // 30s — only prevents duplicate job dispatch
             Log::info('ProcessAutoReply job dispatched', ['message_id' => $message->id]);
+        }
+    }
+
+    /** Read Instagram/Messenger location attachment coordinates into ordinary message text. */
+    private function extractMetaLocation(array $message): ?array
+    {
+        foreach (($message['attachments'] ?? []) as $attachment) {
+            if (strtolower((string) ($attachment['type'] ?? '')) !== 'location') {
+                continue;
+            }
+
+            $payload = $attachment['payload'] ?? [];
+            $coordinates = $payload['coordinates'] ?? $payload;
+            $latitude = $coordinates['lat'] ?? $coordinates['latitude'] ?? null;
+            $longitude = $coordinates['long'] ?? $coordinates['lng'] ?? $coordinates['longitude'] ?? null;
+
+            if (!is_numeric($latitude) || !is_numeric($longitude)) {
+                Log::warning('Meta location attachment did not include numeric coordinates');
+                continue;
+            }
+
+            $latitude = (float) $latitude;
+            $longitude = (float) $longitude;
+            if ($latitude < -90 || $latitude > 90 || $longitude < -180 || $longitude > 180) {
+                Log::warning('Meta location attachment coordinates are out of range');
+                continue;
+            }
+
+            return ['lat' => $latitude, 'lng' => $longitude];
+        }
+
+        return null;
+    }
+
+    private function hasMetaLocationAttachment(array $message): bool
+    {
+        foreach (($message['attachments'] ?? []) as $attachment) {
+            if (strtolower((string) ($attachment['type'] ?? '')) === 'location') {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    /** File-cache errors must not discard a verified customer webhook. */
+    private function safeCacheHas(string $key): bool
+    {
+        try {
+            return Cache::has($key);
+        } catch (\Throwable $e) {
+            Log::warning('Webhook cache read failed; continuing without cache', [
+                'key' => $key,
+                'error' => $e->getMessage(),
+            ]);
+            return false;
+        }
+    }
+
+    private function safeCachePut(string $key, mixed $value, mixed $ttl): void
+    {
+        try {
+            Cache::put($key, $value, $ttl);
+        } catch (\Throwable $e) {
+            Log::warning('Webhook cache write failed; continuing with message processing', [
+                'key' => $key,
+                'error' => $e->getMessage(),
+            ]);
         }
     }
 

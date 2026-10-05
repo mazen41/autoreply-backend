@@ -51,7 +51,7 @@ class SallaService
             'client_id'     => $clientId,
             'redirect_uri'  => $redirectUri,
             'response_type' => 'code',
-            'scope'         => 'offline_access settings.read orders.read_write customers.read_write products.read',
+            'scope'         => 'offline_access settings.read orders.read_write customers.read_write products.read metadata.read',
             'state'         => $state,
         ];
 

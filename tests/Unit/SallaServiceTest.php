@@ -25,10 +25,11 @@ class SallaServiceTest extends TestCase
 
         $url = $this->sallaService->getAuthorizationUrl('test_state');
 
-        $this->assertStringContainsString('accounts.salla.sa/oauth2/authorize', $url);
+        $this->assertStringContainsString('accounts.salla.sa/oauth2/auth', $url);
         $this->assertStringContainsString('client_id=test_client_id', $url);
         $this->assertStringContainsString('state=test_state', $url);
         $this->assertStringContainsString('response_type=code', $url);
+        $this->assertStringContainsString('metadata.read', $url);
     }
 
     public function test_verify_webhook_signature_valid(): void

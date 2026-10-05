@@ -438,7 +438,9 @@ class WebhookController extends Controller
     /** Search nested template/location payloads without logging customer coordinates. */
     private function findMetaCoordinates(mixed $data, int $depth = 0): ?array
     {
-        if (!is_array($data) || $depth > 8) {
+        // The webhook log normalizer truncates at depth 9, so template payloads
+        // can carry valid coordinates deeper than the original shallow search.
+        if (!is_array($data) || $depth > 32) {
             return null;
         }
 

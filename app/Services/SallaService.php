@@ -606,8 +606,8 @@ class SallaService
     }
 
     /**
-     * Search paginated Salla city results. The API returns only one page by default,
-     * so scanning just `data` can miss valid cities outside the first 15 entries.
+     * Search paginated Salla city results. Salla defaults to 15 records per page,
+     * but supports up to 60. Use the maximum to keep checkout lookups bounded.
      *
      * @return array{id: ?int, names: array<int, string>}
      */
@@ -624,9 +624,12 @@ class SallaService
 
         for ($page = 1; $page <= $maxPages; $page++) {
             $response = $this->cachedSallaResponse(
-                "salla_cities_v2_ch_{$channel->id}_{$countryId}_page_{$page}",
+                "salla_cities_v3_ch_{$channel->id}_{$countryId}_page_{$page}",
                 $endpoint,
-                fn () => $this->apiCallForChannel($channel, 'GET', $endpoint, ['page' => $page])
+                fn () => $this->apiCallForChannel($channel, 'GET', $endpoint, [
+                    'page' => $page,
+                    'per_page' => 60,
+                ])
             );
 
             foreach ($response['data'] ?? [] as $city) {

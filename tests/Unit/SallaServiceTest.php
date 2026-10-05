@@ -231,5 +231,9 @@ class SallaServiceTest extends TestCase
         $this->assertSame(778, $shippingAddress['city_id'] ?? null);
         Http::assertSentCount(3);
         Http::assertSent(fn ($request) => str_contains($request->url(), 'cities?page=2'));
+        Http::assertSent(fn ($request) =>
+            str_contains($request->url(), '/cities')
+            && str_contains($request->url(), 'per_page=60')
+        );
     }
 }

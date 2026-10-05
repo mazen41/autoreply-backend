@@ -203,6 +203,10 @@ class WebhookController extends Controller
                         fn ($attachment) => is_array($attachment) ? ($attachment['type'] ?? null) : null,
                         $attachments
                     )));
+                    Log::info('Instagram attachment had no extractable location coordinates', [
+                        'attachment_types' => $attachmentTypes,
+                        'payload_key_paths' => $this->summarizeMetaAttachmentStructure($attachments),
+                    ]);
                     $typeLabel = $attachmentTypes ? implode(', ', $attachmentTypes) : 'unknown';
                     $messageText = "Customer shared an Instagram attachment (type: {$typeLabel}) without readable text or coordinates. If delivery location is still needed, ask for a Google Maps link or latitude and longitude.";
                 }
@@ -462,6 +466,33 @@ class WebhookController extends Controller
         }
 
         return null;
+    }
+
+    /** Return attachment keys and value types only; never log location values. */
+    private function summarizeMetaAttachmentStructure(array $attachments): array
+    {
+        $paths = [];
+        $visit = function (mixed $value, string $path, int $depth) use (&$visit, &$paths): void {
+            if (!is_array($value) || $depth > 32 || count($paths) >= 120) {
+                return;
+            }
+
+            foreach ($value as $key => $child) {
+                if (count($paths) >= 120) {
+                    return;
+                }
+
+                $childPath = $path . '.' . (string) $key;
+                $paths[] = $childPath . ' (' . (is_array($child) ? 'array' : get_debug_type($child)) . ')';
+                if (is_array($child)) {
+                    $visit($child, $childPath, $depth + 1);
+                }
+            }
+        };
+
+        $visit($attachments, 'attachments', 0);
+
+        return $paths;
     }
 
     /** File-cache errors must not discard a verified customer webhook. */

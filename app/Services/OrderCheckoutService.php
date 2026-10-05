@@ -14,7 +14,7 @@ class OrderCheckoutService
      */
     public const REQUIRED_FIELDS = ['full_name', 'phone', 'address'];
 
-    /** Resolve a delivery address to coordinates without asking for a pin. */
+    /** Resolve city-level delivery coordinates without requiring a street match or map pin. */
     public function geocodeDeliveryAddress(string $address, ?string $phone = null): array
     {
         $normalizedAddress = trim(preg_replace('/\s+/', ' ', $address));
@@ -28,19 +28,22 @@ class OrderCheckoutService
         }
 
         $country = $this->deliveryCountryForAddress($normalizedAddress, $phone);
-        $query = $normalizedAddress . ', ' . $country['name'];
+        $city = $this->extractDeliveryCity($normalizedAddress);
+        if (!$city) {
+            return ['status' => 'not_found', 'coordinates' => null];
+        }
         $countryCodes = 'sa,ae,kw,qa,bh,om,ye,iq,sy,jo,lb,ps,eg,ly,tn,dz,ma,sd,so,dj,km,mr,eh';
-        $cacheKey = 'nominatim:delivery:' . hash('sha256', mb_strtolower($query));
+        $cacheKey = 'nominatim:delivery-city:' . hash('sha256', mb_strtolower($city . ', ' . $country['name']));
         $cached = Cache::get($cacheKey);
         if (is_array($cached)) {
             return $cached;
         }
 
         try {
-            $search = function (?string $allowedCountries) use ($endpoint, $query) {
+            $search = function (?string $allowedCountries, bool $global = false) use ($endpoint, $city, $country) {
                 // Nominatim limits public usage to one request per second.
                 // Share a throttle across queue workers and cache query results.
-                return Cache::lock('nominatim:request-throttle', 15)->block(10, function () use ($endpoint, $query, $allowedCountries) {
+                return Cache::lock('nominatim:request-throttle', 15)->block(10, function () use ($endpoint, $city, $country, $allowedCountries, $global) {
                     $lastRequestAt = (float) Cache::get('nominatim:last-request-at', 0);
                     $waitMicroseconds = (int) max(0, (1 - (microtime(true) - $lastRequestAt)) * 1_000_000);
                     if ($waitMicroseconds > 0) {
@@ -48,10 +51,14 @@ class OrderCheckoutService
                     }
 
                     $parameters = [
-                        'q' => $query,
-                        'format' => 'json',
+                        'city' => $city,
+                        'format' => 'jsonv2',
                         'limit' => 1,
+                        'addressdetails' => 1,
                     ];
+                    if (!$global) {
+                        $parameters['country'] = $country['name'];
+                    }
                     if ($allowedCountries !== null) {
                         $parameters['countrycodes'] = $allowedCountries;
                     }
@@ -79,7 +86,7 @@ class OrderCheckoutService
             }
             if ($results === []) {
                 // Retry unrestricted only after a successful but empty regional search.
-                $response = $search(null);
+                $response = $search(null, true);
                 if (!$response->successful()) {
                     Log::warning('Nominatim global address lookup failed', ['http_status' => $response->status()]);
                     return ['status' => 'unavailable', 'coordinates' => null];
@@ -114,6 +121,84 @@ class OrderCheckoutService
             Log::warning('Nominatim address lookup unavailable', ['error' => $e->getMessage()]);
             return ['status' => 'unavailable', 'coordinates' => null];
         }
+    }
+
+    /** Extract a city from free-form address text for city-only geocoding. */
+    private function extractDeliveryCity(string $address): ?string
+    {
+        $cities = [
+            'Alexandria' => ['alexandria', 'al iskandariyya', 'iskandariya', 'الإسكندرية'],
+            'Cairo' => ['cairo', 'القاهرة'],
+            'Giza' => ['giza', 'al jizah', 'الجيزة'],
+            'Port Said' => ['port said', 'بورسعيد'],
+            'Mansoura' => ['mansoura', 'المنصورة'],
+            'Tanta' => ['tanta', 'طنطا'],
+            'Asyut' => ['asyut', 'assiut', 'أسيوط'],
+            'Luxor' => ['luxor', 'الأقصر'],
+            'Aswan' => ['aswan', 'أسوان'],
+            'Suez' => ['suez', 'السويس'],
+            'Ismailia' => ['ismailia', 'الإسماعيلية'],
+            'Fayoum' => ['fayoum', 'الفَيُّوم', 'الفيوم'],
+            'Riyadh' => ['riyadh', 'ar riyadh', 'الرياض'],
+            'Jeddah' => ['jeddah', 'جدّة', 'جدة'],
+            'Mecca' => ['mecca', 'makkah', 'مكة'],
+            'Medina' => ['medina', 'madinah', 'المدينة المنورة'],
+            'Dammam' => ['dammam', 'الدمام'],
+            'Al Khobar' => ['al khobar', 'khobar', 'الخبر'],
+            'Taif' => ['taif', 'الطائف'],
+            'Tabuk' => ['tabuk', 'تبوك'],
+            'Abha' => ['abha', 'أبها'],
+            'Dubai' => ['dubai', 'دبي'],
+            'Abu Dhabi' => ['abu dhabi', 'أبو ظبي', 'أبوظبي'],
+            'Sharjah' => ['sharjah', 'الشارقة'],
+            'Kuwait City' => ['kuwait city', 'مدينة الكويت'],
+            'Doha' => ['doha', 'الدوحة'],
+            'Manama' => ['manama', 'المنامة'],
+            'Muscat' => ['muscat', 'مسقط'],
+            'Amman' => ['amman', 'عمان'],
+            'Beirut' => ['beirut', 'بيروت'],
+            'Baghdad' => ['baghdad', 'بغداد'],
+            'Damascus' => ['damascus', 'دمشق'],
+            'Tunis' => ['tunis', 'تونس'],
+            'Algiers' => ['algiers', 'الجزائر'],
+            'Casablanca' => ['casablanca', 'الدار البيضاء'],
+            'Khartoum' => ['khartoum', 'الخرطوم'],
+        ];
+
+        foreach ($cities as $city => $aliases) {
+            foreach ($aliases as $alias) {
+                $pattern = '/(?<![\pL\pN])' . preg_quote($alias, '/') . '(?![\pL\pN])/iu';
+                if (preg_match($pattern, $address)) {
+                    return $city;
+                }
+            }
+        }
+
+        // If the user provided a comma-separated delivery address, the last
+        // component before the country is the city. This supports cities that
+        // are not in the common-name list above while keeping the lookup city-only.
+        $parts = array_values(array_filter(array_map('trim', explode(',', $address))));
+        if (count($parts) > 1) {
+            $lastPart = end($parts);
+            foreach (['Egypt', 'Saudi Arabia', 'United Arab Emirates', 'Kuwait', 'Qatar', 'Bahrain', 'Oman', 'Yemen', 'Iraq', 'Syria', 'Jordan', 'Lebanon', 'Palestine', 'Libya', 'Tunisia', 'Algeria', 'Morocco', 'Sudan', 'Somalia', 'Djibouti', 'Comoros', 'Mauritania', 'Western Sahara'] as $countryName) {
+                if (strcasecmp($lastPart, $countryName) === 0) {
+                    array_pop($parts);
+                    break;
+                }
+            }
+
+            $candidate = trim((string) end($parts));
+            if ($candidate !== '' && !preg_match('/\d/u', $candidate)) {
+                return $candidate;
+            }
+        }
+
+        // A city-only reply is also a valid lookup query.
+        if (count($parts) <= 1 && !preg_match('/\d/u', $address)) {
+            return trim($address);
+        }
+
+        return null;
     }
 
     /** Determine the English country name to append to the geocoding query. */

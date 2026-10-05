@@ -1413,8 +1413,8 @@ class ProcessAutoReply implements ShouldQueue
             }
         }
 
-        // Resolve coordinates from the written Saudi address in the background;
-        // customers should never be asked to provide coordinates or a map link.
+        // Resolve approximate delivery coordinates from the city alone;
+        // a matching street or house number is not required.
         if (
             $sallaCheckoutActive
             && empty($updatedCheckoutState['geo_coordinates'])
@@ -1955,8 +1955,8 @@ class ProcessAutoReply implements ShouldQueue
 
         if ($sallaCheckoutActive && $addressGeocodingStatus === 'not_found') {
             $aiResponse = $detectedLanguage === 'arabic'
-                ? 'لم أتمكن من تحديد عنوان التوصيل. من فضلك وضّح المدينة والحي والشارع ورقم المبنى والرمز البريدي. لا تحتاج إلى إرسال رابط خرائط أو إحداثيات.'
-                : "I couldn't match that address to a Saudi delivery location. Please clarify the city, district, street, building number, and postal code. You don't need to send a map link or coordinates.";
+                ? 'لم أتمكن من تحديد المدينة. من فضلك أرسل اسم المدينة فقط؛ لا تحتاج إلى إرسال إحداثيات أو رابط خرائط.'
+                : "I couldn't identify the delivery city. Please send the city name only; you don't need to provide coordinates or a map link.";
         }
 
         // ── IMAGE SEND VERIFICATION (fixes: bot claiming "here are the photos"

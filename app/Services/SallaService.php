@@ -538,28 +538,74 @@ class SallaService
      * Dynamically resolve Salla shipping address fields against the merchant's Salla account data.
      * Returns null if city_id or required address components cannot be confidently resolved.
      */
-    public function resolveShippingAddressForChannel(Channel $channel, string $freeformAddress): ?array
+    public function resolveShippingAddressForChannel(Channel $channel, string $freeformAddress, string $phone = ''): ?array
     {
         if (empty(trim($freeformAddress))) {
             return null;
         }
 
-        // 1. Fetch cities dynamically from the merchant's Salla account API
+        // Salla exposes cities under /countries/{country}/cities; /cities is not
+        // a valid Admin API endpoint. Resolve the country ID from Salla's country
+        // catalog using the same normalized calling code used for the customer.
+        $phoneData = $this->normalizePhoneForCustomer($phone);
+        $countryCode = match ($phoneData['mobile_code_country']) {
+            '+20' => 'EG', '+966' => 'SA', '+971' => 'AE', '+965' => 'KW',
+            '+974' => 'QA', '+973' => 'BH', '+968' => 'OM', '+967' => 'YE',
+            '+962' => 'JO', '+961' => 'LB', '+964' => 'IQ', '+1' => 'US',
+            '+44' => 'GB', '+90' => 'TR', '+91' => 'IN', '+33' => 'FR',
+            '+49' => 'DE', default => 'SA',
+        };
+
+        try {
+            $countriesRes = \Illuminate\Support\Facades\Cache::remember("salla_countries_ch_{$channel->id}", 43200, function () use ($channel) {
+                return $this->apiCallForChannel($channel, 'GET', '/countries');
+            });
+            $country = collect($countriesRes['data'] ?? [])->first(
+                fn ($candidate) => strtoupper((string) ($candidate['code'] ?? '')) === $countryCode
+            );
+            $countryId = $country['id'] ?? null;
+
+            if (!$countryId) {
+                Log::warning('SallaService: country code not found in Salla country catalog', [
+                    'channel_id' => $channel->id,
+                    'country_code' => $countryCode,
+                ]);
+                return null;
+            }
+        } catch (\Exception $e) {
+            Log::warning('SallaService: GET /countries lookup failed for channel', [
+                'channel_id' => $channel->id,
+                'error' => $e->getMessage(),
+            ]);
+            return null;
+        }
+
+        // Fetch cities using the country-specific route documented by Salla.
         $matchedCityId = null;
         try {
-            $citiesRes = \Illuminate\Support\Facades\Cache::remember("salla_cities_ch_{$channel->id}", 43200, function () use ($channel) {
-                return $this->apiCallForChannel($channel, 'GET', '/cities');
+            $citiesRes = \Illuminate\Support\Facades\Cache::remember("salla_cities_ch_{$channel->id}_{$countryId}", 43200, function () use ($channel, $countryId) {
+                return $this->apiCallForChannel($channel, 'GET', "/countries/{$countryId}/cities");
             });
             $cities = $citiesRes['data'] ?? [];
 
             $addressLower = mb_strtolower($freeformAddress);
 
             foreach ($cities as $c) {
-                $cityNameEn = !empty($c['name']) ? mb_strtolower(trim($c['name'])) : '';
-                $cityNameAr = !empty($c['name_ar']) ? mb_strtolower(trim($c['name_ar'])) : '';
+                $cityNames = array_filter([
+                    $c['name'] ?? null,
+                    $c['name_en'] ?? null,
+                    $c['name_ar'] ?? null,
+                ]);
+                $cityMatches = false;
+                foreach ($cityNames as $cityName) {
+                    $cityName = mb_strtolower(trim((string) $cityName));
+                    if ($cityName !== '' && str_contains($addressLower, $cityName)) {
+                        $cityMatches = true;
+                        break;
+                    }
+                }
 
-                if (($cityNameEn !== '' && str_contains($addressLower, $cityNameEn)) ||
-                    ($cityNameAr !== '' && str_contains($addressLower, $cityNameAr))) {
+                if ($cityMatches) {
                     $matchedCityId = (int)$c['id'];
                     break;
                 }
@@ -605,7 +651,7 @@ class SallaService
 
         $addressData = array_filter([
             'city_id'       => $matchedCityId,
-            'country_id'    => 1,
+            'country_id'    => (int) $countryId,
             'street_number' => $streetNumber,
             'block'         => $block,
             'postal_code'   => $postalCode,
@@ -638,7 +684,7 @@ class SallaService
         }
 
         $freeformAddress = $checkoutState['address'] ?? '';
-        $shippingAddress = $this->resolveShippingAddressForChannel($channel, $freeformAddress);
+        $shippingAddress = $this->resolveShippingAddressForChannel($channel, $freeformAddress, $phone);
 
         if (!$shippingAddress) {
             Log::warning('SallaService: shipping address could not be confidently mapped to merchant Salla city/fields', [

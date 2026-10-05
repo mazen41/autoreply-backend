@@ -104,12 +104,15 @@ class CheckoutOrderFlowTest extends TestCase
                     ]
                 ]
             ], 200),
-            'api.salla.dev/admin/v2/cities' => Http::response([
-                'data' => [
-                    ['id' => 10, 'name' => 'Giza', 'name_ar' => 'الجيزة'],
-                    ['id' => 1, 'name' => 'Riyadh', 'name_ar' => 'الرياض'],
-                ]
-            ], 200),
+            'api.salla.dev/admin/v2/countries' => Http::response(['data' => [
+                ['id' => 1473353380, 'code' => 'SA'], ['id' => 1723506348, 'code' => 'EG'],
+            ]], 200),
+            'api.salla.dev/admin/v2/countries/*/cities' => Http::response(['data' => [
+                ['id' => 10, 'name' => 'Giza', 'name_en' => 'Giza'],
+                ['id' => 1, 'name' => 'Riyadh', 'name_en' => 'Riyadh'],
+                ['id' => 2, 'name' => 'Jeddah', 'name_en' => 'Jeddah'],
+                ['id' => 11, 'name' => 'Cairo', 'name_en' => 'Cairo'],
+            ]], 200),
             'api.salla.dev/admin/v2/customers*' => Http::response([
                 'data' => [['id' => 7711, 'mobile' => '966501234567']]
             ], 200),
@@ -144,6 +147,9 @@ class CheckoutOrderFlowTest extends TestCase
         $this->assertNotNull($conversation->checkout_state);
         $this->assertEquals('completed', $conversation->checkout_state['status']);
         $this->assertEquals('SAL-889900', $conversation->checkout_state['order_id']);
+        Http::assertSent(fn ($request) => $request->method() === 'POST'
+            && str_ends_with(parse_url($request->url(), PHP_URL_PATH), '/orders')
+            && ($request['ship_to']['country'] ?? null) === 1473353380);
 
         // Idempotency check: duplicate confirmation turn
         $msg3 = Message::create([
@@ -217,8 +223,11 @@ class CheckoutOrderFlowTest extends TestCase
                     'needs_images' => false,
                 ])]]]
             ], 200),
-            'api.salla.dev/admin/v2/cities' => Http::response([
-                'data' => [['id' => 1, 'name' => 'Riyadh', 'name_ar' => 'الرياض']]
+            'api.salla.dev/admin/v2/countries' => Http::response(['data' => [
+                ['id' => 1473353380, 'code' => 'SA'],
+            ]], 200),
+            'api.salla.dev/admin/v2/countries/*/cities' => Http::response([
+                'data' => [['id' => 1, 'name' => 'Riyadh', 'name_en' => 'Riyadh']]
             ], 200),
             'api.salla.dev/admin/v2/customers*' => Http::response([
                 'data' => [['id' => 5544, 'mobile' => '966501234567']]
@@ -240,6 +249,12 @@ class CheckoutOrderFlowTest extends TestCase
 
         $this->assertNotEquals('completed', $conversation->checkout_state['status'] ?? null);
         $this->assertEmpty($conversation->checkout_state['order_id'] ?? null);
+        $failedOrderReply = Message::where('conversation_id', $conversation->id)
+            ->where('is_ai', true)
+            ->orderByDesc('id')
+            ->value('content');
+        $this->assertStringContainsString('technical issue processing your order', $failedOrderReply);
+        $this->assertStringNotContainsString('order has been placed', mb_strtolower($failedOrderReply));
 
         $enrollmentCount = SequenceEnrollment::where('conversation_id', $conversation->id)
             ->where('sequence_id', $sequence->id)
@@ -305,8 +320,11 @@ class CheckoutOrderFlowTest extends TestCase
                     'escalation_reason' => 'none',
                     'needs_images' => false,
                 ])]]]], 200),
-            'api.salla.dev/admin/v2/cities' => Http::response([
-                'data' => [['id' => 2, 'name' => 'Jeddah', 'name_ar' => 'جدة']]
+            'api.salla.dev/admin/v2/countries' => Http::response(['data' => [
+                ['id' => 1473353380, 'code' => 'SA'],
+            ]], 200),
+            'api.salla.dev/admin/v2/countries/*/cities' => Http::response([
+                'data' => [['id' => 2, 'name' => 'Jeddah', 'name_en' => 'Jeddah']]
             ], 200),
             'api.salla.dev/admin/v2/customers*' => Http::response([
                 'data' => [['id' => 3322, 'mobile' => '966501234567']]

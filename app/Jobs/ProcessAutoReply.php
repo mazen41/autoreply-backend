@@ -2000,6 +2000,12 @@ class ProcessAutoReply implements ShouldQueue
         // No post-AI order creation — orders are created BEFORE the AI reply so
         // the AI can correctly reference the real order ID in its response.
         //
+        // Order creation may replace an AI-generated success claim with the real
+        // success or failure outcome. Persist that final text before sending it.
+        if ($replyMessage->content !== $aiResponse) {
+            $replyMessage->update(['content' => $aiResponse]);
+        }
+
         // Only clear checkout state on a fresh greeting when there is no in-progress order.
         if ($updatedCheckoutState && $intent === 'greeting' && empty($updatedCheckoutState['order_id']) && empty($updatedCheckoutState['product_name'])) {
             $conversation->update(['checkout_state' => null]);

@@ -135,7 +135,12 @@ class SallaOrderStateRecoveryTest extends TestCase
                 ],
                 'pagination' => ['total' => 1, 'count' => 1, 'per_page' => 10, 'current_page' => 1]
             ], 200),
-            'api.salla.dev/admin/v2/cities' => Http::response(['data' => [['id' => 1, 'name' => 'Cairo']]], 200),
+            'api.salla.dev/admin/v2/countries' => Http::response(['data' => [
+                ['id' => 1723506348, 'code' => 'EG'],
+            ]], 200),
+            'api.salla.dev/admin/v2/countries/*/cities' => Http::response([
+                'data' => [['id' => 1, 'name' => 'Cairo', 'name_en' => 'Cairo']]
+            ], 200),
             'api.salla.dev/admin/v2/customers*' => function ($request) {
                 return $request->method() === 'POST'
                     ? Http::response(['data' => ['id' => 7711]], 200)

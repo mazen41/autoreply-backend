@@ -26,6 +26,7 @@ class CheckoutOrderFlowTest extends TestCase
     {
         parent::setUp();
         Cache::flush();
+        config(['services.groq.api_key' => 'test-groq-key']);
         Log::shouldReceive('info')->zeroOrMoreTimes();
         Log::shouldReceive('error')->zeroOrMoreTimes();
         Log::shouldReceive('warning')->zeroOrMoreTimes();
@@ -258,6 +259,7 @@ class CheckoutOrderFlowTest extends TestCase
             'type' => 'salla',
             'status' => 'connected',
             'access_token' => 'test_token',
+            'ai_enabled' => true,
         ]);
 
         $conversation = Conversation::factory()->create([
@@ -284,8 +286,8 @@ class CheckoutOrderFlowTest extends TestCase
         ]);
 
         Http::fake([
-            'api.groq.com/*' => Http::response([
-                'choices' => [['message' => ['content' => json_encode([
+            'api.groq.com/*' => Http::sequence()
+                ->push(['choices' => [['message' => ['content' => json_encode([
                     'success' => true,
                     'reply' => 'Processing.',
                     'intent' => 'place_order',
@@ -293,15 +295,25 @@ class CheckoutOrderFlowTest extends TestCase
                     'confidence' => 0.99,
                     'escalation_reason' => 'none',
                     'needs_images' => false,
-                ])]]]
-            ], 200),
+                ])]]]], 200)
+                ->push(['choices' => [['message' => ['content' => json_encode([
+                    'success' => true,
+                    'reply' => 'Order placed successfully!',
+                    'intent' => 'place_order',
+                    'needs_escalation' => false,
+                    'confidence' => 0.99,
+                    'escalation_reason' => 'none',
+                    'needs_images' => false,
+                ])]]]], 200),
             'api.salla.dev/admin/v2/cities' => Http::response([
                 'data' => [['id' => 2, 'name' => 'Jeddah', 'name_ar' => 'جدة']]
             ], 200),
             'api.salla.dev/admin/v2/customers*' => Http::response([
                 'data' => [['id' => 3322, 'mobile' => '966501234567']]
             ], 200),
-            'api.salla.dev/admin/v2/orders' => Http::response('Server Error', 500),
+            'api.salla.dev/admin/v2/orders' => Http::sequence()
+                ->push('Server Error', 500)
+                ->push(['status' => 200, 'data' => ['id' => 991122, 'reference_id' => 'SAL-991122']], 200),
             'api.salla.dev/*' => Http::response(['data' => []], 200)
         ]);
 
@@ -317,31 +329,6 @@ class CheckoutOrderFlowTest extends TestCase
             'content' => 'yes confirm order',
             'direction' => 'inbound',
             'is_ai' => false,
-        ]);
-
-        Http::fake([
-            'api.groq.com/*' => Http::response([
-                'choices' => [['message' => ['content' => json_encode([
-                    'success' => true,
-                    'reply' => 'Order placed successfully! 🎉',
-                    'intent' => 'place_order',
-                    'needs_escalation' => false,
-                    'confidence' => 0.99,
-                    'escalation_reason' => 'none',
-                    'needs_images' => false,
-                ])]]]
-            ], 200),
-            'api.salla.dev/admin/v2/cities' => Http::response([
-                'data' => [['id' => 2, 'name' => 'Jeddah', 'name_ar' => 'جدة']]
-            ], 200),
-            'api.salla.dev/admin/v2/customers*' => Http::response([
-                'data' => [['id' => 3322, 'mobile' => '966501234567']]
-            ], 200),
-            'api.salla.dev/admin/v2/orders' => Http::response([
-                'status' => 200,
-                'data' => ['id' => 991122, 'reference_id' => 'SAL-991122']
-            ], 200),
-            'api.salla.dev/*' => Http::response(['data' => []], 200)
         ]);
 
         $job2 = new ProcessAutoReply($msg2->id);

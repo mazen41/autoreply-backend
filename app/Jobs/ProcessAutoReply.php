@@ -444,7 +444,7 @@ class ProcessAutoReply implements ShouldQueue
 
             if ($productMap) {
                 $referencedProduct = [
-                    'salla_product_id' => $productMap->salla_product_id,
+                    'salla_product_id' => $productMap->salla_product_id ?? $productMap->commerce_external_id,
                     'commerce_channel_id' => $productMap->commerce_channel_id,
                     'commerce_external_id' => $productMap->commerce_external_id,
                     'sku'              => $productMap->sku,
@@ -823,24 +823,23 @@ class ProcessAutoReply implements ShouldQueue
         // Find Salla channel — Priority 1: Bot's explicit ecommerce_channel_id if set
         // Priority 2: Conversation's own channel if it IS a Salla channel
         // Priority 3: Fall back to resolveUniqueConnectedChannel
-        $sallaChannel = null;
-        if (!empty($bot?->ecommerce_channel_id)) {
-            $assignedStore = Channel::where('id', $bot->ecommerce_channel_id)
-                ->where('user_id', $user->id)
-                ->where('status', 'connected')
-                ->first();
+        // Resolve commerce once for this processing cycle. Provider-specific
+        // paths below receive only this backend-authorized connection.
+        $commerceContext = app(\App\Services\EcommerceChannelResolver::class)
+            ->resolveConversation($conversation, $bot);
+        $commerceChannel = $commerceContext['connection'];
+        $sallaChannel = $commerceChannel?->type === 'salla' ? $commerceChannel : null;
 
-            if ($assignedStore && $assignedStore->type === 'salla') {
-                $sallaChannel = $assignedStore;
-            }
-        }
-
-        if (!$sallaChannel) {
-            if ($channel->type === 'salla') {
-                $sallaChannel = $channel;
-            } else {
-                $sallaChannel = $this->resolveUniqueConnectedChannel($user->id, 'salla');
-            }
+        if (
+            !empty($referencedProduct['commerce_channel_id'])
+            && (int) $referencedProduct['commerce_channel_id'] !== (int) ($commerceChannel?->id ?? 0)
+        ) {
+            Log::warning('ProcessAutoReply: ignored referenced product from a different commerce connection', [
+                'conversation_id' => $conversation->id,
+                'product_connection_id' => $referencedProduct['commerce_channel_id'],
+                'resolved_connection_id' => $commerceChannel?->id,
+            ]);
+            $referencedProduct = null;
         }
 
         // ── SALLA EXCLUSIVE MODE DETECTION ────────────────────────────────────
@@ -881,23 +880,6 @@ class ProcessAutoReply implements ShouldQueue
         // table. Feed the selected store's products into the same aggregate
         // and image-send path used by Salla, so browsing requests do not fall
         // back to an empty list just because the store is not Salla.
-        $commerceChannel = null;
-        if ($bot && !empty($bot->ecommerce_channel_id)) {
-            $commerceChannel = Channel::where('id', $bot->ecommerce_channel_id)
-                ->where('user_id', $user->id)
-                ->whereIn('type', ['shopify', 'woocommerce'])
-                ->where('status', 'connected')->first();
-        }
-        if (!$commerceChannel && in_array($channel->type, ['shopify', 'woocommerce'], true) && $channel->status === 'connected') {
-            $commerceChannel = $channel;
-        }
-        if (!$commerceChannel && !$sallaChannel) {
-            $commerceStores = Channel::where('user_id', $user->id)
-                ->whereIn('type', ['shopify', 'woocommerce'])->where('status', 'connected')->get();
-            if ($commerceStores->count() === 1) {
-                $commerceChannel = $commerceStores->first();
-            }
-        }
         if (!$sallaChannel && $commerceChannel && $isProductAggregate) {
             $commerceProducts = \App\Models\Product::where('business_id', $commerceChannel->business_id)
                 ->where('commerce_channel_id', $commerceChannel->id)
@@ -931,6 +913,41 @@ class ProcessAutoReply implements ShouldQueue
                 'provider' => $commerceChannel->type,
                 'total_count' => $productsAggregateContext['total_count'],
             ]);
+        }
+
+        // Shopify and WooCommerce order lookups are scoped to the same
+        // connection as the product catalog for this conversation.
+        if ($isOrderStatus && $commerceChannel && in_array($commerceChannel->type, ['shopify', 'woocommerce'], true)) {
+            $phone = preg_replace('/[^0-9]/', '', $conversation->sender_id ?? '');
+            try {
+                if ($commerceChannel->type === 'shopify' && $phone !== '') {
+                    $response = Http::withToken($commerceChannel->access_token)
+                        ->get("https://{$commerceChannel->page_id}/admin/api/2026-07/orders.json", [
+                            'status' => 'any',
+                            'limit' => 1,
+                            'order' => 'created_at desc',
+                            'fields' => 'id,name,order_number,financial_status,fulfillment_status,total_price,currency,created_at,line_items',
+                            'query' => $phone,
+                        ]);
+                    $order = $response->successful() ? ($response->json()['orders'][0] ?? null) : null;
+                    if ($order) {
+                        $sallaContext = $this->formatShopifyOrderForAI($order);
+                    }
+                } elseif ($commerceChannel->type === 'woocommerce' && $phone !== '') {
+                    $order = (new \App\Services\WooCommerceService())
+                        ->getOrderByPhone($commerceChannel->metadata ?? [], $phone);
+                    if ($order) {
+                        $sallaContext = (new \App\Services\WooCommerceService())->formatOrderForAI($order);
+                    }
+                }
+            } catch (\Throwable $e) {
+                Log::warning('ProcessAutoReply: scoped commerce order lookup failed', [
+                    'conversation_id' => $conversation->id,
+                    'connection_id' => $commerceChannel->id,
+                    'provider' => $commerceChannel->type,
+                    'error' => $e->getMessage(),
+                ]);
+            }
         }
 
         if ($sallaChannel) {
@@ -1041,10 +1058,11 @@ class ProcessAutoReply implements ShouldQueue
                             Log::warning('ProcessAutoReply: Salla order lookup (non-WA) failed', ['error' => $e->getMessage()]);
                         }
 
-                        // Fallback to Shopify if Salla lookup failed
-                        if (!$sallaContext) {
+                        // Query only the Shopify account already resolved for
+                        // this conversation. Never search a different provider.
+                        if (!$sallaContext && $commerceChannel?->type === 'shopify') {
                             try {
-                                $shopifyChannel = $this->resolveUniqueConnectedChannel($channel->user_id, 'shopify');
+                                $shopifyChannel = $commerceChannel;
 
                                 if ($shopifyChannel && $phoneMatch) {
                                     $shopifyResponse = Http::withToken($shopifyChannel->access_token)
@@ -1067,13 +1085,11 @@ class ProcessAutoReply implements ShouldQueue
                             }
                         }
 
-                        // Fallback to WooCommerce if Shopify lookup also failed
-                        if (!$sallaContext) {
+                        // Query only the resolved WooCommerce account.
+                        if (!$sallaContext && $commerceChannel?->type === 'woocommerce') {
                             try {
-                                $wooCommerceChannel = ($channel->type === 'woocommerce')
-                                    ? $channel
-                                    : $this->resolveUniqueConnectedChannel($channel->user_id, 'woocommerce');
-                                
+                                $wooCommerceChannel = $commerceChannel;
+
                                 if ($wooCommerceChannel && $phoneMatch) {
                                     $wooCommerceService = new \App\Services\WooCommerceService();
                                     $wooOrder = $wooCommerceService->getOrderByPhone($wooCommerceChannel->metadata, $phoneMatch);
@@ -1603,6 +1619,15 @@ class ProcessAutoReply implements ShouldQueue
             'salla_orders_aggregate'   => $ordersAggregateContext,
             'salla_connected'          => (bool) $sallaChannel,
             'commerce_store_connected' => (bool) $commerceChannel,
+            'commerce_context' => [
+                'status' => $commerceContext['status'] ?? 'unresolved',
+                'resolution_source' => $commerceContext['source'] ?? 'unresolved',
+                'provider' => $commerceChannel?->type,
+                'store_name' => $commerceChannel?->page_name,
+            ],
+            'commerce_context_instruction' => empty($commerceChannel)
+                ? 'No commerce store is resolved for this conversation. Do not search or mention products, customers, orders, inventory, or perform checkout. If the customer asks for store data, ask which connected store/catalog they mean; never choose one yourself.'
+                : 'Use only the resolved commerce connection above for every product, customer, inventory, order, and checkout operation. Never use another store or ask the customer to choose a store.',
             // CRITICAL ISSUE — REPLY-TO-PRODUCT CONTEXT: the product the
             // customer deterministically referenced by replying to its image,
             // if any. See getUltimateSystemPrompt() — when present, the AI
@@ -1865,7 +1890,7 @@ class ProcessAutoReply implements ShouldQueue
         if (
             $shouldEscalate
             && $intent === 'place_order'
-            && $sallaChannel
+            && $commerceChannel
             && !empty($updatedCheckoutState['salla_product_id'])
             && !in_array($escalationReason, $checkoutHardEscalations, true)
         ) {
@@ -2082,7 +2107,7 @@ class ProcessAutoReply implements ShouldQueue
             $intent === 'place_order'
             && $containsConfirmPhrase
             && !$isProductBrowseMessage
-            && $sallaChannel
+            && $commerceChannel
             && !empty($fieldStatus['is_complete'])
             && !empty($checkoutState['salla_product_id'])
             && !empty($checkoutState['customer_phone'] ?? $checkoutState['phone'] ?? '')
@@ -2109,6 +2134,8 @@ class ProcessAutoReply implements ShouldQueue
                 // Normalise checkout_state keys to what SallaService expects
                 $orderInput = [
                     'salla_product_id' => $checkoutState['salla_product_id'],
+                    'commerce_external_id' => $checkoutState['commerce_external_id'] ?? $checkoutState['salla_product_id'],
+                    'commerce_channel_id' => $commerceChannel->id,
                     'product_name'     => $checkoutState['product_name']     ?? null,
                     'product_price'    => $checkoutState['product_price']    ?? 0,
                     'full_name'        => $checkoutState['full_name']         ?? $checkoutState['customer_name']    ?? null,
@@ -2170,7 +2197,7 @@ class ProcessAutoReply implements ShouldQueue
                         ]);
                     }
 
-                    Log::info('ProcessAutoReply: Salla order created and reply overridden with real order ID', [
+                    Log::info('ProcessAutoReply: commerce order created and reply overridden with real order ID', [
                         'conversation_id' => $conversation->id,
                         'order_id'        => $realOrderId,
                     ]);
@@ -2195,7 +2222,7 @@ class ProcessAutoReply implements ShouldQueue
                             'checkout_state' => null,
                             'requires_human' => true,
                             'escalated_at' => now(),
-                            'escalation_reason' => 'salla_order_creation_failed',
+                            'escalation_reason' => $commerceChannel->type . '_order_creation_failed',
                         ]);
                         $updatedCheckoutState = [];
                         $checkoutState = [];
@@ -2680,8 +2707,8 @@ class ProcessAutoReply implements ShouldQueue
                         ],
                         [
                             'channel_id'       => $channel->id,
-                            'salla_product_id' => empty($item['commerce_channel_id']) && isset($item['id']) ? (string) $item['id'] : null,
-                            'commerce_channel_id' => $item['commerce_channel_id'] ?? null,
+                            'salla_product_id' => ($conversation->ecommerceConnection?->type === 'salla' && isset($item['id'])) ? (string) $item['id'] : null,
+                            'commerce_channel_id' => $item['commerce_channel_id'] ?? $conversation->ecommerce_connection_id,
                             'commerce_external_id' => $item['commerce_external_id'] ?? null,
                             'sku'              => $item['sku'] ?? null,
                             'product_name'     => $item['name'] ?? null,
@@ -2733,6 +2760,9 @@ class ProcessAutoReply implements ShouldQueue
                 $success = $this->sendWhatsAppReply($channel, $senderId, $content, $images);
             } elseif ($channel->type === 'telegram') {
                 $success = $this->sendTelegramReply($channel, $senderId, $content);
+            } elseif ($channel->type === 'web_chat') {
+                broadcast(new \App\Events\WebChatMessageReceived($replyMessage));
+                $success = true;
             } elseif ($channel->type === 'tiktok') {
                 $success = $this->sendTikTokReply($channel, $senderId, $content);
             }
@@ -3056,16 +3086,15 @@ class ProcessAutoReply implements ShouldQueue
                 return $currentState;
             }
 
-            $user = $channel->user;
+            $commerceContext = app(\App\Services\EcommerceChannelResolver::class)
+                ->resolveConversation($conversation, $conversation->bot);
+            $commerceChannel = $commerceContext['connection'] ?? null;
             $externalOrderId = null;
             $externalSource  = null;
 
-            // 1. Try Salla order creation if Salla channel connected
-            // Prefer the conversation's own channel if it IS Salla; otherwise
-            // resolve safely (null when 0 or multiple Salla stores).
-            $sallaChannel = ($channel->type === 'salla')
-                ? $channel
-                : $this->resolveUniqueConnectedChannel($user->id, 'salla');
+            // The active conversation connection is authoritative for every
+            // order operation; this method never probes other connected stores.
+            $sallaChannel = $commerceChannel?->type === 'salla' ? $commerceChannel : null;
 
             if ($sallaChannel) {
                 try {
@@ -3098,28 +3127,41 @@ class ProcessAutoReply implements ShouldQueue
                 }
             }
 
-            // 2. Try Shopify order creation if Shopify channel connected and no external ID yet
-            if (!$externalOrderId) {
-                $shopifyChannel = ($channel->type === 'shopify')
-                    ? $channel
-                    : $this->resolveUniqueConnectedChannel($user->id, 'shopify');
+            // Shopify order creation may run only against the resolved Shopify
+            // connection. Unsupported providers fail closed below.
+            if (!$externalOrderId && $commerceChannel?->type === 'shopify') {
+                $shopifyChannel = $commerceChannel;
 
-                if ($shopifyChannel) {
                     try {
+                        $commerceProduct = \App\Models\Product::query()
+                            ->where('business_id', $conversation->business_id)
+                            ->where('commerce_channel_id', $shopifyChannel->id)
+                            ->where('commerce_external_id', (string) ($checkoutState['commerce_external_id'] ?? ''))
+                            ->first();
+                        $variants = $commerceProduct?->metadata['variants'] ?? [];
+                        $selectedVariantId = $checkoutState['commerce_variant_id'] ?? null;
+                        $variantGid = count($variants) === 1
+                            ? ($variants[0]['id'] ?? null)
+                            : collect($variants)->firstWhere('id', $selectedVariantId)['id'] ?? null;
+                        if (!$variantGid || !preg_match('~/ProductVariant/(\d+)$~', (string) $variantGid, $variantMatch)) {
+                            throw new \RuntimeException('The selected Shopify product has no synced variant ID.');
+                        }
+                        $nameParts = preg_split('/\s+/', trim((string) ($checkoutState['full_name'] ?? '')), 2) ?: [];
                         $shop  = $shopifyChannel->page_id;
                         $token = $shopifyChannel->access_token;
-                        $response = Http::withToken($token)->post("https://{$shop}/admin/api/2024-01/orders.json", [
+                        $response = Http::withToken($token)->post("https://{$shop}/admin/api/2026-07/orders.json", [
                             'order' => [
                                 'line_items' => [
                                     [
-                                        'title'    => $checkoutState['product_name'] ?? 'Product',
-                                        'price'    => (float)($checkoutState['product_price'] ?? 0),
-                                        'quantity' => 1,
+                                        'variant_id' => (int) $variantMatch[1],
+                                        'quantity' => max(1, (int) ($checkoutState['quantity'] ?? 1)),
                                     ]
                                 ],
                                 'customer' => [
-                                    'first_name' => $checkoutState['full_name'] ?? $conversation->sender_name,
+                                    'first_name' => $nameParts[0] ?? '',
+                                    'last_name'  => $nameParts[1] ?? ($nameParts[0] ?? ''),
                                     'phone'      => $checkoutState['phone'] ?? $conversation->sender_id,
+                                    'email'      => $checkoutState['email'] ?? null,
                                 ],
                                 'shipping_address' => [
                                     'address1' => $checkoutState['address'] ?? '',
@@ -3151,7 +3193,31 @@ class ProcessAutoReply implements ShouldQueue
                             'error'           => $e->getMessage(),
                         ]);
                         return null;
+                }
+            }
+
+            if (!$externalOrderId && $commerceChannel?->type === 'woocommerce') {
+                try {
+                    $wooProduct = \App\Models\Product::query()
+                        ->where('business_id', $conversation->business_id)
+                        ->where('commerce_channel_id', $commerceChannel->id)
+                        ->where('commerce_external_id', (string) ($checkoutState['commerce_external_id'] ?? ''))
+                        ->first();
+                    $checkoutState['commerce_product_metadata'] = $wooProduct?->metadata ?? [];
+                    $wooResponse = app(\App\Services\WooCommerceService::class)
+                        ->createOrderForChannel($commerceChannel, $checkoutState);
+                    $wooOrder = $wooResponse['data'] ?? [];
+                    $externalOrderId = (string) ($wooOrder['id'] ?? '');
+                    if ($externalOrderId !== '') {
+                        $externalSource = 'woocommerce';
                     }
+                } catch (\Throwable $e) {
+                    Log::error('WOOCOMMERCE_ORDER_CREATION_FAILED', [
+                        'conversation_id' => $conversation->id,
+                        'channel_id' => $commerceChannel->id,
+                        'error' => $e->getMessage(),
+                    ]);
+                    return null;
                 }
             }
 
@@ -3222,30 +3288,5 @@ class ProcessAutoReply implements ShouldQueue
         }
     }
 
-    /**
-     * Resolve a connected channel of the given type for a user only when there
-     * is EXACTLY one such channel.  Returns null when:
-     *   - no connected channel of that type exists (safe — nothing to query)
-     *   - multiple channels of that type exist (safe — we cannot pick randomly)
-     *
-     * Callers MUST handle a null return gracefully (skip the lookup, log a
-     * warning if useful).  This method never throws.
-     */
-    private function resolveUniqueConnectedChannel(int $userId, string $type): ?Channel
-    {
-        $candidates = Channel::where('user_id', $userId)
-            ->where('type', $type)
-            ->where('status', 'connected')
-            ->get();
 
-        if ($candidates->count() === 1) {
-            return $candidates->first();
-        }
-
-        if ($candidates->count() > 1) {
-            Log::warning("ProcessAutoReply: multiple {$type} channels for user {$userId} — skipping ambiguous lookup");
-        }
-
-        return null;
-    }
 }

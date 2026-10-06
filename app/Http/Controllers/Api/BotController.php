@@ -52,7 +52,7 @@ class BotController extends Controller
     {
         $business = $this->getResolvedBusinessProfile($request);
         $bots = Bot::where('business_profile_id', $business->id)
-            ->with(['channels:id,type,page_name,page_id', 'ecommerceChannel:id,type,page_name,page_id', 'knowledgeAssignments'])
+            ->with(['channels:id,type,page_name,page_id', 'ecommerceChannel:id,type,page_name,page_id', 'ecommerceConnections:id,type,page_name,page_id,status', 'knowledgeAssignments'])
             ->orderBy('created_at', 'desc')
             ->get();
 
@@ -76,6 +76,9 @@ class BotController extends Controller
             'ai_confidence_threshold' => 'nullable|numeric|min:0|max:1',
             'escalation_config' => 'nullable|array',
             'ecommerce_channel_id' => 'nullable|integer',
+            'ecommerce_connection_ids' => 'nullable|array',
+            'ecommerce_connection_ids.*' => 'integer',
+            'default_ecommerce_connection_id' => 'nullable|integer',
             'channel_ids' => 'nullable|array',
             'channel_ids.*' => 'integer',
             'knowledge_assignments' => 'nullable|array',
@@ -83,9 +86,16 @@ class BotController extends Controller
             'knowledge_assignments.*.channel_id' => 'nullable|integer',
         ]);
 
+        $connectionIds = $request->input('ecommerce_connection_ids');
+        if ($connectionIds === null && $request->filled('ecommerce_channel_id')) {
+            $connectionIds = [(int) $request->ecommerce_channel_id];
+        }
+        $defaultConnectionId = $request->input('default_ecommerce_connection_id', $request->ecommerce_channel_id);
+        $validCommerceIds = $this->validateCommerceConnections($connectionIds ?? [], $defaultConnectionId, $business);
+
         $bot = Bot::create([
             'business_profile_id' => $business->id,
-            'ecommerce_channel_id' => $request->ecommerce_channel_id,
+            'ecommerce_channel_id' => $defaultConnectionId,
             'name' => $request->name,
             'status' => $request->status ?? 'active',
             'ai_provider' => $request->ai_provider ?? 'gemini',
@@ -97,10 +107,12 @@ class BotController extends Controller
             'escalation_config' => $request->escalation_config,
         ]);
 
+        $this->syncCommerceConnections($bot, $validCommerceIds, $defaultConnectionId);
+
         if (!empty($request->channel_ids)) {
             // Only attach channels belonging to the user's business
             $validChannelIds = Channel::whereIn('id', $request->channel_ids)
-                ->where('user_id', $request->user()->id)
+                ->where('business_id', $business->id)
                 ->pluck('id')
                 ->toArray();
 
@@ -134,7 +146,7 @@ class BotController extends Controller
 
         return response()->json([
             'message' => 'Bot created successfully',
-            'bot' => $bot->load(['channels:id,type,page_name,page_id', 'ecommerceChannel:id,type,page_name,page_id', 'knowledgeAssignments']),
+            'bot' => $bot->load(['channels:id,type,page_name,page_id', 'ecommerceChannel:id,type,page_name,page_id', 'ecommerceConnections:id,type,page_name,page_id,status', 'knowledgeAssignments']),
         ], 201);
     }
 
@@ -142,7 +154,7 @@ class BotController extends Controller
     {
         $business = $this->getResolvedBusinessProfile($request);
         $bot = Bot::where('business_profile_id', $business->id)
-            ->with(['channels', 'ecommerceChannel', 'knowledgeAssignments.knowledgeFile', 'knowledgeAssignments.channel'])
+            ->with(['channels', 'ecommerceChannel', 'ecommerceConnections', 'knowledgeAssignments.knowledgeFile', 'knowledgeAssignments.channel'])
             ->findOrFail($id);
 
         return response()->json(['bot' => $bot]);
@@ -164,11 +176,14 @@ class BotController extends Controller
             'ai_confidence_threshold' => 'nullable|numeric|min:0|max:1',
             'escalation_config' => 'nullable|array',
             'ecommerce_channel_id' => 'nullable|integer',
+            'ecommerce_connection_ids' => 'sometimes|array',
+            'ecommerce_connection_ids.*' => 'integer',
+            'default_ecommerce_connection_id' => 'nullable|integer',
             'channel_ids' => 'nullable|array',
             'knowledge_assignments' => 'nullable|array',
         ]);
 
-        $bot->update($request->only([
+        $updates = $request->only([
             'name',
             'status',
             'ai_provider',
@@ -178,12 +193,29 @@ class BotController extends Controller
             'reply_style',
             'ai_confidence_threshold',
             'escalation_config',
-            'ecommerce_channel_id',
-        ]));
+        ]);
+        $connectionFieldsProvided = $request->exists('ecommerce_connection_ids')
+            || $request->exists('ecommerce_channel_id')
+            || $request->exists('default_ecommerce_connection_id');
+        $validCommerceIds = null;
+        $defaultConnectionId = null;
+        if ($connectionFieldsProvided) {
+            $connectionIds = $request->input('ecommerce_connection_ids');
+            if ($connectionIds === null && $request->filled('ecommerce_channel_id')) {
+                $connectionIds = [(int) $request->ecommerce_channel_id];
+            }
+            $defaultConnectionId = $request->input('default_ecommerce_connection_id', $request->input('ecommerce_channel_id'));
+            $validCommerceIds = $this->validateCommerceConnections($connectionIds ?? [], $defaultConnectionId, $business);
+            $updates['ecommerce_channel_id'] = $defaultConnectionId;
+        }
+        $bot->update($updates);
+        if ($connectionFieldsProvided) {
+            $this->syncCommerceConnections($bot, $validCommerceIds ?? [], $defaultConnectionId);
+        }
 
         if ($request->has('channel_ids')) {
             $validChannelIds = Channel::whereIn('id', $request->channel_ids ?? [])
-                ->where('user_id', $request->user()->id)
+                ->where('business_id', $business->id)
                 ->pluck('id')
                 ->toArray();
 
@@ -239,7 +271,7 @@ class BotController extends Controller
     {
         $business = $this->getResolvedBusinessProfile($request);
         $bot = Bot::where('business_profile_id', $business->id)
-            ->with(['channels:id,type,page_name,page_id,status'])
+            ->with(['channels:id,type,page_name,page_id,status', 'ecommerceConnections:id,type,page_name,page_id,status'])
             ->findOrFail($id);
 
         return response()->json([
@@ -271,7 +303,7 @@ class BotController extends Controller
         ]);
 
         $validChannelIds = Channel::whereIn('id', $request->channel_ids)
-            ->where('user_id', $request->user()->id)
+            ->where('business_id', $business->id)
             ->pluck('id')
             ->toArray();
 
@@ -310,12 +342,53 @@ class BotController extends Controller
         $bot = Bot::where('business_profile_id', $business->id)->findOrFail($id);
 
         $channel = Channel::where('id', $channelId)
-            ->where('user_id', $request->user()->id)
+            ->where('business_id', $business->id)
             ->firstOrFail();
 
         $bot->channels()->detach($channel->id);
 
         return response()->json(['message' => 'Channel detached successfully']);
+    }
+
+    private function validateCommerceConnections(array $ids, $defaultId, BusinessProfile $business): array
+    {
+        $ids = array_values(array_unique(array_map('intval', $ids)));
+        if ($defaultId !== null && !in_array((int) $defaultId, $ids, true)) {
+            $ids[] = (int) $defaultId;
+        }
+
+        if (!$ids) {
+            return [];
+        }
+
+        $valid = Channel::query()
+            ->whereIn('id', $ids)
+            ->where('business_id', $business->id)
+            ->whereIn('type', ['salla', 'shopify', 'woocommerce'])
+            ->where('status', 'connected')
+            ->pluck('id')
+            ->map(fn ($id) => (int) $id)
+            ->all();
+
+        if (count($valid) !== count($ids)) {
+            throw \Illuminate\Validation\ValidationException::withMessages([
+                'ecommerce_connection_ids' => 'One or more commerce connections are not connected to this business.',
+            ]);
+        }
+
+        return $valid;
+    }
+
+    private function syncCommerceConnections(Bot $bot, array $ids, $defaultId): void
+    {
+        $sync = [];
+        foreach ($ids as $id) {
+            $sync[$id] = [
+                'is_enabled' => true,
+                'is_default' => $defaultId !== null && (int) $defaultId === (int) $id,
+            ];
+        }
+        $bot->ecommerceConnections()->sync($sync);
     }
 
     // ── BOT-KNOWLEDGE ASSIGNMENT MANAGEMENT ──────────────────────────────────

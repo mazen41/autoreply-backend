@@ -198,6 +198,7 @@ class ChannelController extends Controller
                         : null,
                 'connected_at'         => $channel->connected_at,
                 'ai_enabled'           => $channel->ai_enabled,
+                'default_ecommerce_connection_id' => $channel->default_ecommerce_connection_id,
                 'integration'          => in_array($channel->type, ['shopify', 'woocommerce'], true) ? [
                     'store_url' => $channel->metadata['store_url'] ?? $channel->page_id,
                     'sync_status' => $channel->metadata['sync_status'] ?? 'connected',
@@ -499,7 +500,21 @@ class ChannelController extends Controller
 
         $validated = $request->validate([
             'ai_enabled' => 'boolean',
+            'default_ecommerce_connection_id' => 'nullable|integer',
         ]);
+
+        if (array_key_exists('default_ecommerce_connection_id', $validated) && $validated['default_ecommerce_connection_id'] !== null) {
+            $connection = Channel::query()
+                ->whereKey($validated['default_ecommerce_connection_id'])
+                ->where('business_id', $channel->business_id)
+                ->where('status', 'connected')
+                ->whereIn('type', ['salla', 'shopify', 'woocommerce'])
+                ->first();
+
+            if (!$connection) {
+                return response()->json(['message' => 'The selected store is not connected to this business.'], 422);
+            }
+        }
 
         $channel->update($validated);
 

@@ -5,8 +5,8 @@ namespace App\Models;
 use Illuminate\Database\Eloquent\Factories\HasFactory;
 use Illuminate\Database\Eloquent\Model;
 use Illuminate\Database\Eloquent\Relations\BelongsTo;
-use Illuminate\Database\Eloquent\Relations\BelongsToMany;
 use Illuminate\Database\Eloquent\Relations\HasMany;
+use Illuminate\Database\Eloquent\Relations\BelongsToMany;
 
 class Bot extends Model
 {
@@ -40,6 +40,13 @@ class Bot extends Model
     public function ecommerceChannel(): BelongsTo
     {
         return $this->belongsTo(Channel::class, 'ecommerce_channel_id');
+    }
+
+    public function ecommerceConnections(): BelongsToMany
+    {
+        return $this->belongsToMany(Channel::class, 'bot_ecommerce_connections', 'bot_id', 'ecommerce_connection_id')
+            ->withPivot(['is_enabled', 'is_default', 'settings'])
+            ->withTimestamps();
     }
 
     public function channels(): BelongsToMany

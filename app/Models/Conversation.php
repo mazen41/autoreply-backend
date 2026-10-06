@@ -27,6 +27,10 @@ class Conversation extends Model
         'assigned_agent_id',
         'assigned_at',
         'checkout_state',
+        'ecommerce_connection_id',
+        'commerce_context_status',
+        'commerce_context_source',
+        'commerce_context_resolved_at',
     ];
 
     protected $casts = [
@@ -37,11 +41,17 @@ class Conversation extends Model
         'requires_human'       => 'boolean',
         'escalation_notified'  => 'boolean',
         'checkout_state'       => 'array',
+        'commerce_context_resolved_at' => 'datetime',
     ];
 
     public function channel()
     {
         return $this->belongsTo(Channel::class);
+    }
+
+    public function ecommerceConnection()
+    {
+        return $this->belongsTo(Channel::class, 'ecommerce_connection_id');
     }
 
     public function business()

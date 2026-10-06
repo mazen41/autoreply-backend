@@ -8,6 +8,7 @@ use App\Models\Product;
 use App\Models\Conversation;
 use Illuminate\Support\Facades\Log;
 use Illuminate\Support\Facades\Validator;
+use Illuminate\Support\Facades\DB;
 
 class ActionExecutor
 {
@@ -92,54 +93,11 @@ class ActionExecutor
      */
     private function createOrder(array $payload, int $conversationId): array
     {
-        $validator = Validator::make($payload, [
-            'product_id' => 'required|integer',
-            'quantity' => 'required|integer|min:1',
-        ]);
-
-        if ($validator->fails()) {
-            return [
-                'success' => false,
-                'error' => 'Invalid order data: ' . $validator->errors()->first(),
-            ];
-        }
-
-        $conversation = Conversation::find($conversationId);
-        $business = $conversation->business;
-
-        // Check if product exists and belongs to business
-        $product = Product::where('business_id', $business->id)
-            ->where('id', $payload['product_id'])
-            ->first();
-
-        if (!$product) {
-            return [
-                'success' => false,
-                'error' => 'Product not found',
-            ];
-        }
-
-        // Check stock
-        if ($product->stock_quantity < $payload['quantity']) {
-            return [
-                'success' => false,
-                'error' => 'Insufficient stock',
-            ];
-        }
-
-        // Create order (simplified - in real system, you'd have an orders table)
-        $orderId = 'ORD-' . time() . '-' . rand(1000, 9999);
-
-        // Update stock
-        $product->decrement('stock_quantity', $payload['quantity']);
-
+        // Commerce orders must pass through the provider-backed conversation
+        // checkout path, which owns store authorization and idempotency.
         return [
-            'success' => true,
-            'order_id' => $orderId,
-            'product' => $product->name,
-            'quantity' => $payload['quantity'],
-            'total' => $product->price * $payload['quantity'],
-            'message' => "تم إنشاء الطلب رقم {$orderId} ✅",
+            'success' => false,
+            'error' => 'Order creation must be completed through the conversation checkout flow.',
         ];
     }
 
@@ -149,9 +107,22 @@ class ActionExecutor
     private function getProducts(array $payload, int $conversationId): array
     {
         $conversation = Conversation::find($conversationId);
+        if (!$conversation || !$conversation->business) {
+            return ['success' => false, 'error' => 'Conversation business context is unavailable.'];
+        }
         $business = $conversation->business;
 
-        $query = Product::where('business_id', $business->id)->active();
+        $commerceContext = app(EcommerceChannelResolver::class)->resolveConversation($conversation);
+        $connection = $commerceContext['connection'] ?? null;
+        if (($commerceContext['status'] ?? 'unresolved') !== 'resolved'
+            || !$connection
+            || (int) $connection->business_id !== (int) $conversation->business_id) {
+            return ['success' => false, 'error' => 'No authorized commerce store is resolved for this conversation.'];
+        }
+
+        $query = Product::where('business_id', $business->id)
+            ->where('commerce_channel_id', $connection->id)
+            ->active();
 
         // Apply filters if provided
         if (isset($payload['category'])) {
@@ -188,21 +159,39 @@ class ActionExecutor
     private function checkStatus(array $payload, int $conversationId): array
     {
         $orderId = $payload['order_id'] ?? null;
-
         if (!$orderId) {
-            return [
-                'success' => false,
-                'error' => 'Order ID required',
-            ];
+            return ['success' => false, 'error' => 'Order ID required'];
         }
 
-        // In real system, you'd check actual order status
-        // For now, return mock status
+        $conversation = Conversation::find($conversationId);
+        if (!$conversation || !$conversation->business) {
+            return ['success' => false, 'error' => 'Conversation business context is unavailable.'];
+        }
+
+        $commerceContext = app(EcommerceChannelResolver::class)->resolveConversation($conversation);
+        $connection = $commerceContext['connection'] ?? null;
+        if (($commerceContext['status'] ?? 'unresolved') !== 'resolved' || !$connection) {
+            return ['success' => false, 'error' => 'No authorized commerce store is resolved for this conversation.'];
+        }
+
+        $order = DB::table('commerce_orders')
+            ->where('business_id', $conversation->business_id)
+            ->where('channel_id', $connection->id)
+            ->where(function ($query) use ($orderId) {
+                $query->where('external_id', (string) $orderId)
+                    ->orWhere('order_number', (string) $orderId);
+            })
+            ->first();
+        if (!$order) {
+            return ['success' => false, 'error' => 'Order was not found in this store.'];
+        }
+
         return [
             'success' => true,
-            'order_id' => $orderId,
-            'status' => 'processing',
-            'message' => 'الطلب قيد المعالجة',
+            'order_id' => $order->external_id,
+            'order_number' => $order->order_number,
+            'status' => $order->status,
+            'fulfillment_status' => $order->fulfillment_status,
         ];
     }
 

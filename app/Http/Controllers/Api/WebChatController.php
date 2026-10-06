@@ -6,6 +6,8 @@ use App\Http\Controllers\Controller;
 use App\Models\WebChatSession;
 use App\Models\Conversation;
 use App\Models\Message;
+use App\Models\Channel;
+use App\Models\BusinessProfile;
 use App\Services\NotificationService;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\Auth;
@@ -54,16 +56,44 @@ class WebChatController extends Controller
         $conversation = Conversation::where('web_chat_session_id', $session->id)->first();
 
         if (!$conversation) {
+            $business = BusinessProfile::findOrFail($session->business_id);
+            $channel = Channel::firstOrCreate(
+                ['business_id' => $business->id, 'type' => 'web_chat', 'page_id' => 'web-chat-' . $business->id],
+                [
+                    'user_id' => $business->user_id,
+                    'page_name' => 'Website Chat',
+                    'access_token' => '',
+                    'status' => 'connected',
+                    'connected_at' => now(),
+                    'ai_enabled' => true,
+                ]
+            );
+
             $conversation = Conversation::create([
-                'business_id' => $request->business_id,
-                'channel_id' => null, // Web chat doesn't use traditional channels
-                'sender_id' => $request->session_id,
-                'sender_name' => $request->visitor_name ?? 'Website Visitor',
+                'business_id' => $business->id,
+                'channel_id' => $channel->id,
+                'sender_id' => $session->session_id,
+                'sender_name' => $session->visitor_name ?? 'Website Visitor',
                 'status' => 'active',
-                'source' => 'web_chat',
                 'web_chat_session_id' => $session->id,
                 'last_message_at' => now(),
             ]);
+        }
+
+        if (!$conversation->channel_id) {
+            $business = BusinessProfile::findOrFail($session->business_id);
+            $channel = Channel::firstOrCreate(
+                ['business_id' => $business->id, 'type' => 'web_chat', 'page_id' => 'web-chat-' . $business->id],
+                [
+                    'user_id' => $business->user_id,
+                    'page_name' => 'Website Chat',
+                    'access_token' => '',
+                    'status' => 'connected',
+                    'connected_at' => now(),
+                    'ai_enabled' => true,
+                ]
+            );
+            $conversation->update(['channel_id' => $channel->id]);
         }
 
         // Resolve/link the business-scoped Customer (web-chat session identity)

@@ -189,7 +189,7 @@ class ProductReplyContextTest extends TestCase
         $this->assertEquals($expectedProductIds, $maps->pluck('salla_product_id')->all());
 
         // Every row must have a distinct outgoing message id — no collisions.
-        $this->assertEquals(5, $maps->pluck('whatsapp_message_id')->unique()->count());
+        $this->assertEquals(5, $maps->pluck('platform_message_id')->unique()->count());
 
         // Spot-check one row's full data integrity.
         $beltMap = $maps->firstWhere('salla_product_id', '103');
@@ -216,7 +216,7 @@ class ProductReplyContextTest extends TestCase
             ProductMessageMap::create([
                 'conversation_id' => $fixture['conversation']->id,
                 'channel_id' => $fixture['whatsappChannel']->id,
-                'whatsapp_message_id' => 'MEDIA_MSG_' . ($i + 1),
+                'platform_message_id' => 'MEDIA_MSG_' . ($i + 1),
                 'salla_product_id' => (string) $p['id'],
                 'product_name' => $p['name'],
                 'product_price' => (string) $p['price']['amount'],

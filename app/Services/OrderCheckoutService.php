@@ -409,6 +409,8 @@ class OrderCheckoutService
         // Merge fields: preserve existing values if new extraction is null (NO OVERWRITING WITH NULL!)
         $mergedState = array_merge($existingState, array_filter([
             'salla_product_id' => $referencedProduct['salla_product_id'] ?? ($existingState['salla_product_id'] ?? null),
+            'commerce_external_id' => $referencedProduct['commerce_external_id'] ?? ($existingState['commerce_external_id'] ?? null),
+            'commerce_channel_id' => $referencedProduct['commerce_channel_id'] ?? ($existingState['commerce_channel_id'] ?? null),
             'sku'              => $referencedProduct['sku']              ?? ($existingState['sku']              ?? null),
             'product_name'     => $referencedProduct['name']             ?? ($existingState['product_name']     ?? null),
             'product_price'    => $referencedProduct['price']            ?? ($existingState['product_price']    ?? null),

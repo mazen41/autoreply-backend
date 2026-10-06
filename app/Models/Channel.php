@@ -8,9 +8,16 @@ use Illuminate\Database\Eloquent\Model;
 class Channel extends Model
 {
     use HasFactory;
+    protected $hidden = [
+        'access_token',
+        'page_access_token',
+        'refresh_token',
+    ];
+
     protected $fillable = [
         'user_id',
         'business_id',
+        'default_ecommerce_connection_id',
         'type',
         'page_id',
         'page_name',
@@ -127,5 +134,22 @@ class Channel extends Model
         return $this->belongsToMany(Bot::class, 'bot_channels', 'channel_id', 'bot_id')
             ->withPivot('is_primary')
             ->withTimestamps();
+    }
+
+    public function ecommerceBots()
+    {
+        return $this->belongsToMany(Bot::class, 'bot_ecommerce_connections', 'ecommerce_connection_id', 'bot_id')
+            ->withPivot(['is_enabled', 'is_default', 'settings'])
+            ->withTimestamps();
+    }
+
+    public function defaultEcommerceConnection()
+    {
+        return $this->belongsTo(self::class, 'default_ecommerce_connection_id');
+    }
+
+    public function isEcommerceConnection(): bool
+    {
+        return in_array(strtolower((string) $this->type), ['salla', 'shopify', 'woocommerce'], true);
     }
 }

@@ -22,11 +22,13 @@ class CommerceStoreSyncService
             'sync_status' => 'syncing',
             'sync_started_at' => now()->toIso8601String(),
             'sync_error' => null,
+            'sync_warnings' => [],
         ])])->save();
 
         try {
+            $warnings = [];
             $counts = $channel->type === 'shopify'
-                ? $this->syncShopify($channel)
+                ? $this->syncShopify($channel, $warnings)
                 : $this->syncWooCommerce($channel);
 
             $metadata = $channel->fresh()->metadata ?? [];
@@ -34,6 +36,7 @@ class CommerceStoreSyncService
             $metadata['last_synced_at'] = now()->toIso8601String();
             $metadata['sync_counts'] = $counts;
             $metadata['sync_error'] = null;
+            $metadata['sync_warnings'] = $warnings;
             $channel->forceFill(['metadata' => $metadata])->save();
 
             return $counts;
@@ -46,7 +49,7 @@ class CommerceStoreSyncService
         }
     }
 
-    private function syncShopify(Channel $channel): array
+    private function syncShopify(Channel $channel, array &$warnings): array
     {
         $counts = ['products' => 0, 'orders' => 0, 'customers' => 0];
         $domain = strtolower($channel->page_id);
@@ -106,22 +109,14 @@ query Orders($after: String) {
     edges { cursor node {
       id name createdAt updatedAt displayFinancialStatus displayFulfillmentStatus cancelledAt
       currencyCode totalPriceSet { shopMoney { amount currencyCode } }
-      customer { id displayName email phone }
-      shippingAddress { name address1 address2 city province country zip phone }
       lineItems(first: 100) { edges { node { title quantity sku originalUnitPriceSet { shopMoney { amount currencyCode } } variant { id product { id } } } } }
     } }
     pageInfo { hasNextPage endCursor }
   }
 }
 GQL, 'orders', function (array $order) use ($channel, &$counts): void {
-            $customer = $order['customer'] ?? [];
             $money = $order['totalPriceSet']['shopMoney'] ?? [];
-            $shipping = $order['shippingAddress'] ?? [];
             $lineItems = array_map(fn ($edge) => $edge['node'] ?? [], $order['lineItems']['edges'] ?? []);
-            $address = implode(', ', array_filter([
-                $shipping['address1'] ?? null, $shipping['address2'] ?? null, $shipping['city'] ?? null,
-                $shipping['province'] ?? null, $shipping['country'] ?? null, $shipping['zip'] ?? null,
-            ]));
 
             CommerceOrder::updateOrCreate(
                 ['channel_id' => $channel->id, 'external_id' => (string) $order['id']],
@@ -130,9 +125,8 @@ GQL, 'orders', function (array $order) use ($channel, &$counts): void {
                     'status' => strtolower($order['displayFinancialStatus'] ?? 'unknown'),
                     'fulfillment_status' => strtolower($order['displayFulfillmentStatus'] ?? 'unfulfilled'),
                     'total' => (float) ($money['amount'] ?? 0), 'currency' => $money['currencyCode'] ?? null,
-                    'customer_name' => $customer['displayName'] ?? ($shipping['name'] ?? null),
-                    'customer_email' => $customer['email'] ?? null, 'customer_phone' => $customer['phone'] ?? null,
-                    'shipping_address' => $address ?: null, 'line_items' => $lineItems,
+                    'customer_name' => null, 'customer_email' => null, 'customer_phone' => null,
+                    'shipping_address' => null, 'line_items' => $lineItems,
                     'raw_data' => ['id' => $order['id'], 'updated_at' => $order['updatedAt'] ?? null, 'cancelled_at' => $order['cancelledAt'] ?? null],
                     'ordered_at' => $order['createdAt'] ?? null,
                 ]
@@ -140,7 +134,8 @@ GQL, 'orders', function (array $order) use ($channel, &$counts): void {
             $counts['orders']++;
         });
 
-        $this->paginateShopify($domain, $version, $headers, <<<'GQL'
+        try {
+            $this->paginateShopify($domain, $version, $headers, <<<'GQL'
 query Customers($after: String) {
   customers(first: 100, after: $after, sortKey: CREATED_AT) {
     edges { cursor node { id displayName firstName lastName email phone state createdAt updatedAt } }
@@ -159,7 +154,19 @@ GQL, 'customers', function (array $remote) use ($channel, &$counts): void {
                 ]
             );
             $counts['customers']++;
-        });
+            });
+        } catch (RuntimeException $e) {
+            if (!str_contains(strtolower($e->getMessage()), 'not approved to access the customer object')
+                && !str_contains(strtolower($e->getMessage()), 'protected customer data')) {
+                throw $e;
+            }
+
+            $warnings[] = 'Shopify customer sync is paused until Protected Customer Data access is approved.';
+            Log::warning('Shopify customer sync skipped because protected customer data is not approved', [
+                'channel_id' => $channel->id,
+                'error' => $e->getMessage(),
+            ]);
+        }
 
         return $counts;
     }

@@ -202,6 +202,7 @@ class ChannelController extends Controller
                     'sync_counts' => $channel->metadata['sync_counts'] ?? ['products' => 0, 'orders' => 0, 'customers' => 0],
                     'last_synced_at' => $channel->metadata['last_synced_at'] ?? null,
                     'sync_error' => $channel->metadata['sync_error'] ?? null,
+                    'sync_warnings' => $channel->metadata['sync_warnings'] ?? [],
                     'webhook_status' => $channel->metadata['webhook_status'] ?? null,
                     'webhooks_registered' => $channel->metadata['webhooks_registered'] ?? null,
                 ] : null,
@@ -695,4 +696,3 @@ class ChannelController extends Controller
         // which might be different from the one we assumed
     }
 }
-

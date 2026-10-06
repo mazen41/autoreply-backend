@@ -28,12 +28,9 @@ class ShopifyController extends Controller
             return response()->json(['error' => 'Shopify is not configured on the server.'], 503);
         }
 
-        // The Shopify details supplied for this app specify managed installation
-        // (use_legacy_install_flow=false). This backend implements authorization-code
-        // OAuth, which Shopify will not invoke for managed installations.
-        if (!filter_var(env('SHOPIFY_USE_LEGACY_INSTALL_FLOW', false), FILTER_VALIDATE_BOOLEAN)) {
+        if (!config('services.shopify.use_legacy_install_flow')) {
             return response()->json([
-                'error' => 'Shopify is configured for managed installation. Enable the legacy install flow for this OAuth callback, or implement App Bridge token exchange for the embedded app.',
+                'error' => 'This connection starts from the NazBiz Channels page and requires Shopify standalone authorization-code flow. Set use_legacy_install_flow=true and embedded=false in the Shopify app settings, then deploy the app configuration.',
             ], 409);
         }
 
@@ -61,6 +58,13 @@ class ShopifyController extends Controller
     {
         $secret = config('services.shopify.client_secret');
         $shop = $this->normalizeShop((string) $request->query('shop', ''));
+        if ($request->query('error')) {
+            $state = (string) $request->query('state', '');
+            $stateData = $state !== '' ? Cache::pull('shopify_oauth_state:' . hash('sha256', $state)) : null;
+            if ($stateData && ($stateData['shop'] ?? null) === $shop) {
+                return redirect($this->frontendUrl() . '/dashboard/channels?error=shopify_cancelled');
+            }
+        }
         if (!$secret || !$shop || !$this->validCallbackHmac($request, $secret)) {
             return redirect($this->frontendUrl() . '/dashboard/channels?error=shopify_invalid_callback');
         }
@@ -208,6 +212,7 @@ class ShopifyController extends Controller
             'FULFILLMENTS_CREATE', 'FULFILLMENTS_UPDATE', 'CUSTOMERS_CREATE', 'CUSTOMERS_UPDATE',
             'APP_UNINSTALLED',
         ];
+        $registered = 0;
         foreach ($topics as $topic) {
             try {
                 $response = Http::withHeaders(['X-Shopify-Access-Token' => $channel->access_token])
@@ -215,13 +220,25 @@ class ShopifyController extends Controller
                         'query' => 'mutation CreateWebhook($topic: WebhookSubscriptionTopic!, $webhookSubscription: WebhookSubscriptionInput!) { webhookSubscriptionCreate(topic: $topic, webhookSubscription: $webhookSubscription) { userErrors { field message } webhookSubscription { id uri } } }',
                         'variables' => ['topic' => $topic, 'webhookSubscription' => ['uri' => $callback, 'format' => 'JSON']],
                     ]);
-                if (!$response->successful() || !empty($response->json('errors')) || !empty($response->json('data.webhookSubscriptionCreate.userErrors'))) {
+                $subscription = $response->json('data.webhookSubscriptionCreate.webhookSubscription');
+                if ($response->successful() && empty($response->json('errors'))
+                    && empty($response->json('data.webhookSubscriptionCreate.userErrors'))
+                    && !empty($subscription['id'])) {
+                    $registered++;
+                } else {
                     Log::warning('Shopify webhook subscription was not created', ['channel_id' => $channel->id, 'topic' => $topic]);
                 }
             } catch (\Throwable $e) {
                 Log::warning('Shopify webhook subscription failed', ['channel_id' => $channel->id, 'topic' => $topic, 'error' => $e->getMessage()]);
             }
         }
+
+        $metadata = $channel->fresh()->metadata ?? [];
+        $metadata['webhooks_registered'] = $registered;
+        $metadata['webhook_status'] = $registered === count($topics)
+            ? 'registered'
+            : ($registered > 0 ? 'partial' : 'error');
+        $channel->forceFill(['metadata' => $metadata])->save();
     }
 
     private function validCallbackHmac(Request $request, string $secret): bool

@@ -29,12 +29,19 @@ class WooCommerceController extends Controller
             'store_url' => $storeUrl,
             'created_at' => now()->timestamp,
         ], now()->addMinutes(15));
+        $this->saveConnectionResult($state, (int) $request->user()->id, 'pending');
+
+        $returnUrl = rtrim((string) config('app.frontend_url', env('FRONTEND_URL', '')), '/')
+            . '/dashboard/channels?' . http_build_query([
+                'connection' => 'woocommerce',
+                'connection_state' => $state,
+            ]);
 
         $params = [
             'app_name' => config('app.name', 'NazBiz'),
             'scope' => 'read_write',
             'user_id' => $state,
-            'return_url' => rtrim((string) config('app.frontend_url', env('FRONTEND_URL', '')), '/') . '/dashboard/channels?success=woocommerce_connected',
+            'return_url' => $returnUrl,
             'callback_url' => rtrim((string) config('app.url'), '/') . '/api/channels/woocommerce/callback',
         ];
 
@@ -55,8 +62,10 @@ class WooCommerceController extends Controller
         if (!$stateData || now()->timestamp - (int) ($stateData['created_at'] ?? 0) > 900) {
             return response()->json(['error' => 'Authorization request expired or invalid.'], 401);
         }
+        $userId = (int) $stateData['user_id'];
         if (empty($payload['consumer_key']) || empty($payload['consumer_secret'])
             || ($payload['key_permissions'] ?? '') !== 'read_write') {
+            $this->saveConnectionResult($state, $userId, 'failed', 'WooCommerce did not grant read/write API access.');
             return response()->json(['error' => 'WooCommerce did not grant the required read/write API access.'], 422);
         }
 
@@ -67,19 +76,21 @@ class WooCommerceController extends Controller
             $response = Http::withBasicAuth($consumerKey, $consumerSecret)->timeout(20)
                 ->get($storeUrl . '/wp-json/wc/v3/system_status');
             if (!$response->successful()) {
+                $this->saveConnectionResult($state, $userId, 'failed', 'WooCommerce could not verify the approved API key.');
                 Log::warning('WooCommerce authorization credentials failed verification', [
                     'status' => $response->status(), 'store_url' => $storeUrl,
                 ]);
                 return response()->json(['error' => 'WooCommerce could not verify the approved API key.'], 422);
             }
 
-            $business = \App\Models\BusinessProfile::firstOrCreate(['user_id' => $stateData['user_id']]);
+            $business = \App\Models\BusinessProfile::firstOrCreate(['user_id' => $userId]);
             $status = $response->json();
             $channel = Channel::updateOrCreate(
-                ['user_id' => $stateData['user_id'], 'type' => 'woocommerce', 'page_id' => $storeUrl],
+                ['user_id' => $userId, 'type' => 'woocommerce', 'page_id' => $storeUrl],
                 [
                     'business_id' => $business->id,
                     'page_name' => $status['settings']['store_name'] ?? parse_url($storeUrl, PHP_URL_HOST),
+                    'access_token' => '',
                     'status' => 'connected',
                     'connected_at' => now(),
                     'metadata' => [
@@ -95,13 +106,31 @@ class WooCommerceController extends Controller
 
             $this->registerWebhooks($channel);
             SyncCommerceStore::dispatch($channel->id);
+            $this->saveConnectionResult($state, $userId, 'connected', null, $channel->id);
             return response()->json(['success' => true]);
         } catch (\Throwable $e) {
+            $this->saveConnectionResult($state, $userId, 'failed', 'Could not finish connecting WooCommerce. Please try again.');
             Log::error('WooCommerce authorization callback failed', [
                 'store_url' => $storeUrl, 'error' => $e->getMessage(),
             ]);
             return response()->json(['error' => 'Could not finish connecting WooCommerce.'], 500);
         }
+    }
+
+    /** Return the server-verified result after WooCommerce redirects back. */
+    public function connectionStatus(Request $request)
+    {
+        $validated = $request->validate(['state' => ['required', 'string', 'max:100']]);
+        $result = Cache::get($this->connectionResultKey($validated['state']));
+        if (!$result || (int) ($result['user_id'] ?? 0) !== (int) $request->user()->id) {
+            return response()->json(['status' => 'expired', 'error' => 'Connection request expired. Please try again.'], 404);
+        }
+
+        return response()->json(array_filter([
+            'status' => $result['status'] ?? 'pending',
+            'channel_id' => $result['channel_id'] ?? null,
+            'error' => $result['error'] ?? null,
+        ], fn ($value) => $value !== null));
     }
 
     public function sync(Request $request, int $channelId)
@@ -171,7 +200,9 @@ class WooCommerceController extends Controller
         $consumerSecret = decrypt($metadata['consumer_secret'] ?? '');
         $webhookSecret = decrypt($metadata['webhook_secret'] ?? '');
         $deliveryUrl = rtrim((string) config('app.url'), '/') . '/api/woocommerce/webhook';
-        foreach (['order.created', 'order.updated', 'product.created', 'product.updated', 'customer.created', 'customer.updated'] as $topic) {
+        $topics = ['order.created', 'order.updated', 'product.created', 'product.updated', 'customer.created', 'customer.updated'];
+        $registered = 0;
+        foreach ($topics as $topic) {
             try {
                 $response = Http::withBasicAuth($consumerKey, $consumerSecret)->timeout(20)
                     ->post($storeUrl . '/wp-json/wc/v3/webhooks', [
@@ -181,7 +212,9 @@ class WooCommerceController extends Controller
                         'secret' => $webhookSecret,
                         'status' => 'active',
                     ]);
-                if (!$response->successful()) {
+                if ($response->successful() && !empty($response->json('id'))) {
+                    $registered++;
+                } else {
                     Log::warning('WooCommerce webhook registration failed', [
                         'channel_id' => $channel->id, 'topic' => $topic, 'status' => $response->status(),
                     ]);
@@ -192,6 +225,13 @@ class WooCommerceController extends Controller
                 ]);
             }
         }
+
+        $metadata = $channel->fresh()->metadata ?? [];
+        $metadata['webhooks_registered'] = $registered;
+        $metadata['webhook_status'] = $registered === count($topics)
+            ? 'registered'
+            : ($registered > 0 ? 'partial' : 'error');
+        $channel->forceFill(['metadata' => $metadata])->save();
     }
 
     private function normalizeStoreUrl(string $value): ?string
@@ -210,5 +250,20 @@ class WooCommerceController extends Controller
         }
         $path = rtrim($parts['path'] ?? '', '/');
         return 'https://' . $host . (isset($parts['port']) ? ':' . $parts['port'] : '') . $path;
+    }
+
+    private function connectionResultKey(string $state): string
+    {
+        return 'woocommerce_connection_result:' . hash('sha256', $state);
+    }
+
+    private function saveConnectionResult(string $state, int $userId, string $status, ?string $error = null, ?int $channelId = null): void
+    {
+        Cache::put($this->connectionResultKey($state), array_filter([
+            'user_id' => $userId,
+            'status' => $status,
+            'error' => $error,
+            'channel_id' => $channelId,
+        ], fn ($value) => $value !== null), now()->addMinutes(20));
     }
 }

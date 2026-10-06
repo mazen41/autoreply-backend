@@ -181,12 +181,19 @@ class ChannelController extends Controller
                 'page_name'            => $channel->page_name,
                 'instagram_account_id' => $channel->instagram_account_id,
                 'status'               => in_array($channel->type, ['shopify', 'woocommerce'], true)
-                    && ($channel->metadata['sync_status'] ?? '') === 'error'
+                    && (($channel->metadata['sync_status'] ?? '') === 'error'
+                        || in_array(($channel->metadata['webhook_status'] ?? ''), ['error', 'partial'], true))
                         ? 'error'
                         : (in_array($channel->type, ['shopify', 'woocommerce'], true)
                             && in_array(($channel->metadata['sync_status'] ?? ''), ['queued', 'syncing'], true)
                                 ? 'syncing'
                                 : $channel->status),
+                'status_message'       => in_array($channel->type, ['shopify', 'woocommerce'], true)
+                    ? ($channel->metadata['sync_error']
+                        ?? (in_array(($channel->metadata['webhook_status'] ?? ''), ['error', 'partial'], true)
+                            ? 'Store webhooks could not all be registered; automatic updates may be delayed.'
+                            : null))
+                    : null,
                 'connected_at'         => $channel->connected_at,
                 'ai_enabled'           => $channel->ai_enabled,
                 'integration'          => in_array($channel->type, ['shopify', 'woocommerce'], true) ? [
@@ -194,6 +201,9 @@ class ChannelController extends Controller
                     'sync_status' => $channel->metadata['sync_status'] ?? 'connected',
                     'sync_counts' => $channel->metadata['sync_counts'] ?? ['products' => 0, 'orders' => 0, 'customers' => 0],
                     'last_synced_at' => $channel->metadata['last_synced_at'] ?? null,
+                    'sync_error' => $channel->metadata['sync_error'] ?? null,
+                    'webhook_status' => $channel->metadata['webhook_status'] ?? null,
+                    'webhooks_registered' => $channel->metadata['webhooks_registered'] ?? null,
                 ] : null,
                 'capabilities'         => $capabilities[$channel->type] ?? [
                     'inbound_webhook'  => true,
@@ -685,7 +695,4 @@ class ChannelController extends Controller
         // which might be different from the one we assumed
     }
 }
-
-
-
 

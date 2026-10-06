@@ -189,6 +189,7 @@ Route::middleware('auth:sanctum')->group(function () {
     Route::post('/channels/shopify/connect', [ShopifyController::class, 'connect'])->middleware('plan.enforce:max_channels');
     Route::post('/channels/shopify/{channelId}/sync', [ShopifyController::class, 'sync']);
     Route::post('/channels/woocommerce/connect', [WooCommerceController::class, 'connect'])->middleware('plan.enforce:max_channels');
+    Route::get('/channels/woocommerce/connection-status', [WooCommerceController::class, 'connectionStatus']);
     Route::post('/channels/woocommerce/{channelId}/sync', [WooCommerceController::class, 'sync']);
     Route::get('/channels/shopify/orders',    [ShopifyController::class, 'getOrders']);
     Route::get('/channels/woocommerce/orders', [WooCommerceController::class, 'getOrders']);

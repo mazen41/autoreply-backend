@@ -47,6 +47,7 @@ return [
         'redirect' => env('SHOPIFY_REDIRECT_URI'),
         'scopes' => env('SHOPIFY_SCOPES', 'read_products,read_inventory,read_orders,read_customers,write_orders,write_customers,write_webhooks'),
         'api_version' => env('SHOPIFY_API_VERSION', '2026-07'),
+        'use_legacy_install_flow' => filter_var(env('SHOPIFY_USE_LEGACY_INSTALL_FLOW', false), FILTER_VALIDATE_BOOLEAN),
     ],
 
     'facebook' => [

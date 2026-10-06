@@ -188,12 +188,14 @@ class ChannelController extends Controller
                             && in_array(($channel->metadata['sync_status'] ?? ''), ['queued', 'syncing'], true)
                                 ? 'syncing'
                                 : $channel->status),
-                'status_message'       => in_array($channel->type, ['shopify', 'woocommerce'], true)
-                    ? ($channel->metadata['sync_error']
+                    'status_message'       => in_array($channel->type, ['shopify', 'woocommerce'], true)
+                        ? ($channel->metadata['sync_error']
                         ?? (in_array(($channel->metadata['webhook_status'] ?? ''), ['error', 'partial'], true)
-                            ? 'Store webhooks could not all be registered; automatic updates may be delayed.'
+                            ? (($channel->metadata['webhook_failure_message'] ?? null)
+                                ? 'Store webhooks are incomplete: ' . $channel->metadata['webhook_failure_message']
+                                : 'Store webhooks could not all be registered; automatic updates may be delayed.')
                             : null))
-                    : null,
+                        : null,
                 'connected_at'         => $channel->connected_at,
                 'ai_enabled'           => $channel->ai_enabled,
                 'integration'          => in_array($channel->type, ['shopify', 'woocommerce'], true) ? [
@@ -205,6 +207,7 @@ class ChannelController extends Controller
                     'sync_warnings' => $channel->metadata['sync_warnings'] ?? [],
                     'webhook_status' => $channel->metadata['webhook_status'] ?? null,
                     'webhooks_registered' => $channel->metadata['webhooks_registered'] ?? null,
+                    'webhook_failure_message' => $channel->metadata['webhook_failure_message'] ?? null,
                 ] : null,
                 'capabilities'         => $capabilities[$channel->type] ?? [
                     'inbound_webhook'  => true,

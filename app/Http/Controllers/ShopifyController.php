@@ -213,7 +213,47 @@ class ShopifyController extends Controller
             'APP_UNINSTALLED',
         ];
         $registered = 0;
+        $failures = [];
+
+        // Reconnecting a shop must not fail just because Shopify already has
+        // the same shop-scoped subscriptions from an earlier connection.
+        try {
+            $existingResponse = Http::withHeaders(['X-Shopify-Access-Token' => $channel->access_token])
+                ->timeout(20)->post("https://{$domain}/admin/api/{$version}/graphql.json", [
+                    'query' => 'query ExistingWebhooks { webhookSubscriptions(first: 250) { edges { node { id topic uri } } } }',
+                ]);
+            $existingPayload = $existingResponse->json();
+            $existingEdges = $existingResponse->json('data.webhookSubscriptions.edges', []);
+            if (!$existingResponse->successful() || !empty($existingPayload['errors']) || !is_array($existingEdges)) {
+                Log::warning('Shopify existing webhook lookup failed; attempting registration anyway', [
+                    'channel_id' => $channel->id,
+                    'http_status' => $existingResponse->status(),
+                    'errors' => $existingPayload['errors'] ?? [],
+                ]);
+                $existingEdges = [];
+            }
+        } catch (\Throwable $e) {
+            $existingEdges = [];
+            Log::warning('Shopify existing webhook lookup failed; attempting registration anyway', [
+                'channel_id' => $channel->id,
+                'error' => $e->getMessage(),
+            ]);
+        }
+
+        $existing = [];
+        foreach ($existingEdges as $edge) {
+            $node = $edge['node'] ?? [];
+            if (($node['uri'] ?? null) === $callback && isset($node['topic'])) {
+                $existing[$node['topic']] = true;
+            }
+        }
+
         foreach ($topics as $topic) {
+            if (isset($existing[$topic])) {
+                $registered++;
+                continue;
+            }
+
             try {
                 $response = Http::withHeaders(['X-Shopify-Access-Token' => $channel->access_token])
                     ->timeout(20)->post("https://{$domain}/admin/api/{$version}/graphql.json", [
@@ -226,15 +266,42 @@ class ShopifyController extends Controller
                     && !empty($subscription['id'])) {
                     $registered++;
                 } else {
-                    Log::warning('Shopify webhook subscription was not created', ['channel_id' => $channel->id, 'topic' => $topic]);
+                    $reason = [
+                        'http_status' => $response->status(),
+                        'graphql_errors' => $response->json('errors', []),
+                        'user_errors' => $response->json('data.webhookSubscriptionCreate.userErrors', []),
+                    ];
+                    $failures[$topic] = $reason;
+                    Log::warning('Shopify webhook subscription was not created', [
+                        'channel_id' => $channel->id,
+                        'topic' => $topic,
+                        ...$reason,
+                    ]);
                 }
             } catch (\Throwable $e) {
-                Log::warning('Shopify webhook subscription failed', ['channel_id' => $channel->id, 'topic' => $topic, 'error' => $e->getMessage()]);
+                $failures[$topic] = ['error' => $e->getMessage()];
+                Log::warning('Shopify webhook subscription failed', [
+                    'channel_id' => $channel->id,
+                    'topic' => $topic,
+                    'error' => $e->getMessage(),
+                ]);
             }
         }
 
         $metadata = $channel->fresh()->metadata ?? [];
         $metadata['webhooks_registered'] = $registered;
+        $metadata['webhook_failures'] = $failures;
+        if ($failures) {
+            $failedTopic = array_key_first($failures);
+            $failure = $failures[$failedTopic];
+            $details = $failure['user_errors'][0]['message']
+                ?? $failure['graphql_errors'][0]['message']
+                ?? $failure['error']
+                ?? ('HTTP ' . ($failure['http_status'] ?? 'error'));
+            $metadata['webhook_failure_message'] = $failedTopic . ': ' . Str::limit((string) $details, 240);
+        } else {
+            unset($metadata['webhook_failure_message']);
+        }
         $metadata['webhook_status'] = $registered === count($topics)
             ? 'registered'
             : ($registered > 0 ? 'partial' : 'error');

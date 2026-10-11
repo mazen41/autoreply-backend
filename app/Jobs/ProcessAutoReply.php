@@ -542,7 +542,10 @@ class ProcessAutoReply implements ShouldQueue
         // A referenced product is evidence about identity, not permission to
         // place an order. Ordering language is required; pointer-only messages
         // remain product questions and still pass through the order summary flow.
-        $checkoutState = $conversation->checkout_state ?? null;
+        // Stored checkout values are sanitized on load so a placeholder or platform ID saved by an earlier turn can never reach the summary or the order payload.
+        $checkoutState = is_array($conversation->checkout_state)
+            ? \App\Services\OrderCheckoutService::sanitizeStoredPhone($conversation->checkout_state)
+            : null;
 
         // Handle explicit checkout cancellation before product recovery, AI
         // classification, or any provider order API can run. This transition is
@@ -3722,6 +3725,15 @@ class ProcessAutoReply implements ShouldQueue
                                 'conversation_id' => $conversation->id,
                                 'status'          => $response->status(),
                             ]);
+                            if (in_array($response->status(), [401, 403], true)) {
+                                // The store token is invalid or revoked: no order can be created until it is reconnected.
+                                Log::critical('SHOPIFY_AUTH_FAILED', [
+                                    'conversation_id' => $conversation->id,
+                                    'connection_id'   => $commerceChannel->id,
+                                    'status'          => $response->status(),
+                                ]);
+                                app(\App\Services\HandoffTaskService::class)->openForConversation($conversation, 'shopify_auth_failed', 'high');
+                            }
                             return null;
                         }
                     } catch (\Exception $e) {

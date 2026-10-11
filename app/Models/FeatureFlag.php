@@ -11,11 +11,13 @@ class FeatureFlag extends Model
         'name',
         'description',
         'is_globally_enabled',
+        'requires_business_opt_in',
         'allowed_business_ids',
     ];
 
     protected $casts = [
         'is_globally_enabled' => 'boolean',
+        'requires_business_opt_in' => 'boolean',
         'allowed_business_ids' => 'array',
     ];
 
@@ -34,6 +36,18 @@ class FeatureFlag extends Model
      */
     public function isEnabledForBusiness(?int $businessId): bool
     {
+        if ($this->requires_business_opt_in) {
+            if (!$businessId) {
+                return false;
+            }
+
+            return (bool) \Illuminate\Support\Facades\DB::table('business_feature_flag_assignments')
+                ->where('business_id', $businessId)
+                ->where('feature_flag_id', $this->id)
+                ->where('enabled', true)
+                ->exists();
+        }
+
         if ($this->is_globally_enabled) {
             return true;
         }

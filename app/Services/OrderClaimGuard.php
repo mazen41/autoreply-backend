@@ -62,6 +62,7 @@ class OrderClaimGuard
     {
         $connectionId = (int) ($state['commerce_channel_id'] ?? $state['order_connection_id'] ?? 0);
         $productId = (string) ($state['commerce_external_id'] ?? $state['salla_product_id'] ?? '');
+        $variantId = (string) ($state['commerce_variant_id'] ?? '');
         $phone = preg_replace('/\D+/', '', (string) ($state['phone'] ?? $state['customer_phone'] ?? ''));
         $address = mb_strtolower(trim((string) ($state['address'] ?? $state['customer_address'] ?? '')));
         $summarySentAt = $state['confirmation_summary_sent_at'] ?? null;
@@ -76,13 +77,17 @@ class OrderClaimGuard
             return null;
         }
 
-        $fingerprint = hash('sha256', implode('|', [$connectionId, $productId, $phone, $address]));
+        $fingerprints = [hash('sha256', implode('|', [$connectionId, $productId, $variantId, $phone, $address]))];
+        // Keep completed orders created before variant-aware idempotency readable.
+        if ($variantId === '') {
+            $fingerprints[] = hash('sha256', implode('|', [$connectionId, $productId, $phone, $address]));
+        }
 
         return CommerceOrderAttempt::query()
             ->where('business_id', $conversation->business_id)
             ->where('conversation_id', $conversation->id)
             ->where('connection_id', $connectionId)
-            ->where('checkout_fingerprint', $fingerprint)
+            ->whereIn('checkout_fingerprint', $fingerprints)
             ->where('status', 'completed')
             ->whereNotNull('external_order_id')
             ->where('external_order_id', '!=', '')

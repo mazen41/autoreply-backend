@@ -75,6 +75,7 @@ class CheckoutOrderFlowTest extends TestCase
         $state['confirmation_summary_fingerprint'] = hash('sha256', implode('|', [
             (string) ($state['commerce_channel_id'] ?? ''),
             (string) ($state['commerce_external_id'] ?? $state['salla_product_id'] ?? ''),
+            (string) ($state['commerce_variant_id'] ?? ''),
             preg_replace('/\D+/', '', (string) ($state['phone'] ?? $state['customer_phone'] ?? '')),
             mb_strtolower(trim((string) ($state['address'] ?? $state['customer_address'] ?? ''))),
         ]));
@@ -410,6 +411,20 @@ class CheckoutOrderFlowTest extends TestCase
             'user_id' => $user->id, 'business_id' => $business->id,
             'type' => 'shopify', 'page_id' => 'incident-test.myshopify.com', 'status' => 'connected',
         ]);
+        \App\Models\Product::create([
+            'business_id' => $business->id,
+            'commerce_channel_id' => $store->id,
+            'commerce_external_id' => 'sample-product-105',
+            'name' => 'Sample Product',
+            'price' => 749.95,
+            'metadata' => ['variants' => [[
+                'id' => 'gid://shopify/ProductVariant/105',
+                'title' => 'Default Title',
+                'price' => '749.95',
+                'availableForSale' => true,
+            ]]],
+            'is_active' => true,
+        ]);
         $channel = Channel::factory()->create([
             'user_id' => $user->id, 'business_id' => $business->id,
             'type' => 'instagram', 'ai_enabled' => true,
@@ -446,7 +461,7 @@ class CheckoutOrderFlowTest extends TestCase
         $this->assertStringContainsString('phone number', strtolower($reply->content));
         $this->assertStringNotContainsString('being processed', strtolower($reply->content));
         $this->assertStringNotContainsString('we have your full name', strtolower($reply->content));
-        $this->assertDatabaseHas('handoff_tasks', [
+        $this->assertDatabaseMissing('handoff_tasks', [
             'conversation_id' => $conversation->id,
             'reason' => 'ai_claim_blocked',
             'status' => 'open',

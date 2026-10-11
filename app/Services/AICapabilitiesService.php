@@ -919,7 +919,7 @@ JSON;
 
                         Log::info('AICapabilitiesService: successfully recovered truncated JSON via field extraction', [
                             'intent' => $mIntent[1],
-                            'reply'  => substr($extractedReply, 0, 100),
+                            'reply_length' => mb_strlen($extractedReply),
                         ]);
                     }
                 }
@@ -940,13 +940,18 @@ JSON;
                     if ($looksLikeJson) {
                         // Raw JSON leaked — escalate, never send JSON structure to customer
                         Log::error('AI returned raw JSON that could not be parsed — escalating to human instead of sending garbage', [
-                            'raw_response' => substr($response, 0, 300),
+                            'provider' => self::$lastRequestProvider,
+                            'model' => self::$lastRequestModel,
+                            'response_length' => strlen($response),
+                            'response_starts_with_json' => true,
                         ]);
-                        return self::getFallbackResponse();
+                        return self::getFallbackResponse('malformed_json_object');
                     }
 
                     Log::warning('AI returned plain text instead of JSON — wrapping as reply', [
-                        'raw_response' => substr($response, 0, 300),
+                        'provider' => self::$lastRequestProvider,
+                        'model' => self::$lastRequestModel,
+                        'response_length' => strlen($response),
                     ]);
                     $aiResult = [
                         'reply'            => $plainText,
@@ -959,10 +964,12 @@ JSON;
 
             if (!$aiResult || !isset($aiResult['reply']) || !isset($aiResult['intent'])) {
                 Log::error('AI returned invalid JSON — all strategies failed', [
-                    'raw_response' => substr($response, 0, 800),
-                    'cleaned'      => substr($cleaned, 0, 400),
+                    'provider' => self::$lastRequestProvider,
+                    'model' => self::$lastRequestModel,
+                    'response_length' => strlen($response),
+                    'cleaned_response_length' => strlen($cleaned),
                 ]);
-                return self::getFallbackResponse();
+                return self::getFallbackResponse('invalid_json');
             }
 
             // Final sanitization: strip any stray markdown fences from the reply text
@@ -973,9 +980,11 @@ JSON;
             // Also detect if the reply field itself is raw JSON (another leak vector)
             if (str_starts_with(ltrim($aiResult['reply']), '{') || str_starts_with(ltrim($aiResult['reply']), '[')) {
                 Log::error('AI reply field contains raw JSON structure — escalating', [
-                    'reply_preview' => substr($aiResult['reply'], 0, 200),
+                    'provider' => self::$lastRequestProvider,
+                    'model' => self::$lastRequestModel,
+                    'reply_length' => mb_strlen($aiResult['reply']),
                 ]);
-                return self::getFallbackResponse();
+                return self::getFallbackResponse('raw_json_reply_field');
             }
 
             // Validate the reply TEXT (not the JSON wrapper)
@@ -985,9 +994,11 @@ JSON;
                 Log::warning('AI response validation failed', [
                     'reasons' => $validation['reasons'],
                     'intent'  => $aiResult['intent'],
-                    'reply'   => substr($aiResult['reply'], 0, 200),
+                    'provider' => self::$lastRequestProvider,
+                    'model' => self::$lastRequestModel,
+                    'reply_length' => mb_strlen($aiResult['reply']),
                 ]);
-                return self::getFallbackResponse();
+                return self::getFallbackResponse('response_validation_failed');
             }
 
             return [
@@ -1009,14 +1020,14 @@ JSON;
                 'model' => self::$lastRequestModel,
                 'exception_type' => get_class($e),
             ]);
-            return self::getFallbackResponse();
+            return self::getFallbackResponse('provider_exception');
         }
     }
 
     /**
      * Fallback Response
      */
-    private static function getFallbackResponse(): array
+    private static function getFallbackResponse(string $failureCode = 'ai_failure'): array
     {
         return [
             'success' => false,
@@ -1024,7 +1035,10 @@ JSON;
             'intent' => 'escalation',
             'needs_escalation' => true,
             'confidence' => 0.5,
-            'validation' => ['valid' => false, 'reasons' => ['ai_failure']]
+            'validation' => ['valid' => false, 'reasons' => [$failureCode]],
+            'failure_code' => $failureCode,
+            'provider' => self::$lastRequestProvider,
+            'model' => self::$lastRequestModel,
         ];
     }
 

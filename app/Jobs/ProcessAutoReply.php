@@ -1592,6 +1592,7 @@ class ProcessAutoReply implements ShouldQueue
             $message,
             $updatedCheckoutState
         );
+        $confirmationStateBeforeUpdate = $updatedCheckoutState['confirmation_state'] ?? null;
         $updatedCheckoutState = $checkoutService->updateConfirmationState(
             $updatedCheckoutState,
             $message->content,
@@ -1634,6 +1635,27 @@ class ProcessAutoReply implements ShouldQueue
             '/(?:\\b(?:yes|yeah|yep|sure|ok|okay|confirm|order\\s+this|i\\s+want\\s+(?:to\\s+order\\s+)?this|i\\s+wanna\\s+order\\s+this|place\\s+(?:the\\s+)?order)\\b|نعم|أكد|اكد|تأكيد|موافق|تأكيد الطلب|اعتمد الطلب)/ui',
             $incomingLower
         );
+        if ($containsConfirmPhrase || $hasValidOrderSummary) {
+            Log::info('ProcessAutoReply: checkout confirmation gate evaluated', [
+                'conversation_id' => $conversation->id,
+                'message_id' => $message->id,
+                'provider' => $commerceChannel?->type,
+                'connection_id' => $commerceChannel?->id,
+                'contains_confirmation_phrase' => $containsConfirmPhrase,
+                'has_valid_sent_summary' => $hasValidOrderSummary,
+                'confirmation_state_before' => $confirmationStateBeforeUpdate,
+                'confirmation_state_after' => $updatedCheckoutState['confirmation_state'] ?? null,
+                'checkout_complete' => (bool) ($fieldStatus['is_complete'] ?? false),
+                'missing_fields' => array_values($fieldStatus['missing_fields'] ?? []),
+                'product_present' => !empty($updatedCheckoutState['salla_product_id']),
+                'variant_present' => !empty($updatedCheckoutState['commerce_variant_id']),
+                'name_present' => !empty($updatedCheckoutState['full_name'] ?? $updatedCheckoutState['customer_name'] ?? ''),
+                'phone_present' => !empty($updatedCheckoutState['customer_phone'] ?? $updatedCheckoutState['phone'] ?? ''),
+                'address_present' => !empty($updatedCheckoutState['address'] ?? $updatedCheckoutState['customer_address'] ?? ''),
+                'auto_order_confirmation_enabled' => (bool) $autoOrderConfirmationEnabled,
+                'is_product_browse_message' => (bool) $isProductBrowseMessage,
+            ]);
+        }
         $realOrderId = $updatedCheckoutState['order_id'] ?? null;
 
         // Ignore legacy internal/fake order IDs left by earlier checkout runs.
@@ -1857,7 +1879,23 @@ class ProcessAutoReply implements ShouldQueue
         if (!$aiResult['success']) {
             Log::error('ProcessAutoReply: AI call failed', [
                 'conversation_id' => $conversation->id,
-                'fallback_used' => true
+                'message_id' => $message->id,
+                'fallback_used' => true,
+                'provider' => $auditProvider,
+                'model' => $auditModel,
+                'error_type' => isset($aiResult['error']) ? get_debug_type($aiResult['error']) : null,
+                'error_code' => is_array($aiResult['error'] ?? null) ? ($aiResult['error']['code'] ?? null) : null,
+                'failure_code' => $aiResult['failure_code'] ?? data_get($aiResult, 'validation.reasons.0'),
+                'confirmation_phrase' => (bool) $containsConfirmPhrase,
+                'confirmation_state' => $checkoutState['confirmation_state'] ?? null,
+                'valid_summary' => (bool) $hasValidOrderSummary,
+                'checkout_complete' => (bool) ($fieldStatus['is_complete'] ?? false),
+                'commerce_connection_id' => $commerceChannel?->id,
+                'commerce_provider' => $commerceChannel?->type,
+                'order_submission_reached' => false,
+                'order_submission_skipped_reason' => $containsConfirmPhrase
+                    ? 'AI failed before commerce order creation block'
+                    : 'message was not classified as an explicit order confirmation',
             ]);
 
             // A failed AI call must not turn a successful product lookup into
@@ -2071,6 +2109,30 @@ class ProcessAutoReply implements ShouldQueue
 
         // A missing OAuth grant can leave this conversation without a connected
         // Salla store. Never claim a confirmed checkout was submitted in that case.
+        $orderCreationGateFailures = [];
+        if (!$containsConfirmPhrase) $orderCreationGateFailures[] = 'no_confirmation_phrase';
+        if (!in_array($checkoutState['confirmation_state'] ?? null, ['confirmed', 'order_placed'], true)) $orderCreationGateFailures[] = 'confirmation_state_not_confirmed';
+        if ($isProductBrowseMessage) $orderCreationGateFailures[] = 'product_browse_message';
+        if (!$commerceChannel) $orderCreationGateFailures[] = 'commerce_connection_unresolved';
+        if (empty($fieldStatus['is_complete'])) $orderCreationGateFailures[] = 'checkout_fields_incomplete';
+        if (empty($checkoutState['salla_product_id'])) $orderCreationGateFailures[] = 'product_id_missing';
+        if (empty($checkoutState['customer_phone'] ?? $checkoutState['phone'] ?? '')) $orderCreationGateFailures[] = 'phone_missing';
+        if (empty($checkoutState['address'] ?? $checkoutState['customer_address'] ?? '')) $orderCreationGateFailures[] = 'address_missing';
+        if (empty($checkoutState['full_name'] ?? $checkoutState['customer_name'] ?? '')) $orderCreationGateFailures[] = 'name_missing';
+        if (!$autoOrderConfirmationEnabled) $orderCreationGateFailures[] = 'automatic_order_submission_disabled';
+        if ($containsConfirmPhrase || in_array($checkoutState['confirmation_state'] ?? null, ['confirmed', 'order_placed'], true)) {
+            Log::info('ProcessAutoReply: commerce order creation gate result', [
+                'conversation_id' => $conversation->id,
+                'message_id' => $message->id,
+                'provider' => $commerceChannel?->type,
+                'connection_id' => $commerceChannel?->id,
+                'passed' => empty($orderCreationGateFailures),
+                'failed_conditions' => $orderCreationGateFailures,
+                'confirmation_state' => $checkoutState['confirmation_state'] ?? null,
+                'confirmation_phrase' => (bool) $containsConfirmPhrase,
+                'checkout_complete' => (bool) ($fieldStatus['is_complete'] ?? false),
+            ]);
+        }
         if (
             $containsConfirmPhrase
             && in_array($checkoutState['confirmation_state'] ?? null, ['confirmed', 'order_placed'], true)
@@ -2790,6 +2852,14 @@ $aiResponse = $intro
             $latestCheckoutState['confirmation_summary_fingerprint'] = $this->orderFingerprint($latestCheckoutState);
             $latestCheckoutState['confirmation_summary_sent_at'] = now()->toIso8601String();
             $conversation->update(['checkout_state' => $latestCheckoutState]);
+            Log::info('ProcessAutoReply: sent order summary recorded for confirmation', [
+                'conversation_id' => $conversation->id,
+                'incoming_message_id' => $message->id,
+                'summary_message_id' => $replyMessage->id,
+                'summary_send_status' => $replyMessage->fresh()->send_status,
+                'summary_fingerprint_present' => !empty($latestCheckoutState['confirmation_summary_fingerprint']),
+                'confirmation_state' => $latestCheckoutState['confirmation_state'] ?? null,
+            ]);
         }
         
         // If send failed, provide fallback response to user
@@ -3602,11 +3672,24 @@ $aiResponse = $intro
      */
     private function createRealExternalOrder(Conversation $conversation, array $checkoutState, Channel $channel): ?array
     {
+        Log::info('ProcessAutoReply: commerce order creation handler entered', [
+            'conversation_id' => $conversation->id,
+            'channel_id' => $channel->id,
+            'requested_connection_id' => $checkoutState['commerce_channel_id'] ?? null,
+            'product_id_present' => !empty($checkoutState['commerce_external_id'] ?? $checkoutState['salla_product_id'] ?? null),
+            'variant_id_present' => !empty($checkoutState['commerce_variant_id']),
+            'customer_name_present' => !empty($checkoutState['full_name'] ?? $checkoutState['customer_name'] ?? ''),
+            'customer_phone_present' => !empty($checkoutState['phone'] ?? $checkoutState['customer_phone'] ?? ''),
+            'delivery_address_present' => !empty($checkoutState['address'] ?? $checkoutState['customer_address'] ?? ''),
+        ]);
         $lockKey = "create_order_lock_conv_{$conversation->id}";
         $lock = Cache::lock($lockKey, 10);
 
         if (!$lock->get()) {
-            Log::info('ProcessAutoReply: order creation lock active for conversation', ['conversation_id' => $conversation->id]);
+            Log::warning('ProcessAutoReply: order creation skipped because conversation lock is held', [
+                'conversation_id' => $conversation->id,
+                'lock_key' => $lockKey,
+            ]);
             return null;
         }
 
@@ -3650,8 +3733,22 @@ $aiResponse = $intro
             $externalSource  = null;
 
             if (!$commerceChannel || (int) $commerceChannel->business_id !== (int) $conversation->business_id) {
+                Log::error('ProcessAutoReply: commerce order blocked because resolved connection is missing or outside business scope', [
+                    'conversation_id' => $conversation->id,
+                    'business_id' => $conversation->business_id,
+                    'resolved_connection_id' => $commerceChannel?->id,
+                    'resolved_connection_business_id' => $commerceChannel?->business_id,
+                    'provider' => $commerceChannel?->type,
+                ]);
                 return null;
             }
+            Log::info('ProcessAutoReply: commerce order connection authorized', [
+                'conversation_id' => $conversation->id,
+                'business_id' => $conversation->business_id,
+                'connection_id' => $commerceChannel->id,
+                'provider' => $commerceChannel->type,
+                'connection_status' => $commerceChannel->status,
+            ]);
 
             // Persist an order attempt before contacting the provider. The
             // summary message ID distinguishes a later, intentional checkout
@@ -3703,6 +3800,8 @@ $aiResponse = $intro
                     'conversation_id' => $conversation->id,
                     'connection_id' => $commerceChannel->id,
                     'attempt_id' => $attempt->id,
+                    'attempt_status' => $attempt->status,
+                    'provider_request_sent' => false,
                 ]);
                 return null;
             }
@@ -3717,6 +3816,11 @@ $aiResponse = $intro
 
             if ($sallaChannel) {
                 try {
+                    Log::info('ProcessAutoReply: sending order request to Salla', [
+                        'conversation_id' => $conversation->id,
+                        'connection_id' => $sallaChannel->id,
+                        'product_id_present' => !empty($checkoutState['salla_product_id']),
+                    ]);
                     $sallaService = new SallaService();
                     $sallaRes = $sallaService->createOrderForChannel($sallaChannel, $checkoutState);
                     
@@ -3772,12 +3876,37 @@ $aiResponse = $intro
                             ? ($variants[0]['id'] ?? null)
                             : collect($variants)->firstWhere('id', $selectedVariantId)['id'] ?? null;
                         if (!$variantGid || !preg_match('~/ProductVariant/(\d+)$~', (string) $variantGid, $variantMatch)) {
+                            Log::error('ProcessAutoReply: Shopify order blocked before API request because variant could not be resolved', [
+                                'conversation_id' => $conversation->id,
+                                'connection_id' => $shopifyChannel->id,
+                                'product_record_found' => (bool) $commerceProduct,
+                                'variant_count' => count($variants),
+                                'selected_variant_present' => !empty($selectedVariantId),
+                            ]);
                             throw new \RuntimeException('The selected Shopify product has no synced variant ID.');
                         }
                         $nameParts = preg_split('/\s+/', trim((string) ($checkoutState['full_name'] ?? '')), 2) ?: [];
                         $shop  = $shopifyChannel->page_id;
                         $token = $shopifyChannel->access_token;
+                        Log::info('ProcessAutoReply: sending order request to Shopify', [
+                            'conversation_id' => $conversation->id,
+                            'connection_id' => $shopifyChannel->id,
+                            'shop_domain' => $shop,
+                            'api_version' => config('services.shopify.api_version', '2026-07'),
+                            'variant_resolved' => true,
+                            'quantity' => (int) ($checkoutState['quantity'] ?? 1),
+                        ]);
                         $response = \App\Services\ShopifyHttp::client($token)->post("https://{$shop}/admin/api/" . config('services.shopify.api_version', '2026-07') . "/orders.json", \App\Services\ShopifyOrderPayload::build((int) $variantMatch[1], (int) ($checkoutState['quantity'] ?? 1), $checkoutState));
+                        Log::info('ProcessAutoReply: Shopify order API response received', [
+                            'conversation_id' => $conversation->id,
+                            'connection_id' => $shopifyChannel->id,
+                            'http_status' => $response->status(),
+                            'successful' => $response->successful(),
+                            'order_id_present' => !empty($response->json('order.id')),
+                            'error_fields' => is_array($response->json('errors'))
+                                ? array_slice(array_map('strval', array_keys($response->json('errors'))), 0, 20)
+                                : [],
+                        ]);
 
                         if ($response->successful()) {
                             $resJson = $response->json();
@@ -3811,7 +3940,10 @@ $aiResponse = $intro
                     } catch (\Exception $e) {
                         Log::error('SHOPIFY_ORDER_CREATION_FAILED', [
                             'conversation_id' => $conversation->id,
-                        'exception_type' => get_class($e),
+                            'connection_id' => $shopifyChannel->id,
+                            'exception_type' => get_class($e),
+                            'exception_code' => is_numeric($e->getCode()) ? (int) $e->getCode() : null,
+                            'provider_request_started' => true,
                         ]);
                         return null;
                 }
@@ -3819,6 +3951,11 @@ $aiResponse = $intro
 
             if (!$externalOrderId && $commerceChannel?->type === 'woocommerce') {
                 try {
+                    Log::info('ProcessAutoReply: sending order request to WooCommerce', [
+                        'conversation_id' => $conversation->id,
+                        'connection_id' => $commerceChannel->id,
+                        'product_id_present' => !empty($checkoutState['commerce_external_id']),
+                    ]);
                     $wooProduct = \App\Models\Product::query()
                         ->where('business_id', $conversation->business_id)
                         ->where('commerce_channel_id', $commerceChannel->id)
@@ -3829,6 +3966,11 @@ $aiResponse = $intro
                         ->createOrderForChannel($commerceChannel, $checkoutState);
                     $wooOrder = $wooResponse['data'] ?? [];
                     $externalOrderId = (string) ($wooOrder['id'] ?? '');
+                    Log::info('ProcessAutoReply: WooCommerce order response processed', [
+                        'conversation_id' => $conversation->id,
+                        'connection_id' => $commerceChannel->id,
+                        'order_id_present' => $externalOrderId !== '',
+                    ]);
                     if ($externalOrderId !== '') {
                         $externalSource = 'woocommerce';
                     }
@@ -3959,12 +4101,30 @@ $aiResponse = $intro
 
     private function hasValidOrderSummaryForConfirmation(Conversation $conversation, Message $incoming, array $state): bool
     {
+        $shouldLogValidation = (bool) preg_match(
+            '/(?:\\b(?:yes|yeah|yep|sure|ok|okay|confirm|place\\s+(?:the\\s+)?order)\\b|نعم|أكد|اكد|تأكيد|موافق|اعتمد الطلب)/ui',
+            mb_strtolower(trim((string) $incoming->content))
+        ) || ($state['confirmation_state'] ?? null) === 'confirmation_pending';
         $summaryId = (int) ($state['confirmation_summary_message_id'] ?? 0);
         if ($summaryId < 1 || empty($state['confirmation_summary_fingerprint'])) {
+            if ($shouldLogValidation) Log::info('ProcessAutoReply: order summary validation failed', [
+                'conversation_id' => $conversation->id,
+                'incoming_message_id' => $incoming->id,
+                'summary_message_id_present' => $summaryId > 0,
+                'summary_fingerprint_present' => !empty($state['confirmation_summary_fingerprint']),
+                'reason' => $summaryId < 1 ? 'summary_message_id_missing' : 'summary_fingerprint_missing',
+            ]);
             return false;
         }
 
         if (!hash_equals((string) $state['confirmation_summary_fingerprint'], $this->orderFingerprint($state))) {
+            if ($shouldLogValidation) Log::warning('ProcessAutoReply: order summary fingerprint mismatch', [
+                'conversation_id' => $conversation->id,
+                'incoming_message_id' => $incoming->id,
+                'summary_message_id' => $summaryId,
+                'stored_fingerprint_matches_current_checkout' => false,
+                'reason' => 'checkout_state_changed_since_summary',
+            ]);
             return false;
         }
 
@@ -3975,6 +4135,15 @@ $aiResponse = $intro
             ->where('send_status', 'sent')
             ->first();
         if (!$summary || empty($summary->metadata['order_summary'])) {
+            if ($shouldLogValidation) Log::info('ProcessAutoReply: order summary validation failed', [
+                'conversation_id' => $conversation->id,
+                'incoming_message_id' => $incoming->id,
+                'summary_message_id' => $summaryId,
+                'summary_message_found_and_sent' => (bool) $summary,
+                'summary_marker_present' => (bool) ($summary && !empty($summary->metadata['order_summary'])),
+                'summary_send_status' => $summary?->send_status,
+                'reason' => !$summary ? 'summary_not_found_or_not_sent' : 'summary_marker_missing',
+            ]);
             return false;
         }
 
@@ -3985,6 +4154,11 @@ $aiResponse = $intro
             (string) ($summary->whatsapp_message_id ?? ''),
             (string) ($summary->gmail_message_id ?? ''),
         ], true)) {
+            if ($shouldLogValidation) Log::info('ProcessAutoReply: order summary validated by explicit reply reference', [
+                'conversation_id' => $conversation->id,
+                'incoming_message_id' => $incoming->id,
+                'summary_message_id' => $summary->id,
+            ]);
             return true;
         }
 
@@ -3992,7 +4166,7 @@ $aiResponse = $intro
         // preceding conversation message, with no intervening turns.
         // Only customer messages and merchant-typed replies count as intervening turns.
         // The bot's own follow-up text must not invalidate a confirmation of its summary.
-        return !Message::query()
+        $hasInterveningTurn = Message::query()
             ->where('conversation_id', $conversation->id)
             ->where('id', '>', $summary->id)
             ->where('id', '<', $incoming->id)
@@ -4002,6 +4176,17 @@ $aiResponse = $intro
                         ->where(fn ($s) => $s->whereNull('source')->orWhere('source', '!=', 'ai')));
             })
             ->exists();
+        if ($shouldLogValidation) Log::info('ProcessAutoReply: order summary validation result', [
+            'conversation_id' => $conversation->id,
+            'incoming_message_id' => $incoming->id,
+            'summary_message_id' => $summary->id,
+            'summary_sent' => $summary->send_status === 'sent',
+            'has_intervening_customer_or_merchant_turn' => $hasInterveningTurn,
+            'valid' => !$hasInterveningTurn,
+            'reason' => $hasInterveningTurn ? 'intervening_customer_or_merchant_message' : 'latest_sent_summary_is_valid',
+        ]);
+
+        return !$hasInterveningTurn;
     }
 
     /**

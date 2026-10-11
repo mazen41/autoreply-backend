@@ -219,6 +219,14 @@ class ChannelController extends Controller
                 'ai_enabled'           => $channel->ai_enabled,
                 'effective_ai_enabled' => $effectiveAiEnabled,
                 'ai_pause_reason'      => $aiPauseReason,
+                // Used by the bot mapping wizard to show a primary-responder
+                // control only when multiple active bots share this account.
+                'bots'                 => $activeBots->map(fn ($bot) => [
+                    'id' => $bot->id,
+                    'name' => $bot->name,
+                    'status' => $bot->status,
+                    'pivot' => ['is_primary' => (bool) ($bot->pivot->is_primary ?? false)],
+                ])->values(),
                 'default_ecommerce_connection_id' => $channel->default_ecommerce_connection_id,
                 'integration'          => in_array($channel->type, ['shopify', 'woocommerce'], true) ? [
                     'store_url' => $channel->metadata['store_url'] ?? $channel->page_id,

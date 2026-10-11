@@ -123,6 +123,13 @@ class BotController extends Controller
             'knowledge_assignments.*.channel_id' => 'nullable|integer',
         ]);
 
+        $validChannelIds = $this->validateCommunicationChannelAssignments(
+            $request->input('channel_ids', []),
+            $request->input('primary_channel_ids', []),
+            [],
+            $business,
+        );
+
         $connectionIds = $request->input('ecommerce_connection_ids');
         if ($connectionIds === null && $request->filled('ecommerce_channel_id')) {
             $connectionIds = [(int) $request->ecommerce_channel_id];
@@ -134,8 +141,6 @@ class BotController extends Controller
             $business
         );
 
-        $validChannelIds = Channel::whereIn('id', $request->input('channel_ids', []))
-            ->where('business_id', $business->id)->pluck('id')->all();
         $channelStoreRouting = $this->validateChannelStoreRouting(
             $request->input('channel_store_routing', []),
             $validChannelIds,
@@ -251,6 +256,17 @@ class BotController extends Controller
             'knowledge_assignments.*.channel_id' => 'nullable|integer',
         ]);
 
+        $currentChannelIds = $bot->channels()->pluck('channels.id')->map(fn ($id) => (int) $id)->all();
+        $requestedChannelIds = $request->has('channel_ids')
+            ? $request->input('channel_ids', [])
+            : $currentChannelIds;
+        $validChannelIds = $this->validateCommunicationChannelAssignments(
+            $requestedChannelIds,
+            $request->input('primary_channel_ids', []),
+            $request->has('channel_ids') ? [] : $currentChannelIds,
+            $business,
+        );
+
         $updates = $request->only([
             'name',
             'status',
@@ -279,9 +295,6 @@ class BotController extends Controller
         $knowledgeAssignments = $request->has('knowledge_assignments')
             ? $this->validateKnowledgeAssignments($request->input('knowledge_assignments', []), $business)
             : null;
-        $validChannelIds = $request->has('channel_ids')
-            ? Channel::whereIn('id', $request->input('channel_ids', []))->where('business_id', $business->id)->pluck('id')->all()
-            : $bot->channels()->pluck('channels.id')->all();
         $routingCommerceIds = $validCommerceIds ?? $bot->ecommerceConnections()->pluck('channels.id')->map(fn ($value) => (int) $value)->all();
         $channelStoreRouting = $this->validateChannelStoreRouting(
             $request->input('channel_store_routing', []),
@@ -326,6 +339,21 @@ class BotController extends Controller
                 ];
             }
             $bot->channels()->sync($syncData);
+        } elseif ($request->has('primary_channel_ids')) {
+            $primaryIds = array_map('intval', $request->input('primary_channel_ids', []));
+            DB::table('bot_channels')
+                ->whereIn('channel_id', $primaryIds)
+                ->where('bot_id', '!=', $bot->id)
+                ->update(['is_primary' => false]);
+            DB::table('bot_channels')
+                ->where('bot_id', $bot->id)
+                ->update(['is_primary' => false]);
+            if (!empty($primaryIds)) {
+                DB::table('bot_channels')
+                    ->where('bot_id', $bot->id)
+                    ->whereIn('channel_id', $primaryIds)
+                    ->update(['is_primary' => true]);
+            }
         }
 
         foreach ($channelStoreRouting as $channelId => $connectionId) {
@@ -403,10 +431,12 @@ class BotController extends Controller
             'primary_channel_ids.*' => 'integer',
         ]);
 
-        $validChannelIds = Channel::whereIn('id', $request->channel_ids)
-            ->where('business_id', $business->id)
-            ->pluck('id')
-            ->toArray();
+        $validChannelIds = $this->validateCommunicationChannelAssignments(
+            $request->input('channel_ids', []),
+            $request->input('primary_channel_ids', []),
+            [],
+            $business,
+        );
 
         if (empty($validChannelIds)) {
             return response()->json(['error' => 'No valid channels found'], 422);
@@ -502,8 +532,21 @@ class BotController extends Controller
     private function validateCommerceConnections(array $ids, $defaultId, BusinessProfile $business): array
     {
         $ids = array_values(array_unique(array_map('intval', $ids)));
+        if ($defaultId !== null && !Channel::query()
+            ->whereKey((int) $defaultId)
+            ->where('business_id', $business->id)
+            ->whereIn('type', ['salla', 'shopify', 'woocommerce'])
+            ->where('status', 'connected')
+            ->exists()) {
+            throw ValidationException::withMessages([
+                'default_ecommerce_connection_id' => 'The default store must be connected to this business.',
+            ]);
+        }
+
         if ($defaultId !== null && !in_array((int) $defaultId, $ids, true)) {
-            $ids[] = (int) $defaultId;
+            throw ValidationException::withMessages([
+                'default_ecommerce_connection_id' => 'The default store must also be selected for this agent.',
+            ]);
         }
 
         if (!$ids) {
@@ -526,6 +569,55 @@ class BotController extends Controller
         }
 
         return $valid;
+    }
+
+    /** Validate that every selected channel is a business-owned communication account, never a store. */
+    private function validateCommunicationChannelAssignments(
+        array $channelIds,
+        array $primaryChannelIds,
+        array $currentlyAttachedIds,
+        BusinessProfile $business,
+    ): array {
+        $channelIds = array_values(array_unique(array_map('intval', $channelIds)));
+        $primaryChannelIds = array_values(array_unique(array_map('intval', $primaryChannelIds)));
+        $attachedIds = array_values(array_unique(array_map('intval', $currentlyAttachedIds)));
+
+        foreach ($channelIds as $index => $channelId) {
+            $eligible = Channel::query()
+                ->whereKey($channelId)
+                ->where('business_id', $business->id)
+                ->whereNotIn('type', ['salla', 'shopify', 'woocommerce'])
+                ->exists();
+
+            if (!$eligible) {
+                throw ValidationException::withMessages([
+                    "channel_ids.{$index}" => 'Select a communication channel connected to this business. Commerce stores cannot be assigned as channels.',
+                ]);
+            }
+        }
+
+        $effectiveChannelIds = $channelIds ?: $attachedIds;
+        foreach ($primaryChannelIds as $index => $channelId) {
+            $eligible = Channel::query()
+                ->whereKey($channelId)
+                ->where('business_id', $business->id)
+                ->whereNotIn('type', ['salla', 'shopify', 'woocommerce'])
+                ->exists();
+
+            if (!$eligible) {
+                throw ValidationException::withMessages([
+                    "primary_channel_ids.{$index}" => 'A commerce store cannot be marked as a primary responder.',
+                ]);
+            }
+
+            if (!in_array($channelId, $effectiveChannelIds, true)) {
+                throw ValidationException::withMessages([
+                    "primary_channel_ids.{$index}" => 'A primary responder must also be assigned to this agent.',
+                ]);
+            }
+        }
+
+        return $channelIds;
     }
 
     private function syncCommerceConnections(Bot $bot, array $ids, $defaultId): void

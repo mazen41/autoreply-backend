@@ -48,7 +48,7 @@ class BotTenantAuthorizationTest extends TestCase
             'name' => 'My bot',
             'channel_ids' => [$ownedChannel->id],
             'primary_channel_ids' => [$foreignChannel->id],
-        ])->assertCreated();
+        ])->assertUnprocessable();
 
         $this->assertDatabaseHas('bot_channels', [
             'bot_id' => $foreignBot->id,

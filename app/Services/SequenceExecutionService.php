@@ -35,15 +35,17 @@ class SequenceExecutionService
             return;
         }
 
-        $execution->status = 'executed';
-        $execution->executed_at = now();
+        // Do not mark the execution complete before the provider action has
+        // finished. A worker crash after the send must remain recoverable.
+        $execution->status = 'processing';
+        $execution->save();
 
         try {
             switch ($step->step_type) {
                 case 'message':
-                    $this->executeMessageStep($execution, $enrollment, $step);
-                    // After message, move to next step
-                    $this->moveToNextStep($enrollment);
+                    if ($this->executeMessageStep($execution, $enrollment, $step)) {
+                        $this->moveToNextStep($enrollment);
+                    }
                     break;
                 case 'delay':
                     $this->executeDelayStep($execution, $enrollment, $step);
@@ -65,16 +67,23 @@ class SequenceExecutionService
                     $execution->markAsSkipped('unknown_step_type');
             }
         } catch (\Exception $e) {
+            if ($e instanceof \App\Exceptions\AutomationPausedException) {
+                throw $e;
+            }
             // Record the failure on the execution record even when the
             // caller doesn't route through the job's catch (retry) layer.
             $execution->markAsFailed($e->getMessage());
             throw $e;
         }
 
-        $execution->save();
+        if (!in_array($execution->status, ['failed', 'skipped'], true)) {
+            $execution->markAsExecuted($execution->message_id);
+        } else {
+            $execution->save();
+        }
     }
 
-    protected function executeMessageStep(SequenceStepExecution $execution, SequenceEnrollment $enrollment, SequenceStep $step): void
+    protected function executeMessageStep(SequenceStepExecution $execution, SequenceEnrollment $enrollment, SequenceStep $step): bool
     {
         $conversation = $enrollment->conversation;
         $sequence = $enrollment->sequence;
@@ -83,41 +92,38 @@ class SequenceExecutionService
             throw new \Exception('Conversation not found');
         }
 
-        // Get channel for sending.
-        // IMPORTANT: order by most-recently-connected first. This is defense
-        // in depth against stale duplicate Channel rows (e.g. an old
-        // disconnected WhatsApp instance's channel that didn't get its status
-        // flipped in time) — even though EvolutionApiService now actively
-        // marks stale channels disconnected on reconnect/close, an explicit
-        // order here means we never silently pick the wrong one if that sync
-        // is ever delayed or missed.
-        $channel = $sequence->channel ? Channel::where('business_id', $sequence->business_id)
-            ->where('type', $sequence->channel)
-            ->where('status', 'connected')
-            ->orderByDesc('connected_at')
-            ->first() : $conversation->channel;
-
-        // Even if $conversation->channel resolved to something, it may be
-        // stale (e.g. the conversation was created against an instance that
-        // has since disconnected and been replaced). Re-verify it's actually
-        // still connected, and if not, fall back to the business's current
-        // live channel of the same type rather than sending into a dead session.
-        if ($channel && $channel->status !== 'connected') {
-            Log::warning('SequenceExecutionService: resolved channel is not connected, looking for a live replacement', [
-                'stale_channel_id' => $channel->id,
-                'business_id'      => $sequence->business_id,
-                'channel_type'     => $channel->type,
-            ]);
-
-            $channel = Channel::where('business_id', $sequence->business_id)
-                ->where('type', $channel->type)
-                ->where('status', 'connected')
-                ->orderByDesc('connected_at')
-                ->first();
+        // A sequence belongs to the conversation's channel/account. Never
+        // silently switch to another connected account of the same type.
+        $channel = $conversation->channel;
+        $expectedChannelType = strtolower((string) $sequence->channel);
+        // The sequence editor calls its email channel "email" while connected
+        // Gmail accounts are persisted as "gmail" channels.
+        if ($expectedChannelType === 'email') {
+            $expectedChannelType = 'gmail';
+        }
+        if (!$channel || (int) $channel->business_id !== (int) $sequence->business_id
+            || ($expectedChannelType !== '' && strtolower((string) $channel->type) !== $expectedChannelType)) {
+            $this->pauseForUnavailableConversationChannel($execution, $enrollment, $conversation);
+            return false;
+        }
+        if ($channel->status !== 'connected') {
+            $this->pauseForUnavailableConversationChannel($execution, $enrollment, $conversation);
+            return false;
         }
 
-        if (!$channel) {
-            throw new \Exception('No connected channel found for sending message');
+        $consent = app(ConsentGate::class)->checkConversation($conversation, 'marketing');
+        if (!$consent->allowed) {
+            $reason = 'consent_' . $consent->reason;
+            $execution->markAsSkipped($reason);
+            $enrollment->stop($reason);
+            Log::info('Sequence message blocked by consent gate', [
+                'sequence_id' => $sequence->id,
+                'enrollment_id' => $enrollment->id,
+                'execution_id' => $execution->id,
+                'conversation_id' => $conversation->id,
+                'reason' => $consent->reason,
+            ]);
+            return false;
         }
 
         // CRITICAL FIX: Move external provider call OUTSIDE DB transaction
@@ -127,14 +133,21 @@ class SequenceExecutionService
         // 2. Call provider (outside transaction)
         // 3. Update status based on provider result (outside transaction)
 
-        DB::transaction(function () use ($conversation, $step, $execution, $channel) {
-            // Create message record with pending status
-            $messageRecord = Message::create([
+        $messageRecord = DB::transaction(function () use ($conversation, $step, $execution, $channel) {
+            $existing = $execution->message_id
+                ? Message::query()->lockForUpdate()->find($execution->message_id)
+                : null;
+
+            if ($existing) {
+                return $existing;
+            }
+
+            $message = Message::create([
                 'conversation_id' => $conversation->id,
                 'content' => $step->message,
                 'type' => 'text',
                 'direction' => 'outbound',
-                'status' => 'sent',
+                'status' => 'pending',
                 'is_ai' => true,
                 'source' => 'sequence',
                 'delivery_status' => 'pending',
@@ -144,8 +157,58 @@ class SequenceExecutionService
                 ]),
             ]);
 
-            $execution->message_id = $messageRecord->id;
+            app(AiReplyAuditService::class)->record($message, [
+                'commerce_connection_id' => $conversation->ecommerce_connection_id,
+                'prompt_version' => 'sequence-content',
+                'ai_provider' => 'automation',
+                'ai_model' => 'sequence-step',
+                'escalation_reason' => 'automated_sequence_step',
+                'consent_basis' => 'marketing_opt_in',
+            ]);
+
+            // Link the durable outbound row before contacting the provider. A
+            // retry can then inspect its provider ID and reuse the same row.
+            $execution->message_id = $message->id;
+            $execution->save();
+
+            return $message;
         });
+
+        if (app(\App\Services\UsageMeter::class)->blockMessageIfOverLimit($sequence->business, $messageRecord)) {
+            $reason = $messageRecord->fresh()->error_details ?: 'business_plan_limit_reached';
+            $execution->markAsSkipped('plan_limit_exceeded');
+            $enrollment->stop('plan_limit_exceeded');
+            Log::notice('SequenceExecutionService: sequence message blocked by business plan limit', [
+                'business_id' => $sequence->business_id,
+                'sequence_id' => $sequence->id,
+                'enrollment_id' => $enrollment->id,
+                'execution_id' => $execution->id,
+                'message_id' => $messageRecord->id,
+                'reason' => $reason,
+            ]);
+            return false;
+        }
+
+        if ($this->hasProviderAcceptanceEvidence($messageRecord)) {
+            $messageRecord->update([
+                'status' => 'sent',
+                'send_status' => 'sent',
+                'delivery_status' => 'sent',
+                'error_details' => null,
+            ]);
+            return true;
+        }
+
+        // Recheck the business and sequence pause immediately before the
+        // provider call. Preserve this step as pending so queue release can
+        // continue it after the merchant resumes automation.
+        if ($sequence->status === 'paused'
+            || app(\App\Services\AutomationRunControl::class)->isBusinessPaused((int) $sequence->business_id)) {
+            $execution->status = 'pending';
+            $execution->save();
+            $messageRecord->update(['status' => 'queued', 'send_status' => 'pending']);
+            throw new \App\Exceptions\AutomationPausedException('Automation paused before sequence delivery.');
+        }
 
         // Now call the provider OUTSIDE the transaction
         try {
@@ -153,11 +216,55 @@ class SequenceExecutionService
         } catch (\Exception $e) {
             // Provider failed - update message status to failed
             Message::where('id', $execution->message_id)->update([
+                'status' => 'failed',
+                'send_status' => 'failed',
                 'delivery_status' => 'failed',
                 'error_details' => $e->getMessage(),
             ]);
             throw $e; // Re-throw to trigger retry logic
         }
+
+        return true;
+    }
+
+    private function pauseForUnavailableConversationChannel(
+        SequenceStepExecution $execution,
+        SequenceEnrollment $enrollment,
+        Conversation $conversation,
+    ): void {
+        $reason = 'channel_disconnected';
+        $execution->markAsSkipped($reason);
+        $enrollment->pause($reason);
+
+        try {
+            app(\App\Services\HandoffTaskService::class)->openForConversation($conversation, $reason, 'high');
+        } catch (\Throwable $exception) {
+            Log::error('SequenceExecutionService: failed to open channel-disconnected handoff', [
+                'conversation_id' => $conversation->id,
+                'enrollment_id' => $enrollment->id,
+                'exception_type' => get_class($exception),
+            ]);
+        }
+
+        Log::warning('SequenceExecutionService: paused sequence because conversation channel is unavailable', [
+            'conversation_id' => $conversation->id,
+            'enrollment_id' => $enrollment->id,
+            'channel_id' => $conversation->channel_id,
+            'reason' => $reason,
+        ]);
+    }
+
+    private function hasProviderAcceptanceEvidence(Message $message): bool
+    {
+        $metadata = is_array($message->metadata) ? $message->metadata : [];
+        $providerIds = $metadata['provider_message_ids'] ?? [];
+
+        return !empty($metadata['platform_message_id'])
+            || (is_array($providerIds) && $providerIds !== [])
+            || !empty($message->whatsapp_message_id)
+            || !empty($message->gmail_message_id)
+            || in_array($message->send_status, ['sent', 'delivered', 'read'], true)
+            || in_array($message->status, ['sent', 'delivered', 'read'], true);
     }
 
     protected function executeDelayStep(SequenceStepExecution $execution, SequenceEnrollment $enrollment, SequenceStep $step): void
@@ -232,27 +339,25 @@ class SequenceExecutionService
             return;
         }
 
+        $fromStepOrder = (int) $enrollment->current_step;
         $enrollment->current_step = $targetStep->step_order;
         $enrollment->save();
 
         $scheduledAt = now();
-        $executionKey = SequenceStepExecution::generateKey($enrollment->id, $targetStep->id, $scheduledAt->toDateTimeString());
+        $execution = SequenceStepExecution::createForEnrollment(
+            $enrollment,
+            $targetStep,
+            $scheduledAt,
+            ['jumped_from_step_order' => $fromStepOrder],
+        );
 
-        // Idempotent: skip if already exists
-        $existing = SequenceStepExecution::where('execution_key', $executionKey)->first();
-        if ($existing) {
-            ExecuteSequenceStep::dispatch($existing->id);
+        if (!$execution) {
+            Log::warning('Sequence jump stopped by the per-enrollment execution cap', [
+                'enrollment_id' => $enrollment->id,
+                'target_step_id' => $targetStep->id,
+            ]);
             return;
         }
-
-        $execution = SequenceStepExecution::create([
-            'sequence_id' => $enrollment->sequence_id,
-            'sequence_enrollment_id' => $enrollment->id,
-            'sequence_step_id' => $targetStep->id,
-            'execution_key' => $executionKey,
-            'status' => 'pending',
-            'scheduled_at' => $scheduledAt,
-        ]);
 
         ExecuteSequenceStep::dispatch($execution->id);
     }
@@ -307,6 +412,7 @@ class SequenceExecutionService
                     $this->sendTelegramMessage($conversation, $message, $channel, $messageRecord);
                     break;
                 case 'email':
+                case 'gmail':
                     $this->sendEmailMessage($conversation, $message, $channel, $messageRecord);
                     break;
                 default:
@@ -319,6 +425,8 @@ class SequenceExecutionService
 
             // Provider succeeded - update delivery status
             $messageRecord->update([
+                'status' => 'sent',
+                'send_status' => 'sent',
                 'delivery_status' => 'sent',
             ]);
 
@@ -326,9 +434,11 @@ class SequenceExecutionService
             Log::error("Failed to send sequence message", [
                 'message_id' => $messageRecord->id,
                 'channel_type' => $channel->type,
-                'error' => $e->getMessage(),
+                'exception_type' => get_class($e),
             ]);
             $messageRecord->update([
+                'status' => 'failed',
+                'send_status' => 'failed',
                 'delivery_status' => 'failed',
                 'error_details' => $e->getMessage(),
             ]);
@@ -340,49 +450,39 @@ class SequenceExecutionService
     {
         // Facebook and Instagram both use the Meta Graph Send API with the
         // page/account access token — identical wire behavior to AI replies.
-        $success = app(\App\Services\MetaMessengerService::class)->sendText(
+        $result = app(\App\Services\MetaMessengerService::class)->sendTextWithResult(
             $channel,
             (string) $conversation->sender_id,
             $message
         );
 
-        if (!$success) {
-            throw new \Exception("Meta {$channel->type} send failed (recipient {$conversation->sender_id})");
+        $metadata = $messageRecord->metadata ?? [];
+        $metadata['provider_message_ids'] = $result['message_ids'] ?? [];
+        if (!empty($result['message_id'])) {
+            $metadata['platform_message_id'] = $result['message_id'];
+        }
+        $messageRecord->update([
+            'metadata' => $metadata,
+            'error_details' => $result['error'] ?? null,
+        ]);
+
+        if (!$result['success']) {
+            throw new \Exception($result['error'] ?: "Meta {$channel->type} send rejected by provider.");
         }
 
         $messageRecord->update([
+            'status' => 'sent',
             'send_status' => 'sent',
+            'delivery_status' => 'sent',
         ]);
     }
 
     protected function sendWhatsAppMessage(Conversation $conversation, string $message, Channel $channel, Message $messageRecord): void
     {
-        $evolutionService = new EvolutionApiService();
-
-        // Send via Evolution API. A successful (200) response only confirms
-        // Evolution's REST layer accepted the request into its send queue —
-        // it does NOT confirm the message actually reached WhatsApp, since
-        // that depends on the underlying session (Baileys/WhatsApp Web) still
-        // being alive. Real delivery confirmation arrives later via the
-        // messages.update webhook (DELIVERY_ACK / READ status), the same way
-        // it's tracked for normal AI replies elsewhere in the app.
-        //
-        // Marking this 'delivered' immediately, before that webhook arrives,
-        // is what let a message look successfully sent in our own logs/dashboard
-        // while never actually reaching the customer's phone (the channel had
-        // silently disconnected). Mark it 'sent'/'pending' instead, and let the
-        // existing messages.update webhook handler update it to the real status
-        // once WhatsApp actually confirms delivery.
-        $evolutionService->sendTextMessage(
-            $channel->page_id, // instance name
-            $conversation->sender_id,
-            $message
-        );
-
-        $messageRecord->update([
-            'whatsapp_message_id' => $messageRecord->id, // Use message ID as reference
-            'send_status' => 'sent',
-        ]);
+        $messageRecord->content = $message;
+        if (!app(ChannelMessageService::class)->sendMessage($channel, $conversation, $messageRecord)) {
+            throw new \RuntimeException($messageRecord->fresh()->error_details ?: 'WhatsApp message could not be sent through the configured provider.');
+        }
     }
 
     protected function sendTelegramMessage(Conversation $conversation, string $message, Channel $channel, Message $messageRecord): void
@@ -390,8 +490,9 @@ class SequenceExecutionService
         // Use existing TelegramService
         $telegramService = new TelegramService();
 
-        // Extract bot token from channel metadata or config
-        $botToken = $channel->metadata['bot_token'] ?? null;
+        // Channel::access_token decrypts the persisted token. Metadata may be
+        // stale or user-controlled and is not an authorization source.
+        $botToken = $channel->access_token;
 
         if (!$botToken) {
             Log::error("Telegram bot token not found in channel metadata", [
@@ -400,35 +501,37 @@ class SequenceExecutionService
             throw new \Exception('Telegram bot token not configured');
         }
 
-        $success = $telegramService->sendMessage($botToken, $conversation->sender_id, $message);
+        $providerMessageId = null;
+        $success = $telegramService->sendMessage($botToken, $conversation->sender_id, $message, $providerMessageId);
 
         if (!$success) {
             throw new \Exception('Failed to send Telegram message');
         }
 
-        $messageRecord->update([
+        $updates = [
+            'status' => 'sent',
             'send_status' => 'sent',
-        ]);
+            'delivery_status' => 'sent',
+        ];
+        if ($providerMessageId) {
+            $metadata = $messageRecord->metadata ?? [];
+            $metadata['provider_message_ids'] = [$providerMessageId];
+            $metadata['platform_message_id'] = $providerMessageId;
+            $updates['metadata'] = $metadata;
+        }
+        $messageRecord->update($updates);
     }
 
     protected function sendEmailMessage(Conversation $conversation, string $message, Channel $channel, Message $messageRecord): void
     {
-        // Use Laravel Mail facade for email sending
-        $recipientEmail = $conversation->sender_email ?? $conversation->sender_id;
-
-        if (!$recipientEmail) {
-            throw new \Exception('No email address found for conversation');
+        if ($channel->type === 'gmail') {
+            if (!app(ChannelMessageService::class)->sendMessage($channel, $conversation, $messageRecord)) {
+                throw new \RuntimeException($messageRecord->fresh()->error_details ?: 'Gmail message could not be sent through the connected account.');
+            }
+            return;
         }
 
-        \Illuminate\Support\Facades\Mail::raw($message, function ($mail) use ($recipientEmail) {
-            $mail->to($recipientEmail)
-                ->subject('Automated Message')
-                ->from(config('mail.from.address'), config('mail.from.name'));
-        });
-
-        $messageRecord->update([
-            'send_status' => 'sent',
-        ]);
+        throw new \RuntimeException('Sequence email messages require a connected Gmail channel.');
     }
 
     protected function evaluateCondition(SequenceEnrollment $enrollment, array $conditionConfig): bool
@@ -468,7 +571,7 @@ class SequenceExecutionService
             $targetTime = \Carbon\Carbon::parse($conditionTime);
             return $currentTime->gte($targetTime);
         } catch (\Exception $e) {
-            Log::error("Failed to parse time condition: {$e->getMessage()}");
+            Log::error('Failed to parse time condition', ['exception_type' => get_class($e)]);
             return true;
         }
     }
@@ -550,28 +653,14 @@ class SequenceExecutionService
         
         // Keep $scheduledAt as a Carbon instance for the delay math below —
         // convert to string only for the execution key / DB columns.
-        $executionKey = SequenceStepExecution::generateKey($enrollment->id, $nextStep->id, $scheduledAt->toDateTimeString());
-
-        // Idempotent: skip if already exists
-        $existing = SequenceStepExecution::where('execution_key', $executionKey)->first();
-        if ($existing) {
-            $jobDelay = (int) round(now()->diffInSeconds($scheduledAt, false));
-            if ($jobDelay <= 0) {
-                ExecuteSequenceStep::dispatch($existing->id)->delay(1);
-            } else {
-                ExecuteSequenceStep::dispatch($existing->id)->delay($jobDelay);
-            }
+        $execution = SequenceStepExecution::createForEnrollment($enrollment, $nextStep, $scheduledAt);
+        if (!$execution) {
+            Log::warning('Sequence delay continuation stopped by the per-enrollment execution cap', [
+                'enrollment_id' => $enrollment->id,
+                'step_id' => $nextStep->id,
+            ]);
             return;
         }
-
-        $execution = SequenceStepExecution::create([
-            'sequence_id' => $enrollment->sequence_id,
-            'sequence_enrollment_id' => $enrollment->id,
-            'sequence_step_id' => $nextStep->id,
-            'execution_key' => $executionKey,
-            'status' => 'pending',
-            'scheduled_at' => $scheduledAt,
-        ]);
 
         Log::info("scheduleNextStepAfterDelay: Created next step execution after delay", [
             'enrollment_id' => $enrollment->id,
@@ -648,23 +737,14 @@ class SequenceExecutionService
 
             // Create execution record for delay step (immediate)
             $scheduledAt = now();
-            $executionKey = SequenceStepExecution::generateKey($enrollment->id, $nextStep->id, $scheduledAt->toDateTimeString());
-
-            // Idempotent: skip if already exists
-            $existing = SequenceStepExecution::where('execution_key', $executionKey)->first();
-            if ($existing) {
-                ExecuteSequenceStep::dispatch($existing->id);
+            $execution = SequenceStepExecution::createForEnrollment($enrollment, $nextStep, $scheduledAt);
+            if (!$execution) {
+                Log::warning('Sequence continuation stopped by the per-enrollment execution cap', [
+                    'enrollment_id' => $enrollment->id,
+                    'step_id' => $nextStep->id,
+                ]);
                 return;
             }
-
-            $execution = SequenceStepExecution::create([
-                'sequence_id' => $enrollment->sequence_id,
-                'sequence_enrollment_id' => $enrollment->id,
-                'sequence_step_id' => $nextStep->id,
-                'execution_key' => $executionKey,
-                'status' => 'pending',
-                'scheduled_at' => $scheduledAt,
-            ]);
 
             // Dispatch immediately - delay step will handle scheduling the next step
             ExecuteSequenceStep::dispatch($execution->id);
@@ -673,23 +753,14 @@ class SequenceExecutionService
 
         // For non-delay steps, execute immediately
         $scheduledAt = now();
-        $executionKey = SequenceStepExecution::generateKey($enrollment->id, $nextStep->id, $scheduledAt->toDateTimeString());
-
-        // Idempotent: skip if already exists
-        $existing = SequenceStepExecution::where('execution_key', $executionKey)->first();
-        if ($existing) {
-            ExecuteSequenceStep::dispatch($existing->id);
+        $execution = SequenceStepExecution::createForEnrollment($enrollment, $nextStep, $scheduledAt);
+        if (!$execution) {
+            Log::warning('Sequence continuation stopped by the per-enrollment execution cap', [
+                'enrollment_id' => $enrollment->id,
+                'step_id' => $nextStep->id,
+            ]);
             return;
         }
-
-        $execution = SequenceStepExecution::create([
-            'sequence_id' => $enrollment->sequence_id,
-            'sequence_enrollment_id' => $enrollment->id,
-            'sequence_step_id' => $nextStep->id,
-            'execution_key' => $executionKey,
-            'status' => 'pending',
-            'scheduled_at' => $scheduledAt,
-        ]);
 
         Log::info("moveToNextStep: Executing next step immediately", [
             'enrollment_id' => $enrollment->id,
@@ -716,12 +787,12 @@ class SequenceExecutionService
             $engine->executeWorkflowsForEvent(
                 \App\Services\AutomationEngine::EVENT_SEQUENCE_COMPLETED,
                 $conversation,
-                ['sequence_id' => $enrollment->sequence_id]
+                ['sequence_id' => $enrollment->sequence_id, 'sequence_enrollment_id' => $enrollment->id]
             );
         } catch (\Throwable $e) {
             Log::error('SequenceExecutionService: failed to fire sequence_completed event', [
                 'enrollment_id' => $enrollment->id,
-                'error' => $e->getMessage(),
+                'exception_type' => get_class($e),
             ]);
         }
     }

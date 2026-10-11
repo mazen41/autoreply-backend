@@ -11,6 +11,7 @@ use App\Models\BusinessProfile;
 use App\Models\User;
 use App\Models\Message;
 use App\Models\Channel;
+use App\Models\ContactConsent;
 use App\Jobs\ExecuteSequenceStep;
 use App\Services\SequenceService;
 use App\Services\SequenceEnrollmentService;
@@ -59,6 +60,7 @@ class SequenceEndToEndTest extends TestCase
             'type'         => 'whatsapp',
             'status'       => 'connected',
             'connected_at' => now(),
+            'metadata'     => ['whatsapp_provider' => 'evolution', 'unofficial_risk_accepted' => true],
         ]);
 
         $this->sequenceService   = app(SequenceService::class);
@@ -103,7 +105,7 @@ class SequenceEndToEndTest extends TestCase
         $this->assertEquals('active', $activatedSequence->status);
 
         // 3. Create conversation and enroll
-        $conversation = Conversation::factory()->create([
+        $conversation = $this->createOptedInConversation([
             'business_id' => $this->business->id,
             'channel_id'  => $this->channel->id,
         ]);
@@ -160,7 +162,7 @@ class SequenceEndToEndTest extends TestCase
             'step_order'  => 1,
         ]);
 
-        $conversation = Conversation::factory()->create([
+        $conversation = $this->createOptedInConversation([
             'business_id' => $this->business->id,
             'channel_id'  => $this->channel->id,
         ]);
@@ -232,7 +234,7 @@ class SequenceEndToEndTest extends TestCase
             ],
         ]);
 
-        $conversation = Conversation::factory()->create([
+        $conversation = $this->createOptedInConversation([
             'business_id' => $this->business->id,
             'channel_id'  => $this->channel->id,
         ]);
@@ -284,7 +286,7 @@ class SequenceEndToEndTest extends TestCase
             'sequence_id' => $sequence->id,
         ]);
 
-        $otherConversation = Conversation::factory()->create([
+        $otherConversation = $this->createOptedInConversation([
             'business_id' => $otherBusiness->id,
         ]);
 
@@ -300,6 +302,7 @@ class SequenceEndToEndTest extends TestCase
         $sequence = Sequence::factory()->create([
             'business_id' => $this->business->id,
             'status'      => 'active',
+            'channel'     => 'whatsapp',
         ]);
 
         SequenceStep::factory()->create([
@@ -309,7 +312,7 @@ class SequenceEndToEndTest extends TestCase
             'message'     => 'Final message',
         ]);
 
-        $conversation = Conversation::factory()->create([
+        $conversation = $this->createOptedInConversation([
             'business_id' => $this->business->id,
             'channel_id'  => $this->channel->id,
         ]);
@@ -352,9 +355,13 @@ class SequenceEndToEndTest extends TestCase
             'sequence_id' => $sequence->id,
         ]);
 
-        $conversation = Conversation::factory()->create([
+        $conversation = $this->createOptedInConversation([
             'business_id' => $this->business->id,
             'channel_id'  => $this->channel->id,
+        ]);
+        Message::factory()->create([
+            'conversation_id' => $conversation->id,
+            'direction' => 'inbound',
         ]);
 
         // Simulate ProcessAutoReply trigger
@@ -383,7 +390,7 @@ class SequenceEndToEndTest extends TestCase
             'message'     => 'Test message',
         ]);
 
-        $conversation = Conversation::factory()->create([
+        $conversation = $this->createOptedInConversation([
             'business_id' => $this->business->id,
             'channel_id'  => $this->channel->id,
         ]);
@@ -414,5 +421,23 @@ class SequenceEndToEndTest extends TestCase
             ->count();
 
         $this->assertEquals(0, $messageCount);
+    }
+
+    private function createOptedInConversation(array $attributes): Conversation
+    {
+        $conversation = Conversation::factory()->create($attributes);
+        ContactConsent::create([
+            'business_id' => $conversation->business_id,
+            'channel' => $conversation->channel?->type ?? 'whatsapp',
+            'contact_identifier' => app(\App\Services\ConsentGate::class)->normalizeIdentifier(
+                $conversation->sender_id,
+                $conversation->channel?->type ?? 'whatsapp'
+            ),
+            'scope' => 'marketing',
+            'status' => 'opted_in',
+            'source' => 'form',
+            'captured_at' => now(),
+        ]);
+        return $conversation;
     }
 }

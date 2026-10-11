@@ -14,8 +14,11 @@ use App\Models\SequenceStep;
 use App\Models\SequenceEnrollment;
 use App\Models\SequenceStepExecution;
 use App\Models\ConversationTag;
+use App\Models\ContactConsent;
 use App\Services\AutomationEngine;
 use Illuminate\Foundation\Testing\RefreshDatabase;
+use Illuminate\Support\Facades\Http;
+use Illuminate\Support\Facades\Queue;
 use Tests\TestCase;
 
 class WorkflowSequenceE2ETest extends TestCase
@@ -40,12 +43,15 @@ class WorkflowSequenceE2ETest extends TestCase
             'business_id' => $this->business->id,
             'type'        => 'whatsapp',
             'status'      => 'connected',
+            'metadata'    => ['whatsapp_provider' => 'cloud'],
         ]);
 
         $this->otherUser = User::factory()->create();
         $this->otherBusiness = BusinessProfile::factory()->create([
             'user_id' => $this->otherUser->id,
         ]);
+
+        Http::fake(['*' => Http::response(['messages' => [['id' => 'fake-message-id']]], 200)]);
     }
 
     /**
@@ -53,6 +59,8 @@ class WorkflowSequenceE2ETest extends TestCase
      */
     public function test_complete_workflow_to_sequence_journey()
     {
+        Queue::fake();
+
         // Create a test sequence
         $sequence = Sequence::factory()->create([
             'business_id' => $this->business->id,
@@ -118,6 +126,16 @@ class WorkflowSequenceE2ETest extends TestCase
         $conversation = Conversation::factory()->create([
             'business_id' => $this->business->id,
             'channel_id'  => $this->channel->id,
+            'ai_enabled'  => true,
+        ]);
+        ContactConsent::create([
+            'business_id' => $this->business->id,
+            'channel' => 'whatsapp',
+            'contact_identifier' => app(\App\Services\ConsentGate::class)->normalizeIdentifier($conversation->sender_id, 'whatsapp'),
+            'scope' => 'marketing',
+            'status' => 'opted_in',
+            'source' => 'form',
+            'captured_at' => now(),
         ]);
 
         Message::factory()->create([
@@ -133,6 +151,7 @@ class WorkflowSequenceE2ETest extends TestCase
         // Verify workflow executed
         $this->assertTrue($results['triggered']);
         $this->assertCount(3, $results['actions_executed'], json_encode($results));
+        $this->assertEmpty($results['errors'], json_encode($results));
 
         // Verify workflow execution record created
         $this->assertDatabaseHas('workflow_executions', [

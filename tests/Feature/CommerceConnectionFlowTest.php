@@ -3,6 +3,7 @@
 namespace Tests\Feature;
 
 use App\Jobs\SyncCommerceStore;
+use App\Models\BusinessProfile;
 use App\Models\Channel;
 use App\Models\User;
 use Illuminate\Foundation\Testing\RefreshDatabase;
@@ -37,9 +38,12 @@ class CommerceConnectionFlowTest extends TestCase
         Config::set('services.shopify.use_legacy_install_flow', true);
 
         $user = User::factory()->create();
+        $business = BusinessProfile::create(['user_id' => $user->id, 'name' => 'Store Owner Business']);
+        $user->update(['business_id' => $business->id]);
         Sanctum::actingAs($user);
 
-        $start = $this->postJson('/api/channels/shopify/connect', ['shop_domain' => 'https://mystore.myshopify.com/'])
+        $start = $this->withHeader('X-Business-Id', (string) $business->id)
+            ->postJson('/api/channels/shopify/connect', ['shop_domain' => 'https://mystore.myshopify.com/'])
             ->assertOk()
             ->json('authorization_url');
 
@@ -85,9 +89,62 @@ class CommerceConnectionFlowTest extends TestCase
             'type' => 'shopify',
             'page_id' => 'mystore.myshopify.com',
             'page_name' => 'My Store',
+            'business_id' => $business->id,
             'status' => 'connected',
         ]);
         Queue::assertPushed(SyncCommerceStore::class);
+    }
+
+    public function test_shopify_oauth_keeps_the_explicitly_selected_business(): void
+    {
+        Queue::fake();
+        Config::set('services.shopify.client_id', 'shopify-client-id');
+        Config::set('services.shopify.client_secret', 'shopify-client-secret');
+        Config::set('services.shopify.redirect', 'https://api.nazbiz.io/api/channels/callback/shopify');
+        Config::set('services.shopify.scopes', 'read_products,read_orders');
+        Config::set('services.shopify.api_version', '2026-07');
+        Config::set('services.shopify.use_legacy_install_flow', true);
+
+        $user = User::factory()->create();
+        $primaryBusiness = BusinessProfile::create(['user_id' => $user->id, 'name' => 'Primary']);
+        $selectedBusiness = BusinessProfile::create(['user_id' => $user->id, 'name' => 'Selected']);
+        $user->update(['business_id' => $primaryBusiness->id]);
+        Sanctum::actingAs($user);
+
+        $start = $this->withHeader('X-Business-Id', (string) $selectedBusiness->id)
+            ->postJson('/api/channels/shopify/connect', ['shop_domain' => 'mystore.myshopify.com'])
+            ->assertOk()->json('authorization_url');
+        parse_str((string) parse_url($start, PHP_URL_QUERY), $authorization);
+
+        Http::fake(function (ClientRequest $request) {
+            if (str_ends_with($request->url(), '/admin/oauth/access_token')) {
+                return Http::response(['access_token' => 'shop-access-token', 'scope' => 'read_products,read_orders'], 200);
+            }
+            if (str_contains($request->body(), 'query { shop')) {
+                return Http::response(['data' => ['shop' => [
+                    'id' => 'gid://shopify/Shop/456', 'name' => 'Selected Store', 'myshopifyDomain' => 'mystore.myshopify.com',
+                ]]], 200);
+            }
+            return Http::response(['data' => ['webhookSubscriptionCreate' => ['userErrors' => [], 'webhookSubscription' => ['id' => 'gid://shopify/WebhookSubscription/1']]]], 200);
+        });
+
+        $callback = [
+            'code' => 'one-time-code', 'shop' => 'mystore.myshopify.com', 'state' => $authorization['state'],
+            'timestamp' => (string) now()->timestamp,
+        ];
+        $signed = $callback;
+        ksort($signed, SORT_STRING);
+        $callback['hmac'] = hash_hmac('sha256', http_build_query($signed, '', '&', PHP_QUERY_RFC3986), 'shopify-client-secret');
+
+        $this->get('/api/channels/callback/shopify?' . http_build_query($callback))
+            ->assertRedirect('https://app.nazbiz.io/dashboard/channels?success=shopify_connected');
+
+        $this->assertDatabaseHas('channels', [
+            'user_id' => $user->id,
+            'type' => 'shopify',
+            'page_id' => 'mystore.myshopify.com',
+            'business_id' => $selectedBusiness->id,
+        ]);
     }
 
     public function test_shopify_managed_install_is_rejected_with_actionable_configuration_error(): void
@@ -119,9 +176,11 @@ class CommerceConnectionFlowTest extends TestCase
         });
 
         $user = User::factory()->create();
+        $business = BusinessProfile::create(['user_id' => $user->id, 'name' => 'Woo Owner Business']);
+        $user->update(['business_id' => $business->id]);
         Sanctum::actingAs($user);
 
-        $authorizationUrl = $this->postJson('/api/channels/woocommerce/connect', [
+        $authorizationUrl = $this->withHeader('X-Business-Id', (string) $business->id)->postJson('/api/channels/woocommerce/connect', [
             'store_url' => 'https://woo.example.com',
         ])->assertOk()->json('authorization_url');
 
@@ -149,6 +208,7 @@ class CommerceConnectionFlowTest extends TestCase
             'type' => 'woocommerce',
             'page_id' => 'https://woo.example.com',
             'page_name' => 'Woo Store',
+            'business_id' => $business->id,
             'status' => 'connected',
         ]);
         Queue::assertPushed(SyncCommerceStore::class);

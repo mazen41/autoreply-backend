@@ -19,6 +19,7 @@ class WorkflowExecution extends Model
         'workflow_id',
         'conversation_id',
         'business_id',
+        'event_id',
         'status',
         'trigger_data',
         'results',

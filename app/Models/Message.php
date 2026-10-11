@@ -8,6 +8,35 @@ use Illuminate\Database\Eloquent\Model;
 class Message extends Model
 {
     use HasFactory;
+
+    protected static function booted(): void
+    {
+        static::creating(function (Message $message): void {
+            // New outbound rows are immediately visible as queued, while the
+            // legacy `pending` value remains readable for existing rows.
+            if ($message->direction === 'outbound' && in_array($message->send_status, [null, 'pending'], true)) {
+                $message->send_status = 'queued';
+            }
+        });
+
+        static::created(function (Message $message): void {
+            app(\App\Services\InboundConsentKeywordHandler::class)->handle($message);
+        });
+
+        static::updated(function (Message $message): void {
+            if ($message->direction !== 'outbound'
+                || !$message->wasChanged(['send_status', 'delivery_status', 'error_details'])) {
+                return;
+            }
+
+            $conversation = $message->conversation()->with('channel:id,type,page_name,user_id', 'bot:id,name')->first();
+            $userId = (int) ($conversation?->channel?->user_id ?? 0);
+            if ($conversation && $userId > 0) {
+                broadcast(new \App\Events\MessageReceived($message->fresh(), $conversation, $userId));
+            }
+        });
+    }
+
     protected $fillable = [
         'conversation_id',
         'content',
@@ -22,6 +51,8 @@ class Message extends Model
         'reactions',
         'media_url',
         'media_type',
+        'media_processing_status',
+        'media_processing_reason',
         'mime_type',
         'file_name',
         'file_size',
@@ -54,5 +85,10 @@ class Message extends Model
     public function conversation()
     {
         return $this->belongsTo(Conversation::class);
+    }
+
+    public function aiReplyAudit()
+    {
+        return $this->hasOne(AiReplyAudit::class);
     }
 }

@@ -94,7 +94,7 @@ class ChannelStabilityService
         } catch (\Exception $e) {
             Log::error('Auto-reconnect failed', [
                 'channel_id' => $channel->id,
-                'error' => $e->getMessage(),
+                'exception_type' => get_class($e),
             ]);
             return false;
         }

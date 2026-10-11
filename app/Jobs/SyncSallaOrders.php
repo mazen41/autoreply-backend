@@ -56,7 +56,6 @@ class SyncSallaOrders implements ShouldQueue
             if (!$ordersResponse->successful()) {
                 Log::error('Failed to fetch Salla orders', [
                     'status' => $ordersResponse->status(),
-                    'body' => $ordersResponse->body(),
                 ]);
                 return;
             }
@@ -111,8 +110,7 @@ class SyncSallaOrders implements ShouldQueue
         } catch (\Exception $e) {
             Log::error('Failed to sync Salla orders', [
                 'channel_id' => $this->channelId,
-                'error' => $e->getMessage(),
-                'trace' => $e->getTraceAsString(),
+                'exception_type' => get_class($e),
             ]);
             throw $e;
         }

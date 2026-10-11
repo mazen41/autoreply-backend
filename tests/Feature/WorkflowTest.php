@@ -38,6 +38,7 @@ class WorkflowTest extends TestCase
         $this->business = BusinessProfile::factory()->create([
             'user_id' => $this->user->id,
         ]);
+        $this->withHeader('X-Business-Id', (string) $this->business->id);
 
         $this->otherUser = User::factory()->create();
         $this->otherBusiness = BusinessProfile::factory()->create([
@@ -71,6 +72,33 @@ class WorkflowTest extends TestCase
             'name' => 'Test Workflow',
             'business_id' => $this->business->id,
         ]);
+    }
+
+    public function test_visual_builder_workflow_payload_is_normalized_to_engine_contract(): void
+    {
+        $response = $this->actingAs($this->user)->postJson('/api/workflows', [
+            'name' => 'Visual Builder Contract',
+            'trigger' => ['type' => 'keyword', 'keywords' => ['hi']],
+            'conditions' => [
+                ['field' => 'message_contains', 'value' => 'urgent', 'operator' => 'contains'],
+            ],
+            'actions' => [
+                ['type' => 'add_tag', 'config' => ['tag' => 'priority']],
+            ],
+        ]);
+
+        $response->assertCreated()
+            ->assertJsonPath('trigger.type', 'keyword')
+            ->assertJsonPath('trigger.conditions.keywords.0', 'hi')
+            ->assertJsonPath('conditions.0.type', 'message_contains')
+            ->assertJsonPath('conditions.0.comparison', 'contains')
+            ->assertJsonPath('actions.0.type', 'add_tag')
+            ->assertJsonPath('actions.0.tag', 'priority');
+
+        $workflow = AutomationWorkflow::where('name', 'Visual Builder Contract')->firstOrFail();
+        $this->assertSame(['hi'], $workflow->trigger_config['conditions']['keywords']);
+        $this->assertSame('message_contains', $workflow->conditions[0]['type']);
+        $this->assertSame('priority', $workflow->actions_config[0]['tag']);
     }
 
     public function test_user_can_list_their_workflows()
@@ -222,8 +250,7 @@ class WorkflowTest extends TestCase
         $response = $this->actingAs($this->otherUser)
             ->getJson('/api/workflows');
 
-        $response->assertStatus(200);
-        $this->assertCount(0, $response->json());
+        $response->assertStatus(403);
     }
 
     public function test_workflow_execution_creates_record()

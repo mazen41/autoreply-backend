@@ -7,9 +7,11 @@ use Illuminate\Support\Facades\Http;
 use Illuminate\Support\Facades\Log;
 use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\Redis;
+use Illuminate\Support\Facades\DB;
 use Tests\TestCase;
 use App\Models\User;
 use App\Models\BusinessProfile;
+use App\Models\Bot;
 use App\Models\Channel;
 use App\Models\Conversation;
 use App\Models\Message;
@@ -41,6 +43,246 @@ class CheckoutOrderFlowTest extends TestCase
         ]);
     }
 
+    private function seedSallaCity(Channel $channel, string $name, int $cityId): void
+    {
+        DB::table('salla_cities')->insert([
+            'channel_id' => $channel->id,
+            'country_code' => 'SA',
+            'country_id' => 1473353380,
+            'salla_city_id' => $cityId,
+            'name' => $name,
+            'name_en' => $name,
+            'name_ar' => null,
+            'synced_at' => now(),
+            'created_at' => now(),
+            'updated_at' => now(),
+        ]);
+    }
+
+    private function saveSentOrderSummary(Conversation $conversation): void
+    {
+        $state = $conversation->checkout_state ?? [];
+        $summary = Message::create([
+            'conversation_id' => $conversation->id,
+            'content' => 'Please review your order summary and confirm.',
+            'direction' => 'outbound',
+            'is_ai' => true,
+            'send_status' => 'sent',
+            'metadata' => ['order_summary' => true],
+        ]);
+        $state['confirmation_summary_message_id'] = $summary->id;
+        $state['confirmation_summary_fingerprint'] = hash('sha256', implode('|', [
+            (string) ($state['commerce_channel_id'] ?? ''),
+            (string) ($state['commerce_external_id'] ?? $state['salla_product_id'] ?? ''),
+            preg_replace('/\D+/', '', (string) ($state['phone'] ?? $state['customer_phone'] ?? '')),
+            mb_strtolower(trim((string) ($state['address'] ?? $state['customer_address'] ?? ''))),
+        ]));
+        $conversation->update(['checkout_state' => $state]);
+    }
+
+    public function test_order_confirmation_requires_a_prior_pending_summary(): void
+    {
+        $service = app(\App\Services\OrderCheckoutService::class);
+        $complete = [
+            'salla_product_id' => 'product-a',
+            'full_name' => 'Ahmed Ali',
+            'phone' => '+966501234567',
+            'address' => 'Riyadh',
+        ];
+
+        $firstConfirmation = $service->updateConfirmationState($complete, 'yes confirm', true, false);
+        $this->assertSame('confirmation_pending', $firstConfirmation['confirmation_state']);
+
+        $pendingWithoutSummary = $firstConfirmation;
+        unset($pendingWithoutSummary['confirmation_summary_message_id']);
+        $bareOkWithoutSummary = $service->updateConfirmationState($pendingWithoutSummary, 'ok', true, false);
+        $this->assertSame('confirmation_pending', $bareOkWithoutSummary['confirmation_state']);
+
+        $pendingWithSummary = array_merge($firstConfirmation, ['confirmation_summary_message_id' => 123]);
+        $bareOkWithSummary = $service->updateConfirmationState($pendingWithSummary, 'ok', true, false);
+        $this->assertSame('confirmation_pending', $bareOkWithSummary['confirmation_state']);
+
+        $secondConfirmation = $service->updateConfirmationState($pendingWithSummary, 'yes confirm', true, true);
+        $this->assertSame('confirmed', $secondConfirmation['confirmation_state']);
+    }
+
+    public function test_explicit_cancel_stops_pending_checkout_before_any_provider_order_request(): void
+    {
+        \Illuminate\Support\Facades\Event::fake();
+        Http::fake();
+
+        [$conversation, $message] = $this->makeCancellationFlow('cancel order', [
+            'salla_product_id' => 'product-a',
+            'commerce_external_id' => 'product-a',
+            'product_name' => 'Watch',
+            'confirmation_state' => 'confirmation_pending',
+        ]);
+
+        (new ProcessAutoReply($message->id))->handle();
+
+        $this->assertNull($conversation->fresh()->checkout_state);
+        $reply = Message::query()->where('conversation_id', $conversation->id)->where('direction', 'outbound')->latest('id')->firstOrFail();
+        $this->assertSame('checkout_cancelled', $reply->source);
+        $this->assertStringContainsString('No order was submitted', $reply->content);
+        Http::assertNotSent(fn ($request) => str_contains($request->url(), 'api.salla.dev/admin/v2/orders'));
+        Http::assertNotSent(fn ($request) => str_contains($request->url(), 'api.groq.com'));
+    }
+
+    public function test_cancelling_an_already_placed_order_opens_handoff_without_reposting(): void
+    {
+        \Illuminate\Support\Facades\Event::fake();
+        config(['handoff.email_notifications' => false]);
+        Http::fake();
+
+        [$conversation, $message] = $this->makeCancellationFlow('please cancel my order', [
+            'salla_product_id' => 'product-a',
+            'commerce_external_id' => 'product-a',
+            'product_name' => 'Watch',
+            'order_id' => 'SALLA-123',
+            'status' => 'completed',
+            'confirmation_state' => 'order_placed',
+        ]);
+
+        (new ProcessAutoReply($message->id))->handle();
+
+        $freshConversation = $conversation->fresh();
+        $this->assertSame('SALLA-123', $freshConversation->checkout_state['order_id']);
+        $this->assertTrue((bool) $freshConversation->requires_human);
+        $this->assertSame('pending_human', $freshConversation->status);
+        $this->assertDatabaseHas('handoff_tasks', [
+            'conversation_id' => $conversation->id,
+            'reason' => 'order_cancellation_requested',
+            'status' => 'open',
+        ]);
+        $reply = Message::query()->where('conversation_id', $conversation->id)->where('direction', 'outbound')->latest('id')->firstOrFail();
+        $this->assertSame('order_cancellation_handoff', $reply->source);
+        $this->assertStringContainsString('has already been placed', $reply->content);
+        Http::assertNotSent(fn ($request) => str_contains($request->url(), 'api.salla.dev/admin/v2/orders'));
+        Http::assertNotSent(fn ($request) => str_contains($request->url(), 'api.groq.com'));
+    }
+
+    private function makeCancellationFlow(string $messageText, array $checkoutState): array
+    {
+        $user = User::factory()->create();
+        $business = BusinessProfile::factory()->create(['user_id' => $user->id, 'ai_provider' => 'groq']);
+        $commerceChannel = Channel::factory()->create([
+            'user_id' => $user->id,
+            'business_id' => $business->id,
+            'type' => 'salla',
+            'status' => 'connected',
+            'access_token' => 'test-token',
+        ]);
+        $channel = Channel::factory()->create([
+            'user_id' => $user->id,
+            'business_id' => $business->id,
+            'type' => 'instagram',
+            'ai_enabled' => true,
+        ]);
+        $conversation = Conversation::factory()->create([
+            'channel_id' => $channel->id,
+            'business_id' => $business->id,
+            'ecommerce_connection_id' => $commerceChannel->id,
+            'sender_id' => 'instagram-customer-1',
+            'ai_enabled' => true,
+            'checkout_state' => $checkoutState,
+        ]);
+        $message = Message::create([
+            'conversation_id' => $conversation->id,
+            'content' => $messageText,
+            'direction' => 'inbound',
+            'is_ai' => false,
+        ]);
+
+        return [$conversation, $message];
+    }
+
+    public function test_social_profile_name_is_not_used_as_verified_delivery_name(): void
+    {
+        $user = User::factory()->create();
+        $business = BusinessProfile::factory()->create(['user_id' => $user->id]);
+        $channel = Channel::factory()->create(['user_id' => $user->id, 'business_id' => $business->id]);
+        $conversation = Conversation::factory()->create([
+            'channel_id' => $channel->id,
+            'business_id' => $business->id,
+            'sender_id' => 'social-account-id',
+            'sender_name' => 'Chris Store',
+        ]);
+
+        $state = app(\App\Services\OrderCheckoutService::class)->extractAndMergeState(
+            $conversation,
+            'phone is +966501234567'
+        );
+
+        $this->assertArrayNotHasKey('full_name', $state);
+    }
+
+    public function test_unlabeled_address_numbers_are_not_accepted_as_phone_numbers(): void
+    {
+        $conversation = Conversation::factory()->create([
+            'sender_id' => 'instagram-customer-id',
+            'checkout_state' => ['salla_product_id' => 'product-a'],
+        ]);
+
+        $state = app(\App\Services\OrderCheckoutService::class)->extractAndMergeState(
+            $conversation,
+            'My address is 1234567890 Main Street, Riyadh'
+        );
+
+        $this->assertArrayNotHasKey('phone', $state);
+    }
+
+    public function test_unknown_country_phone_does_not_default_to_saudi_for_geocoding(): void
+    {
+        config(['services.nominatim.endpoint' => 'https://nominatim.test']);
+        Http::fake();
+
+        $result = app(\App\Services\OrderCheckoutService::class)
+            ->geocodeDeliveryAddress('Main Street, Unknown City', '1234567890');
+
+        $this->assertSame('country_unknown', $result['status']);
+        Http::assertNothingSent();
+    }
+
+    public function test_selecting_a_different_product_clears_completed_order_identity(): void
+    {
+        $user = User::factory()->create();
+        $business = BusinessProfile::factory()->create(['user_id' => $user->id]);
+        $channel = Channel::factory()->create([
+            'user_id' => $user->id,
+            'business_id' => $business->id,
+            'type' => 'instagram',
+        ]);
+        $conversation = Conversation::factory()->create([
+            'channel_id' => $channel->id,
+            'business_id' => $business->id,
+            'checkout_state' => [
+                'salla_product_id' => 'product-a',
+                'commerce_external_id' => 'product-a',
+                'commerce_channel_id' => 10,
+                'status' => 'completed',
+                'order_id' => 'ORDER-A',
+                'order_fingerprint' => 'old-fingerprint',
+            ],
+        ]);
+
+        $state = app(\App\Services\OrderCheckoutService::class)->extractAndMergeState(
+            $conversation,
+            'I want this one',
+            [
+                'salla_product_id' => 'product-b',
+                'commerce_external_id' => 'product-b',
+                'commerce_channel_id' => 10,
+                'name' => 'Product B',
+                'price' => 20,
+            ]
+        );
+
+        $this->assertSame('product-b', $state['commerce_external_id']);
+        $this->assertArrayNotHasKey('order_id', $state);
+        $this->assertArrayNotHasKey('order_fingerprint', $state);
+        $this->assertArrayNotHasKey('status', $state);
+    }
+
     /** @test */
     public function it_extracts_and_merges_address_without_overwriting_and_creates_order_on_explicit_confirmation()
     {
@@ -52,7 +294,7 @@ class CheckoutOrderFlowTest extends TestCase
         ]);
         try { Redis::del("rate_limit:{$business->id}:{$user->id}"); } catch (\Throwable) {}
 
-        $channel = Channel::factory()->create([
+        $commerceChannel = Channel::factory()->create([
             'user_id' => $user->id,
             'business_id' => $business->id,
             'type' => 'salla',
@@ -61,10 +303,27 @@ class CheckoutOrderFlowTest extends TestCase
             'ai_enabled' => true,
             'ai_enabled' => true,
         ]);
+        $channel = Channel::factory()->create([
+            'user_id' => $user->id,
+            'business_id' => $business->id,
+            'type' => 'instagram',
+            'ai_enabled' => true,
+        ]);
+        $bot = Bot::create([
+            'business_profile_id' => $business->id,
+            'name' => 'Checkout Test Agent',
+            'status' => 'active',
+            'ai_provider' => 'groq',
+            'ecommerce_channel_id' => $commerceChannel->id,
+        ]);
+        $bot->channels()->attach($channel->id, ['is_primary' => true]);
+        $this->seedSallaCity($commerceChannel, 'Giza', 10);
 
         $conversation = Conversation::factory()->create([
             'channel_id' => $channel->id,
             'business_id' => $business->id,
+            'bot_id' => $bot->id,
+            'ecommerce_connection_id' => $commerceChannel->id,
             'sender_id' => '+966501234567',
             'sender_name' => 'Ahmed Ali',
             'ai_enabled' => true,
@@ -75,6 +334,12 @@ class CheckoutOrderFlowTest extends TestCase
                 'product_currency' => 'SAR',
                 'full_name' => 'Ahmed Ali',
                 'phone' => '+966501234567',
+                'email' => 'ahmed@example.com',
+                'postal_code' => '12345',
+                'geo_coordinates' => ['lat' => 24.7136, 'lng' => 46.6753],
+                'building_number' => '36',
+                'short_address' => 'RRAA1234',
+                'additional_number' => '1234',
             ],
         ]);
 
@@ -87,6 +352,7 @@ class CheckoutOrderFlowTest extends TestCase
         ]);
 
         Http::fake([
+            'graph.facebook.com/*' => Http::response(['message_id' => 'meta-summary'], 200),
             'api.groq.com/*' => Http::response([
                 'choices' => [
                     [
@@ -116,6 +382,11 @@ class CheckoutOrderFlowTest extends TestCase
             'api.salla.dev/admin/v2/customers*' => Http::response([
                 'data' => [['id' => 7711, 'mobile' => '966501234567']]
             ], 200),
+            'api.salla.dev/admin/v2/shipping/companies/estimate-rate*' => Http::response(['data' => [[
+                'company_id' => 5,
+                'total' => ['amount' => 20, 'currency' => 'SAR'],
+                'services' => [['name' => 'cod', 'amount' => ['amount' => 0]]],
+            ]]], 200),
             'api.salla.dev/admin/v2/orders' => Http::response([
                 'status' => 200,
                 'data' => ['id' => 889900, 'reference_id' => 'SAL-889900']
@@ -172,7 +443,7 @@ class CheckoutOrderFlowTest extends TestCase
         $user = User::factory()->create();
         $business = BusinessProfile::factory()->create(['user_id' => $user->id, 'ai_provider' => 'groq']);
         try { Redis::del("rate_limit:{$business->id}:{$user->id}"); } catch (\Throwable) {}
-        $channel = Channel::factory()->create([
+        $commerceChannel = Channel::factory()->create([
             'user_id' => $user->id,
             'business_id' => $business->id,
             'type' => 'salla',
@@ -180,6 +451,21 @@ class CheckoutOrderFlowTest extends TestCase
             'access_token' => 'test_token',
             'ai_enabled' => true,
         ]);
+        $channel = Channel::factory()->create([
+            'user_id' => $user->id,
+            'business_id' => $business->id,
+            'type' => 'instagram',
+            'ai_enabled' => true,
+        ]);
+        $bot = Bot::create([
+            'business_profile_id' => $business->id,
+            'name' => 'Checkout Failure Test Agent',
+            'status' => 'active',
+            'ai_provider' => 'groq',
+            'ecommerce_channel_id' => $commerceChannel->id,
+        ]);
+        $bot->channels()->attach($channel->id, ['is_primary' => true]);
+        $this->seedSallaCity($commerceChannel, 'Riyadh', 1);
 
         $sequence = Sequence::create([
             'business_id' => $business->id,
@@ -191,6 +477,8 @@ class CheckoutOrderFlowTest extends TestCase
         $conversation = Conversation::factory()->create([
             'channel_id' => $channel->id,
             'business_id' => $business->id,
+            'bot_id' => $bot->id,
+            'ecommerce_connection_id' => $commerceChannel->id,
             'sender_id' => '+966501234567',
             'sender_name' => 'Sara Mohamed',
             'ai_enabled' => true,
@@ -201,8 +489,16 @@ class CheckoutOrderFlowTest extends TestCase
                 'full_name' => 'Sara Mohamed',
                 'phone' => '+966501234567',
                 'address' => 'Riyadh Al Olaya',
+                'email' => 'sara@example.com',
+                'postal_code' => '12345',
+                'geo_coordinates' => ['lat' => 24.7136, 'lng' => 46.6753],
+                'building_number' => '12',
+                'short_address' => 'RRAA1234',
+                'additional_number' => '1234',
+                'confirmation_state' => 'confirmation_pending',
             ],
         ]);
+        $this->saveSentOrderSummary($conversation);
 
         $msg = Message::create([
             'conversation_id' => $conversation->id,
@@ -212,6 +508,7 @@ class CheckoutOrderFlowTest extends TestCase
         ]);
 
         Http::fake([
+            'graph.facebook.com/*' => Http::response(['message_id' => 'meta-error-summary'], 200),
             'api.groq.com/*' => Http::response([
                 'choices' => [['message' => ['content' => json_encode([
                     'success' => true,
@@ -232,6 +529,11 @@ class CheckoutOrderFlowTest extends TestCase
             'api.salla.dev/admin/v2/customers*' => Http::response([
                 'data' => [['id' => 5544, 'mobile' => '966501234567']]
             ], 200),
+            'api.salla.dev/admin/v2/shipping/companies/estimate-rate*' => Http::response(['data' => [[
+                'company_id' => 5,
+                'total' => ['amount' => 20, 'currency' => 'SAR'],
+                'services' => [['name' => 'cod', 'amount' => ['amount' => 0]]],
+            ]]], 200),
             'api.salla.dev/admin/v2/orders' => Http::response([
                 'status' => 422,
                 'error' => [
@@ -281,6 +583,13 @@ class CheckoutOrderFlowTest extends TestCase
             'access_token' => 'instagram-token',
             'ai_enabled' => true,
         ]);
+        $bot = Bot::create([
+            'business_profile_id' => $business->id,
+            'name' => 'No Store Checkout Test Agent',
+            'status' => 'active',
+            'ai_provider' => 'groq',
+        ]);
+        $bot->channels()->attach($instagramChannel->id, ['is_primary' => true]);
         Channel::factory()->create([
             'user_id' => $user->id,
             'business_id' => $business->id,
@@ -292,6 +601,7 @@ class CheckoutOrderFlowTest extends TestCase
         $conversation = Conversation::factory()->create([
             'channel_id' => $instagramChannel->id,
             'business_id' => $business->id,
+            'bot_id' => $bot->id,
             'sender_id' => 'instagram-customer-123',
             'ai_enabled' => true,
             'checkout_state' => [
@@ -348,7 +658,7 @@ class CheckoutOrderFlowTest extends TestCase
         $user = User::factory()->create();
         $business = BusinessProfile::factory()->create(['user_id' => $user->id, 'ai_provider' => 'groq']);
         try { Redis::del("rate_limit:{$business->id}:{$user->id}"); } catch (\Throwable) {}
-        $channel = Channel::factory()->create([
+        $commerceChannel = Channel::factory()->create([
             'user_id' => $user->id,
             'business_id' => $business->id,
             'type' => 'salla',
@@ -356,10 +666,27 @@ class CheckoutOrderFlowTest extends TestCase
             'access_token' => 'test_token',
             'ai_enabled' => true,
         ]);
+        $channel = Channel::factory()->create([
+            'user_id' => $user->id,
+            'business_id' => $business->id,
+            'type' => 'instagram',
+            'ai_enabled' => true,
+        ]);
+        $bot = Bot::create([
+            'business_profile_id' => $business->id,
+            'name' => 'Checkout Retry Test Agent',
+            'status' => 'active',
+            'ai_provider' => 'groq',
+            'ecommerce_channel_id' => $commerceChannel->id,
+        ]);
+        $bot->channels()->attach($channel->id, ['is_primary' => true]);
+        $this->seedSallaCity($commerceChannel, 'Jeddah', 2);
 
         $conversation = Conversation::factory()->create([
             'channel_id' => $channel->id,
             'business_id' => $business->id,
+            'bot_id' => $bot->id,
+            'ecommerce_connection_id' => $commerceChannel->id,
             'sender_id' => '+966501234567',
             'sender_name' => 'Mazen',
             'ai_enabled' => true,
@@ -370,8 +697,16 @@ class CheckoutOrderFlowTest extends TestCase
                 'full_name' => 'Mazen',
                 'phone' => '+966501234567',
                 'address' => 'Jeddah',
+                'email' => 'mazen@example.com',
+                'postal_code' => '23456',
+                'geo_coordinates' => ['lat' => 21.5433, 'lng' => 39.1728],
+                'building_number' => '7',
+                'short_address' => 'JEDA1234',
+                'additional_number' => '5678',
+                'confirmation_state' => 'confirmation_pending',
             ],
         ]);
+        $this->saveSentOrderSummary($conversation);
 
         $msg1 = Message::create([
             'conversation_id' => $conversation->id,
@@ -381,6 +716,7 @@ class CheckoutOrderFlowTest extends TestCase
         ]);
 
         Http::fake([
+            'graph.facebook.com/*' => Http::response(['message_id' => 'meta-retry-summary'], 200),
             'api.groq.com/*' => Http::sequence()
                 ->push(['choices' => [['message' => ['content' => json_encode([
                     'success' => true,
@@ -409,6 +745,11 @@ class CheckoutOrderFlowTest extends TestCase
             'api.salla.dev/admin/v2/customers*' => Http::response([
                 'data' => [['id' => 3322, 'mobile' => '966501234567']]
             ], 200),
+            'api.salla.dev/admin/v2/shipping/companies/estimate-rate*' => Http::response(['data' => [[
+                'company_id' => 5,
+                'total' => ['amount' => 20, 'currency' => 'SAR'],
+                'services' => [['name' => 'cod', 'amount' => ['amount' => 0]]],
+            ]]], 200),
             'api.salla.dev/admin/v2/orders' => Http::sequence()
                 ->push('Server Error', 500)
                 ->push(['status' => 200, 'data' => ['id' => 991122, 'reference_id' => 'SAL-991122']], 200),
@@ -419,6 +760,11 @@ class CheckoutOrderFlowTest extends TestCase
         $job1->handle();
 
         $conversation->refresh();
+        $this->assertDatabaseHas('handoff_tasks', [
+            'conversation_id' => $conversation->id,
+            'status' => 'open',
+            'reason' => 'salla_order_creation_failed',
+        ]);
         $this->assertNotEquals('completed', $conversation->checkout_state['status'] ?? null);
         $this->assertEmpty($conversation->checkout_state['order_id'] ?? null);
 
@@ -427,6 +773,7 @@ class CheckoutOrderFlowTest extends TestCase
             'content' => 'yes confirm order',
             'direction' => 'inbound',
             'is_ai' => false,
+            'metadata' => ['quoted_message_id' => (string) $conversation->checkout_state['confirmation_summary_message_id']],
         ]);
 
         $job2 = new ProcessAutoReply($msg2->id);
@@ -435,5 +782,9 @@ class CheckoutOrderFlowTest extends TestCase
         $conversation->refresh();
         $this->assertEquals('completed', $conversation->checkout_state['status']);
         $this->assertEquals('SAL-991122', $conversation->checkout_state['order_id']);
+        $this->assertDatabaseHas('handoff_tasks', [
+            'conversation_id' => $conversation->id,
+            'status' => 'resolved',
+        ]);
     }
 }

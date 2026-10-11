@@ -107,8 +107,7 @@ class WooCommerceService
             return $response->json()[0];
         } catch (\Exception $e) {
             Log::error('WooCommerce order lookup failed', [
-                'error' => $e->getMessage(),
-                'phone' => $phone,
+                'exception_type' => get_class($e),
             ]);
             return null;
         }

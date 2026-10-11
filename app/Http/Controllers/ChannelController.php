@@ -4,6 +4,7 @@ namespace App\Http\Controllers;
 
 use App\Models\Channel;
 use App\Services\SallaService;
+use App\Services\OAuthStateService;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\Http;
 use Illuminate\Support\Facades\Log;
@@ -49,8 +50,6 @@ class ChannelController extends Controller
                 'metadata'         => [
                     'scopes'      => $tokenData['scope'] ?? null,
                     'merchant_id' => $merchantId,
-                    'user_info'   => $userInfo,
-                    'store_info'  => $storeInfo,
                 ],
             ];
 
@@ -71,7 +70,6 @@ class ChannelController extends Controller
 
             Log::info('Salla install: unclaimed channel stored, awaiting claim', [
                 'channel_id' => $channel->id,
-                'store_id'   => $storeId,
             ]);
 
             $claimToken = \Illuminate\Support\Facades\Crypt::encryptString(json_encode([
@@ -81,7 +79,7 @@ class ChannelController extends Controller
 
             return redirect($frontend . '/dashboard/channels?salla_claim=' . urlencode($claimToken));
         } catch (\Exception $e) {
-            Log::error('Salla install (no user state) failed', ['message' => $e->getMessage()]);
+            Log::error('Salla install (no user state) failed', ['exception_type' => get_class($e)]);
             return redirect($frontend . '/dashboard/channels?error=salla_oauth_failed');
         }
     }
@@ -149,7 +147,7 @@ class ChannelController extends Controller
 
     public function index(Request $request)
     {
-        $user = $request->user();
+        $business = app(\App\Services\ActiveBusiness::class)->resolve($request, permission: 'read');
 
         // Phase 4 audit: explicit per-channel integration capabilities, so the
         // UI can show what each connection can actually do instead of letting
@@ -170,10 +168,31 @@ class ChannelController extends Controller
             ],
         ];
 
-        $channels = Channel::where('user_id', $user->getAuthIdentifier())
+        $channels = Channel::where('business_id', $business->id)
+            ->with('bots:id,status,business_profile_id')
             ->latest('connected_at')
             ->get()
-            ->map(function ($channel) use ($capabilities) {
+            ->map(function ($channel) use ($capabilities, $business) {
+            $businessBots = $channel->bots->where('business_profile_id', $business->id)->values();
+            $activeBots = $businessBots->where('status', 'active')->values();
+            $primaryBot = $activeBots->first(fn ($bot) => (bool) ($bot->pivot->is_primary ?? false));
+            $resolvedBot = $activeBots->count() === 1
+                ? $activeBots->first()
+                : ($activeBots->count() > 1 ? $primaryBot : null);
+            $noAgentFailClosedEnabled = \App\Models\FeatureFlag::isEnabled('phase3_no_agent_fail_closed', (int) $business->id);
+            $legacyFallbackAllowed = !$noAgentFailClosedEnabled;
+            $routingAvailable = (bool) $resolvedBot || $legacyFallbackAllowed;
+            $effectiveAiEnabled = (bool) $channel->ai_enabled
+                && $channel->status === 'connected'
+                && $routingAvailable;
+            $aiPauseReason = !$channel->ai_enabled
+                ? 'channel_ai_paused'
+                : ($channel->status !== 'connected'
+                    ? 'channel_not_connected'
+                    : (!$routingAvailable
+                        ? ($activeBots->count() > 1 ? 'multiple_active_agents_without_primary' : 'no_active_agent')
+                        : null));
+
             return [
                 'id'                   => $channel->id,
                 'type'                 => $channel->type,
@@ -198,6 +217,8 @@ class ChannelController extends Controller
                         : null,
                 'connected_at'         => $channel->connected_at,
                 'ai_enabled'           => $channel->ai_enabled,
+                'effective_ai_enabled' => $effectiveAiEnabled,
+                'ai_pause_reason'      => $aiPauseReason,
                 'default_ecommerce_connection_id' => $channel->default_ecommerce_connection_id,
                 'integration'          => in_array($channel->type, ['shopify', 'woocommerce'], true) ? [
                     'store_url' => $channel->metadata['store_url'] ?? $channel->page_id,
@@ -226,13 +247,12 @@ class ChannelController extends Controller
 
     public function connectFacebook(Request $request)
     {
-        $token = $request->query('token');
-        $accessToken = \Laravel\Sanctum\PersonalAccessToken::findToken($token);
-        if (!$accessToken) {
-            return redirect(env('FRONTEND_URL') . '/dashboard/channels?error=unauthorized');
-        }
-        $user  = $accessToken->tokenable;
-        $state = $user->id . ':' . $request->query('redirect', 'dashboard');
+        $user = $request->user();
+        abort_unless($user, 401);
+        $business = app(\App\Services\ActiveBusiness::class)->resolve($request, permission: 'write');
+        $state = app(OAuthStateService::class)->issue('facebook', (int) $user->id, [
+            'redirect' => 'dashboard', 'business_id' => $business->id,
+        ]);
 
         $appId       = env('META_APP_ID');
         $redirectUri = env('APP_URL') . '/api/channels/callback/facebook';
@@ -256,28 +276,46 @@ class ChannelController extends Controller
             'state'         => $state,
         ]);
 
-        return redirect($url);
+        return response()->json(['url' => $url]);
     }
 
     public function callbackFacebook(Request $request)
     {
         \Log::info('=== FACEBOOK CALLBACK START ===');
-        \Log::info('All request params', $request->all());
+        \Log::info('OAuth callback received', [
+            'has_code' => $request->filled('code'),
+            'has_state' => $request->filled('state'),
+            'has_provider_error' => $request->filled('error'),
+        ]);
+
+        $stateData = app(OAuthStateService::class)->consume('facebook', $request->query('state'));
+        $userId = $stateData['user_id'] ?? null;
+        if (!$userId || !\App\Models\User::whereKey($userId)->exists()) {
+            return redirect(env('FRONTEND_URL') . '/dashboard/channels?error=facebook_invalid_state');
+        }
+        try {
+            $businessProfile = app(\App\Services\BusinessAccessService::class)->authorize(
+                \App\Models\User::findOrFail($userId),
+                (int) ($stateData['context']['business_id'] ?? 0),
+                'write',
+                hideUnauthorized: false,
+            );
+        } catch (\Throwable) {
+            return redirect(env('FRONTEND_URL') . '/dashboard/channels?error=facebook_invalid_state');
+        }
 
         $code   = $request->get('code');
-        $stateParts = explode(':', $request->get('state') ?? '');
-        $userId = $stateParts[0] ?? null;
         $error  = $request->get('error');
 
-        \Log::info('Parsed params', [
+        \Log::info('Facebook OAuth callback parsed', [
             'code_exists' => !empty($code),
-            'user_id'     => $userId,
-            'error'       => $error,
+            'has_user_id' => !empty($userId),
+            'has_provider_error' => !empty($error),
         ]);
 
         // User denied permissions
         if ($error || !$code) {
-            \Log::error('OAuth denied or no code', ['error' => $error]);
+            \Log::error('OAuth denied or no code', ['has_provider_error' => !empty($error)]);
             return redirect(env('FRONTEND_URL') . '/dashboard/channels?error=facebook_denied');
         }
 
@@ -308,7 +346,7 @@ class ChannelController extends Controller
 
         \Log::info('Token exchange response', [
             'status' => $tokenResponse->status(),
-            'body'   => $tokenResponse->json(),
+            'has_access_token' => !empty($tokenResponse->json()['access_token'] ?? null),
         ]);
 
         if (!$tokenResponse->successful()) {
@@ -323,9 +361,7 @@ class ChannelController extends Controller
             return redirect(env('FRONTEND_URL') . '/dashboard/channels?error=token_failed');
         }
 
-        \Log::info('Got user access token', [
-            'token_preview' => substr($userAccessToken, 0, 20) . '...',
-        ]);
+        \Log::info('Facebook user access token received');
 
         // Step 2: Get pages this user manages (classic personal-admin Pages)
         \Log::info('Fetching user pages...');
@@ -336,7 +372,7 @@ class ChannelController extends Controller
 
         \Log::info('Pages response', [
             'status' => $pagesResponse->status(),
-            'body'   => $pagesResponse->json(),
+            'page_count' => count($pagesResponse->json()['data'] ?? []),
         ]);
 
         $pages = $pagesResponse->json()['data'] ?? [];
@@ -353,7 +389,7 @@ class ChannelController extends Controller
 
             \Log::info('Businesses response', [
                 'status' => $businessesResponse->status(),
-                'body'   => $businessesResponse->json(),
+                'business_count' => count($businessesResponse->json()['data'] ?? []),
             ]);
 
             $businesses = $businessesResponse->json()['data'] ?? [];
@@ -365,10 +401,8 @@ class ChannelController extends Controller
                 ]);
 
                 \Log::info('Owned pages response', [
-                    'business_id' => $business['id'],
-                    'business_name' => $business['name'] ?? null,
                     'status'      => $ownedPagesResponse->status(),
-                    'body'        => $ownedPagesResponse->json(),
+                    'page_count'  => count($ownedPagesResponse->json()['data'] ?? []),
                 ]);
 
                 $ownedPages = $ownedPagesResponse->json()['data'] ?? [];
@@ -378,7 +412,6 @@ class ChannelController extends Controller
 
         \Log::info('Pages found', [
             'count' => count($pages),
-            'pages' => array_map(fn($p) => ['id' => $p['id'], 'name' => $p['name']], $pages),
         ]);
 
         if (empty($pages)) {
@@ -392,7 +425,7 @@ class ChannelController extends Controller
             $pageName        = $page['name'];
             $pageAccessToken = $page['access_token'];
 
-            \Log::info('Processing page', ['id' => $pageId, 'name' => $pageName]);
+            \Log::info('Processing Facebook page connection');
 
             // Exchange short-lived page token for long-lived token
             $longLivedResponse = Http::get('https://graph.facebook.com/v19.0/oauth/access_token', [
@@ -407,8 +440,6 @@ class ChannelController extends Controller
                 : $pageAccessToken;
 
             // Step 3: Save Facebook channel with encrypted token
-            $businessProfile = \App\Models\BusinessProfile::where('user_id', $userId)->first();
-
             $channel = Channel::updateOrCreate(
                 [
                     'user_id' => $userId,
@@ -461,9 +492,14 @@ class ChannelController extends Controller
                     ->update(['page_id' => $pageId]);
             }
 
-            // Step 5: Subscribe page to webhook — include Instagram fields
+            // Subscribe to supported Facebook and Instagram webhook fields.
+            // `instagram_manage_messages` is a permission, not a webhook field.
+            $subscribedFields = 'messages,messaging_postbacks,message_echoes,message_reads,feed,comments';
+            if ($igAccountId) {
+                $subscribedFields .= ',messaging_seen';
+            }
             Http::post("https://graph.facebook.com/v19.0/{$pageId}/subscribed_apps", [
-                'subscribed_fields' => 'messages,messaging_postbacks,message_echoes,instagram_manage_messages,feed,comments',
+                'subscribed_fields' => $subscribedFields,
                 'access_token'      => $longLivedToken,
             ]);
 
@@ -481,10 +517,11 @@ class ChannelController extends Controller
         return redirect(env('FRONTEND_URL') . '/dashboard/channels?success=facebook_connected');
     }
 
-    public function disconnect($id)
+    public function disconnect(Request $request, $id)
     {
+        $business = app(\App\Services\ActiveBusiness::class)->resolve($request, permission: 'write');
         $channel = Channel::where('id', $id)
-            ->where('user_id', auth()->id())
+            ->where('business_id', $business->id)
             ->firstOrFail();
 
         $channel->delete();
@@ -494,14 +531,37 @@ class ChannelController extends Controller
 
     public function update(Request $request, $id)
     {
+        $business = app(\App\Services\ActiveBusiness::class)->resolve($request, permission: 'write');
         $channel = Channel::where('id', $id)
-            ->where('user_id', auth()->id())
+            ->where('business_id', $business->id)
             ->firstOrFail();
 
         $validated = $request->validate([
             'ai_enabled' => 'boolean',
             'default_ecommerce_connection_id' => 'nullable|integer',
         ]);
+
+        if ($channel->type === 'tiktok' && ($validated['ai_enabled'] ?? false)) {
+            return response()->json([
+                'message' => 'TikTok messaging is unsupported; automated replies cannot be enabled for this channel.',
+            ], 422);
+        }
+
+        if (
+            array_key_exists('ai_enabled', $validated)
+            && $request->boolean('ai_enabled')
+            && \App\Models\FeatureFlag::isEnabled('phase3_setup_verification_required', (int) $business->id)
+        ) {
+            $readiness = app(\App\Services\AiSetupVerificationService::class)->checklist($business);
+            if (!$readiness['ready']) {
+                return response()->json([
+                    'message' => 'Complete the AI setup checklist before enabling replies.',
+                    'ready' => false,
+                    'checks' => $readiness['checks'],
+                    'missing' => $readiness['missing'],
+                ], 422);
+            }
+        }
 
         if (array_key_exists('default_ecommerce_connection_id', $validated) && $validated['default_ecommerce_connection_id'] !== null) {
             $connection = Channel::query()
@@ -526,25 +586,22 @@ class ChannelController extends Controller
      */
     public function connectSalla(Request $request)
     {
-        $token = $request->query('token');
-        $accessToken = \Laravel\Sanctum\PersonalAccessToken::findToken($token);
-        
-        if (!$accessToken) {
-            return redirect(env('FRONTEND_URL') . '/dashboard/channels?error=unauthorized');
-        }
-        
-        $user = $accessToken->tokenable;
-        $state = $user->id . ':' . $request->query('redirect', 'dashboard');
+        $user = $request->user();
+        abort_unless($user, 401);
+        $business = app(\App\Services\ActiveBusiness::class)->resolve($request, permission: 'write');
+        $state = app(OAuthStateService::class)->issue('salla', (int) $user->id, [
+            'redirect' => 'dashboard', 'business_id' => $business->id,
+        ]);
 
         $sallaService = new SallaService();
         
         try {
             $authUrl = $sallaService->getAuthorizationUrl($state);
-            return redirect($authUrl);
+            return response()->json(['url' => $authUrl]);
         } catch (\Exception $e) {
             Log::error('Salla connect error', [
                 'user_id' => $user->id,
-                'error' => $e->getMessage(),
+                'exception_type' => get_class($e),
             ]);
             return redirect(env('FRONTEND_URL') . '/dashboard/channels?error=salla_config_error');
         }
@@ -556,32 +613,49 @@ class ChannelController extends Controller
     public function callbackSalla(Request $request)
     {
         Log::info('=== SALLA CALLBACK START ===');
-        Log::info('Request params', $request->except(['code']));
+        Log::info('Salla OAuth callback received', [
+            'has_code' => $request->filled('code'),
+            'has_state' => $request->filled('state'),
+            'has_provider_error' => $request->filled('error'),
+        ]);
 
         $code  = $request->get('code');
-        $state = $request->get('state');
+        $state = (string) $request->get('state', '');
+        $stateData = $state !== '' ? app(OAuthStateService::class)->consume('salla', $state) : null;
         $error = $request->get('error');
 
+        // Salla's Easy Mode supplies its own opaque state. Preserve that
+        // unclaimed-install flow, but never reinterpret an expired or forged
+        // NazBiz state (or the old user-id state format) as an Easy Mode install.
+        if (!$stateData && ($state === '' || str_starts_with($state, 'naz_') || preg_match('/^\d+:/', $state))) {
+            if ($state !== '') {
+                return redirect(env('FRONTEND_URL') . '/dashboard/channels?error=salla_invalid_state');
+            }
+        }
+
         if ($error || !$code) {
-            Log::error('Salla OAuth denied or no code', ['error' => $error]);
+            Log::error('Salla OAuth denied or no code', ['has_provider_error' => !empty($error)]);
             return redirect(env('FRONTEND_URL') . '/dashboard/channels?error=salla_denied');
         }
 
-        // State carries "userId:redirect" for normal OAuth flow
-        // For Salla Easy Mode (app installation), state is random
-        $userId   = null;
-        $redirect = 'dashboard';
-        if ($state) {
-            $parts    = explode(':', $state, 2);
-            $userId   = $parts[0] ?? null;
-            $redirect = $parts[1] ?? 'dashboard';
-        }
+        $userId = $stateData['user_id'] ?? null;
 
         // If no valid user ID in state, this is likely Salla Easy Mode installation
         // Redirect to frontend dashboard (authentication middleware will handle redirect to login if needed)
         if (!$userId || !is_numeric($userId)) {
             Log::warning('No valid user ID in Salla OAuth state - Salla-initiated install, exchanging code and issuing claim token');
             return $this->handleSallaInstallWithoutUser($code);
+        }
+
+        try {
+            $businessProfile = app(\App\Services\BusinessAccessService::class)->authorize(
+                \App\Models\User::findOrFail($userId),
+                (int) ($stateData['context']['business_id'] ?? 0),
+                'write',
+                hideUnauthorized: false,
+            );
+        } catch (\Throwable) {
+            return redirect(env('FRONTEND_URL') . '/dashboard/channels?error=salla_invalid_state');
         }
 
         try {
@@ -599,9 +673,9 @@ class ChannelController extends Controller
             $merchantId = (string) ($userInfo['merchant']['id'] ?? $userInfo['id'] ?? '');
 
             Log::info('Salla user info received', [
-                'user_id'     => $userInfo['id'] ?? null,
-                'merchant_id' => $merchantId,
-                'email'       => $userInfo['email'] ?? null,
+                'has_user_id' => !empty($userInfo['id']),
+                'has_merchant_id' => $merchantId !== '',
+                'has_email' => !empty($userInfo['email']),
             ]);
 
             // 2b. Fetch store details from the Admin API (name, domain, etc.)
@@ -611,13 +685,11 @@ class ChannelController extends Controller
 
             if (empty($storeId)) {
                 Log::error('Salla callback: could not resolve store/merchant ID', [
-                    'user_info'  => $userInfo,
-                    'store_info' => $storeInfo,
+                    'user_info_keys' => array_keys($userInfo),
+                    'store_info_keys' => array_keys($storeInfo),
                 ]);
                 return redirect(env('FRONTEND_URL') . '/dashboard/channels?error=store_info_failed');
             }
-
-            $businessProfile = \App\Models\BusinessProfile::where('user_id', $userId)->first();
 
             // 3. Check for an orphaned placeholder created by app.installed webhook
             $existing = Channel::where('type', 'salla')
@@ -642,8 +714,6 @@ class ChannelController extends Controller
                     'metadata'         => array_merge($existing->metadata ?? [], [
                         'scopes'      => $tokenData['scope'] ?? null,
                         'merchant_id' => $merchantId,
-                        'user_info'   => $userInfo,
-                        'store_info'  => $storeInfo,
                     ]),
                 ]);
                 $channel = $existing->fresh();
@@ -666,8 +736,6 @@ class ChannelController extends Controller
                         'metadata'         => [
                         'scopes'      => $tokenData['scope'] ?? null,
                         'merchant_id' => $merchantId,
-                        'user_info'   => $userInfo,
-                        'store_info'  => $storeInfo,
                     ],
                 ]
                 );
@@ -675,9 +743,6 @@ class ChannelController extends Controller
 
             Log::info('Salla channel saved', [
                 'channel_id' => $channel->id,
-                'store_name' => $storeName,
-                'store_id'   => $storeId,
-                'user_id'    => $userId,
             ]);
 
             $this->subscribeSallaWebhooks($channel, $accessToken);
@@ -686,8 +751,7 @@ class ChannelController extends Controller
 
         } catch (\Exception $e) {
             Log::error('Salla OAuth callback error', [
-                'message' => $e->getMessage(),
-                'trace'   => $e->getTraceAsString(),
+                'exception_type' => get_class($e),
             ]);
             return redirect(env('FRONTEND_URL') . '/dashboard/channels?error=salla_oauth_failed');
         }

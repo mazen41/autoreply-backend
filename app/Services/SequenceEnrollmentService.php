@@ -11,15 +11,13 @@ use App\Jobs\ExecuteSequenceStep;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Log;
 use Illuminate\Database\QueryException;
+use Illuminate\Validation\ValidationException;
 
 class SequenceEnrollmentService
 {
     public function enrollConversation(Sequence $sequence, Conversation $conversation, int $startStep = 1, array $extraMetadata = []): SequenceEnrollment
     {
-        // Enforce business isolation: conversation must belong to the same business as the sequence
-        if ($conversation->business_id !== $sequence->business_id) {
-            throw new \Exception('Conversation does not belong to the same business as the sequence');
-        }
+        $this->assertEnrollmentAllowed($sequence, $conversation);
 
         // Check for duplicate active enrollment
         $existingEnrollment = SequenceEnrollment::forSequence($sequence->id)
@@ -74,6 +72,8 @@ class SequenceEnrollmentService
 
     public function enrollConversationWithoutDuplicateCheck(Sequence $sequence, Conversation $conversation, int $startStep = 1): SequenceEnrollment
     {
+        $this->assertEnrollmentAllowed($sequence, $conversation);
+
         try {
             $enrollment = DB::transaction(function () use ($sequence, $conversation, $startStep) {
                 $enrollment = SequenceEnrollment::create([
@@ -160,7 +160,7 @@ class SequenceEnrollmentService
             }
         }
 
-        return $query->with(['conversation', 'sequence'])
+        return $query->with(['conversation.channel', 'sequence'])
             ->orderBy('created_at', 'desc')
             ->get();
     }
@@ -235,30 +235,45 @@ class SequenceEnrollmentService
         }
 
         $scheduledAt = now();
-        $executionKey = SequenceStepExecution::generateKey($enrollment->id, $currentStep->id, $scheduledAt->toDateTimeString());
 
-        // Idempotent: if a record with this key already exists, skip creation
-        $existing = SequenceStepExecution::where('execution_key', $executionKey)->first();
-        if ($existing) {
-            $enrollment->_pendingExecutionId = $existing->id;
+        // A pending execution for the current step is the same dispatch even
+        // when a duplicate scheduler runs in a later second. Lock the
+        // enrollment around lookup+create so concurrent dispatchers cannot
+        // create two visits for one pending step.
+        [$execution, $created] = DB::transaction(function () use ($enrollment, $currentStep, $scheduledAt) {
+            SequenceEnrollment::query()->whereKey($enrollment->id)->lockForUpdate()->first();
+            $existing = SequenceStepExecution::query()
+                ->where('sequence_enrollment_id', $enrollment->id)
+                ->where('sequence_step_id', $currentStep->id)
+                ->where('status', 'pending')
+                ->orderBy('id')
+                ->first();
+
+            if ($existing) {
+                return [$existing, false];
+            }
+
+            return [SequenceStepExecution::createForEnrollment($enrollment, $currentStep, $scheduledAt), true];
+        });
+
+        if ($execution && !$created) {
+            $enrollment->_pendingExecutionId = $execution->id;
             return;
         }
-
-        $execution = SequenceStepExecution::create([
-            'sequence_id' => $enrollment->sequence_id,
-            'sequence_enrollment_id' => $enrollment->id,
-            'sequence_step_id' => $currentStep->id,
-            'execution_key' => $executionKey,
-            'status' => 'pending',
-            'scheduled_at' => $scheduledAt,
-        ]);
+        if (!$execution) {
+            Log::warning('Sequence enrollment stopped by the per-enrollment execution cap', [
+                'enrollment_id' => $enrollment->id,
+                'step_id' => $currentStep->id,
+            ]);
+            return;
+        }
 
         Log::info("QueueStepExecution: Created execution record", [
             'execution_id' => $execution->id,
             'enrollment_id' => $enrollment->id,
             'step_id' => $currentStep->id,
             'step_type' => $currentStep->step_type,
-            'execution_key' => $executionKey,
+            'execution_key' => $execution->execution_key,
         ]);
 
         $enrollment->scheduleNextExecution(0);
@@ -300,6 +315,18 @@ class SequenceEnrollmentService
             return false;
         }
 
+        $takeoverGuardEnabled = \App\Models\FeatureFlag::isEnabled(
+            'phase5_sequence_takeover_guard',
+            (int) $sequence->business_id,
+        );
+        if ((int) $conversation->business_id !== (int) $sequence->business_id || ($takeoverGuardEnabled && $conversation->requires_human)) {
+            return false;
+        }
+
+        if (!app(ConsentGate::class)->checkConversation($conversation, 'marketing')->allowed) {
+            return false;
+        }
+
         // Check if sequence has steps
         if ($sequence->steps()->count() === 0) {
             return false;
@@ -316,6 +343,25 @@ class SequenceEnrollmentService
         }
 
         return true;
+    }
+
+    private function assertEnrollmentAllowed(Sequence $sequence, Conversation $conversation): void
+    {
+        if ((int) $conversation->business_id !== (int) $sequence->business_id) {
+            throw ValidationException::withMessages(['conversation_id' => 'Conversation does not belong to this sequence business.']);
+        }
+
+        if ($conversation->requires_human && \App\Models\FeatureFlag::isEnabled(
+            'phase5_sequence_takeover_guard',
+            (int) $sequence->business_id,
+        )) {
+            throw ValidationException::withMessages(['conversation_id' => 'Sequence enrollment is blocked while a human agent owns this conversation.']);
+        }
+
+        $consent = app(ConsentGate::class)->checkConversation($conversation, 'marketing');
+        if (!$consent->allowed) {
+            throw ValidationException::withMessages(['consent' => 'Sequence enrollment blocked: ' . $consent->reason . '.']);
+        }
     }
 
     public function getEnrollmentStatsForSequence(Sequence $sequence): array

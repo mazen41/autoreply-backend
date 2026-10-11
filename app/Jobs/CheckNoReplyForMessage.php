@@ -6,6 +6,7 @@ use App\Models\Conversation;
 use App\Models\Message;
 use App\Models\Sequence;
 use App\Models\SequenceEnrollment;
+use App\Services\ConsentGate;
 use App\Services\SequenceEnrollmentService;
 use Illuminate\Bus\Queueable;
 use Illuminate\Contracts\Queue\ShouldQueue;
@@ -94,25 +95,78 @@ class CheckNoReplyForMessage implements ShouldQueue
             return;
         }
 
-        // --- Guard: cycle check — did a new cycle start since dispatch? ---
-        // A new cycle means: customer replied → AI replied again → new job
-        // dispatched with expectedCycle+1. The current job is stale.
-        $currentCycle = SequenceEnrollment::where('sequence_id', $this->sequenceId)
-            ->where('conversation_id', $this->conversationId)
-            ->max('no_reply_cycle') ?? 0;
+        if ($aiReply->direction !== 'outbound') {
+            return;
+        }
 
-        if ($currentCycle > $this->expectedCycle) {
-            Log::info('CheckNoReplyForMessage: newer cycle exists — stale timer, skipping', [
-                'sequence_id'    => $this->sequenceId,
+        $consent = app(ConsentGate::class)->checkConversation($conversation, 'marketing');
+
+        if (!$consent->allowed) {
+            DB::table('sequence_no_reply_cycles')
+                ->where('sequence_id', $this->sequenceId)
+                ->where('conversation_id', $this->conversationId)
+                ->where('cycle', $this->expectedCycle)
+                ->where('ai_reply_message_id', $this->aiReplyMessageId)
+                ->whereNull('processed_at')
+                ->update(['processed_at' => now(), 'updated_at' => now()]);
+
+            Log::info('CheckNoReplyForMessage: marketing consent blocked no-reply enrollment', [
+                'sequence_id' => $this->sequenceId,
                 'conversation_id' => $this->conversationId,
-                'expected_cycle' => $this->expectedCycle,
-                'current_cycle'  => $currentCycle,
+                'reason' => $consent->reason,
             ]);
             return;
         }
 
-        // --- All guards passed: enroll ---
+        if ($conversation->requires_human) {
+            DB::table('sequence_no_reply_cycles')
+                ->where('sequence_id', $this->sequenceId)
+                ->where('conversation_id', $this->conversationId)
+                ->where('cycle', $this->expectedCycle)
+                ->where('ai_reply_message_id', $this->aiReplyMessageId)
+                ->whereNull('processed_at')
+                ->update(['processed_at' => now(), 'updated_at' => now()]);
+            Log::info('CheckNoReplyForMessage: human-owned conversation blocked no-reply enrollment', [
+                'sequence_id' => $this->sequenceId,
+                'conversation_id' => $this->conversationId,
+            ]);
+            return;
+        }
+
+        // Claim the current timer and create the enrollment atomically. The
+        // persisted cycle exists at dispatch time and the processed_at gate
+        // makes duplicate queue deliveries idempotent.
         DB::transaction(function () use ($sequence, $conversation, $enrollmentService) {
+            $cycleState = DB::table('sequence_no_reply_cycles')
+                ->where('sequence_id', $this->sequenceId)
+                ->where('conversation_id', $this->conversationId)
+                ->lockForUpdate()
+                ->first();
+
+            if (!$cycleState
+                || (int) $cycleState->cycle !== $this->expectedCycle
+                || (int) $cycleState->ai_reply_message_id !== $this->aiReplyMessageId
+                || $cycleState->processed_at !== null) {
+                Log::info('CheckNoReplyForMessage: stale or already processed timer skipped', [
+                    'sequence_id' => $this->sequenceId,
+                    'conversation_id' => $this->conversationId,
+                    'expected_cycle' => $this->expectedCycle,
+                    'current_cycle' => $cycleState->cycle ?? null,
+                ]);
+                return;
+            }
+
+            $customerReplied = Message::where('conversation_id', $this->conversationId)
+                ->where('direction', 'inbound')
+                ->where('id', '>', $this->aiReplyMessageId)
+                ->exists();
+            if ($customerReplied) {
+                return;
+            }
+
+            DB::table('sequence_no_reply_cycles')
+                ->where('id', $cycleState->id)
+                ->update(['processed_at' => now(), 'updated_at' => now()]);
 
             // Stop any existing active enrollment for this sequence+conversation
             // (from a previous cycle that completed or is still running).
@@ -122,12 +176,12 @@ class CheckNoReplyForMessage implements ShouldQueue
                 ->first();
 
             if ($existing) {
-                $existing->stop('new_no_reply_cycle');
+                $enrollmentService->unenrollConversation($existing, 'new_no_reply_cycle');
             }
 
             // Check allow_reentry for non-active past enrollments.
             $settings     = $sequence->settings ?? [];
-            $allowReentry = $settings['allow_reentry'] ?? true; // no_reply defaults to allow reentry
+            $allowReentry = $settings['allow_reentry'] ?? false;
 
             if (!$allowReentry) {
                 $pastEnrollment = SequenceEnrollment::where('sequence_id', $this->sequenceId)
@@ -170,7 +224,8 @@ class CheckNoReplyForMessage implements ShouldQueue
             ]);
 
             // Kick off the first step immediately via the existing execution service.
-            $enrollmentService->queueStepExecution($enrollment);
+            $enrollmentService->createStepExecutionRecord($enrollment);
+            DB::afterCommit(fn () => $enrollmentService->dispatchStepExecution($enrollment));
         });
     }
 
@@ -180,7 +235,7 @@ class CheckNoReplyForMessage implements ShouldQueue
             'sequence_id'     => $this->sequenceId,
             'conversation_id' => $this->conversationId,
             'ai_reply_id'     => $this->aiReplyMessageId,
-            'error'           => $e->getMessage(),
+            'exception_type'  => get_class($e),
         ]);
     }
 }

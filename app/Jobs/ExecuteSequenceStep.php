@@ -21,12 +21,16 @@ class ExecuteSequenceStep implements ShouldQueue
 {
     use Dispatchable, InteractsWithQueue, Queueable, SerializesModels;
 
-    public $tries = 3;
+    public $tries = 10;
+    public $maxExceptions = 3;
     public $backoff = [30, 60, 120];
     public $timeout = 120;
 
     // Delete the job after max retries to prevent infinite retry loops
     public $deleteAfterMissing = true;
+
+    private const LOCK_TTL_SECONDS = 180;
+    private const PROCESSING_STALE_AFTER_SECONDS = 180;
 
     public function __construct(
         public int $executionId
@@ -50,11 +54,42 @@ class ExecuteSequenceStep implements ShouldQueue
             ]);
             return;
         }
+        if ($execution->status === 'skipped') {
+            return;
+        }
+
+        // A live processing record is probably owned by another worker. The
+        // execution lock expires if a worker dies, so reclaim only after the
+        // worker timeout has elapsed; otherwise release this duplicate job.
+        if ($execution->status === 'processing' && $execution->updated_at?->gt(now()->subSeconds(self::PROCESSING_STALE_AFTER_SECONDS))) {
+            $this->release(15);
+            return;
+        }
 
         $enrollment = $execution->enrollment;
 
+        if ($enrollment?->sequence && (
+            $enrollment->sequence->status === 'paused'
+            || app(\App\Services\AutomationRunControl::class)->releaseIfPaused($this, (int) $enrollment->sequence->business_id)
+        )) {
+            if ($enrollment->sequence->status === 'paused') {
+                $this->release(60);
+            }
+            return;
+        }
+
         if (!$enrollment || !$enrollment->canContinue()) {
             $execution->markAsSkipped('enrollment_not_active');
+            return;
+        }
+
+        $conversation = $enrollment->conversation;
+        if (
+            $conversation?->requires_human === true
+            && \App\Models\FeatureFlag::isEnabled('phase5_sequence_takeover_guard', (int) $conversation->business_id)
+        ) {
+            $execution->markAsSkipped('human_takeover');
+            $enrollment->stop('human_takeover');
             return;
         }
 
@@ -69,7 +104,7 @@ class ExecuteSequenceStep implements ShouldQueue
 
         // Concurrency lock: prevent multiple workers from executing the same step simultaneously
         $lockKey = "sequence_step_execution:{$enrollment->id}:{$step->id}";
-        $lock = Cache::lock($lockKey, 60); // 60 second lock
+        $lock = Cache::lock($lockKey, self::LOCK_TTL_SECONDS);
 
         if (!$lock->get()) {
             Log::warning("Sequence step execution already in progress, skipping", [
@@ -77,12 +112,16 @@ class ExecuteSequenceStep implements ShouldQueue
                 'enrollment_id' => $enrollment->id,
                 'step_id' => $step->id,
             ]);
+            $this->release(15);
             return;
         }
 
         try {
             // Mark as processing
             $execution->status = 'processing';
+            $execution->metadata = array_merge($execution->metadata ?? [], [
+                'processing_started_at' => now()->toIso8601String(),
+            ]);
             $execution->save();
 
             // Execute the step - external provider calls happen inside but should be safe now
@@ -90,6 +129,10 @@ class ExecuteSequenceStep implements ShouldQueue
             $executionService->executeStep($execution, $enrollment, $step);
 
         } catch (\Exception $e) {
+            if ($e instanceof \App\Exceptions\AutomationPausedException) {
+                $this->release(60);
+                return;
+            }
             $execution->markAsFailed($e->getMessage());
             // Do NOT fail the enrollment here — let the job retry first.
             // Enrollment is only failed in failed() after all retries exhausted.
@@ -97,7 +140,7 @@ class ExecuteSequenceStep implements ShouldQueue
                 'execution_id' => $execution->id,
                 'enrollment_id' => $enrollment->id,
                 'step_id' => $step->id,
-                'error' => $e->getMessage(),
+                'exception_type' => get_class($e),
             ]);
             throw $e;
         } finally {
@@ -124,7 +167,7 @@ class ExecuteSequenceStep implements ShouldQueue
             'execution_id' => $this->executionId,
             'attempts' => $this->attempts(),
             'max_tries' => $this->tries,
-            'error' => $exception->getMessage(),
+            'exception_type' => get_class($exception),
         ]);
     }
 }

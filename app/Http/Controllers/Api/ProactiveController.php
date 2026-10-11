@@ -11,6 +11,7 @@ use Illuminate\Support\Facades\Auth;
 use Illuminate\Support\Facades\Log;
 use Illuminate\Support\Facades\Bus;
 use App\Jobs\SendProactiveMessage;
+use App\Services\ConsentGate;
 
 class ProactiveController extends Controller
 {
@@ -92,11 +93,12 @@ class ProactiveController extends Controller
             return response()->json(['error' => 'Campaign already sent'], 400);
         }
 
-        // Update campaign status
-        $campaign->update(['status' => 'in_progress']);
-
         // Get target audience
         $targetAudience = $this->calculateTargetAudience($user, $campaign->segment_config);
+
+        if ($targetAudience->isEmpty()) {
+            return response()->json(['error' => 'No eligible recipients have marketing consent for this campaign.'], 400);
+        }
 
         // Dispatch jobs for each recipient
         $jobs = [];
@@ -220,7 +222,23 @@ class ProactiveController extends Controller
             }, '<=', $segmentConfig['message_count_max']);
         }
 
-        return $query->get();
+        return $query->with('channel')->get()->filter(function (Conversation $conversation) {
+            $channel = $conversation->channel;
+            if (!$channel) {
+                return false;
+            }
+
+            $contact = $channel->type === 'gmail'
+                ? ($conversation->sender_email ?? '')
+                : ($conversation->sender_id ?? '');
+
+            return app(ConsentGate::class)->check(
+                $conversation->business_id,
+                $contact,
+                $channel->type,
+                'marketing'
+            )->allowed;
+        })->values();
     }
 
     /**

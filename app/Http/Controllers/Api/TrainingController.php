@@ -17,11 +17,11 @@ class TrainingController extends Controller
      */
     public function getCorrections(Request $request)
     {
-        $user = Auth::user();
+        $business = app(\App\Services\ActiveBusiness::class)->resolve($request, permission: 'read');
         
         $corrections = MessageCorrection::with(['originalMessage.conversation', 'approvedBy'])
-            ->whereHas('originalMessage.conversation.channel', function ($query) use ($user) {
-                $query->where('user_id', $user->id);
+            ->whereHas('originalMessage.conversation', function ($query) use ($business) {
+                $query->where('business_id', $business->id);
             })
             ->orderBy('created_at', 'desc')
             ->get();
@@ -39,15 +39,13 @@ class TrainingController extends Controller
     public function approveCorrection(Request $request, $id)
     {
         $user = Auth::user();
-        $correction = MessageCorrection::with('originalMessage.conversation.channel')->find($id);
+        $business = app(\App\Services\ActiveBusiness::class)->resolve($request, permission: 'write');
+        $correction = MessageCorrection::with('originalMessage.conversation.channel')
+            ->whereHas('originalMessage.conversation', fn ($query) => $query->where('business_id', $business->id))
+            ->find($id);
 
         if (!$correction) {
             return response()->json(['error' => 'Correction not found'], 404);
-        }
-
-        // Verify ownership
-        if ($correction->originalMessage->conversation->channel->user_id !== $user->id) {
-            return response()->json(['error' => 'Unauthorized'], 403);
         }
 
         $correction->update([
@@ -76,16 +74,13 @@ class TrainingController extends Controller
      */
     public function rejectCorrection(Request $request, $id)
     {
-        $user = Auth::user();
-        $correction = MessageCorrection::with('originalMessage.conversation.channel')->find($id);
+        $business = app(\App\Services\ActiveBusiness::class)->resolve($request, permission: 'write');
+        $correction = MessageCorrection::with('originalMessage.conversation.channel')
+            ->whereHas('originalMessage.conversation', fn ($query) => $query->where('business_id', $business->id))
+            ->find($id);
 
         if (!$correction) {
             return response()->json(['error' => 'Correction not found'], 404);
-        }
-
-        // Verify ownership
-        if ($correction->originalMessage->conversation->channel->user_id !== $user->id) {
-            return response()->json(['error' => 'Unauthorized'], 403);
         }
 
         $correction->delete();
@@ -99,6 +94,7 @@ class TrainingController extends Controller
     public function createCorrection(Request $request)
     {
         $user = Auth::user();
+        $business = app(\App\Services\ActiveBusiness::class)->resolve($request, permission: 'write');
         
         $validated = $request->validate([
             'original_message_id' => 'required|exists:messages,id',
@@ -108,10 +104,9 @@ class TrainingController extends Controller
         ]);
 
         // Verify ownership
-        $originalMessage = \App\Models\Message::with('conversation.channel')->find($validated['original_message_id']);
-        if (!$originalMessage || $originalMessage->conversation->channel->user_id !== $user->id) {
-            return response()->json(['error' => 'Unauthorized'], 403);
-        }
+        $originalMessage = \App\Models\Message::with('conversation.channel')
+            ->whereHas('conversation', fn ($query) => $query->where('business_id', $business->id))
+            ->findOrFail($validated['original_message_id']);
 
         $correction = MessageCorrection::create([
             'original_message_id' => $validated['original_message_id'],
@@ -235,13 +230,12 @@ class TrainingController extends Controller
     {
         $validated = $request->validate([
             'preset'      => 'sometimes|string|in:today,last_7_days,this_month,last_30_days,all_time',
-            'business_id' => 'sometimes|nullable|integer',
         ]);
 
         $preset = $validated['preset'] ?? 'last_30_days';
-        $businessId = $validated['business_id'] ?? null;
+        $business = app(\App\Services\ActiveBusiness::class)->resolve($request, permission: 'read');
 
-        $stats = app(TrainingStatsService::class)->statistics($preset, $businessId);
+        $stats = app(TrainingStatsService::class)->statistics((int) $business->id, $preset);
 
         return response()->json($stats, 200, [], JSON_PRESERVE_ZERO_FRACTION);
     }

@@ -51,12 +51,23 @@ class SendDueEmailCampaigns extends Command
 
                 $campaign->update(['status' => 'sending', 'sent_at' => now()]);
 
-                foreach ($campaign->recipients()->where('status', 'pending')->pluck('id') as $recipientId) {
-                    SendEmailCampaignMessage::dispatch($recipientId);
-                }
+                $recipientIds = $campaign->recipients()
+                    ->where('status', 'pending')
+                    ->pluck('id')
+                    ->all();
+                $campaignId = $campaign->id;
 
-                Log::info('Scheduled email campaign dispatched', ['campaign_id' => $campaign->id]);
-                $this->info("Dispatched campaign #{$campaign->id}");
+                // Queue drivers are not configured for after-commit dispatch in
+                // every environment. Register explicitly so workers cannot
+                // process recipient jobs before the campaign transaction commits.
+                DB::afterCommit(function () use ($recipientIds, $campaignId) {
+                    foreach ($recipientIds as $recipientId) {
+                        SendEmailCampaignMessage::dispatch($recipientId);
+                    }
+
+                    Log::info('Scheduled email campaign dispatched', ['campaign_id' => $campaignId]);
+                    $this->info("Dispatched campaign #{$campaignId}");
+                });
             });
         }
 

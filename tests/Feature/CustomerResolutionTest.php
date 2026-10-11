@@ -18,6 +18,7 @@ use Illuminate\Foundation\Testing\RefreshDatabase;
 use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\Http;
 use Illuminate\Support\Facades\Queue;
+use Illuminate\Support\Facades\Storage;
 use Tests\TestCase;
 
 /**
@@ -226,6 +227,48 @@ class CustomerResolutionTest extends TestCase
         $this->assertSame(1, Conversation::where('sender_id', 'ig-sender-888')->count());
     }
 
+    public function test_instagram_attachment_is_downloaded_and_saved_privately(): void
+    {
+        config(['services.meta.app_secret' => 'test-meta-secret']);
+        config(['services.evolution.incoming_media_disk' => 'private_media']);
+        Storage::fake('private_media');
+        Http::fake(['lookaside.fbsbx.com/*' => Http::response('private-meta-image', 200, ['Content-Type' => 'image/jpeg'])]);
+        Queue::fake();
+
+        $fixture = $this->makeBusiness();
+        $this->makeChannel($fixture, 'instagram', ['page_id' => '17841400000000999']);
+        $payload = [
+            'object' => 'instagram',
+            'entry' => [[
+                'id' => '17841400000000999',
+                'messaging' => [[
+                    'sender' => ['id' => 'ig-media-sender'],
+                    'recipient' => ['id' => '17841400000000999'],
+                    'message' => [
+                        'mid' => 'ig-media-' . uniqid(),
+                        'attachments' => [[
+                            'type' => 'image',
+                            'payload' => ['url' => 'https://lookaside.fbsbx.com/media/image.jpg'],
+                        ]],
+                    ],
+                ]],
+            ]],
+        ];
+        $body = json_encode($payload);
+        $signature = 'sha256=' . hash_hmac('sha256', $body, 'test-meta-secret');
+
+        $this->call('POST', '/api/webhook/meta', [], [], [], [
+            'HTTP_X-HUB-SIGNATURE-256' => $signature,
+            'CONTENT_TYPE' => 'application/json',
+        ], $body)->assertOk();
+
+        $message = Message::whereHas('conversation', fn ($query) => $query->where('sender_id', 'ig-media-sender'))->firstOrFail();
+        $this->assertSame('image', $message->media_type);
+        $this->assertSame('pending', $message->media_processing_status);
+        $this->assertSame('private_media', $message->metadata['media']['storage_disk']);
+        Storage::disk('private_media')->assertExists($message->media_url);
+    }
+
     // ── WhatsApp inbound via Evolution ────────────────────────────────────────
 
     public function test_whatsapp_inbound_creates_customer_with_phone(): void
@@ -276,6 +319,13 @@ class CustomerResolutionTest extends TestCase
         $fixture = $this->makeBusiness();
 
         $igChannel = $this->makeChannel($fixture, 'instagram', ['page_id' => '17841400000000200']);
+        $bot = Bot::create([
+            'business_profile_id' => $fixture['business']->id,
+            'name' => 'Customer Resolution Test Agent',
+            'status' => 'active',
+            'ai_provider' => 'groq',
+        ]);
+        $bot->channels()->attach($igChannel->id, ['is_primary' => true]);
 
         // The customer exists from a prior WhatsApp purchase, phone known.
         $whatsappCustomer = app(CustomerService::class)->resolve(
@@ -290,6 +340,7 @@ class CustomerResolutionTest extends TestCase
         $conversation = Conversation::create([
             'channel_id' => $igChannel->id,
             'business_id' => $fixture['business']->id,
+            'bot_id' => $bot->id,
             'sender_id' => 'ig-sender-313',
             'status' => 'open',
             'checkout_state' => [

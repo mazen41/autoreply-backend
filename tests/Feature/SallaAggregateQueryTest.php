@@ -4,6 +4,7 @@ namespace Tests\Feature;
 
 use App\Jobs\ProcessAutoReply;
 use App\Models\BusinessProfile;
+use App\Models\Bot;
 use App\Models\Channel;
 use App\Models\Conversation;
 use App\Models\Message;
@@ -86,9 +87,18 @@ class SallaAggregateQueryTest extends TestCase
             'refresh_token' => 'fake-salla-refresh-token',
         ]);
 
+        $bot = Bot::create([
+            'business_profile_id' => $business->id,
+            'name' => 'Salla Aggregate Test Agent',
+            'status' => 'active',
+            'ecommerce_channel_id' => $sallaChannel->id,
+        ]);
+        $bot->channels()->attach($whatsappChannel->id, ['is_primary' => true]);
+
         $conversation = Conversation::create([
             'channel_id' => $whatsappChannel->id,
             'business_id' => $business->id,
+            'bot_id' => $bot->id,
             'sender_id' => '966500000000',
             'status' => 'open',
         ]);

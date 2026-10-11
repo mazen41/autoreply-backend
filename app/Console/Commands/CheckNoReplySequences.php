@@ -87,17 +87,17 @@ class CheckNoReplySequences extends Command
                         Log::error('Failed to enroll conversation in no-reply sequence', [
                             'sequence_id' => $sequence->id,
                             'conversation_id' => $conversation->id,
-                            'error' => $e->getMessage(),
+                            'exception_type' => get_class($e),
                         ]);
-                        $this->error("Failed to enroll conversation {$conversation->id}: {$e->getMessage()}");
+                        $this->error("Failed to enroll conversation {$conversation->id}.");
                     }
                 }
             } catch (\Exception $e) {
                 Log::error('Failed to process no-reply sequence', [
                     'sequence_id' => $sequence->id,
-                    'error' => $e->getMessage(),
+                    'exception_type' => get_class($e),
                 ]);
-                $this->error("Failed to process sequence {$sequence->id}: {$e->getMessage()}");
+                $this->error("Failed to process sequence {$sequence->id}.");
             }
         }
 

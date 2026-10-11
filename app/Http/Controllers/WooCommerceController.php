@@ -11,6 +11,7 @@ use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Http;
 use Illuminate\Support\Facades\Log;
 use Illuminate\Support\Str;
+use App\Services\OAuthStateService;
 
 class WooCommerceController extends Controller
 {
@@ -23,12 +24,11 @@ class WooCommerceController extends Controller
             return response()->json(['error' => 'Enter a public HTTPS WooCommerce store URL.'], 422);
         }
 
-        $state = Str::random(48);
-        Cache::put('woocommerce_oauth_state:' . hash('sha256', $state), [
-            'user_id' => (int) $request->user()->id,
+        $business = app(\App\Services\ActiveBusiness::class)->resolve($request, permission: 'write');
+        $state = app(OAuthStateService::class)->issue('woocommerce', (int) $request->user()->id, [
             'store_url' => $storeUrl,
-            'created_at' => now()->timestamp,
-        ], now()->addMinutes(15));
+            'business_id' => $business->id,
+        ]);
         $this->saveConnectionResult($state, (int) $request->user()->id, 'pending');
 
         $returnUrl = rtrim((string) config('app.frontend_url', env('FRONTEND_URL', '')), '/')
@@ -58,18 +58,31 @@ class WooCommerceController extends Controller
             $payload = $request->all();
         }
         $state = (string) ($payload['user_id'] ?? '');
-        $stateData = $state !== '' ? Cache::pull('woocommerce_oauth_state:' . hash('sha256', $state)) : null;
-        if (!$stateData || now()->timestamp - (int) ($stateData['created_at'] ?? 0) > 900) {
+        $stateData = app(OAuthStateService::class)->consume('woocommerce', $state);
+        if (!$stateData) {
             return response()->json(['error' => 'Authorization request expired or invalid.'], 401);
         }
         $userId = (int) $stateData['user_id'];
+        $storeUrl = $stateData['context']['store_url'] ?? null;
+        if (!$storeUrl || !\App\Models\User::whereKey($userId)->exists()) {
+            return response()->json(['error' => 'Authorization request expired or invalid.'], 401);
+        }
+        try {
+            $business = app(\App\Services\BusinessAccessService::class)->authorize(
+                \App\Models\User::findOrFail($userId),
+                (int) ($stateData['context']['business_id'] ?? 0),
+                'write',
+                hideUnauthorized: false,
+            );
+        } catch (\Throwable) {
+            return response()->json(['error' => 'The selected business is no longer available.'], 403);
+        }
         if (empty($payload['consumer_key']) || empty($payload['consumer_secret'])
             || ($payload['key_permissions'] ?? '') !== 'read_write') {
             $this->saveConnectionResult($state, $userId, 'failed', 'WooCommerce did not grant read/write API access.');
             return response()->json(['error' => 'WooCommerce did not grant the required read/write API access.'], 422);
         }
 
-        $storeUrl = $stateData['store_url'];
         $consumerKey = (string) $payload['consumer_key'];
         $consumerSecret = (string) $payload['consumer_secret'];
         try {
@@ -83,7 +96,6 @@ class WooCommerceController extends Controller
                 return response()->json(['error' => 'WooCommerce could not verify the approved API key.'], 422);
             }
 
-            $business = \App\Models\BusinessProfile::firstOrCreate(['user_id' => $userId]);
             $status = $response->json();
             $channel = Channel::updateOrCreate(
                 ['user_id' => $userId, 'type' => 'woocommerce', 'page_id' => $storeUrl],
@@ -111,7 +123,7 @@ class WooCommerceController extends Controller
         } catch (\Throwable $e) {
             $this->saveConnectionResult($state, $userId, 'failed', 'Could not finish connecting WooCommerce. Please try again.');
             Log::error('WooCommerce authorization callback failed', [
-                'store_url' => $storeUrl, 'error' => $e->getMessage(),
+                'store_url' => $storeUrl, 'exception_type' => get_class($e),
             ]);
             return response()->json(['error' => 'Could not finish connecting WooCommerce.'], 500);
         }
@@ -221,7 +233,7 @@ class WooCommerceController extends Controller
                 }
             } catch (\Throwable $e) {
                 Log::warning('WooCommerce webhook registration error', [
-                    'channel_id' => $channel->id, 'topic' => $topic, 'error' => $e->getMessage(),
+                    'channel_id' => $channel->id, 'topic' => $topic, 'exception_type' => get_class($e),
                 ]);
             }
         }

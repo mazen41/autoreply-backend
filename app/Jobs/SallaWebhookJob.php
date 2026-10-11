@@ -150,7 +150,7 @@ class SallaWebhookJob implements ShouldQueue
             } catch (\Throwable $e) {
                 Log::warning('Salla webhook: customer resolution failed', [
                     'conversation_id' => $conversation->id,
-                    'error'           => $e->getMessage(),
+                    'exception_type' => get_class($e),
                 ]);
             }
 

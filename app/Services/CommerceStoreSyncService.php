@@ -43,7 +43,7 @@ class CommerceStoreSyncService
         } catch (\Throwable $e) {
             $metadata = $channel->fresh()->metadata ?? [];
             $metadata['sync_status'] = 'error';
-            $metadata['sync_error'] = $e->getMessage();
+            $metadata['sync_error'] = 'Commerce store sync failed (' . get_class($e) . ').';
             $channel->forceFill(['metadata' => $metadata])->save();
             throw $e;
         }
@@ -164,7 +164,7 @@ GQL, 'customers', function (array $remote) use ($channel, &$counts): void {
             $warnings[] = 'Shopify customer sync is paused until Protected Customer Data access is approved.';
             Log::warning('Shopify customer sync skipped because protected customer data is not approved', [
                 'channel_id' => $channel->id,
-                'error' => $e->getMessage(),
+                'reason' => 'protected_customer_data_access_required',
             ]);
         }
 

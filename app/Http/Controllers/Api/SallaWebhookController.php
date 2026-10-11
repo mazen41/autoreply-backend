@@ -17,10 +17,12 @@ class SallaWebhookController extends Controller
     {
         Log::info('=== SALLA WEBHOOK RECEIVED ===');
         
-        // Log all headers for debugging
         Log::info('Webhook headers', [
-            'all_headers' => $request->headers->all(),
             'content_type' => $request->header('Content-Type'),
+            'has_signature' => $request->hasHeader('X-Salla-Signature')
+                || $request->hasHeader('X-Salla-Hmac-Sha256')
+                || $request->hasHeader('Signature'),
+            'has_token' => $request->hasHeader('Authorization'),
         ]);
 
         // Get webhook signature from different possible headers
@@ -60,6 +62,7 @@ class SallaWebhookController extends Controller
 
             $sallaService = new SallaService();
             if (!$sallaService->verifyWebhookSignature($payload, $signature)) {
+                app(\App\Support\OperationalMetricCounter::class)->increment('webhook_signature_failures');
                 Log::error('Invalid Salla webhook signature');
                 return response()->json([
                     'status'            => 'rejected',
@@ -82,9 +85,10 @@ class SallaWebhookController extends Controller
                     'error'             => 'webhook_secret_not_configured',
                 ], 500);
             }
-            if ($authToken !== $webhookSecret) {
+            if (!hash_equals((string) $webhookSecret, (string) $authToken)) {
+                app(\App\Support\OperationalMetricCounter::class)->increment('webhook_signature_failures');
                 Log::error('Invalid Salla webhook token', [
-                    'provided' => substr($authToken, 0, 10) . '...',
+                    'strategy' => 'token',
                 ]);
                 return response()->json([
                     'status'            => 'rejected',
@@ -121,7 +125,7 @@ class SallaWebhookController extends Controller
         Log::info('Salla webhook event', [
             'event' => $event,
             'data_keys' => array_keys($fullData),
-            'payload_preview' => substr($payload, 0, 500),
+            'payload_bytes' => strlen($payload),
         ]);
 
         // Dispatch job for async processing
@@ -133,7 +137,7 @@ class SallaWebhookController extends Controller
             ]);
         } catch (\Exception $e) {
             Log::error('Failed to dispatch SallaWebhookJob', [
-                'error' => $e->getMessage(),
+                'exception' => get_class($e),
             ]);
             return response()->json([
                 'status' => 'error',

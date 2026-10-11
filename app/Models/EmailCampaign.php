@@ -21,12 +21,14 @@ class EmailCampaign extends Model
         'clicked_count',
         'failed_count',
         'error_message',
+        'paused_at',
     ];
 
     protected $casts = [
         'audience_criteria' => 'array',
         'scheduled_at' => 'datetime',
         'sent_at' => 'datetime',
+        'paused_at' => 'datetime',
     ];
 
     public function business()

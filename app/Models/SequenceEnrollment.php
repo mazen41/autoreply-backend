@@ -144,6 +144,33 @@ class SequenceEnrollment extends Model
         $this->save();
     }
 
+    public function pause(string $reason): void
+    {
+        $metadata = $this->metadata ?? [];
+        $metadata['pause_reason'] = $reason;
+        $metadata['paused_at'] = now()->toIso8601String();
+        $this->update([
+            'status' => 'paused',
+            'next_execution_at' => null,
+            'metadata' => $metadata,
+        ]);
+    }
+
+    public function resume(): void
+    {
+        if ($this->status !== 'paused') {
+            return;
+        }
+
+        $metadata = $this->metadata ?? [];
+        unset($metadata['pause_reason'], $metadata['paused_at']);
+        $this->update([
+            'status' => 'active',
+            'next_execution_at' => now(),
+            'metadata' => $metadata,
+        ]);
+    }
+
     public function fail($error = null)
     {
         $this->status = 'failed';

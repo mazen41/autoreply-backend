@@ -28,45 +28,70 @@ class ChannelMessageService
         $senderId = $conversation->sender_id;
         $content = $message->content;
 
+        $business = $conversation->business;
+        if ($business && app(UsageMeter::class)->blockMessageIfOverLimit($business, $message)) {
+            Log::notice('ChannelMessageService: outbound message blocked by business plan', [
+                'business_id' => $business->id,
+                'conversation_id' => $conversation->id,
+                'message_id' => $message->id,
+            ]);
+            return false;
+        }
+
         try {
             $success = false;
 
             switch ($channel->type) {
                 case 'facebook':
-                    $success = $this->sendFacebookReply($channel, $senderId, $content, $images);
+                    $success = $this->sendFacebookReply($channel, $senderId, $content, $images, $message);
                     break;
                 case 'instagram':
-                    $success = $this->sendInstagramReply($channel, $senderId, $content, $images);
+                    $success = $this->sendInstagramReply($channel, $senderId, $content, $images, $message);
                     break;
                 case 'gmail':
-                    $success = $this->sendGmailReply($channel, $conversation, $content);
+                    $success = $this->sendGmailReply($channel, $conversation, $content, $message);
                     break;
                 case 'whatsapp':
-                    $success = $this->sendWhatsAppReply($channel, $senderId, $content, $images);
+                    $success = $this->sendWhatsAppReply($channel, $conversation, $message, $senderId, $content, $images);
                     break;
                 case 'telegram':
                     $success = $this->sendTelegramReply($channel, $senderId, $content);
                     break;
                 case 'tiktok':
-                    $success = $this->sendTikTokReply($channel, $senderId, $content);
+                    $message->update(['error_details' => 'unsupported_channel_type']);
+                    $success = false;
                     break;
                 default:
                     Log::warning("ChannelMessageService: unsupported channel type", [
                         'channel_type' => $channel->type,
                         'channel_id' => $channel->id,
                     ]);
-                    return false;
+                    $message->update(['error_details' => 'unsupported_channel_type']);
+                    $success = false;
+                    break;
             }
 
             if ($success) {
-                $message->update(['send_status' => 'sent']);
+                $message->update([
+                    'status' => 'sent',
+                    'send_status' => 'sent',
+                    'delivery_status' => 'sent',
+                    'error_details' => null,
+                ]);
                 Log::info('ChannelMessageService: message sent successfully', [
                     'platform' => $channel->type,
                     'message_id' => $message->id,
                     'conversation_id' => $conversation->id,
                 ]);
             } else {
-                $message->update(['send_status' => 'failed']);
+                $fresh = $message->fresh();
+                $blocked = $fresh?->send_status === 'blocked' || $fresh?->status === 'blocked';
+                $message->update([
+                    'status' => $blocked ? 'blocked' : 'failed',
+                    'send_status' => $blocked ? 'blocked' : 'failed',
+                    'delivery_status' => $blocked ? $fresh?->delivery_status : 'failed',
+                    'error_details' => $fresh?->error_details ?: ($blocked ? 'send_blocked_by_policy' : 'provider_rejected'),
+                ]);
                 Log::error('ChannelMessageService: message send failed', [
                     'platform' => $channel->type,
                     'message_id' => $message->id,
@@ -76,9 +101,14 @@ class ChannelMessageService
             return $success;
 
         } catch (\Exception $e) {
-            $message->update(['send_status' => 'failed']);
+            $message->update([
+                'status' => 'failed',
+                'send_status' => 'failed',
+                'delivery_status' => 'failed',
+                'error_details' => $e->getMessage(),
+            ]);
             Log::error('ChannelMessageService: send message exception', [
-                'error' => $e->getMessage(),
+                'exception_type' => get_class($e),
                 'platform' => $channel->type,
                 'message_id' => $message->id,
             ]);
@@ -86,52 +116,32 @@ class ChannelMessageService
         }
     }
 
-    private function sendFacebookReply(Channel $channel, string $recipientId, string $message, array $images = []): bool
+    private function sendFacebookReply(Channel $channel, string $recipientId, string $message, array $images = [], ?Message $messageRecord = null): bool
     {
-        $accessToken = $channel->access_token;
-        $baseUrl = "https://graph.facebook.com/v19.0/me/messages?access_token={$accessToken}";
-
-        // Send images first
-        foreach ($images as $imageUrl) {
-            Http::timeout(10)->post($baseUrl, [
-                'recipient' => ['id' => $recipientId],
-                'message' => [
-                    'attachment' => [
-                        'type' => 'image',
-                        'payload' => [
-                            'url' => $imageUrl,
-                            'is_reusable' => true
-                        ]
-                    ]
-                ],
+        $result = app(MetaMessengerService::class)
+            ->sendTextWithResult($channel, $recipientId, $message, $images);
+        if ($messageRecord) {
+            $metadata = $messageRecord->metadata ?? [];
+            $metadata['provider_message_ids'] = $result['message_ids'] ?? [];
+            if (!empty($result['message_id'])) {
+                $metadata['platform_message_id'] = $result['message_id'];
+            }
+            $messageRecord->update([
+                'metadata' => $metadata,
+                'error_details' => $result['error'] ?? null,
             ]);
         }
 
-        // Send text message
-        $response = Http::timeout(10)
-            ->post($baseUrl, [
-                'recipient' => ['id' => $recipientId],
-                'message' => ['text' => $message],
-            ]);
-
-        if (!$response->successful()) {
-            Log::error('ChannelMessageService: Facebook send failed', [
-                'status' => $response->status(),
-                'body' => $response->json(),
-                'recipient' => $recipientId,
-            ]);
-        }
-
-        return $response->successful();
+        return (bool) $result['success'];
     }
 
-    private function sendInstagramReply(Channel $channel, string $recipientId, string $message, array $images = []): bool
+    private function sendInstagramReply(Channel $channel, string $recipientId, string $message, array $images = [], ?Message $messageRecord = null): bool
     {
         // Instagram uses the same API as Facebook with the page access token
-        return $this->sendFacebookReply($channel, $recipientId, $message, $images);
+        return $this->sendFacebookReply($channel, $recipientId, $message, $images, $messageRecord);
     }
 
-    private function sendGmailReply(Channel $channel, Conversation $conversation, string $body): bool
+    private function sendGmailReply(Channel $channel, Conversation $conversation, string $body, ?Message $messageRecord = null): bool
     {
         $gmailCtrl = new \App\Http\Controllers\GmailController();
         $client = $gmailCtrl->getAuthenticatedClient($channel);
@@ -173,18 +183,71 @@ class ChannelMessageService
                 $messageObj->setThreadId($threadId);
             }
 
-            $gmail->users_messages->send('me', $messageObj);
+            $sent = $gmail->users_messages->send('me', $messageObj);
+            $providerMessageId = $sent->getId();
+            if ($messageRecord && $providerMessageId) {
+                $metadata = is_array($messageRecord->metadata) ? $messageRecord->metadata : [];
+                $metadata['platform_message_id'] = (string) $providerMessageId;
+                $metadata['provider_message_ids'] = [(string) $providerMessageId];
+                $messageRecord->update([
+                    'gmail_message_id' => (string) $providerMessageId,
+                    'metadata' => $metadata,
+                ]);
+            }
             return true;
 
         } catch (\Exception $e) {
-            Log::error('ChannelMessageService: Gmail send exception', ['error' => $e->getMessage()]);
+            Log::error('ChannelMessageService: Gmail send exception', ['exception_type' => get_class($e)]);
             return false;
         }
     }
 
-    private function sendWhatsAppReply(Channel $channel, string $recipientId, string $message, array $images = []): bool
+    private function sendWhatsAppReply(Channel $channel, Conversation $conversation, Message $messageRecord, string $recipientId, string $message, array $images = []): bool
     {
         try {
+            if (($channel->metadata['whatsapp_provider'] ?? null) === 'cloud') {
+                if (!$this->isWithinWhatsAppCustomerCareWindow($conversation)) {
+                    $messageRecord->update([
+                        'status' => 'blocked', 'send_status' => 'blocked',
+                        'error_details' => 'WhatsApp Cloud customer care window expired.',
+                    ]);
+                    Log::notice('WhatsApp Cloud free-form message blocked outside customer care window', [
+                        'channel_id' => $channel->id,
+                        'conversation_id' => $conversation->id,
+                    ]);
+                    return false;
+                }
+
+                $cloud = app(WhatsAppCloudApiService::class);
+                foreach ($images as $imageUrl) {
+                    $imageResult = $cloud->sendImage($channel, $recipientId, $imageUrl);
+                    if (!$imageResult['success']) {
+                        $messageRecord->update(['error_details' => 'WhatsApp Cloud image send failed: ' . ($imageResult['reason'] ?? 'provider_rejected')]);
+                        return false;
+                    }
+                }
+                $result = $cloud->sendText($channel, $recipientId, $message);
+                if ($result['success'] && !empty($result['message_id'])) {
+                    $messageRecord->update(['whatsapp_message_id' => $result['message_id']]);
+                }
+                if (!$result['success']) {
+                    $messageRecord->update(['error_details' => 'WhatsApp Cloud text send failed: ' . ($result['reason'] ?? 'provider_rejected')]);
+                }
+                return $result['success'];
+            }
+
+            if (($channel->metadata['unofficial_risk_accepted'] ?? false) !== true) {
+                Log::warning('Unofficial WhatsApp send blocked: risk acknowledgment is missing', [
+                    'channel_id' => $channel->id,
+                    'conversation_id' => $conversation->id,
+                ]);
+                $messageRecord->update([
+                    'status' => 'blocked', 'send_status' => 'blocked',
+                    'error_details' => 'Unofficial WhatsApp risk acknowledgment is missing.',
+                ]);
+                return false;
+            }
+
             $whatsappService = new EvolutionApiService();
             $instanceName = $channel->page_id; // We store instance_name in page_id for WhatsApp
 
@@ -203,6 +266,12 @@ class ChannelMessageService
             $response = $whatsappService->sendTextMessage($instanceName, $recipientId, $message);
 
             if (isset($response['key']['id'])) {
+                $messageRecord->update([
+                    'whatsapp_message_id' => $response['key']['id'],
+                    'whatsapp_remote_jid' => $response['key']['remoteJid'] ?? $recipientId,
+                    'whatsapp_from_me' => true,
+                ]);
+
                 $instance = \App\Models\WhatsAppInstance::where('instance_name', $instanceName)->first();
 
                 if ($instance) {
@@ -232,18 +301,30 @@ class ChannelMessageService
                 return true;
             }
 
+            $messageRecord->update(['error_details' => 'WhatsApp provider did not return a message ID.']);
             return false;
 
         } catch (\Exception $e) {
-            Log::error('ChannelMessageService: WhatsApp send exception', ['error' => $e->getMessage()]);
+            Log::error('ChannelMessageService: WhatsApp send exception', ['exception_type' => get_class($e)]);
+            $messageRecord->update(['error_details' => substr($e->getMessage(), 0, 1000)]);
             return false;
         }
+    }
+
+    private function isWithinWhatsAppCustomerCareWindow(Conversation $conversation): bool
+    {
+        $lastInbound = $conversation->messages()
+            ->where('direction', 'inbound')
+            ->latest('created_at')
+            ->first();
+
+        return $lastInbound !== null && $lastInbound->created_at->gt(now()->subHours(24));
     }
 
     private function sendTelegramReply(Channel $channel, string $chatId, string $message): bool
     {
         try {
-            $botToken = decrypt($channel->access_token);
+            $botToken = $channel->access_token;
             $telegramService = new TelegramService();
 
             $success = $telegramService->sendMessage($botToken, $chatId, $message);
@@ -257,7 +338,7 @@ class ChannelMessageService
             return $success;
 
         } catch (\Exception $e) {
-            Log::error('ChannelMessageService: Telegram send exception', ['error' => $e->getMessage()]);
+            Log::error('ChannelMessageService: Telegram send exception', ['exception_type' => get_class($e)]);
             return false;
         }
     }
@@ -286,7 +367,7 @@ class ChannelMessageService
             return false;
 
         } catch (\Exception $e) {
-            Log::error('ChannelMessageService: TikTok send exception', ['error' => $e->getMessage()]);
+            Log::error('ChannelMessageService: TikTok send exception', ['exception_type' => get_class($e)]);
             return false;
         }
     }

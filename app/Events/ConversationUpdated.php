@@ -54,6 +54,6 @@ class ConversationUpdated implements ShouldBroadcast
 
     public function broadcastWith(): array
     {
-        return InboxBroadcastPayload::conversationUpdated($this->conversation);
+        return InboxBroadcastPayload::conversationUpdated($this->conversation, $this->userId);
     }
 }

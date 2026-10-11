@@ -5,6 +5,7 @@ namespace App\Services;
 use App\Models\Sequence;
 use App\Models\SequenceStep;
 use App\Models\SequenceEnrollment;
+use App\Models\SequenceStepExecution;
 use App\Models\Conversation;
 use App\Models\BusinessProfile;
 use App\Services\BusinessHoursService;
@@ -22,6 +23,8 @@ class SequenceService
 
     public function createSequence(array $data, int $businessId): Sequence
     {
+        $this->validateConditionStepPayloads($data['steps'] ?? []);
+
         return DB::transaction(function () use ($data, $businessId) {
             $sequence = Sequence::create([
                 'business_id' => $businessId,
@@ -59,6 +62,8 @@ class SequenceService
 
     public function updateSequence(Sequence $sequence, array $data): Sequence
     {
+        $this->validateConditionStepPayloads($data['steps'] ?? []);
+
         return DB::transaction(function () use ($sequence, $data) {
             $sequence->update([
                 'name' => $data['name'] ?? $sequence->name,
@@ -195,8 +200,11 @@ class SequenceService
         // Validate that all condition steps have valid configuration
         $conditionSteps = $sequence->steps()->where('step_type', 'condition')->get();
         foreach ($conditionSteps as $step) {
-            if (empty($step->condition_config) || empty($step->condition_config['type'])) {
-                throw new \Exception("Condition step {$step->step_order} is missing configuration");
+            $conditionErrors = is_array($step->condition_config)
+                ? app(ConditionEvaluationService::class)->validateConditionConfig($step->condition_config)
+                : ['Condition configuration is required.'];
+            if ($conditionErrors !== []) {
+                throw new \Exception("Condition step {$step->step_order} is invalid: " . implode(' ', $conditionErrors));
             }
         }
 
@@ -208,8 +216,28 @@ class SequenceService
             }
         }
 
-        $sequence->activate();
-        return $sequence;
+        return DB::transaction(function () use ($sequence) {
+            $sequence->activate();
+
+            $pausedEnrollments = $sequence->enrollments()->where('status', 'paused')->get();
+            foreach ($pausedEnrollments as $enrollment) {
+                $enrollment->resume();
+                $step = $enrollment->getCurrentStep();
+                if (!$step) {
+                    $enrollment->complete();
+                    continue;
+                }
+
+                $execution = SequenceStepExecution::createForEnrollment($enrollment, $step, now(), [
+                    'resumed_after_sequence_pause' => true,
+                ]);
+                if ($execution) {
+                    DB::afterCommit(fn () => \App\Jobs\ExecuteSequenceStep::dispatch($execution->id));
+                }
+            }
+
+            return $sequence->fresh();
+        });
     }
 
     public function pauseSequence(Sequence $sequence): Sequence
@@ -218,13 +246,20 @@ class SequenceService
             throw new \Exception('Sequence cannot be paused');
         }
 
-        // Pause all active enrollments
-        $sequence->activeEnrollments()->each(function ($enrollment) {
-            $enrollment->stop('sequence_paused');
-        });
+        return DB::transaction(function () use ($sequence) {
+            // Invalidate queued work without losing the current step. Activation
+            // creates a fresh monotonic execution for each paused enrollment.
+            $sequence->activeEnrollments()->each(function ($enrollment) {
+                $enrollment->executions()
+                    ->whereIn('status', ['pending', 'processing'])
+                    ->get()
+                    ->each(fn (SequenceStepExecution $execution) => $execution->markAsSkipped('sequence_paused'));
+                $enrollment->pause('sequence_paused');
+            });
 
-        $sequence->pause();
-        return $sequence;
+            $sequence->pause();
+            return $sequence->fresh();
+        });
     }
 
     public function archiveSequence(Sequence $sequence): Sequence
@@ -328,5 +363,28 @@ class SequenceService
         }
 
         return $errors;
+    }
+
+    private function validateConditionStepPayloads(array $steps): void
+    {
+        $errors = [];
+        $conditionEvaluator = app(ConditionEvaluationService::class);
+        foreach ($steps as $index => $step) {
+            if (!is_array($step) || ($step['step_type'] ?? null) !== 'condition') {
+                continue;
+            }
+            $config = $step['condition_config'] ?? null;
+            if (!is_array($config)) {
+                $errors["steps.{$index}.condition_config"][] = 'Condition configuration is required.';
+                continue;
+            }
+            foreach ($conditionEvaluator->validateConditionConfig($config) as $error) {
+                $errors["steps.{$index}.condition_config"][] = $error;
+            }
+        }
+
+        if ($errors !== []) {
+            throw \Illuminate\Validation\ValidationException::withMessages($errors);
+        }
     }
 }

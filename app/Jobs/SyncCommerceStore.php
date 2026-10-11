@@ -48,7 +48,7 @@ class SyncCommerceStore implements ShouldQueue
         } catch (\Throwable $e) {
             Log::error('Commerce store sync failed', [
                 'channel_id' => $this->channelId,
-                'error' => $e->getMessage(),
+                'exception_type' => get_class($e),
             ]);
             throw $e;
         } finally {

@@ -10,7 +10,7 @@ class TelegramService
     /**
      * Send a message via Telegram bot
      */
-    public function sendMessage(string $botToken, string $chatId, string $text): bool
+    public function sendMessage(string $botToken, string $chatId, string $text, ?string &$providerMessageId = null): bool
     {
         try {
             $response = Http::timeout(10)->post("https://api.telegram.org/bot{$botToken}/sendMessage", [
@@ -20,19 +20,20 @@ class TelegramService
             ]);
 
             if ($response->successful()) {
-                Log::info('Telegram message sent', ['chat_id' => $chatId]);
+                $providerMessageId = isset($response->json()['result']['message_id'])
+                    ? (string) $response->json()['result']['message_id']
+                    : null;
+                Log::info('Telegram message sent', ['provider_message_id_present' => $providerMessageId !== null]);
                 return true;
             } else {
                 Log::error('Failed to send Telegram message', [
-                    'chat_id' => $chatId,
                     'status' => $response->status(),
-                    'body' => $response->json(),
                 ]);
                 return false;
             }
         } catch (\Exception $e) {
             Log::error('Telegram send message error', [
-                'error' => $e->getMessage(),
+                'exception_type' => get_class($e),
             ]);
             return false;
         }
@@ -49,18 +50,17 @@ class TelegramService
             ]);
 
             if ($response->successful()) {
-                Log::info('Telegram webhook set', ['webhook_url' => $webhookUrl]);
+                Log::info('Telegram webhook set');
                 return true;
             } else {
                 Log::error('Failed to set Telegram webhook', [
-                    'webhook_url' => $webhookUrl,
-                    'response' => $response->json(),
+                    'status' => $response->status(),
                 ]);
                 return false;
             }
         } catch (\Exception $e) {
             Log::error('Telegram set webhook error', [
-                'error' => $e->getMessage(),
+                'exception_type' => get_class($e),
             ]);
             return false;
         }
@@ -79,13 +79,13 @@ class TelegramService
                 return true;
             } else {
                 Log::error('Failed to delete Telegram webhook', [
-                    'response' => $response->json(),
+                    'status' => $response->status(),
                 ]);
                 return false;
             }
         } catch (\Exception $e) {
             Log::error('Telegram delete webhook error', [
-                'error' => $e->getMessage(),
+                'exception_type' => get_class($e),
             ]);
             return false;
         }
@@ -104,13 +104,13 @@ class TelegramService
             } else {
                 Log::error('Failed to get Telegram bot info', [
                     'status' => $response->status(),
-                    'body' => $response->json(),
+                    'status' => $response->status(),
                 ]);
                 return null;
             }
         } catch (\Exception $e) {
             Log::error('Telegram getMe error', [
-                'error' => $e->getMessage(),
+                'exception_type' => get_class($e),
             ]);
             return null;
         }

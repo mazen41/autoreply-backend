@@ -88,6 +88,28 @@ class SallaServiceTest extends TestCase
         $this->assertStringContainsString('2024-12-01', $formatted);
     }
 
+    public function test_unknown_phone_and_address_country_do_not_default_shipping_to_saudi(): void
+    {
+        $channel = Channel::factory()->create(['type' => 'salla', 'status' => 'connected']);
+        \Illuminate\Support\Facades\DB::table('salla_cities')->insert([
+            'channel_id' => $channel->id,
+            'country_code' => 'SA',
+            'country_id' => 1473353380,
+            'salla_city_id' => 4,
+            'name' => 'Riyadh',
+            'name_en' => 'Riyadh',
+            'synced_at' => now(),
+            'created_at' => now(),
+            'updated_at' => now(),
+        ]);
+
+        $unknown = $this->sallaService->resolveShippingAddressForChannel($channel, 'Riyadh, Main Street', '1234567890');
+        $explicitSaudi = $this->sallaService->resolveShippingAddressForChannel($channel, 'Riyadh, Saudi Arabia', '1234567890');
+
+        $this->assertNull($unknown);
+        $this->assertSame(4, $explicitSaudi['city_id'] ?? null);
+    }
+
     public function test_missing_scope_does_not_refresh_or_mark_channel_token_expired(): void
     {
         $channel = Channel::factory()->create([

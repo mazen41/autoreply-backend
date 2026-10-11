@@ -10,7 +10,6 @@ use App\Models\EmailCampaignRecipient;
 use App\Services\EmailCampaignAudienceService;
 use Carbon\Carbon;
 use Illuminate\Http\Request;
-use Illuminate\Support\Facades\Auth;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Log;
 use Illuminate\Validation\ValidationException;
@@ -22,9 +21,10 @@ class EmailCampaignController extends Controller
     /**
      * Resolve the authenticated user's business, enforcing ownership.
      */
-    private function business(): BusinessProfile
+    private function business(Request $request): BusinessProfile
     {
-        return BusinessProfile::where('user_id', Auth::id())->firstOrFail();
+        $permission = $request->isMethod('GET') ? 'read' : 'write';
+        return app(\App\Services\ActiveBusiness::class)->resolve($request, permission: $permission);
     }
 
     /**
@@ -57,7 +57,7 @@ class EmailCampaignController extends Controller
 
     public function index(Request $request)
     {
-        $business = $this->business();
+        $business = $this->business($request);
 
         $query = EmailCampaign::where('business_id', $business->id)
             ->withCount('recipients')
@@ -82,14 +82,19 @@ class EmailCampaignController extends Controller
             'subject'          => 'required|string|max:255',
             'content'          => 'required|string',
             'audience_criteria'=> 'nullable|array',
-            'audience_criteria.mode' => 'nullable|string|in:manual,gmail',
+            'audience_criteria.mode' => 'nullable|string|in:manual,gmail,contacts',
             'audience_criteria.recipients' => 'nullable|array',
             'audience_criteria.recipients.*' => 'email|max:255',
+            'audience_criteria.channel_ids' => 'nullable|array',
+            'audience_criteria.channel_ids.*' => 'integer',
+            'audience_criteria.channel_types' => 'nullable|array',
+            'audience_criteria.channel_types.*' => 'string|max:50',
+            'audience_criteria.last_active_days' => 'nullable|integer|min:1',
             'scheduled_at'     => 'nullable|date',
             'timezone'         => 'nullable|string',
         ]);
 
-        $business = $this->business();
+        $business = $this->business($request);
         $audienceCriteria = $this->normalizeAudienceCriteria($validated['audience_criteria'] ?? []);
 
         $scheduledAt = null;
@@ -127,14 +132,19 @@ class EmailCampaignController extends Controller
             'subject'          => 'sometimes|required|string|max:255',
             'content'          => 'sometimes|required|string',
             'audience_criteria'=> 'nullable|array',
-            'audience_criteria.mode' => 'nullable|string|in:manual,gmail',
+            'audience_criteria.mode' => 'nullable|string|in:manual,gmail,contacts',
             'audience_criteria.recipients' => 'nullable|array',
             'audience_criteria.recipients.*' => 'email|max:255',
+            'audience_criteria.channel_ids' => 'nullable|array',
+            'audience_criteria.channel_ids.*' => 'integer',
+            'audience_criteria.channel_types' => 'nullable|array',
+            'audience_criteria.channel_types.*' => 'string|max:50',
+            'audience_criteria.last_active_days' => 'nullable|integer|min:1',
             'scheduled_at'     => 'nullable|date',
             'timezone'         => 'nullable|string',
         ]);
 
-        $business = $this->business();
+        $business = $this->business($request);
         $campaign = EmailCampaign::where('business_id', $business->id)->findOrFail($campaignId);
 
         if (!in_array($campaign->status, ['draft', 'scheduled'])) {
@@ -177,20 +187,38 @@ class EmailCampaignController extends Controller
 
     public function send(Request $request, $campaignId)
     {
-        $business = $this->business();
+        $business = $this->business($request);
         $campaign = EmailCampaign::where('business_id', $business->id)->findOrFail($campaignId);
 
-        if (!in_array($campaign->status, ['draft', 'scheduled'])) {
+        $sendState = DB::transaction(function () use ($campaign, $business) {
+            $claimed = EmailCampaign::where('id', $campaign->id)
+                ->where('business_id', $business->id)
+                ->whereIn('status', ['draft', 'scheduled'])
+                ->update(['status' => 'sending', 'sent_at' => now()]);
+
+            if ($claimed !== 1) {
+                return 'already_claimed';
+            }
+
+            $campaign->refresh();
+            $this->audience->buildRecipients($campaign, true);
+
+            if ($campaign->total_recipients === 0) {
+                $campaign->update(['status' => 'draft', 'sent_at' => null]);
+                return 'empty';
+            }
+
+            return 'claimed';
+        });
+
+        if ($sendState === 'empty') {
+            return response()->json(['error' => 'No valid recipients found for this campaign audience.'], 400);
+        }
+        if ($sendState !== 'claimed') {
             return response()->json(['error' => 'Only draft or scheduled campaigns can be sent'], 400);
         }
 
-        $this->audience->buildRecipients($campaign, true);
-
-        if ($campaign->total_recipients === 0) {
-            return response()->json(['error' => 'No valid recipients found for this campaign audience.'], 400);
-        }
-
-        $campaign->update(['status' => 'sending', 'sent_at' => now()]);
+        $campaign->refresh();
 
         foreach ($campaign->recipients()->where('status', 'pending')->pluck('id') as $recipientId) {
             SendEmailCampaignMessage::dispatch($recipientId);
@@ -204,6 +232,24 @@ class EmailCampaignController extends Controller
         return response()->json(['success' => true, 'campaign' => $campaign->fresh()]);
     }
 
+    public function pause(Request $request, $campaignId)
+    {
+        $business = app(\App\Services\ActiveBusiness::class)->resolve($request, permission: 'automation_write');
+        $campaign = EmailCampaign::where('business_id', $business->id)->findOrFail($campaignId);
+        app(\App\Services\AutomationRunControl::class)->pauseCampaign($business, $campaign, true);
+
+        return response()->json(['success' => true, 'paused' => true, 'campaign' => $campaign->fresh()]);
+    }
+
+    public function resume(Request $request, $campaignId)
+    {
+        $business = app(\App\Services\ActiveBusiness::class)->resolve($request, permission: 'automation_write');
+        $campaign = EmailCampaign::where('business_id', $business->id)->findOrFail($campaignId);
+        app(\App\Services\AutomationRunControl::class)->pauseCampaign($business, $campaign, false);
+
+        return response()->json(['success' => true, 'paused' => false, 'campaign' => $campaign->fresh()]);
+    }
+
     public function schedule(Request $request, $campaignId)
     {
         $validated = $request->validate([
@@ -211,7 +257,7 @@ class EmailCampaignController extends Controller
             'timezone'     => 'nullable|string',
         ]);
 
-        $business = $this->business();
+        $business = $this->business($request);
         $campaign = EmailCampaign::where('business_id', $business->id)->findOrFail($campaignId);
 
         // Allow scheduling a draft, and re-scheduling (changing the time on)
@@ -260,9 +306,9 @@ class EmailCampaignController extends Controller
     /**
      * Cancel a scheduled campaign — revert it back to draft.
      */
-    public function cancelSchedule($campaignId)
+    public function cancelSchedule(Request $request, $campaignId)
     {
-        $business = $this->business();
+        $business = $this->business($request);
         $campaign = EmailCampaign::where('business_id', $business->id)->findOrFail($campaignId);
 
         if ($campaign->status !== 'scheduled') {
@@ -277,9 +323,9 @@ class EmailCampaignController extends Controller
         return response()->json(['success' => true, 'campaign' => $campaign->fresh()]);
     }
 
-    public function destroy($campaignId)
+    public function destroy(Request $request, $campaignId)
     {
-        $business = $this->business();
+        $business = $this->business($request);
         $campaign = EmailCampaign::where('business_id', $business->id)->findOrFail($campaignId);
 
         if ($campaign->status === 'sending') {
@@ -295,9 +341,9 @@ class EmailCampaignController extends Controller
     /**
      * Campaign statistics (recipients breakdown).
      */
-    public function stats($campaignId)
+    public function stats(Request $request, $campaignId)
     {
-        $business = $this->business();
+        $business = $this->business($request);
         $campaign = EmailCampaign::where('business_id', $business->id)->findOrFail($campaignId);
 
         $recipientBreakdown = $campaign->recipients()
@@ -334,9 +380,25 @@ class EmailCampaignController extends Controller
      * Public click-tracking redirect. No auth — mail client GETs this URL.
      * Increments clicked_count on first click then redirects to the real URL.
      */
-    public function trackClick(Request $request, $recipientId)
+    public function trackClick(Request $request, string $recipientId, string $linkToken)
     {
         $recipient = $this->findRecipientForTracking($recipientId);
+        $url = $recipient?->tracking_links[$linkToken] ?? null;
+
+        if (!$recipient || !$url) {
+            abort(404);
+        }
+
+        $expectedToken = hash_hmac(
+            'sha256',
+            $recipient->tracking_token . "\n" . $url,
+            (string) config('app.key')
+        );
+        if (!hash_equals($expectedToken, $linkToken)
+            || !filter_var($url, FILTER_VALIDATE_URL)
+            || !in_array(strtolower((string) parse_url($url, PHP_URL_SCHEME)), ['http', 'https'], true)) {
+            abort(404);
+        }
 
         if ($recipient && $recipient->clicked_at === null) {
             $recipient->update(['clicked_at' => now()]);
@@ -346,29 +408,58 @@ class EmailCampaignController extends Controller
             }
         }
 
-        $url = $request->query('url', '/');
-
-        // Only allow http/https destinations
-        if (!filter_var($url, FILTER_VALIDATE_URL) || !in_array(parse_url($url, PHP_URL_SCHEME), ['http', 'https'])) {
-            $url = '/';
-        }
-
-        return redirect($url);
+        return redirect()->away($url);
     }
 
     private function findRecipientForTracking(string $recipientKey): ?EmailCampaignRecipient
     {
-        return EmailCampaignRecipient::where('tracking_token', $recipientKey)->first()
-            ?: (ctype_digit($recipientKey) ? EmailCampaignRecipient::find((int) $recipientKey) : null);
+        return EmailCampaignRecipient::where('tracking_token', $recipientKey)->first();
+    }
+
+    public function unsubscribe(string $trackingToken): \Illuminate\Http\Response|\Illuminate\Http\JsonResponse
+    {
+        $recipient = $this->findRecipientForTracking($trackingToken);
+        $campaign = $recipient?->campaign;
+        if (!$recipient || !$campaign) {
+            abort(404);
+        }
+
+        $email = mb_strtolower(trim($recipient->email));
+        \App\Models\ContactConsent::updateOrCreate(
+            [
+                'business_id' => $campaign->business_id,
+                'channel' => 'email',
+                'contact_identifier' => $email,
+                'scope' => 'marketing',
+            ],
+            [
+                'status' => 'opted_out',
+                'source' => 'unsubscribe_link',
+                'captured_at' => now(),
+                'evidence' => 'email_campaign_unsubscribe',
+            ]
+        );
+        \App\Models\Suppression::updateOrCreate(
+            [
+                'business_id' => $campaign->business_id,
+                'channel' => 'email',
+                'contact_identifier' => $email,
+                'reason' => 'unsubscribed',
+            ],
+            ['source' => 'unsubscribe_link', 'suppressed_at' => now()]
+        );
+
+        return response('You have been unsubscribed from marketing emails.', 200)
+            ->header('Content-Type', 'text/plain; charset=UTF-8');
     }
 
     /**
      * GET /api/email-campaigns/audience/channels
      * Returns all connected channels available as audience filters.
      */
-    public function audienceChannels(): \Illuminate\Http\JsonResponse
+    public function audienceChannels(Request $request): \Illuminate\Http\JsonResponse
     {
-        $business = $this->business();
+        $business = $this->business($request);
         return response()->json([
             'channels' => $this->audience->availableChannels($business),
         ]);
@@ -385,12 +476,10 @@ class EmailCampaignController extends Controller
             'audience_criteria.mode' => 'required|string|in:manual,gmail,contacts',
         ]);
 
-        $business = $this->business();
+        $business = $this->business($request);
         $criteria = $request->input('audience_criteria');
 
-        $count = $this->audience->previewCount($business, $criteria);
-
-        return response()->json(['count' => $count]);
+        return response()->json($this->audience->previewStats($business, $criteria));
     }
 
     private function normalizeAudienceCriteria(array $criteria): array

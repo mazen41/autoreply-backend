@@ -12,6 +12,9 @@ use App\Models\Channel;
 use App\Models\Bot;
 use App\Models\Sequence;
 use App\Models\SequenceEnrollment;
+use App\Models\ContactConsent;
+use App\Models\FeatureFlag;
+use App\Models\BusinessFeatureFlagAssignment;
 use App\Services\AutomationEngine;
 use Illuminate\Foundation\Testing\RefreshDatabase;
 use Illuminate\Support\Facades\Http;
@@ -39,6 +42,7 @@ class WorkflowEngineRefactorTest extends TestCase
             'type'         => 'whatsapp',
             'status'       => 'connected',
             'connected_at' => now(),
+            'metadata'     => ['whatsapp_provider' => 'evolution', 'unofficial_risk_accepted' => true],
         ]);
     }
 
@@ -323,6 +327,337 @@ class WorkflowEngineRefactorTest extends TestCase
             ->where('conversation_id', $conversation->id)
             ->count();
         $this->assertEquals(1, $executionCount);
+
+        // A distinct source event must not be hidden by a time-window dedupe.
+        $nextMessage = Message::factory()->create([
+            'conversation_id' => $conversation->id,
+            'direction' => 'inbound',
+            'content' => 'What is the price again?',
+        ]);
+        $engine->executeWorkflowsForEvent(
+            AutomationEngine::EVENT_MESSAGE_RECEIVED,
+            $conversation,
+            ['message' => $nextMessage]
+        );
+        $this->assertSame(2, WorkflowExecution::where('workflow_id', $workflow->id)
+            ->where('conversation_id', $conversation->id)->count());
+    }
+
+    public function test_keyword_matching_uses_word_boundaries(): void
+    {
+        $workflow = AutomationWorkflow::factory()->create([
+            'business_id' => $this->business->id,
+            'trigger_config' => ['type' => 'keyword', 'conditions' => ['keywords' => ['hi'], 'match_type' => 'any']],
+            'actions_config' => [['type' => 'add_tag', 'tag' => 'matched_hi']],
+        ]);
+        $conversation = Conversation::factory()->create(['business_id' => $this->business->id]);
+        $message = Message::factory()->create([
+            'conversation_id' => $conversation->id,
+            'direction' => 'inbound',
+            'content' => 'this is it',
+        ]);
+
+        $results = app(AutomationEngine::class)->executeWorkflowsForEvent(
+            AutomationEngine::EVENT_MESSAGE_RECEIVED,
+            $conversation,
+            ['message' => $message]
+        );
+
+        $this->assertFalse($results[0]['triggered']);
+        $this->assertDatabaseMissing('workflow_executions', ['workflow_id' => $workflow->id]);
+    }
+
+    public function test_message_received_send_message_requires_explicit_conditions(): void
+    {
+        AutomationWorkflow::factory()->create([
+            'business_id' => $this->business->id,
+            'trigger_config' => ['type' => 'message_received', 'conditions' => []],
+            'actions_config' => [['type' => 'send_message', 'message' => 'Unqualified automatic message']],
+        ]);
+        Http::fake(['*' => Http::response(['key' => ['id' => 'must-not-send']], 200)]);
+        $conversation = Conversation::factory()->create([
+            'business_id' => $this->business->id,
+            'channel_id' => $this->channel->id,
+        ]);
+        ContactConsent::create([
+            'business_id' => $this->business->id,
+            'channel' => 'whatsapp',
+            'contact_identifier' => app(\App\Services\ConsentGate::class)->normalizeIdentifier($conversation->sender_id, 'whatsapp'),
+            'scope' => 'marketing', 'status' => 'opted_in', 'source' => 'form', 'captured_at' => now(),
+        ]);
+        $message = Message::factory()->create(['conversation_id' => $conversation->id, 'direction' => 'inbound', 'content' => 'hello']);
+
+        $results = app(AutomationEngine::class)->executeWorkflowsForEvent(
+            AutomationEngine::EVENT_MESSAGE_RECEIVED,
+            $conversation,
+            ['message' => $message]
+        );
+
+        $this->assertNotEmpty($results);
+        $this->assertFalse($results[0]['triggered']);
+        $this->assertSame(0, Message::where('conversation_id', $conversation->id)->where('direction', 'outbound')->count());
+        $this->assertSame(0, WorkflowExecution::where('conversation_id', $conversation->id)->count());
+    }
+
+    public function test_send_message_is_blocked_when_ai_is_disabled_or_human_has_taken_over(): void
+    {
+        $this->enableWorkflowReplySafety();
+        AutomationWorkflow::factory()->create([
+            'business_id' => $this->business->id,
+            'trigger_config' => ['type' => 'keyword', 'conditions' => ['keywords' => ['offer'], 'match_type' => 'any']],
+            'actions_config' => [['type' => 'send_message', 'message' => 'Offer']],
+        ]);
+        Http::fake(['*' => Http::response(['key' => ['id' => 'must-not-send']], 200)]);
+
+        foreach ([['ai_enabled' => false, 'requires_human' => false], ['ai_enabled' => true, 'requires_human' => true]] as $state) {
+            $conversation = Conversation::factory()->create(array_merge([
+                'business_id' => $this->business->id,
+                'channel_id' => $this->channel->id,
+            ], $state));
+            ContactConsent::create([
+                'business_id' => $this->business->id,
+                'channel' => 'whatsapp',
+                'contact_identifier' => app(\App\Services\ConsentGate::class)->normalizeIdentifier($conversation->sender_id, 'whatsapp'),
+                'scope' => 'marketing', 'status' => 'opted_in', 'source' => 'form', 'captured_at' => now(),
+            ]);
+            $message = Message::factory()->create(['conversation_id' => $conversation->id, 'direction' => 'inbound', 'content' => 'offer']);
+
+            $results = app(AutomationEngine::class)->executeWorkflowsForEvent(
+                AutomationEngine::EVENT_MESSAGE_RECEIVED,
+                $conversation,
+                ['message' => $message]
+            );
+
+            $this->assertFalse($results[0]['actions_executed'][0]['success']);
+        }
+        $this->assertSame(0, Message::where('direction', 'outbound')->where('source', 'automation')->count());
+    }
+
+    public function test_workflow_reply_safety_is_globally_enforced(): void
+    {
+        AutomationWorkflow::factory()->create([
+            'business_id' => $this->business->id,
+            'trigger_config' => ['type' => 'keyword', 'conditions' => ['keywords' => ['offer'], 'match_type' => 'any']],
+            'actions_config' => [['type' => 'send_message', 'message' => 'Offer']],
+        ]);
+        Http::fake(['*' => Http::response(['key' => ['id' => 'sent']], 200)]);
+        $conversation = Conversation::factory()->create([
+            'business_id' => $this->business->id,
+            'channel_id' => $this->channel->id,
+            'ai_enabled' => true,
+            'requires_human' => true,
+        ]);
+        ContactConsent::create([
+            'business_id' => $this->business->id,
+            'channel' => 'whatsapp',
+            'contact_identifier' => app(\App\Services\ConsentGate::class)->normalizeIdentifier($conversation->sender_id, 'whatsapp'),
+            'scope' => 'marketing', 'status' => 'opted_in', 'source' => 'form', 'captured_at' => now(),
+        ]);
+        $message = Message::factory()->create(['conversation_id' => $conversation->id, 'direction' => 'inbound', 'content' => 'offer']);
+
+        $results = app(AutomationEngine::class)->executeWorkflowsForEvent(
+            AutomationEngine::EVENT_MESSAGE_RECEIVED,
+            $conversation,
+            ['message' => $message]
+        );
+
+        $this->assertFalse($results[0]['actions_executed'][0]['success']);
+        $this->assertSame(0, Message::where('direction', 'outbound')->where('source', 'automation')->count());
+    }
+
+    private function enableWorkflowReplySafety(): void
+    {
+        $flag = FeatureFlag::where('key', 'phase5_workflow_reply_safety')->firstOrFail();
+        BusinessFeatureFlagAssignment::create([
+            'business_id' => $this->business->id,
+            'feature_flag_id' => $flag->id,
+            'enabled' => true,
+        ]);
+    }
+
+    public function test_workflow_conditions_array_is_evaluated_against_the_trigger_event(): void
+    {
+        $workflow = AutomationWorkflow::factory()->create([
+            'business_id' => $this->business->id,
+            'trigger_config' => ['type' => 'message_received', 'conditions' => []],
+            'conditions' => [['type' => 'message_contains', 'config' => ['value' => 'urgent'], 'operator' => 'and', 'comparison' => 'contains']],
+            'actions_config' => [['type' => 'add_tag', 'tag' => 'urgent']],
+        ]);
+        $conversation = Conversation::factory()->create(['business_id' => $this->business->id]);
+        $message = Message::factory()->create(['conversation_id' => $conversation->id, 'direction' => 'inbound', 'content' => 'urgent please']);
+
+        $results = app(AutomationEngine::class)->executeWorkflowsForEvent(
+            AutomationEngine::EVENT_MESSAGE_RECEIVED,
+            $conversation,
+            ['message' => $message]
+        );
+
+        $this->assertTrue($results[0]['triggered']);
+        $this->assertDatabaseHas('conversation_tags', ['conversation_id' => $conversation->id, 'tag' => 'urgent']);
+        $this->assertSame([['type' => 'message_contains', 'config' => ['value' => 'urgent'], 'operator' => 'and', 'comparison' => 'contains']], $workflow->fresh()->conditions);
+    }
+
+    public function test_workflow_execution_records_partial_failure_as_failed(): void
+    {
+        $workflow = AutomationWorkflow::factory()->create([
+            'business_id' => $this->business->id,
+            'trigger_config' => ['type' => 'keyword', 'conditions' => ['keywords' => ['run'], 'match_type' => 'any']],
+            'actions_config' => [
+                ['type' => 'add_tag', 'tag' => 'first-action'],
+                ['type' => 'unknown_action'],
+            ],
+        ]);
+        $conversation = Conversation::factory()->create(['business_id' => $this->business->id]);
+        $message = Message::factory()->create(['conversation_id' => $conversation->id, 'direction' => 'inbound', 'content' => 'run']);
+
+        app(AutomationEngine::class)->executeWorkflowsForEvent(
+            AutomationEngine::EVENT_MESSAGE_RECEIVED,
+            $conversation,
+            ['message' => $message]
+        );
+
+        $this->assertDatabaseHas('workflow_executions', [
+            'workflow_id' => $workflow->id,
+            'status' => 'failed',
+        ]);
+        $this->assertDatabaseHas('conversation_tags', ['conversation_id' => $conversation->id, 'tag' => 'first-action']);
+    }
+
+    public function test_workflow_cannot_start_the_sequence_that_retriggers_itself(): void
+    {
+        $sequence = Sequence::factory()->create(['business_id' => $this->business->id]);
+        $workflow = AutomationWorkflow::factory()->create([
+            'business_id' => $this->business->id,
+            'trigger_config' => ['type' => 'sequence_completed', 'conditions' => ['sequence_id' => $sequence->id]],
+            'actions_config' => [['type' => 'start_sequence', 'sequence_id' => $sequence->id]],
+        ]);
+        $conversation = Conversation::factory()->create(['business_id' => $this->business->id]);
+        $enrollment = SequenceEnrollment::factory()->create([
+            'sequence_id' => $sequence->id,
+            'conversation_id' => $conversation->id,
+            'status' => 'completed',
+        ]);
+
+        $results = app(AutomationEngine::class)->executeWorkflowsForEvent(
+            AutomationEngine::EVENT_SEQUENCE_COMPLETED,
+            $conversation,
+            ['sequence_id' => $sequence->id, 'sequence_enrollment_id' => $enrollment->id]
+        );
+
+        $this->assertTrue($results[0]['triggered']);
+        $this->assertFalse($results[0]['actions_executed'][0]['success']);
+        $this->assertSame('workflow_loop_guard_24h', $results[0]['actions_executed'][0]['error']);
+        $this->assertSame(1, SequenceEnrollment::where('sequence_id', $sequence->id)->count());
+    }
+
+    public function test_workflow_execution_is_capped_at_five_runs_per_conversation_per_hour(): void
+    {
+        $workflow = AutomationWorkflow::factory()->create([
+            'business_id' => $this->business->id,
+            'trigger_config' => ['type' => 'keyword', 'conditions' => ['keywords' => ['run'], 'match_type' => 'any']],
+            'actions_config' => [['type' => 'add_tag', 'tag' => 'capped']],
+        ]);
+        $conversation = Conversation::factory()->create(['business_id' => $this->business->id]);
+        $engine = app(AutomationEngine::class);
+
+        for ($i = 0; $i < 6; $i++) {
+            $message = Message::factory()->create([
+                'conversation_id' => $conversation->id,
+                'direction' => 'inbound',
+                'content' => 'run ' . $i,
+            ]);
+            $results = $engine->executeWorkflowsForEvent(
+                AutomationEngine::EVENT_MESSAGE_RECEIVED,
+                $conversation,
+                ['message' => $message]
+            );
+        }
+
+        $this->assertSame(5, WorkflowExecution::where('workflow_id', $workflow->id)->count());
+        $this->assertFalse($results[0]['triggered']);
+    }
+
+    public function test_scheduled_time_workflow_runs_once_in_business_timezone(): void
+    {
+        $this->business->update(['timezone' => 'America/New_York']);
+        $workflow = AutomationWorkflow::factory()->create([
+            'business_id' => $this->business->id,
+            'trigger_config' => [
+                'type' => 'time',
+                'conditions' => ['time_range' => ['start' => '09:00', 'end' => '17:00']],
+            ],
+            'actions_config' => [['type' => 'add_tag', 'tag' => 'scheduled']],
+        ]);
+        $conversation = Conversation::factory()->create([
+            'business_id' => $this->business->id,
+            'channel_id' => $this->channel->id,
+        ]);
+        $this->travelTo(\Carbon\Carbon::parse('2026-10-10 14:00:00', 'UTC'));
+
+        \Illuminate\Support\Facades\Artisan::call('workflows:run-time-triggers');
+        \Illuminate\Support\Facades\Artisan::call('workflows:run-time-triggers');
+
+        $this->assertSame(1, WorkflowExecution::where('workflow_id', $workflow->id)->where('conversation_id', $conversation->id)->count());
+        $this->assertDatabaseHas('conversation_tags', ['conversation_id' => $conversation->id, 'tag' => 'scheduled']);
+    }
+
+    public function test_replay_retries_only_failed_actions_and_rechecks_consent(): void
+    {
+        Http::fake([
+            '*/message/sendText/*' => Http::response(['key' => ['id' => 'replayed-provider-message']], 200),
+            '*' => Http::response([], 200),
+        ]);
+        $workflow = AutomationWorkflow::factory()->create([
+            'business_id' => $this->business->id,
+            'trigger_config' => ['type' => 'keyword', 'conditions' => ['keywords' => ['offer'], 'match_type' => 'any']],
+            'actions_config' => [
+                ['type' => 'add_tag', 'tag' => 'successful-action'],
+                ['type' => 'send_message', 'message' => 'Marketing offer'],
+            ],
+        ]);
+        $conversation = Conversation::factory()->create([
+            'business_id' => $this->business->id,
+            'channel_id' => $this->channel->id,
+        ]);
+        $message = Message::factory()->create([
+            'conversation_id' => $conversation->id,
+            'direction' => 'inbound',
+            'content' => 'offer',
+        ]);
+
+        app(AutomationEngine::class)->executeWorkflowsForEvent(
+            AutomationEngine::EVENT_MESSAGE_RECEIVED,
+            $conversation,
+            ['message' => $message]
+        );
+        $source = WorkflowExecution::where('workflow_id', $workflow->id)->firstOrFail();
+        $this->assertSame('failed', $source->status);
+        $this->assertTrue($source->results['actions_executed'][0]['success']);
+        $this->assertFalse($source->results['actions_executed'][1]['success']);
+
+        // Remove the successful side effect. A replay must not execute it again.
+        \App\Models\ConversationTag::where('conversation_id', $conversation->id)->where('tag', 'successful-action')->delete();
+        ContactConsent::create([
+            'business_id' => $this->business->id,
+            'channel' => 'whatsapp',
+            'contact_identifier' => app(\App\Services\ConsentGate::class)->normalizeIdentifier($conversation->sender_id, 'whatsapp'),
+            'scope' => 'marketing',
+            'status' => 'opted_in',
+            'source' => 'form',
+            'captured_at' => now(),
+        ]);
+
+        $replay = app(AutomationEngine::class)->replayFailedActions($workflow, $source);
+
+        $this->assertTrue($replay['success']);
+        $this->assertSame(1, count($replay['results']['actions_executed']));
+        $this->assertSame(1, $replay['results']['actions_executed'][0]['action_index']);
+        $this->assertDatabaseMissing('conversation_tags', ['conversation_id' => $conversation->id, 'tag' => 'successful-action']);
+        $this->assertSame(1, Message::where('conversation_id', $conversation->id)->where('source', 'automation')->count());
+
+        $secondAttempt = app(AutomationEngine::class)->replayFailedActions($workflow, $source);
+        $this->assertFalse($secondAttempt['success']);
+        $this->assertSame('failed_actions_already_replayed', $secondAttempt['error']);
     }
 
     // ── BOT SCOPE ────────────────────────────────────────────────────────────
@@ -485,6 +820,11 @@ class WorkflowEngineRefactorTest extends TestCase
             'business_id' => $this->business->id,
             'channel_id'  => $this->channel->id,
         ]);
+        ContactConsent::create([
+            'business_id' => $this->business->id, 'channel' => 'whatsapp',
+            'contact_identifier' => app(\App\Services\ConsentGate::class)->normalizeIdentifier($conversation->sender_id, 'whatsapp'),
+            'scope' => 'marketing', 'status' => 'opted_in', 'source' => 'form', 'captured_at' => now(),
+        ]);
 
         $message = Message::factory()->create([
             'conversation_id' => $conversation->id,
@@ -504,6 +844,29 @@ class WorkflowEngineRefactorTest extends TestCase
         $this->assertNotEmpty($results[0]['actions_executed']);
         fwrite(STDERR, "send_message result: " . json_encode($results[0]['actions_executed']) . "\n");
         $this->assertTrue($results[0]['actions_executed'][0]['success']);
+    }
+
+    public function test_workflow_send_message_is_blocked_without_marketing_consent(): void
+    {
+        AutomationWorkflow::factory()->create([
+            'business_id' => $this->business->id,
+            'trigger_config' => ['type' => 'keyword', 'conditions' => ['keywords' => ['offer'], 'match_type' => 'any']],
+            'actions_config' => [['type' => 'send_message', 'message' => 'A marketing offer']],
+        ]);
+        Http::fake(['*' => Http::response(['key' => ['id' => 'should-not-send']], 200)]);
+        $conversation = Conversation::factory()->create(['business_id' => $this->business->id, 'channel_id' => $this->channel->id]);
+        $message = Message::factory()->create(['conversation_id' => $conversation->id, 'direction' => 'inbound', 'content' => 'offer']);
+
+        $results = app(AutomationEngine::class)->executeWorkflowsForEvent(
+            AutomationEngine::EVENT_MESSAGE_RECEIVED,
+            $conversation,
+            ['message' => $message]
+        );
+
+        $this->assertNotEmpty($results);
+        $this->assertFalse($results[0]['actions_executed'][0]['success']);
+        $this->assertStringContainsString('no_consent', $results[0]['actions_executed'][0]['error']);
+        $this->assertSame(0, Message::where('conversation_id', $conversation->id)->where('direction', 'outbound')->count());
     }
 
     public function test_add_tag_action_executes_correctly()

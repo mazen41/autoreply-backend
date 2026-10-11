@@ -4,6 +4,7 @@ namespace Tests\Feature;
 
 use App\Jobs\ProcessAutoReply;
 use App\Models\BusinessProfile;
+use App\Models\Bot;
 use App\Models\Channel;
 use App\Models\Conversation;
 use App\Models\Message;
@@ -54,6 +55,7 @@ class ProductReplyContextTest extends TestCase
 
     private function makeFixture(): array
     {
+        config(['services.evolution_api.url' => 'http://localhost:8080']);
         $this->makeFreePackage();
 
         $user = User::forceCreate([
@@ -75,6 +77,7 @@ class ProductReplyContextTest extends TestCase
             'status' => 'connected',
             'access_token' => 'test_token_' . \Illuminate\Support\Str::random(10),
             'ai_enabled' => true,
+            'metadata' => ['whatsapp_provider' => 'evolution', 'unofficial_risk_accepted' => true],
         ]);
 
         $sallaChannel = Channel::create([
@@ -86,9 +89,18 @@ class ProductReplyContextTest extends TestCase
             'refresh_token' => 'fake-salla-refresh-token',
         ]);
 
+        $bot = Bot::create([
+            'business_profile_id' => $business->id,
+            'name' => 'Product Reply Test Agent',
+            'status' => 'active',
+            'ecommerce_channel_id' => $sallaChannel->id,
+        ]);
+        $bot->channels()->attach($whatsappChannel->id, ['is_primary' => true]);
+
         $conversation = Conversation::create([
             'channel_id' => $whatsappChannel->id,
             'business_id' => $business->id,
+            'bot_id' => $bot->id,
             'sender_id' => '966500000000',
             'status' => 'open',
         ]);

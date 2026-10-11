@@ -48,6 +48,8 @@ class AIPromptContextTest extends TestCase
         $business = BusinessProfile::create([
             'user_id' => $user->id,
             'business_name' => 'NazBiz',
+            'ai_provider' => 'groq',
+            'ai_model' => 'llama-3.3-70b-versatile',
         ]);
 
         // Bot assigned to a specific Salla store (ecommerce_channel_id) — the
@@ -67,8 +69,9 @@ class AIPromptContextTest extends TestCase
             'business_profile_id' => $business->id,
             'name' => 'NazBiz Bot',
             'status' => 'active',
-            'ai_provider' => 'groq',
-            'ai_model' => 'llama-3.3-70b-versatile',
+            // Null agent overrides must inherit the business provider/model.
+            'ai_provider' => null,
+            'ai_model' => null,
             'ai_confidence_threshold' => 0.70,
             'ecommerce_channel_id' => $store->id,
         ]);
@@ -182,6 +185,7 @@ class AIPromptContextTest extends TestCase
         $business = BusinessProfile::create([
             'user_id' => $user->id,
             'business_name' => 'NazBiz',
+            'ai_provider' => 'groq',
         ]);
 
         $channel = Channel::create([
@@ -194,9 +198,18 @@ class AIPromptContextTest extends TestCase
             'ai_enabled' => true,
         ]);
 
+        $bot = Bot::create([
+            'business_profile_id' => $business->id,
+            'name' => 'Unknown Customer Prompt Agent',
+            'status' => 'active',
+            'ai_provider' => 'groq',
+        ]);
+        $bot->channels()->attach($channel->id, ['is_primary' => true]);
+
         $conversation = Conversation::create([
             'channel_id' => $channel->id,
             'business_id' => $business->id,
+            'bot_id' => $bot->id,
             'sender_id' => '966555000999',
             'status' => 'open',
             // sender_name deliberately absent — no customer name known
@@ -237,22 +250,6 @@ class AIPromptContextTest extends TestCase
                             'confidence' => 0.95,
                             'escalation_reason' => 'none',
                         ])],
-                    ]],
-                ], 200);
-            },
-            // No bot resolved → default provider is gemini.
-            'generativelanguage.googleapis.com/*generateContent*' => function ($request) use (&$captured) {
-                $captured = $request;
-                return Http::response([
-                    'candidates' => [[
-                        'content' => ['parts' => [['text' => json_encode([
-                            'reply' => 'Hi! Welcome to NazBiz.',
-                            'intent' => 'greeting',
-                            'needs_escalation' => false,
-                            'needs_images' => false,
-                            'confidence' => 0.95,
-                            'escalation_reason' => 'none',
-                        ])]]],
                     ]],
                 ], 200);
             },

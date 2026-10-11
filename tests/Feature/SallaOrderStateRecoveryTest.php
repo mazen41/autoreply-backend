@@ -7,9 +7,11 @@ use Illuminate\Support\Facades\Http;
 use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\Log;
 use Illuminate\Support\Facades\Redis;
+use Illuminate\Support\Facades\DB;
 use Tests\TestCase;
 use App\Models\User;
 use App\Models\BusinessProfile;
+use App\Models\Bot;
 use App\Models\Channel;
 use App\Models\Conversation;
 use App\Models\Message;
@@ -55,19 +57,45 @@ class SallaOrderStateRecoveryTest extends TestCase
         ]);
         try { Redis::del("rate_limit:{$business->id}:{$user->id}"); } catch (\Throwable) {}
         
-        $channel = Channel::factory()->create([
+        $commerceChannel = Channel::factory()->create([
             'user_id' => $user->id,
+            'business_id' => $business->id,
             'type' => 'salla',
             'status' => 'connected',
             'access_token' => 'valid_token',
+        ]);
+        $channel = Channel::factory()->create([
+            'user_id' => $user->id,
+            'business_id' => $business->id,
+            'type' => 'instagram',
+            'status' => 'connected',
+            'access_token' => 'test-instagram-token',
             'ai_enabled' => true,
         ]);
-        $channel->business_id = $business->id;
-        $channel->save();
+        $bot = Bot::create([
+            'business_profile_id' => $business->id,
+            'name' => 'Salla Order Recovery Agent',
+            'status' => 'active',
+            'ecommerce_channel_id' => $commerceChannel->id,
+        ]);
+        $bot->channels()->attach($channel->id, ['is_primary' => true]);
+        DB::table('salla_cities')->insert([
+            'channel_id' => $commerceChannel->id,
+            'country_code' => 'EG',
+            'country_id' => 1723506348,
+            'salla_city_id' => 1,
+            'name' => 'Cairo',
+            'name_en' => 'Cairo',
+            'synced_at' => now(),
+            'created_at' => now(),
+            'updated_at' => now(),
+        ]);
 
         $conversation = Conversation::factory()->create([
             'channel_id' => $channel->id,
             'business_id' => $business->id,
+            'bot_id' => $bot->id,
+            'ecommerce_connection_id' => $commerceChannel->id,
             'sender_id' => '+201152879755',
             'ai_enabled' => true,
         ]);
@@ -94,8 +122,10 @@ class SallaOrderStateRecoveryTest extends TestCase
             'metadata' => ['quoted_message_id' => $quotedMessageId],
         ]);
 
-        // Mock LLM call for Turn 1
+        // Mock LLM call for product selection, detail collection, and the
+        // explicit confirmation after the order summary was shown.
         Http::fake([
+            'graph.facebook.com/*' => Http::response(['message_id' => 'meta-order-summary'], 200),
             'api.groq.com/*' => Http::sequence()
                 ->push(['choices' => [['message' => ['content' => json_encode([
                     'success' => true,
@@ -146,6 +176,12 @@ class SallaOrderStateRecoveryTest extends TestCase
                     ? Http::response(['data' => ['id' => 7711]], 200)
                     : Http::response(['data' => []], 200);
             },
+            'api.salla.dev/admin/v2/shipping/companies/estimate-rate*' => Http::response(['data' => [[
+                'company_id' => 5,
+                'total' => ['amount' => 20, 'currency' => 'SAR'],
+                'services' => [['name' => 'cod', 'amount' => ['amount' => 0]]],
+            ]]], 200),
+            'api.salla.dev/admin/v2/orders?*' => Http::response(['data' => []], 200),
             'api.salla.dev/admin/v2/orders' => Http::response(['data' => ['id' => 523147668, 'reference_id' => 'SAL-523147668']], 200),
         ]);
 
@@ -159,10 +195,10 @@ class SallaOrderStateRecoveryTest extends TestCase
         $this->assertEquals('523147668', $conversation->checkout_state['salla_product_id']);
         $this->assertEquals('Fancy Dress', $conversation->checkout_state['product_name']);
 
-        // 3. TURN 2: Customer provides name/address (no quoted message ID)
+        // 3. TURN 2: Customer provides the required delivery details.
         $msg2 = Message::create([
             'conversation_id' => $conversation->id,
-            'content' => 'Mazen Hossny, 123 Nile St, Cairo. 01152879755',
+            'content' => 'My name is Mazen Hossny. My address is Cairo. My phone is 01152879755. Email is mazen@example.com, postal code 11511, building number 123, coordinates 30.0444,31.2357.',
             'direction' => 'inbound',
             'is_ai' => false,
         ]);
@@ -175,7 +211,8 @@ class SallaOrderStateRecoveryTest extends TestCase
         $conversation->refresh();
         $this->assertNotNull($conversation->checkout_state);
         $this->assertEquals('523147668', $conversation->checkout_state['salla_product_id']); // Did not lose product!
-        $this->assertStringContainsString('01152879755', $conversation->checkout_state['phone']); // Extracted phone (normalized)
+        $this->assertStringContainsString('01152879755', $conversation->checkout_state['phone']); // Extracted phone
+        $this->assertSame('confirmation_pending', $conversation->checkout_state['confirmation_state']);
 
         // Verify the bot didn't send the generic "I'm sorry I'm having a brief issue" message,
         // but instead used the AI reply which had the context
@@ -185,7 +222,7 @@ class SallaOrderStateRecoveryTest extends TestCase
             ->first();
             
         $this->assertStringNotContainsString('having a brief issue loading our product catalogue', $botReply2->content);
-        $this->assertStringContainsString('Thanks Mazen', $botReply2->content);
+        $this->assertStringContainsString('Please review your order summary', $botReply2->content);
         
         // 4. TURN 3: Customer confirms order
         $msg3 = Message::create([
@@ -193,6 +230,7 @@ class SallaOrderStateRecoveryTest extends TestCase
             'content' => 'Yes, please confirm',
             'direction' => 'inbound',
             'is_ai' => false,
+            'metadata' => ['quoted_message_id' => (string) $conversation->fresh()->checkout_state['confirmation_summary_message_id']],
         ]);
 
         // Run Turn 3
@@ -204,5 +242,31 @@ class SallaOrderStateRecoveryTest extends TestCase
         $this->assertNotNull($conversation->checkout_state);
         $this->assertEquals('completed', $conversation->checkout_state['status']);
         $this->assertNotEmpty($conversation->checkout_state['order_id']);
+        $this->assertDatabaseHas('commerce_order_attempts', [
+            'conversation_id' => $conversation->id,
+            'connection_id' => $commerceChannel->id,
+            'status' => 'completed',
+            'external_order_id' => $conversation->checkout_state['order_id'],
+        ]);
+
+        // Simulate the checkout-state write being absent after the provider
+        // accepted the order. The durable attempt must recover its real ID and
+        // must not POST another order.
+        $completedState = $conversation->checkout_state;
+        $retryInput = array_merge($completedState, [
+            'commerce_channel_id' => $commerceChannel->id,
+            'commerce_external_id' => $completedState['salla_product_id'],
+        ]);
+        $conversation->update(['checkout_state' => array_diff_key($completedState, array_flip([
+            'status', 'order_id', 'order_number', 'order_fingerprint', 'order_product_id', 'order_connection_id',
+        ]))]);
+        $createOrder = new \ReflectionMethod(ProcessAutoReply::class, 'createRealExternalOrder');
+        $createOrder->setAccessible(true);
+        $recovered = $createOrder->invoke(new ProcessAutoReply($msg3->id), $conversation->fresh(), $retryInput, $channel);
+
+        $this->assertSame($completedState['order_id'], $recovered['order_id']);
+        $providerOrderPosts = Http::recorded(fn ($request) => $request->method() === 'POST'
+            && str_contains($request->url(), 'api.salla.dev/admin/v2/orders'));
+        $this->assertCount(1, $providerOrderPosts);
     }
 }

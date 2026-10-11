@@ -62,17 +62,17 @@ class ResyncTelegramWebhooks extends Command
                     $failed++;
                     Log::error('telegram:resync-webhooks failed for channel', [
                         'channel_id' => $channel->id,
-                        'response' => $response->json(),
+                        'http_status' => $response->status(),
                     ]);
-                    $this->error("  Failed: " . json_encode($response->json()));
+                    $this->error("  Failed with HTTP status {$response->status()}.");
                 }
             } catch (\Exception $e) {
                 $failed++;
                 Log::error('telegram:resync-webhooks exception', [
                     'channel_id' => $channel->id,
-                    'error' => $e->getMessage(),
+                    'exception_type' => get_class($e),
                 ]);
-                $this->error("  Exception: {$e->getMessage()}");
+                $this->error('  Request failed; see application logs for the exception type.');
             }
         }
 

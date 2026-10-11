@@ -4,15 +4,12 @@ namespace App\Http\Controllers\Api;
 
 use App\Http\Controllers\Controller;
 use App\Models\Campaign;
-use App\Models\CampaignLog;
-use App\Models\Conversation;
 use App\Models\Channel;
 use App\Models\BusinessProfile;
-use App\Jobs\SendCampaignMessage;
+use App\Services\CampaignLaunchService;
 use Carbon\Carbon;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\Auth;
-use Illuminate\Support\Facades\Log;
 
 class CampaignController extends Controller
 {
@@ -21,8 +18,6 @@ class CampaignController extends Controller
      */
     public function index(Request $request, $businessId)
     {
-        $this->authorizeBusiness($businessId);
-
         $campaigns = Campaign::where('business_id', $businessId)
             ->with(['channel'])
             ->when($request->filled('status'), fn ($q) => $q->where('status', $request->query('status')))
@@ -32,15 +27,37 @@ class CampaignController extends Controller
         return response()->json($campaigns);
     }
 
+    /** Preview a messaging campaign's eligible audience on its chosen sender. */
+    public function audiencePreview(Request $request, $businessId)
+    {
+        $validated = $request->validate([
+            'channel_id' => 'required|integer',
+            'whatsapp_cloud_template_id' => 'nullable|integer',
+            'filters' => 'nullable|array',
+            'filters.tags' => 'nullable|array',
+            'filters.tags.*' => 'string|max:100',
+            'filters.last_activity_days' => 'nullable|integer|min:1|max:365',
+        ]);
+
+        $this->authorizeChannel((int) $businessId, (int) $validated['channel_id']);
+        $channel = Channel::where('business_id', $businessId)->findOrFail($validated['channel_id']);
+
+        return response()->json(app(\App\Services\CampaignAudiencePreviewService::class)->preview(
+            $channel,
+            $validated['filters'] ?? [],
+            $validated['whatsapp_cloud_template_id'] ?? null
+        ));
+    }
+
     /**
      * Create a new campaign
      */
     public function store(Request $request, $businessId)
     {
-        $this->authorizeBusiness($businessId);
-
         $request->validate([
             'channel_id' => 'required|exists:channels,id',
+            'whatsapp_cloud_template_id' => 'nullable|integer|exists:whatsapp_cloud_templates,id',
+            'whatsapp_template_components' => 'nullable|array',
             'name' => 'required|string|max:255',
             'message' => 'required|string',
             'scheduled_at' => 'nullable|date',
@@ -52,6 +69,11 @@ class CampaignController extends Controller
         ]);
 
         $this->authorizeChannel($businessId, (int) $request->channel_id);
+        $channel = Channel::where('business_id', $businessId)->findOrFail($request->channel_id);
+        $whatsappValidationError = $this->whatsappCampaignValidationError($channel, $businessId, $request->whatsapp_cloud_template_id);
+        if ($whatsappValidationError) {
+            return response()->json(['error' => $whatsappValidationError], 422);
+        }
 
         $scheduledAt = $this->parseScheduledAt($businessId, $request->scheduled_at, $request->timezone);
         if ($request->filled('scheduled_at') && $scheduledAt === false) {
@@ -64,8 +86,10 @@ class CampaignController extends Controller
         $campaign = Campaign::create([
             'business_id' => $businessId,
             'channel_id' => $request->channel_id,
+            'whatsapp_cloud_template_id' => $request->whatsapp_cloud_template_id,
             'name' => $request->name,
             'message' => $request->message,
+            'whatsapp_template_components' => $request->whatsapp_template_components,
             'status' => $scheduledAt ? 'scheduled' : 'draft',
             'scheduled_at' => $scheduledAt,
             'filters' => $request->filters,
@@ -114,10 +138,10 @@ class CampaignController extends Controller
      */
     public function update(Request $request, $businessId, $campaignId)
     {
-        $this->authorizeBusiness($businessId);
-
         $request->validate([
             'channel_id' => 'sometimes|required|exists:channels,id',
+            'whatsapp_cloud_template_id' => 'nullable|integer|exists:whatsapp_cloud_templates,id',
+            'whatsapp_template_components' => 'nullable|array',
             'name' => 'sometimes|string|max:255',
             'message' => 'sometimes|string',
             'scheduled_at' => 'nullable|date',
@@ -139,7 +163,26 @@ class CampaignController extends Controller
             $this->authorizeChannel($businessId, (int) $request->channel_id);
         }
 
-        $updates = $request->only(['channel_id', 'name', 'message', 'filters']);
+        $channel = $request->filled('channel_id')
+            ? Channel::where('business_id', $businessId)->findOrFail($request->channel_id)
+            : $campaign->channel;
+        $templateId = $request->has('whatsapp_cloud_template_id')
+            ? $request->whatsapp_cloud_template_id
+            : $campaign->whatsapp_cloud_template_id;
+        $whatsappValidationError = $this->whatsappCampaignValidationError($channel, $businessId, $templateId);
+        if ($whatsappValidationError) {
+            return response()->json(['error' => $whatsappValidationError], 422);
+        }
+
+        $updates = $request->only([
+            'channel_id', 'name', 'message', 'filters',
+            'whatsapp_cloud_template_id', 'whatsapp_template_components',
+        ]);
+        if ($request->filled('channel_id') && $channel->type !== 'whatsapp'
+            && !$request->has('whatsapp_cloud_template_id')) {
+            $updates['whatsapp_cloud_template_id'] = null;
+            $updates['whatsapp_template_components'] = null;
+        }
         if ($request->has('scheduled_at')) {
             $scheduledAt = $this->parseScheduledAt($businessId, $request->scheduled_at, $request->timezone);
             if ($request->filled('scheduled_at') && $scheduledAt === false) {
@@ -162,8 +205,6 @@ class CampaignController extends Controller
      */
     public function destroy(Request $request, $businessId, $campaignId)
     {
-        $this->authorizeBusiness($businessId);
-
         $campaign = Campaign::where('business_id', $businessId)
             ->findOrFail($campaignId);
 
@@ -182,101 +223,15 @@ class CampaignController extends Controller
      */
     public function launch(Request $request, $businessId, $campaignId)
     {
-        $this->authorizeBusiness($businessId);
+        $result = app(CampaignLaunchService::class)->launch($businessId, $campaignId, ['draft']);
+        $status = $result['status'] ?? 200;
+        unset($result['status']);
 
-        return $this->launchCampaign($businessId, $campaignId, ['draft']);
-    }
-
-    public function launchScheduled(Request $request, $businessId, $campaignId)
-    {
-        return $this->launchCampaign($businessId, $campaignId, ['scheduled']);
-    }
-
-    private function launchCampaign($businessId, $campaignId, array $allowedStatuses)
-    {
-        $campaign = Campaign::where('business_id', $businessId)
-            ->findOrFail($campaignId);
-
-        if (!in_array($campaign->status, $allowedStatuses, true)) {
-            return response()->json(['error' => 'Campaign is not in a launchable status'], 400);
-        }
-
-        // Atomically claim the campaign by flipping its status here, before
-        // building the audience or dispatching any jobs. Without this, two
-        // concurrent launch calls for the same campaign (e.g. the
-        // `campaigns:send-due` cron firing at the same moment as a manual
-        // "Launch Now" click, or two overlapping cron runs) could both pass
-        // the check above and both build the audience + dispatch a full set
-        // of SendCampaignMessage jobs — sending every recipient the campaign
-        // twice. The affected-rows count tells us whether we actually won
-        // the race; if another request already flipped the status, we lost
-        // and must not proceed.
-        $claimed = Campaign::where('id', $campaignId)
-            ->where('business_id', $businessId)
-            ->whereIn('status', $allowedStatuses)
-            ->update(['status' => 'sending', 'sent_at' => now()]);
-
-        if ($claimed === 0) {
-            return response()->json(['error' => 'Campaign is not in a launchable status'], 400);
-        }
-
-        $campaign->refresh();
-
-        // Build audience based on filters: match conversation channel_id directly
-        $query = Conversation::where('channel_id', $campaign->channel_id);
-
-        // Apply filters if provided
-        if ($campaign->filters) {
-            if (isset($campaign->filters['tags'])) {
-                $query->whereHas('tags', function ($q) use ($campaign) {
-                    $q->whereIn('tag', $campaign->filters['tags']);
-                });
-            }
-            if (isset($campaign->filters['last_activity_days'])) {
-                $query->where('last_message_at', '>=', now()->subDays($campaign->filters['last_activity_days']));
-            }
-        }
-
-        $conversations = $query->get();
-
-        // An empty audience means there is nothing left to make the campaign
-        // progress — no SendCampaignMessage job will ever run to flip its
-        // status, so without this it would stay stuck on "sending" forever.
-        if ($conversations->isEmpty()) {
-            $campaign->update([
-                'total_recipients' => 0,
-                'status' => 'failed',
-                'error_message' => 'No matching recipients found for this campaign\'s audience filters.',
-            ]);
-
-            return response()->json(['error' => 'No matching recipients found for this campaign\'s audience filters.'], 400);
-        }
-
-        $campaign->update(['total_recipients' => $conversations->count()]);
-
-        // Create campaign logs and queue jobs
-        foreach ($conversations as $conversation) {
-            $campaignLog = CampaignLog::create([
-                'campaign_id' => $campaign->id,
-                'conversation_id' => $conversation->id,
-                'status' => 'queued',
-            ]);
-
-            SendCampaignMessage::dispatch($campaignLog->id);
-        }
-
-        Log::info('Campaign launched', [
-            'campaign_id' => $campaign->id,
-            'recipients' => $conversations->count(),
-        ]);
-
-        return response()->json(['success' => true, 'campaign' => $campaign->fresh()]);
+        return response()->json($result, $status);
     }
 
     public function cancelSchedule(Request $request, $businessId, $campaignId)
     {
-        $this->authorizeBusiness($businessId);
-
         $campaign = Campaign::where('business_id', $businessId)
             ->findOrFail($campaignId);
 
@@ -292,13 +247,33 @@ class CampaignController extends Controller
         return response()->json(['success' => true, 'campaign' => $campaign]);
     }
 
+    public function pause(Request $request, $businessId, $campaignId)
+    {
+        $business = app(\App\Services\ActiveBusiness::class)->resolve(
+            $request, permission: 'automation_write', routeBusinessId: $businessId
+        );
+        $campaign = Campaign::where('business_id', $business->id)->findOrFail($campaignId);
+        app(\App\Services\AutomationRunControl::class)->pauseCampaign($business, $campaign, true);
+
+        return response()->json(['success' => true, 'paused' => true, 'campaign' => $campaign->fresh()]);
+    }
+
+    public function resume(Request $request, $businessId, $campaignId)
+    {
+        $business = app(\App\Services\ActiveBusiness::class)->resolve(
+            $request, permission: 'automation_write', routeBusinessId: $businessId
+        );
+        $campaign = Campaign::where('business_id', $business->id)->findOrFail($campaignId);
+        app(\App\Services\AutomationRunControl::class)->pauseCampaign($business, $campaign, false);
+
+        return response()->json(['success' => true, 'paused' => false, 'campaign' => $campaign->fresh()]);
+    }
+
     /**
      * Get campaign logs
      */
     public function logs(Request $request, $businessId, $campaignId)
     {
-        $this->authorizeBusiness($businessId);
-
         $campaign = Campaign::where('business_id', $businessId)
             ->findOrFail($campaignId);
 
@@ -310,29 +285,37 @@ class CampaignController extends Controller
         return response()->json($logs);
     }
 
-    private function authorizeBusiness($businessId): void
-    {
-        $ownsBusiness = \App\Models\BusinessProfile::where('id', $businessId)
-            ->where('user_id', Auth::id())
-            ->exists();
-
-        if (!$ownsBusiness) {
-            abort(404);
-        }
-    }
-
     private function authorizeChannel(int $businessId, int $channelId): void
     {
         $ownsChannel = Channel::where('id', $channelId)
-            ->where(function ($q) use ($businessId) {
-                $q->where('business_id', $businessId)
-                  ->orWhere('user_id', Auth::id());
-            })
+            ->where('business_id', $businessId)
             ->whereIn('type', ['whatsapp', 'instagram', 'facebook', 'telegram', 'gmail', 'salla'])
             ->exists();
 
         if (!$ownsChannel) {
             abort(422, 'Select a valid connected messaging channel for this business.');
         }
+    }
+
+    private function whatsappCampaignValidationError(?Channel $channel, int|string $businessId, mixed $templateId): ?string
+    {
+        if (!$channel || $channel->type !== 'whatsapp') {
+            return null;
+        }
+
+        if (($channel->metadata['whatsapp_provider'] ?? null) !== 'cloud') {
+            return 'WhatsApp campaigns are disabled for unofficial Evolution connections.';
+        }
+
+        $templateIsApprovedForChannel = $templateId && \App\Models\WhatsAppCloudTemplate::query()
+            ->where('id', $templateId)
+            ->where('business_id', $businessId)
+            ->where('channel_id', $channel->id)
+            ->where('status', 'APPROVED')
+            ->exists();
+
+        return $templateIsApprovedForChannel
+            ? null
+            : 'Select an approved WhatsApp Cloud API template for this channel.';
     }
 }

@@ -7,6 +7,8 @@ use App\Models\SequenceStep;
 use App\Models\SequenceEnrollment;
 use App\Models\Conversation;
 use App\Models\BusinessProfile;
+use App\Models\Channel;
+use App\Models\ContactConsent;
 use App\Models\User;
 use App\Services\SequenceEnrollmentService;
 use App\Services\SequenceService;
@@ -22,6 +24,7 @@ class SequenceEnrollmentServiceTest extends TestCase
     private SequenceService $sequenceService;
     private User $user;
     private BusinessProfile $business;
+    private Channel $channel;
 
     protected function setUp(): void
     {
@@ -34,6 +37,11 @@ class SequenceEnrollmentServiceTest extends TestCase
         $this->business = BusinessProfile::factory()->create();
         $this->user->business_id = $this->business->id;
         $this->user->save();
+        $this->channel = Channel::factory()->create([
+            'business_id' => $this->business->id,
+            'user_id' => $this->user->id,
+            'type' => 'whatsapp',
+        ]);
     }
 
     public function test_enroll_conversation()
@@ -50,9 +58,7 @@ class SequenceEnrollmentServiceTest extends TestCase
             'step_order' => 1,
         ]);
 
-        $conversation = Conversation::factory()->create([
-            'business_id' => $this->business->id,
-        ]);
+        $conversation = $this->createConsentedConversation();
 
         $enrollment = $this->enrollmentService->enrollConversation($sequence, $conversation);
 
@@ -75,9 +81,7 @@ class SequenceEnrollmentServiceTest extends TestCase
             'sequence_id' => $sequence->id,
         ]);
 
-        $conversation = Conversation::factory()->create([
-            'business_id' => $this->business->id,
-        ]);
+        $conversation = $this->createConsentedConversation();
 
         $this->enrollmentService->enrollConversation($sequence, $conversation);
 
@@ -93,9 +97,7 @@ class SequenceEnrollmentServiceTest extends TestCase
             'business_id' => $this->business->id,
         ]);
 
-        $conversation = Conversation::factory()->create([
-            'business_id' => $this->business->id,
-        ]);
+        $conversation = $this->createConsentedConversation();
 
         $enrollment = SequenceEnrollment::factory()->create([
             'sequence_id' => $sequence->id,
@@ -184,9 +186,7 @@ class SequenceEnrollmentServiceTest extends TestCase
             'sequence_id' => $sequence->id,
         ]);
 
-        $conversation = Conversation::factory()->create([
-            'business_id' => $this->business->id,
-        ]);
+        $conversation = $this->createConsentedConversation();
 
         $canEnroll = $this->enrollmentService->canEnroll($sequence, $conversation);
 
@@ -236,5 +236,24 @@ class SequenceEnrollmentServiceTest extends TestCase
         $this->assertEquals(2, $stats['total']);
         $this->assertEquals(1, $stats['active']);
         $this->assertEquals(1, $stats['completed']);
+    }
+
+    private function createConsentedConversation(): Conversation
+    {
+        $conversation = Conversation::factory()->create([
+            'business_id' => $this->business->id,
+            'channel_id' => $this->channel->id,
+        ]);
+        ContactConsent::create([
+            'business_id' => $this->business->id,
+            'channel' => 'whatsapp',
+            'contact_identifier' => app(\App\Services\ConsentGate::class)->normalizeIdentifier($conversation->sender_id, 'whatsapp'),
+            'scope' => 'marketing',
+            'status' => 'opted_in',
+            'source' => 'form',
+            'captured_at' => now(),
+        ]);
+
+        return $conversation;
     }
 }

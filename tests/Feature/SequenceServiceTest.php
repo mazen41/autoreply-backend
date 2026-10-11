@@ -11,6 +11,7 @@ use App\Models\User;
 use App\Services\SequenceService;
 use App\Services\SequenceEnrollmentService;
 use Illuminate\Foundation\Testing\RefreshDatabase;
+use Illuminate\Support\Facades\Queue;
 use Tests\TestCase;
 
 class SequenceServiceTest extends TestCase
@@ -178,6 +179,44 @@ class SequenceServiceTest extends TestCase
         $paused = $this->sequenceService->pauseSequence($sequence);
 
         $this->assertEquals('paused', $paused->status);
+    }
+
+    public function test_pausing_sequence_pauses_enrollments_and_activation_resumes_them(): void
+    {
+        Queue::fake();
+        $sequence = Sequence::factory()->create([
+            'business_id' => $this->business->id,
+            'status' => 'active',
+            'trigger_type' => 'manual',
+            'channel' => 'whatsapp',
+        ]);
+        $step = SequenceStep::factory()->create([
+            'sequence_id' => $sequence->id,
+            'step_order' => 1,
+            'step_type' => 'message',
+            'message' => 'Resume sequence',
+        ]);
+        $conversation = Conversation::factory()->create(['business_id' => $this->business->id]);
+        $enrollment = SequenceEnrollment::factory()->create([
+            'sequence_id' => $sequence->id,
+            'conversation_id' => $conversation->id,
+            'status' => 'active',
+            'current_step' => 1,
+        ]);
+
+        $this->sequenceService->pauseSequence($sequence);
+        $this->assertSame('paused', $enrollment->fresh()->status);
+        $this->assertSame('sequence_paused', $enrollment->fresh()->metadata['pause_reason'] ?? null);
+
+        $this->sequenceService->activateSequence($sequence->fresh());
+
+        $this->assertSame('active', $enrollment->fresh()->status);
+        Queue::assertPushed(\App\Jobs\ExecuteSequenceStep::class, function ($job) use ($enrollment, $step) {
+            $execution = \App\Models\SequenceStepExecution::find($job->executionId);
+            return $execution
+                && (int) $execution->sequence_enrollment_id === (int) $enrollment->id
+                && (int) $execution->sequence_step_id === (int) $step->id;
+        });
     }
 
     public function test_archive_sequence()

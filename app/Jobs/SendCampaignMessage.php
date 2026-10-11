@@ -32,6 +32,7 @@ class SendCampaignMessage implements ShouldQueue
 
     /** Subject line used for Gmail campaign sends; set from the campaign name in handle(). */
     private string $gmailSubject = 'Message';
+    private ?string $providerMessageId = null;
 
     public function __construct(
         public int $campaignLogId,
@@ -42,6 +43,7 @@ class SendCampaignMessage implements ShouldQueue
 
     public function handle(): void
     {
+        $this->providerMessageId = null;
         $campaignLog = CampaignLog::with(['campaign.channel', 'conversation'])
             ->find($this->campaignLogId);
 
@@ -63,6 +65,33 @@ class SendCampaignMessage implements ShouldQueue
             return;
         }
 
+        // If a previous attempt recorded the provider ID but did not finish
+        // the campaign bookkeeping, reconcile that accepted delivery instead
+        // of sending the same recipient again.
+        if ($campaignLog->status === 'sending') {
+            if ($campaignLog->provider_message_id) {
+                DB::transaction(function () use ($campaignLog) {
+                    $updated = CampaignLog::whereKey($campaignLog->id)
+                        ->where('status', 'sending')
+                        ->whereNotNull('provider_message_id')
+                        ->update(['status' => 'sent', 'sent_at' => now()]);
+
+                    if ($updated === 1) {
+                        Campaign::whereKey($campaignLog->campaign_id)->increment('sent_count');
+                    }
+                });
+                if ($campaignLog->campaign) {
+                    $this->checkCompletion($campaignLog->campaign);
+                }
+            }
+
+            Log::info('SendCampaignMessage: in-progress recipient delivery was not re-sent', [
+                'campaign_log_id' => $campaignLog->id,
+                'provider_id_recorded' => (bool) $campaignLog->provider_message_id,
+            ]);
+            return;
+        }
+
         $campaign = $campaignLog->campaign;
         $conversation = $campaignLog->conversation;
 
@@ -74,12 +103,35 @@ class SendCampaignMessage implements ShouldQueue
             return;
         }
 
+        if ($campaign->paused_at !== null
+            || app(\App\Services\AutomationRunControl::class)->releaseIfPaused($this, $campaign->business_id)) {
+            if ($campaign->paused_at !== null) {
+                $this->release(60);
+            }
+            return;
+        }
+
         $channel = $campaign->channel;
 
         if ($campaign->status !== 'sending' && $campaign->status !== 'sent') {
             Log::info('SendCampaignMessage: Campaign not in sending state', ['campaign_id' => $campaign->id, 'status' => $campaign->status]);
             return;
         }
+
+        // Claim the recipient with a conditional transition before any
+        // external request. Overlapping queue deliveries can both load the
+        // queued row, but only one can transition it to sending.
+        $claimed = CampaignLog::whereKey($campaignLog->id)
+            ->where('status', 'queued')
+            ->update(['status' => 'sending']);
+        if ($claimed !== 1) {
+            Log::info('SendCampaignMessage: recipient claim was already taken', [
+                'campaign_log_id' => $campaignLog->id,
+                'status' => $campaignLog->fresh()?->status,
+            ]);
+            return;
+        }
+        $campaignLog->refresh();
 
         if (!$channel) {
             $campaignLog->update(['status' => 'failed', 'error_message' => 'Campaign channel no longer exists']);
@@ -88,22 +140,103 @@ class SendCampaignMessage implements ShouldQueue
             return;
         }
 
+        // Re-check tenant and routing integrity at execution time. Campaigns
+        // may outlive channel edits, and queued jobs must never send through a
+        // channel or conversation that has since moved to another business.
+        if (
+            (int) $channel->business_id !== (int) $campaign->business_id
+            || (int) $conversation->business_id !== (int) $campaign->business_id
+            || (int) $conversation->channel_id !== (int) $channel->id
+        ) {
+            $reason = 'Campaign channel or conversation belongs to a different business or channel.';
+            $campaignLog->update(['status' => 'failed', 'error_message' => $reason]);
+            $campaign->increment('failed_count');
+            Log::warning('SendCampaignMessage: tenant or channel mismatch blocked', [
+                'campaign_id' => $campaign->id,
+                'campaign_log_id' => $campaignLog->id,
+                'business_id' => $campaign->business_id,
+                'channel_id' => $channel->id,
+                'conversation_id' => $conversation->id,
+            ]);
+            $this->checkCompletion($campaign);
+            return;
+        }
+
+        // Keep the delivery gate aligned with audience preview, including
+        // Gmail's sender_email and normalized email consent channel.
+        $consent = app(\App\Services\ConsentGate::class)->checkConversation($conversation, 'marketing');
+        if (!$consent->allowed) {
+            $campaignLog->update([
+                'status' => 'failed',
+                'error_message' => 'Marketing send blocked: ' . $consent->reason,
+            ]);
+            $campaign->increment('failed_count');
+            Log::info('SendCampaignMessage: consent gate blocked recipient', [
+                'campaign_id' => $campaign->id,
+                'campaign_log_id' => $campaignLog->id,
+                'conversation_id' => $conversation->id,
+                'reason' => $consent->reason,
+            ]);
+            $this->checkCompletion($campaign);
+            return;
+        }
+
+        if (in_array($channel->type, ['facebook', 'instagram'], true)) {
+            $lastInboundAt = Message::where('conversation_id', $conversation->id)
+                ->where('direction', 'inbound')
+                ->max('created_at');
+
+            if (!$lastInboundAt || now()->subHours(24)->greaterThanOrEqualTo($lastInboundAt)) {
+                $reason = 'Meta 24-hour messaging window expired; no approved message tag is configured.';
+                $campaignLog->update([
+                    'status' => 'failed',
+                    'error_message' => $reason,
+                ]);
+                $campaign->increment('failed_count');
+                Campaign::whereKey($campaign->id)
+                    ->whereNull('error_message')
+                    ->update(['error_message' => $reason]);
+
+                Log::info('SendCampaignMessage: Meta messaging window blocked recipient', [
+                    'campaign_id' => $campaign->id,
+                    'campaign_log_id' => $campaignLog->id,
+                    'conversation_id' => $conversation->id,
+                    'channel_id' => $channel->id,
+                ]);
+                $this->checkCompletion($campaign);
+                return;
+            }
+        }
+
         // Rate limiting check per channel (max 30 messages per minute per channel)
         $rateLimitKey = "campaign_rate_limit:{$channel->id}";
         if (Cache::get($rateLimitKey, 0) >= 30) {
-            $this->release(5); // Soft retry in 5s
-            return;
+            if ($this->deferWithoutConsumingRetryBudget($campaignLog)) {
+                return;
+            }
         }
         Cache::add($rateLimitKey, 0, 60);
         if (Cache::increment($rateLimitKey) > 30) {
-            $this->release(5);
-            return;
+            Cache::decrement($rateLimitKey);
+            if ($this->deferWithoutConsumingRetryBudget($campaignLog)) {
+                return;
+            }
         }
 
         // Server-side {name} personalization. Falls back to a safe generic
         // greeting when the contact has no known name so the literal
         // "{name}" placeholder is never sent to a recipient.
         $personalizedContent = $this->personalize($campaign->message, $conversation);
+
+        // Recheck immediately before creating the outbound record/provider call.
+        // If a pause landed while validation was running, return the claim to
+        // queued so resume can continue this recipient without consuming it.
+        if ($campaign->paused_at !== null
+            || app(\App\Services\AutomationRunControl::class)->isBusinessPaused((int) $campaign->business_id)) {
+            CampaignLog::whereKey($campaignLog->id)->where('status', 'sending')->update(['status' => 'queued']);
+            $this->release(60);
+            return;
+        }
 
         // Create message
         $message = Message::create([
@@ -116,18 +249,33 @@ class SendCampaignMessage implements ShouldQueue
             'send_status' => 'pending',
         ]);
 
+        if (app(\App\Services\UsageMeter::class)->blockMessageIfOverLimit($campaign->business, $message)) {
+            $reason = $message->fresh()->error_details ?: 'Business plan usage limit reached.';
+            $campaignLog->update(['status' => 'failed', 'error_message' => $reason]);
+            $campaign->increment('failed_count');
+            $this->checkCompletion($campaign);
+            return;
+        }
+
         // Send message based on channel type
         $this->gmailSubject = $campaign->name ?: 'Message';
         $success = $this->sendMessageToChannel($channel, $conversation, $message, $campaignLog);
 
         if ($success) {
-            $message->update(['send_status' => 'sent']);
-            $campaignLog->update([
-                'status' => 'sent',
-                'sent_at' => now(),
-            ]);
+            DB::transaction(function () use ($message, $campaign, $campaignLog) {
+                $claimed = CampaignLog::whereKey($campaignLog->id)
+                    ->where('status', 'sending')
+                    ->update([
+                        'status' => 'sent',
+                        'sent_at' => now(),
+                        'provider_message_id' => $this->providerMessageId,
+                    ]);
 
-            $campaign->increment('sent_count');
+                if ($claimed === 1) {
+                    $message->update(['send_status' => 'sent']);
+                    Campaign::whereKey($campaign->id)->increment('sent_count');
+                }
+            });
 
             Log::info('SendCampaignMessage: Message sent successfully', [
                 'campaign_log_id' => $this->campaignLogId,
@@ -149,6 +297,11 @@ class SendCampaignMessage implements ShouldQueue
         }
 
         $this->checkCompletion($campaign);
+    }
+
+    public function retryUntil(): \DateTimeInterface
+    {
+        return now()->addDays(14);
     }
 
     /**
@@ -185,12 +338,44 @@ class SendCampaignMessage implements ShouldQueue
         $totalProcessed = ($campaign->sent_count ?? 0) + ($campaign->failed_count ?? 0);
 
         if ($campaign->total_recipients > 0 && $totalProcessed >= $campaign->total_recipients) {
-            $finalStatus = ($campaign->sent_count ?? 0) > 0 ? 'sent' : 'failed';
+            $sent = (int) ($campaign->sent_count ?? 0);
+            $failed = (int) ($campaign->failed_count ?? 0);
+            $finalStatus = $sent > 0 && $failed > 0
+                ? 'partially_sent'
+                : ($sent > 0 ? 'sent' : 'failed');
 
             Campaign::where('id', $campaign->id)
                 ->where('status', 'sending')
                 ->update(['status' => $finalStatus]);
         }
+    }
+
+    /**
+     * Re-dispatch throttled recipients as a fresh delayed job. Queue releases
+     * increment the current job's attempt count, so sustained traffic could
+     * exhaust $tries without ever attempting a provider send. The sync driver
+     * cannot honor delays; it processes serially in-process, so it continues
+     * without applying this queue-worker throttle.
+     */
+    private function deferWithoutConsumingRetryBudget(CampaignLog $campaignLog): bool
+    {
+        if (config('queue.default') === 'sync') {
+            return false;
+        }
+
+        $campaignLog->update(['status' => 'queued']);
+        self::dispatch($campaignLog->id, $this->priority)
+            ->onConnection($this->connection)
+            ->onQueue($this->queue)
+            ->delay(now()->addSeconds(5));
+
+        Log::info('SendCampaignMessage: recipient deferred by rate limit as a fresh job', [
+            'campaign_id' => $campaignLog->campaign_id,
+            'campaign_log_id' => $campaignLog->id,
+            'delay_seconds' => 5,
+        ]);
+
+        return true;
     }
 
     private function sendMessageToChannel(Channel $channel, Conversation $conversation, Message $message, CampaignLog $campaignLog): bool
@@ -205,7 +390,7 @@ class SendCampaignMessage implements ShouldQueue
                     return $this->sendMetaMessage($channel, $senderId, $message->content);
 
                 case 'whatsapp':
-                    return $this->sendWhatsAppMessage($channel, $senderId, $message->content, $campaignLog);
+                    return $this->sendWhatsAppMessage($channel, $senderId, $message, $campaignLog);
 
                 case 'telegram':
                     return $this->sendTelegramMessage($channel, $senderId, $message->content);
@@ -219,7 +404,7 @@ class SendCampaignMessage implements ShouldQueue
             }
         } catch (\Exception $e) {
             Log::error('SendCampaignMessage: Exception', [
-                'error' => $e->getMessage(),
+                'exception_type' => get_class($e),
                 'channel_id' => $channel->id,
             ]);
             return false;
@@ -239,8 +424,12 @@ class SendCampaignMessage implements ShouldQueue
         if (!$response->successful()) {
             Log::error('SendCampaignMessage: Meta send failed', [
                 'status' => $response->status(),
-                'body' => $response->json(),
             ]);
+        }
+
+        if ($response->successful()) {
+            $this->providerMessageId = $response->json('message_id')
+                ?? $response->json('messages.0.id');
         }
 
         return $response->successful();
@@ -252,9 +441,41 @@ class SendCampaignMessage implements ShouldQueue
      * campaigns share the retry/logging/config behaviour with every other
      * outbound WhatsApp path instead of duplicating a second HTTP client.
      */
-    private function sendWhatsAppMessage(Channel $channel, string $recipientId, string $content, CampaignLog $campaignLog): bool
+    private function sendWhatsAppMessage(Channel $channel, string $recipientId, Message $message, CampaignLog $campaignLog): bool
     {
         try {
+            if (($channel->metadata['whatsapp_provider'] ?? null) === 'cloud') {
+                $campaign = $campaignLog->campaign;
+                $template = $campaign?->whatsappCloudTemplate;
+                if (!$template || $template->channel_id !== $channel->id || $template->business_id !== $channel->business_id || $template->status !== 'APPROVED') {
+                    $campaignLog->update(['error_message' => 'An approved WhatsApp Cloud API template is required.']);
+                    return false;
+                }
+
+                $result = app(\App\Services\WhatsAppCloudApiService::class)->sendTemplate(
+                    $channel,
+                    $recipientId,
+                    $template->name,
+                    $template->language,
+                    $campaign->whatsapp_template_components ?? []
+                );
+                if (!empty($result['success'])) {
+                    if (!empty($result['message_id'])) {
+                        $this->providerMessageId = (string) $result['message_id'];
+                        $message->update(['whatsapp_message_id' => $result['message_id']]);
+                    }
+                    return true;
+                }
+
+                $campaignLog->update(['error_message' => 'WhatsApp Cloud API rejected the approved template send.']);
+                return false;
+            }
+
+            if (($channel->metadata['unofficial_risk_accepted'] ?? false) !== true) {
+                $campaignLog->update(['error_message' => 'Unofficial WhatsApp campaigns are disabled until risk acknowledgment is recorded.']);
+                return false;
+            }
+
             // instance_name is stored in page_id for WhatsApp channels
             $instanceName = $channel->page_id;
             if (!$instanceName) {
@@ -265,19 +486,19 @@ class SendCampaignMessage implements ShouldQueue
             }
 
             $whatsappService = new EvolutionApiService();
-            $response = $whatsappService->sendTextMessage($instanceName, $recipientId, $content);
+            $response = $whatsappService->sendTextMessage($instanceName, $recipientId, $message->content);
 
             if (isset($response['key']['id'])) {
+                $this->providerMessageId = (string) $response['key']['id'];
                 return true;
             }
 
-            $errMsg = 'Evolution API error: ' . json_encode($response);
-            $campaignLog->update(['error_message' => substr($errMsg, 0, 500)]);
+            $campaignLog->update(['error_message' => 'Evolution provider did not confirm message delivery.']);
             return false;
         } catch (\Exception $e) {
-            $errMsg = 'WhatsApp send exception: ' . $e->getMessage();
-            Log::error('SendCampaignMessage: ' . $errMsg, [
-                'error' => $e->getMessage(),
+            $errMsg = 'WhatsApp send exception (' . get_class($e) . ')';
+            Log::error('SendCampaignMessage: WhatsApp send exception', [
+                'exception_type' => get_class($e),
                 'channel_id' => $channel->id,
             ]);
             $campaignLog->update(['error_message' => substr($errMsg, 0, 500)]);
@@ -294,18 +515,23 @@ class SendCampaignMessage implements ShouldQueue
     private function sendTelegramMessage(Channel $channel, string $chatId, string $content): bool
     {
         try {
-            $botToken = decrypt($channel->access_token);
+            $botToken = $channel->access_token;
         } catch (\Exception $e) {
             Log::error('SendCampaignMessage: could not decrypt Telegram bot token', [
                 'channel_id' => $channel->id,
-                'error' => $e->getMessage(),
+                'exception_type' => get_class($e),
             ]);
             return false;
         }
 
         $telegramService = new TelegramService();
+        $providerMessageId = null;
+        $sent = $telegramService->sendMessage($botToken, $chatId, $content, $providerMessageId);
+        if ($sent) {
+            $this->providerMessageId = $providerMessageId;
+        }
 
-        return $telegramService->sendMessage($botToken, $chatId, $content);
+        return $sent;
     }
 
     /**
@@ -350,10 +576,11 @@ class SendCampaignMessage implements ShouldQueue
 
             $sent = $gmail->users_messages->send('me', $gmailMessage);
 
-            return (bool) $sent->getId();
+            $this->providerMessageId = $sent->getId() ? (string) $sent->getId() : null;
+            return (bool) $this->providerMessageId;
         } catch (\Exception $e) {
             Log::error('SendCampaignMessage: Gmail send exception', [
-                'error' => $e->getMessage(),
+                'exception_type' => get_class($e),
                 'channel_id' => $channel->id,
             ]);
             return false;
@@ -379,7 +606,7 @@ class SendCampaignMessage implements ShouldQueue
 
         $campaignLog->update([
             'status' => 'failed',
-            'error_message' => $exception->getMessage(),
+            'error_message' => 'Campaign message delivery failed.',
         ]);
 
         $campaign = $campaignLog->campaign;
@@ -390,7 +617,7 @@ class SendCampaignMessage implements ShouldQueue
 
         Log::error('SendCampaignMessage: job failed permanently after retries', [
             'campaign_log_id' => $this->campaignLogId,
-            'error' => $exception->getMessage(),
+            'exception_type' => get_class($exception),
         ]);
     }
 }

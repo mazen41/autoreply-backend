@@ -10,6 +10,7 @@ class CampaignLog extends Model
         'campaign_id',
         'conversation_id',
         'status',
+        'provider_message_id',
         'error_message',
         'sent_at',
     ];

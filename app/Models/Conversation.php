@@ -93,4 +93,9 @@ class Conversation extends Model
     {
         return $this->belongsTo(User::class, 'assigned_agent_id');
     }
+
+    public function handoffTask()
+    {
+        return $this->hasOne(HandoffTask::class);
+    }
 }

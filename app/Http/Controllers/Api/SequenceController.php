@@ -5,6 +5,7 @@ namespace App\Http\Controllers\Api;
 use App\Http\Controllers\Controller;
 use App\Models\Sequence;
 use App\Models\SequenceEnrollment;
+use App\Models\SequenceStepExecution;
 use App\Services\SequenceService;
 use App\Services\SequenceEnrollmentService;
 use Illuminate\Http\Request;
@@ -29,25 +30,8 @@ class SequenceController extends Controller
      */
     private function getResolvedBusinessProfile(Request $request): \App\Models\BusinessProfile
     {
-        $user = $request->user();
-        $requestedBusinessId = $request->header('X-Business-Id') ?? $request->input('business_id');
-
-        if ($requestedBusinessId) {
-            $requestedBusinessId = (int) $requestedBusinessId;
-            $hasAccess = \App\Models\BusinessProfile::where('id', $requestedBusinessId)
-                ->where('user_id', $user->id)
-                ->exists() ||
-                \App\Models\TeamMember::where('business_id', $requestedBusinessId)
-                    ->where('user_id', $user->id)
-                    ->where('is_active', true)
-                    ->exists();
-
-            if ($hasAccess) {
-                return \App\Models\BusinessProfile::findOrFail($requestedBusinessId);
-            }
-        }
-
-        return \App\Models\BusinessProfile::firstOrCreate(['user_id' => $user->id]);
+        $permission = $request->isMethod('GET') ? 'automation_read' : 'automation_write';
+        return app(\App\Services\ActiveBusiness::class)->resolve($request, permission: $permission);
     }
 
     public function index(Request $request)
@@ -88,10 +72,7 @@ class SequenceController extends Controller
 
     public function store(Request $request)
     {
-        $user = Auth::user();
-        if (!$user || !$user->business_id) {
-            return response()->json(['error' => 'Business not found'], 404);
-        }
+        $businessId = $this->getResolvedBusinessProfile($request)->id;
 
         $validated = $request->validate([
             'name' => 'required|string|max:255',
@@ -100,27 +81,28 @@ class SequenceController extends Controller
             'trigger_config' => 'nullable|array',
             'channel' => 'nullable|in:whatsapp,telegram,email',
             'settings' => 'nullable|array',
+            'settings.allow_reentry' => 'sometimes|boolean',
+            'settings.stop_on_reply' => 'sometimes|boolean',
             'steps' => 'nullable|array',
             'bot_id' => 'nullable|integer|exists:bots,id',
         ]);
 
         try {
-            $sequence = $this->sequenceService->createSequence($validated, $user->business_id);
+            $sequence = $this->sequenceService->createSequence($validated, $businessId);
             return response()->json(['data' => $sequence], 201);
+        } catch (\Illuminate\Validation\ValidationException $e) {
+            throw $e;
         } catch (\Exception $e) {
-            Log::error('Failed to create sequence', ['error' => $e->getMessage()]);
+            Log::error('Failed to create sequence', ['exception_type' => get_class($e)]);
             return response()->json(['error' => $e->getMessage()], 500);
         }
     }
 
     public function show(Request $request, $id)
     {
-        $user = Auth::user();
-        if (!$user || !$user->business_id) {
-            return response()->json(['error' => 'Business not found'], 404);
-        }
+        $business = $this->getResolvedBusinessProfile($request);
 
-        $sequence = Sequence::forBusiness($user->business_id)->with('steps')->find($id);
+        $sequence = Sequence::forBusiness($business->id)->with('steps')->find($id);
 
         if (!$sequence) {
             return response()->json(['error' => 'Sequence not found'], 404);
@@ -131,12 +113,9 @@ class SequenceController extends Controller
 
     public function update(Request $request, $id)
     {
-        $user = Auth::user();
-        if (!$user || !$user->business_id) {
-            return response()->json(['error' => 'Business not found'], 404);
-        }
+        $business = $this->getResolvedBusinessProfile($request);
 
-        $sequence = Sequence::forBusiness($user->business_id)->find($id);
+        $sequence = Sequence::forBusiness($business->id)->find($id);
 
         if (!$sequence) {
             return response()->json(['error' => 'Sequence not found'], 404);
@@ -149,26 +128,27 @@ class SequenceController extends Controller
             'trigger_config' => 'nullable|array',
             'channel' => 'nullable|in:whatsapp,telegram,email',
             'settings' => 'nullable|array',
+            'settings.allow_reentry' => 'sometimes|boolean',
+            'settings.stop_on_reply' => 'sometimes|boolean',
             'steps' => 'nullable|array',
         ]);
 
         try {
             $sequence = $this->sequenceService->updateSequence($sequence, $validated);
             return response()->json(['data' => $sequence]);
+        } catch (\Illuminate\Validation\ValidationException $e) {
+            throw $e;
         } catch (\Exception $e) {
-            Log::error('Failed to update sequence', ['error' => $e->getMessage()]);
+            Log::error('Failed to update sequence', ['exception_type' => get_class($e)]);
             return response()->json(['error' => $e->getMessage()], 500);
         }
     }
 
     public function destroy(Request $request, $id)
     {
-        $user = Auth::user();
-        if (!$user || !$user->business_id) {
-            return response()->json(['error' => 'Business not found'], 404);
-        }
+        $business = $this->getResolvedBusinessProfile($request);
 
-        $sequence = Sequence::forBusiness($user->business_id)->find($id);
+        $sequence = Sequence::forBusiness($business->id)->find($id);
 
         if (!$sequence) {
             return response()->json(['error' => 'Sequence not found'], 404);
@@ -178,19 +158,16 @@ class SequenceController extends Controller
             $this->sequenceService->deleteSequence($sequence);
             return response()->json(['success' => true]);
         } catch (\Exception $e) {
-            Log::error('Failed to delete sequence', ['error' => $e->getMessage()]);
+            Log::error('Failed to delete sequence', ['exception_type' => get_class($e)]);
             return response()->json(['error' => $e->getMessage()], 500);
         }
     }
 
     public function activate(Request $request, $id)
     {
-        $user = Auth::user();
-        if (!$user || !$user->business_id) {
-            return response()->json(['error' => 'Business not found'], 404);
-        }
+        $business = $this->getResolvedBusinessProfile($request);
 
-        $sequence = Sequence::forBusiness($user->business_id)->find($id);
+        $sequence = Sequence::forBusiness($business->id)->find($id);
 
         if (!$sequence) {
             return response()->json(['error' => 'Sequence not found'], 404);
@@ -198,21 +175,19 @@ class SequenceController extends Controller
 
         try {
             $sequence = $this->sequenceService->activateSequence($sequence);
+            app(\App\Services\AutomationRunControl::class)->audit($this->getResolvedBusinessProfile($request), 'automation.sequence_resumed', $sequence::class, (int) $sequence->id);
             return response()->json(['data' => $sequence]);
         } catch (\Exception $e) {
-            Log::error('Failed to activate sequence', ['error' => $e->getMessage()]);
+            Log::error('Failed to activate sequence', ['exception_type' => get_class($e)]);
             return response()->json(['error' => $e->getMessage()], 500);
         }
     }
 
     public function pause(Request $request, $id)
     {
-        $user = Auth::user();
-        if (!$user || !$user->business_id) {
-            return response()->json(['error' => 'Business not found'], 404);
-        }
+        $business = $this->getResolvedBusinessProfile($request);
 
-        $sequence = Sequence::forBusiness($user->business_id)->find($id);
+        $sequence = Sequence::forBusiness($business->id)->find($id);
 
         if (!$sequence) {
             return response()->json(['error' => 'Sequence not found'], 404);
@@ -220,21 +195,19 @@ class SequenceController extends Controller
 
         try {
             $sequence = $this->sequenceService->pauseSequence($sequence);
+            app(\App\Services\AutomationRunControl::class)->audit($this->getResolvedBusinessProfile($request), 'automation.sequence_paused', $sequence::class, (int) $sequence->id);
             return response()->json(['data' => $sequence]);
         } catch (\Exception $e) {
-            Log::error('Failed to pause sequence', ['error' => $e->getMessage()]);
+            Log::error('Failed to pause sequence', ['exception_type' => get_class($e)]);
             return response()->json(['error' => $e->getMessage()], 500);
         }
     }
 
     public function duplicate(Request $request, $id)
     {
-        $user = Auth::user();
-        if (!$user || !$user->business_id) {
-            return response()->json(['error' => 'Business not found'], 404);
-        }
+        $business = $this->getResolvedBusinessProfile($request);
 
-        $sequence = Sequence::forBusiness($user->business_id)->find($id);
+        $sequence = Sequence::forBusiness($business->id)->find($id);
 
         if (!$sequence) {
             return response()->json(['error' => 'Sequence not found'], 404);
@@ -244,19 +217,16 @@ class SequenceController extends Controller
             $newSequence = $this->sequenceService->duplicateSequence($sequence);
             return response()->json(['data' => $newSequence], 201);
         } catch (\Exception $e) {
-            Log::error('Failed to duplicate sequence', ['error' => $e->getMessage()]);
+            Log::error('Failed to duplicate sequence', ['exception_type' => get_class($e)]);
             return response()->json(['error' => $e->getMessage()], 500);
         }
     }
 
     public function analytics(Request $request, $id)
     {
-        $user = Auth::user();
-        if (!$user || !$user->business_id) {
-            return response()->json(['error' => 'Business not found'], 404);
-        }
+        $business = $this->getResolvedBusinessProfile($request);
 
-        $sequence = Sequence::forBusiness($user->business_id)->find($id);
+        $sequence = Sequence::forBusiness($business->id)->find($id);
 
         if (!$sequence) {
             return response()->json(['error' => 'Sequence not found'], 404);
@@ -266,19 +236,16 @@ class SequenceController extends Controller
             $analytics = $this->sequenceService->getSequenceAnalytics($sequence);
             return response()->json(['data' => $analytics]);
         } catch (\Exception $e) {
-            Log::error('Failed to get sequence analytics', ['error' => $e->getMessage()]);
+            Log::error('Failed to get sequence analytics', ['exception_type' => get_class($e)]);
             return response()->json(['error' => $e->getMessage()], 500);
         }
     }
 
     public function enrollments(Request $request, $id)
     {
-        $user = Auth::user();
-        if (!$user || !$user->business_id) {
-            return response()->json(['error' => 'Business not found'], 404);
-        }
+        $business = $this->getResolvedBusinessProfile($request);
 
-        $sequence = Sequence::forBusiness($user->business_id)->find($id);
+        $sequence = Sequence::forBusiness($business->id)->find($id);
 
         if (!$sequence) {
             return response()->json(['error' => 'Sequence not found'], 404);
@@ -292,7 +259,7 @@ class SequenceController extends Controller
             $enrollments = $this->enrollmentService->getEnrollmentsForSequence($sequence, $filters);
             return response()->json(['data' => $enrollments]);
         } catch (\Exception $e) {
-            Log::error('Failed to get sequence enrollments', ['error' => $e->getMessage()]);
+            Log::error('Failed to get sequence enrollments', ['exception_type' => get_class($e)]);
             return response()->json(['error' => $e->getMessage()], 500);
         }
     }
@@ -300,11 +267,9 @@ class SequenceController extends Controller
     public function enroll(Request $request, $id)
     {
         $user = Auth::user();
-        if (!$user || !$user->business_id) {
-            return response()->json(['error' => 'Business not found'], 404);
-        }
+        $business = $this->getResolvedBusinessProfile($request);
 
-        $sequence = Sequence::forBusiness($user->business_id)->find($id);
+        $sequence = Sequence::forBusiness($business->id)->find($id);
 
         if (!$sequence) {
             return response()->json(['error' => 'Sequence not found'], 404);
@@ -318,7 +283,7 @@ class SequenceController extends Controller
         try {
             $conversation = \App\Models\Conversation::find($validated['conversation_id']);
             
-            if (!$conversation || $conversation->business_id !== $user->business_id) {
+            if (!$conversation || (int) $conversation->business_id !== (int) $business->id) {
                 return response()->json(['error' => 'Conversation not found or access denied'], 404);
             }
 
@@ -329,20 +294,19 @@ class SequenceController extends Controller
             );
 
             return response()->json(['data' => $enrollment], 201);
+        } catch (\Illuminate\Validation\ValidationException $e) {
+            throw $e;
         } catch (\Exception $e) {
-            Log::error('Failed to enroll conversation', ['error' => $e->getMessage()]);
+            Log::error('Failed to enroll conversation', ['exception_type' => get_class($e)]);
             return response()->json(['error' => $e->getMessage()], 500);
         }
     }
 
     public function unenroll(Request $request, $id)
     {
-        $user = Auth::user();
-        if (!$user || !$user->business_id) {
-            return response()->json(['error' => 'Business not found'], 404);
-        }
+        $business = $this->getResolvedBusinessProfile($request);
 
-        $sequence = Sequence::forBusiness($user->business_id)->find($id);
+        $sequence = Sequence::forBusiness($business->id)->find($id);
 
         if (!$sequence) {
             return response()->json(['error' => 'Sequence not found'], 404);
@@ -363,13 +327,15 @@ class SequenceController extends Controller
             $this->enrollmentService->unenrollConversation($enrollment, $validated['reason'] ?? 'manual');
             return response()->json(['success' => true]);
         } catch (\Exception $e) {
-            Log::error('Failed to unenroll conversation', ['error' => $e->getMessage()]);
+            Log::error('Failed to unenroll conversation', ['exception_type' => get_class($e)]);
             return response()->json(['error' => $e->getMessage()], 500);
         }
     }
 
     public function queueMetrics()
     {
+        abort_unless(Auth::user()?->is_admin, 403);
+
         $pendingExecutions = SequenceStepExecution::pending()->count();
         $processingExecutions = SequenceStepExecution::processing()->count();
         $failedExecutions = SequenceStepExecution::failed()->count();
@@ -416,6 +382,8 @@ class SequenceController extends Controller
 
     public function resetStuckExecutions()
     {
+        abort_unless(Auth::user()?->is_admin, 403);
+
         $resetCount = SequenceStepExecution::processing()
             ->where('updated_at', '<', now()->subHour())
             ->update(['status' => 'pending']);

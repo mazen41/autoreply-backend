@@ -34,6 +34,10 @@ class RetryFailedMessage implements ShouldQueue
             return;
         }
 
+        if ($message->direction !== 'outbound' || in_array($message->send_status, ['blocked', 'sent', 'delivered', 'read'], true)) {
+            return;
+        }
+
         if ($message->delivery_status === 'sent' || $message->delivery_status === 'delivered') {
             Log::info('RetryFailedMessage: message already sent', ['message_id' => $this->messageId]);
             return;
@@ -56,12 +60,24 @@ class RetryFailedMessage implements ShouldQueue
             return;
         }
 
+        $business = $message->conversation?->business;
+        if ($business && app(\App\Services\UsageMeter::class)->blockMessageIfOverLimit($business, $message)) {
+            Log::info('RetryFailedMessage: retry blocked by business usage limit', [
+                'business_id' => $business->id,
+                'message_id' => $message->id,
+            ]);
+            return;
+        }
+
         try {
             $success = $this->sendMessage($channel, $message);
 
             if ($success) {
                 $message->update([
+                    'status' => 'sent',
+                    'send_status' => 'sent',
                     'delivery_status' => 'sent',
+                    'error_details' => null,
                     'retry_count' => $message->retry_count + 1,
                     'last_retry_at' => now(),
                 ]);
@@ -69,6 +85,9 @@ class RetryFailedMessage implements ShouldQueue
                 Log::info('RetryFailedMessage: message sent successfully', ['message_id' => $this->messageId]);
             } else {
                 $message->update([
+                    'status' => 'failed',
+                    'send_status' => 'failed',
+                    'delivery_status' => 'failed',
                     'retry_count' => $message->retry_count + 1,
                     'last_retry_at' => now(),
                 ]);
@@ -78,10 +97,13 @@ class RetryFailedMessage implements ShouldQueue
         } catch (\Exception $e) {
             Log::error('RetryFailedMessage: exception', [
                 'message_id' => $this->messageId,
-                'error' => $e->getMessage(),
+                'exception_type' => get_class($e),
             ]);
 
             $message->update([
+                'status' => 'failed',
+                'send_status' => 'failed',
+                'delivery_status' => 'failed',
                 'retry_count' => $message->retry_count + 1,
                 'last_retry_at' => now(),
                 'error_details' => $e->getMessage(),

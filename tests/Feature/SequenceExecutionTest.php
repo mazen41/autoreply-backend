@@ -10,6 +10,7 @@ use App\Models\Conversation;
 use App\Models\BusinessProfile;
 use App\Models\User;
 use App\Models\Message;
+use App\Models\ContactConsent;
 use App\Models\Channel;
 use App\Jobs\ExecuteSequenceStep;
 use App\Services\SequenceExecutionService;
@@ -54,6 +55,7 @@ class SequenceExecutionTest extends TestCase
             'type'         => 'whatsapp',
             'status'       => 'connected',
             'connected_at' => now(),
+            'metadata'     => ['whatsapp_provider' => 'evolution', 'unofficial_risk_accepted' => true],
         ]);
 
         $this->sequence = Sequence::factory()->create([
@@ -66,6 +68,11 @@ class SequenceExecutionTest extends TestCase
         $this->conversation = Conversation::factory()->create([
             'business_id' => $this->business->id,
             'channel_id'  => $this->channel->id,
+        ]);
+        ContactConsent::create([
+            'business_id' => $this->business->id, 'channel' => 'whatsapp',
+            'contact_identifier' => app(\App\Services\ConsentGate::class)->normalizeIdentifier($this->conversation->sender_id, 'whatsapp'),
+            'scope' => 'marketing', 'status' => 'opted_in', 'source' => 'form', 'captured_at' => now(),
         ]);
     }
 
@@ -143,6 +150,14 @@ class SequenceExecutionTest extends TestCase
             'direction'       => 'outbound',
             'source'          => 'sequence',
         ]);
+        $sequenceMessage = Message::where('conversation_id', $this->conversation->id)
+            ->where('source', 'sequence')
+            ->firstOrFail();
+        $this->assertDatabaseHas('ai_reply_audits', [
+            'message_id' => $sequenceMessage->id,
+            'consent_basis' => 'marketing_opt_in',
+            'ai_provider' => 'automation',
+        ]);
 
         // Verify execution record
         $execution->refresh();
@@ -152,6 +167,43 @@ class SequenceExecutionTest extends TestCase
         // Verify enrollment moved to next step
         $enrollment->refresh();
         $this->assertEquals(2, $enrollment->current_step);
+    }
+
+    public function test_sequence_message_is_skipped_and_enrollment_stops_for_suppressed_contact(): void
+    {
+        SequenceStep::factory()->create([
+            'sequence_id' => $this->sequence->id,
+            'step_order' => 1,
+            'step_type' => 'message',
+            'message' => 'Marketing follow-up',
+            'delay_hours' => 0,
+        ]);
+        $enrollment = SequenceEnrollment::factory()->create([
+            'sequence_id' => $this->sequence->id,
+            'conversation_id' => $this->conversation->id,
+            'status' => 'active',
+            'current_step' => 1,
+            'started_at' => now(),
+            'next_execution_at' => now(),
+        ]);
+        Message::create([
+            'conversation_id' => $this->conversation->id,
+            'content' => 'STOP',
+            'direction' => 'inbound',
+        ]);
+        $execution = SequenceStepExecution::factory()->create([
+            'sequence_id' => $this->sequence->id,
+            'sequence_enrollment_id' => $enrollment->id,
+            'sequence_step_id' => $this->sequence->steps()->first()->id,
+            'status' => 'pending',
+            'scheduled_at' => now(),
+        ]);
+
+        app(SequenceExecutionService::class)->executeStep($execution, $enrollment, $execution->step);
+
+        $this->assertSame('skipped', $execution->fresh()->status);
+        $this->assertSame('stopped', $enrollment->fresh()->status);
+        $this->assertSame(0, Message::where('conversation_id', $this->conversation->id)->where('direction', 'outbound')->count());
     }
 
     public function test_idempotency_prevents_duplicate_execution()

@@ -5,6 +5,7 @@ namespace App\Jobs;
 use App\Models\Channel;
 use App\Models\Conversation;
 use App\Models\Message;
+use App\Models\HandoffTask;
 use App\Http\Controllers\GmailController;
 use App\Services\EvolutionApiService;
 use App\Services\KnowledgeChunker;
@@ -69,6 +70,15 @@ class ProcessAutoReply implements ShouldQueue
 
         $channel = $message->conversation->channel;
         $conversation = $message->conversation;
+
+        if ($channel?->type === 'tiktok') {
+            Log::warning('ProcessAutoReply: TikTok messaging is unsupported; skipping automated reply', [
+                'channel_id' => $channel->id,
+                'conversation_id' => $conversation?->id,
+                'message_id' => $message->id,
+            ]);
+            return;
+        }
 
         if (!$channel || !$channel->ai_enabled) {
             Log::info('ProcessAutoReply: AI not enabled for channel', ['channel_id' => $channel?->id]);
@@ -146,20 +156,34 @@ class ProcessAutoReply implements ShouldQueue
             }
         }
 
-        // Check subscription limits using cached counter
         $user = $channel->user;
         if (!$user) {
             Log::warning('ProcessAutoReply: channel has no user', ['channel_id' => $channel->id]);
             return;
         }
 
-        $subscription = $user->activeSubscription;
-        $package = $subscription ? $subscription->package : \App\Models\Package::where('name', 'Free')->first();
-
-        if (!$package) {
-            Log::error('ProcessAutoReply: no package found', ['user_id' => $user->id]);
+        $business ??= $conversation->business;
+        if (!$business) {
+            Log::warning('ProcessAutoReply: business is unavailable for usage enforcement', [
+                'channel_id' => $channel->id,
+                'conversation_id' => $conversation->id,
+            ]);
             return;
         }
+
+        $usageMeter = app(\App\Services\UsageMeter::class);
+        $aiUsage = $usageMeter->canUse($business, \App\Services\UsageMeter::AI_REPLIES);
+        $outboundUsage = $usageMeter->canUse($business, \App\Services\UsageMeter::OUTBOUND_MESSAGES);
+        if (!$aiUsage['allowed'] || !$outboundUsage['allowed']) {
+            Log::info('ProcessAutoReply: business plan usage limit reached', [
+                'business_id' => $business->id,
+                'channel_id' => $channel->id,
+                'conversation_id' => $conversation->id,
+                'metric' => !$aiUsage['allowed'] ? 'ai_replies' : 'outbound_messages',
+            ]);
+            return;
+        }
+        $this->aiRepliesCount = max(0, $aiUsage['used']) + 1;
 
         // ── NEW-USER SEQUENCE PRIORITY CHECK ─────────────────────────────────
         // This MUST happen before the AI flow. If the incoming message is from a
@@ -187,7 +211,7 @@ class ProcessAutoReply implements ShouldQueue
             } catch (\Exception $e) {
                 Log::warning('ProcessAutoReply: failed to cancel no-reply sequences on customer reply', [
                     'conversation_id' => $conversation->id,
-                    'error'           => $e->getMessage(),
+                    'exception_type' => get_class($e),
                 ]);
             }
 
@@ -218,71 +242,6 @@ class ProcessAutoReply implements ShouldQueue
         }
         // ── END NEW-USER SEQUENCE PRIORITY CHECK ──────────────────────────────
 
-        // Use atomic counter for AI replies limit check to prevent race conditions
-        $cacheKey = "user_{$user->id}_ai_replies_" . now()->format('Y-m');
-        $lockKey = "lock:{$cacheKey}";
-        
-        // Try to acquire a lock for atomic operation
-        $lock = Cache::lock($lockKey, 10);
-        
-        try {
-            if ($lock->get()) {
-                // Initialize counter if not exists
-                if (!Cache::has($cacheKey)) {
-                    $count = Message::where('is_ai', true)
-                        ->where('created_at', '>=', now()->startOfMonth())
-                        ->whereHas('conversation.channel', function ($query) use ($user) {
-                            $query->where('user_id', $user->id);
-                        })
-                        ->count();
-                    Cache::put($cacheKey, $count, now()->endOfMonth());
-                }
-                
-                $aiRepliesThisMonth = (int) Cache::get($cacheKey);
-                
-                // Check limit BEFORE incrementing — increment only after message is actually sent
-                if ($package->ai_replies_limit !== -1 && $aiRepliesThisMonth >= $package->ai_replies_limit) {
-                    Log::info('ProcessAutoReply: AI replies limit reached', [
-                        'user_id' => $user->id,
-                        'limit' => $package->ai_replies_limit,
-                        'used' => $aiRepliesThisMonth
-                    ]);
-                    return;
-                }
-                
-                // Increment counter atomically
-                Cache::increment($cacheKey);
-                
-                // Store the incremented value for later use
-                $this->aiRepliesCount = $aiRepliesThisMonth + 1;
-            } else {
-                // Failed to acquire lock, fall back to database check
-                Log::warning('ProcessAutoReply: Failed to acquire lock, using database fallback', [
-                    'user_id' => $user->id
-                ]);
-                
-                $aiRepliesThisMonth = Message::where('is_ai', true)
-                    ->where('created_at', '>=', now()->startOfMonth())
-                    ->whereHas('conversation.channel', function ($query) use ($user) {
-                        $query->where('user_id', $user->id);
-                    })
-                    ->count();
-                
-                if ($package->ai_replies_limit !== -1 && $aiRepliesThisMonth >= $package->ai_replies_limit) {
-                    Log::info('ProcessAutoReply: AI replies limit reached (fallback)', [
-                        'user_id' => $user->id,
-                        'limit' => $package->ai_replies_limit,
-                        'used' => $aiRepliesThisMonth
-                    ]);
-                    return;
-                }
-                
-                $this->aiRepliesCount = $aiRepliesThisMonth + 1;
-            }
-        } finally {
-            $lock?->release();
-        }
-
         $detectedLanguage = $this->detectLanguage($message->content);
 
         // ── VOICE MESSAGE TRANSCRIPTION ────────────────────────────────────
@@ -290,22 +249,34 @@ class ProcessAutoReply implements ShouldQueue
         if (in_array($message->type ?? '', ['voice', 'audio']) && $message->media_url) {
             try {
                 $voiceService = new \App\Services\VoiceService();
-                $audioPath = storage_path('app/public/' . str_replace('/storage/', '', $message->media_url));
-
-                if (file_exists($audioPath)) {
-                    $voiceTranscription = $voiceService->transcribeAudio($audioPath);
-                    Log::info('ProcessAutoReply: voice message transcribed', [
-                        'conversation_id' => $conversation->id,
-                        'transcription_length' => strlen($voiceTranscription),
-                    ]);
-
-                    // Use transcription as the message content for AI processing
-                    $message->content = $voiceTranscription;
+                $audioPath = app(\App\Services\IncomingMediaStorage::class)->absolutePath(
+                    $message->media_url,
+                    data_get($message->metadata, 'media.storage_disk')
+                );
+                if (!$audioPath) {
+                    throw new \RuntimeException('Inbound audio is unavailable in private storage.');
                 }
+
+                $voiceTranscription = $voiceService->transcribeAudio($audioPath);
+                if (trim($voiceTranscription) === '') {
+                    throw new \RuntimeException('Audio transcription returned no text.');
+                }
+                $message->content = $voiceTranscription;
+                $message->media_processing_status = 'done';
+                $message->media_processing_reason = null;
+                $message->save();
+                Log::info('ProcessAutoReply: voice message transcribed', [
+                    'conversation_id' => $conversation->id,
+                    'transcription_length' => strlen($voiceTranscription),
+                ]);
             } catch (\Throwable $e) {
+                $message->media_processing_status = 'failed';
+                $message->media_processing_reason = 'Voice note could not be transcribed.';
+                $message->content = trim((string) $message->content . ' [Customer voice note could not be processed.]');
+                $message->save();
                 Log::warning('ProcessAutoReply: voice transcription failed', [
                     'conversation_id' => $conversation->id,
-                    'error' => $e->getMessage(),
+                    'error_class' => get_class($e),
                 ]);
             }
         }
@@ -315,7 +286,18 @@ class ProcessAutoReply implements ShouldQueue
         if (($message->type ?? '') === 'image' && $message->media_url) {
             try {
                 $imageService = new \App\Services\ImageUnderstandingService();
-                $imageAnalysis = $imageService->analyzeImage($message->media_url);
+                $imagePath = app(\App\Services\IncomingMediaStorage::class)->absolutePath(
+                    $message->media_url,
+                    data_get($message->metadata, 'media.storage_disk')
+                );
+                if (!$imagePath) {
+                    throw new \RuntimeException('Inbound image is unavailable in private storage.');
+                }
+                $imageAnalysis = $imageService->analyzeImage(
+                    $imagePath,
+                    'Describe this image and identify any products or receipts',
+                    data_get($message->metadata, 'media.storage_disk')
+                );
 
                 if (!empty($imageAnalysis['raw_analysis'])) {
                     Log::info('ProcessAutoReply: image analyzed', [
@@ -329,12 +311,37 @@ class ProcessAutoReply implements ShouldQueue
                         $imageContext .= "\n[Extracted Text: {$imageAnalysis['extracted_text']}]";
                     }
                     $message->content .= $imageContext;
+                    $message->media_processing_status = 'done';
+                    $message->media_processing_reason = null;
+                } else {
+                    $message->media_processing_status = 'failed';
+                    $message->media_processing_reason = 'Image could not be analyzed.';
+                    $message->content = trim((string) $message->content . ' [Customer image could not be processed.]');
                 }
+                $message->save();
             } catch (\Throwable $e) {
+                $message->media_processing_status = 'failed';
+                $message->media_processing_reason = 'Image could not be analyzed.';
+                $message->content = trim((string) $message->content . ' [Customer image could not be processed.]');
+                $message->save();
                 Log::warning('ProcessAutoReply: image analysis failed', [
                     'conversation_id' => $conversation->id,
-                    'error' => $e->getMessage(),
+                    'error_class' => get_class($e),
                 ]);
+            }
+        } elseif (!empty($message->media_url) && !in_array($message->type ?? '', ['audio', 'voice', 'image'], true)) {
+            $message->media_processing_status = 'unsupported';
+            $message->media_processing_reason = 'This media type is not analyzed by the assistant.';
+            $message->save();
+        } elseif (in_array($message->type ?? '', ['audio', 'voice', 'image'], true)
+            && !$message->media_url
+            && $message->media_processing_status === 'failed') {
+            $notice = in_array($message->type, ['audio', 'voice'], true)
+                ? '[Customer voice note could not be processed.]'
+                : '[Customer image could not be processed.]';
+            if (!str_contains((string) $message->content, $notice)) {
+                $message->content = trim((string) $message->content . ' ' . $notice);
+                $message->save();
             }
         }
 
@@ -394,6 +401,15 @@ class ProcessAutoReply implements ShouldQueue
 
             // Send after-hours message and queue for human review
             $afterHoursMessage = $businessHoursCheck['routing_message'];
+            $conversation->update([
+                'requires_human' => true,
+                'ai_enabled' => false,
+                'status' => 'pending_human',
+                'escalated_at' => now(),
+                'escalation_reason' => 'after_hours'
+            ]);
+            app(\App\Services\HandoffTaskService::class)->openForConversation($conversation, 'after_hours');
+
             $replyMessage = Message::create([
                 'conversation_id' => $message->conversation_id,
                 'content' => $afterHoursMessage,
@@ -404,11 +420,20 @@ class ProcessAutoReply implements ShouldQueue
                 'send_status' => 'pending',
             ]);
 
-            $conversation->update([
-                'requires_human' => true,
-                'escalated_at' => now(),
-                'escalation_reason' => 'after_hours'
-            ]);
+            try {
+                app(\App\Services\AiReplyAuditService::class)->record($replyMessage, [
+                    'ai_provider' => 'system',
+                    'ai_model' => 'business_hours_router',
+                    'prompt_version' => config('services.ai.prompt_version', 'v1'),
+                    'escalation_decision' => true,
+                    'escalation_reason' => 'after_hours',
+                ]);
+            } catch (\Throwable $e) {
+                Log::error('ProcessAutoReply: could not persist after-hours reply audit', [
+                    'message_id' => $replyMessage->id,
+                    'exception_type' => get_class($e),
+                ]);
+            }
 
             $this->sendReply($channel, $conversation, $replyMessage);
             return;
@@ -479,6 +504,14 @@ class ProcessAutoReply implements ShouldQueue
         // product is confirmed during place_order, then load it back here so the
         // product identity is never lost between turns.
         $checkoutState = $conversation->checkout_state ?? null;
+
+        // Handle explicit checkout cancellation before product recovery, AI
+        // classification, or any provider order API can run. This transition is
+        // deterministic so an AI guess cannot turn "cancel" into confirmation.
+        if ($this->handleExplicitCheckoutCancellation($channel, $conversation, $message, $checkoutState)) {
+            return;
+        }
+
         $isProductBrowseMessage = (bool) preg_match(
             '/(?:\b(?:show|see|view|browse|list|display|send)\b.{0,60}\b(?:products?|items?|catalog(?:ue)?|images?|photos?|pictures?)\b|\b(?:products?|items?|catalog(?:ue)?)\b.{0,60}\b(?:images?|photos?|pictures?|show|see|view|browse|list|all)\b|i\s+wanna\s+see\s+products?)/iu',
             $message->content
@@ -514,12 +547,6 @@ class ProcessAutoReply implements ShouldQueue
         $sallaContext   = null;
         $productsContext = null;
         $msgLower = mb_strtolower($message->content);
-
-        // Add product awareness to AI context
-        if ($business) {
-            $productService = new ProductAwarenessService();
-            $productsContext = $productService->buildProductContextArray($business->id);
-        }
 
         // Keywords that indicate customer is asking about an EXISTING order
         $orderStatusKeywords = [
@@ -734,6 +761,7 @@ class ProcessAutoReply implements ShouldQueue
         // ── BOT RESOLUTION (Deterministic Hierarchy) ──────────────────────────
         $bot = null;
         $botResolutionSource = 'none';
+        $invalidStickyBot = false;
         if ($business) {
             try {
                 // Priority 1: Existing conversation bot (sticky)
@@ -746,6 +774,7 @@ class ProcessAutoReply implements ShouldQueue
                         $botResolutionSource = 'conversation_snapshot';
                     } else {
                         // Bot exists on conversation but is inactive or from another business
+                        $invalidStickyBot = true;
                         Log::warning('ProcessAutoReply: conversation bot_id is invalid or inactive, clearing', [
                             'conversation_id' => $conversation->id,
                             'invalid_bot_id' => $conversation->bot_id,
@@ -798,7 +827,7 @@ class ProcessAutoReply implements ShouldQueue
                 }
             } catch (\Throwable $e) {
                 Log::warning('ProcessAutoReply: Bot resolution skipped (legacy fallback)', [
-                    'error' => $e->getMessage(),
+                    'exception_type' => get_class($e),
                     'channel_id' => $channel->id ?? null,
                     'business_id' => $business->id,
                 ]);
@@ -823,12 +852,52 @@ class ProcessAutoReply implements ShouldQueue
         // Find Salla channel — Priority 1: Bot's explicit ecommerce_channel_id if set
         // Priority 2: Conversation's own channel if it IS a Salla channel
         // Priority 3: Fall back to resolveUniqueConnectedChannel
+        $noAgentFeatureEnabled = \App\Models\FeatureFlag::isEnabled('phase3_no_agent_fail_closed', (int) $business->id);
+        if ($noAgentFeatureEnabled && ($invalidStickyBot || !$bot)) {
+            $reason = $invalidStickyBot ? 'conversation_agent_inactive_or_invalid' : $botResolutionSource;
+            $conversation->update([
+                'requires_human' => true,
+                'ai_enabled' => false,
+                'status' => 'pending_human',
+                'escalated_at' => now(),
+                'escalation_reason' => $reason,
+            ]);
+            app(\App\Services\HandoffTaskService::class)->openForConversation($conversation, $reason);
+            Log::warning('ProcessAutoReply: no eligible agent resolved; stopped automatic reply and queued human attention', [
+                'conversation_id' => $conversation->id,
+                'channel_id' => $channel->id,
+                'business_id' => $business->id,
+                'resolution_source' => $botResolutionSource,
+                'invalid_sticky_bot' => $invalidStickyBot,
+            ]);
+            return;
+        }
+
         // Resolve commerce once for this processing cycle. Provider-specific
         // paths below receive only this backend-authorized connection.
         $commerceContext = app(\App\Services\EcommerceChannelResolver::class)
             ->resolveConversation($conversation, $bot);
         $commerceChannel = $commerceContext['connection'];
         $sallaChannel = $commerceChannel?->type === 'salla' ? $commerceChannel : null;
+
+        // Product context must follow the same resolved store as commerce
+        // tools. If connected stores exist but routing is unresolved, expose
+        // no catalog rather than mixing products across stores.
+        if ($business) {
+            $productService = new ProductAwarenessService();
+            if ($commerceChannel) {
+                $productsContext = $productService->buildProductContextArray($business->id, (int) $commerceChannel->id);
+            } else {
+                $hasConnectedCommerceStore = Channel::query()
+                    ->where('business_id', $business->id)
+                    ->whereIn('type', ['salla', 'shopify', 'woocommerce'])
+                    ->where('status', 'connected')
+                    ->exists();
+                $productsContext = $hasConnectedCommerceStore
+                    ? []
+                    : $productService->buildProductContextArray($business->id);
+            }
+        }
 
         if (
             !empty($referencedProduct['commerce_channel_id'])
@@ -945,7 +1014,7 @@ class ProcessAutoReply implements ShouldQueue
                     'conversation_id' => $conversation->id,
                     'connection_id' => $commerceChannel->id,
                     'provider' => $commerceChannel->type,
-                    'error' => $e->getMessage(),
+                    'exception_type' => get_class($e),
                 ]);
             }
         }
@@ -967,7 +1036,7 @@ class ProcessAutoReply implements ShouldQueue
                         'total_count' => $productsAggregateContext['total_count'] ?? null,
                     ]);
                 } catch (\Exception $e) {
-                    Log::error('ProcessAutoReply: Salla products aggregate fetch failed', ['error' => $e->getMessage()]);
+                    Log::error('ProcessAutoReply: Salla products aggregate fetch failed', ['exception_type' => get_class($e)]);
                     $productsAggregateContext = ['error' => $e->getMessage()];
                 }
             }
@@ -981,7 +1050,7 @@ class ProcessAutoReply implements ShouldQueue
                         'total_count' => $ordersAggregateContext['total_count'] ?? null,
                     ]);
                 } catch (\Exception $e) {
-                    Log::error('ProcessAutoReply: Salla orders aggregate fetch failed', ['error' => $e->getMessage()]);
+                    Log::error('ProcessAutoReply: Salla orders aggregate fetch failed', ['exception_type' => get_class($e)]);
                     $ordersAggregateContext = ['error' => $e->getMessage()];
                 }
             }
@@ -1016,14 +1085,14 @@ class ProcessAutoReply implements ShouldQueue
                             if ($order) {
                                 $sallaContext = $sallaService->formatOrderForAI($order);
                                 Log::info('ProcessAutoReply: Salla order found for WhatsApp sender', [
-                                    'phone'    => $rawPhone,
+                                    'has_sender_phone' => $rawPhone !== '',
                                     'order_id' => $order['id'] ?? null,
                                 ]);
                             }
                         }
                         // If no order found, sallaContext stays null → AI will ask for order number
                     } catch (\Exception $e) {
-                        Log::warning('ProcessAutoReply: Salla order lookup failed', ['error' => $e->getMessage()]);
+                        Log::warning('ProcessAutoReply: Salla order lookup failed', ['exception_type' => get_class($e)]);
                     }
                 } else {
                     // Non-WhatsApp: scan conversation for order number or phone
@@ -1055,7 +1124,7 @@ class ProcessAutoReply implements ShouldQueue
                                 $sallaContext = $sallaService->formatOrderForAI($order);
                             }
                         } catch (\Exception $e) {
-                            Log::warning('ProcessAutoReply: Salla order lookup (non-WA) failed', ['error' => $e->getMessage()]);
+                            Log::warning('ProcessAutoReply: Salla order lookup (non-WA) failed', ['exception_type' => get_class($e)]);
                         }
 
                         // Query only the Shopify account already resolved for
@@ -1081,7 +1150,7 @@ class ProcessAutoReply implements ShouldQueue
                                     }
                                 }
                             } catch (\Exception $e) {
-                                Log::warning('ProcessAutoReply: Shopify order lookup failed', ['error' => $e->getMessage()]);
+                                Log::warning('ProcessAutoReply: Shopify order lookup failed', ['exception_type' => get_class($e)]);
                             }
                         }
 
@@ -1100,7 +1169,7 @@ class ProcessAutoReply implements ShouldQueue
                                     }
                                 }
                             } catch (\Exception $e) {
-                                Log::warning('ProcessAutoReply: WooCommerce order lookup failed', ['error' => $e->getMessage()]);
+                                Log::warning('ProcessAutoReply: WooCommerce order lookup failed', ['exception_type' => get_class($e)]);
                             }
                         }
                     }
@@ -1176,7 +1245,7 @@ class ProcessAutoReply implements ShouldQueue
                                 'count' => count($productsContext),
                             ]);
                         } catch (\Exception $e) {
-                            Log::warning('ProcessAutoReply: Salla products fetch failed for place_order', ['error' => $e->getMessage()]);
+                            Log::warning('ProcessAutoReply: Salla products fetch failed for place_order', ['exception_type' => get_class($e)]);
                         }
                     }
                 }
@@ -1228,6 +1297,11 @@ class ProcessAutoReply implements ShouldQueue
                 'escalation_reason' => "hard_keyword_override: {$hardEscalation['matched_keyword']}",
                 'ai_enabled' => false,
             ]);
+
+            app(\App\Services\HandoffTaskService::class)->openForConversation(
+                $conversation,
+                'hard_keyword_override: ' . $hardEscalation['matched_keyword']
+            );
 
             $escalationMessage = "Sure 👍 I'm connecting you with a human agent now. Please wait a moment.";
             $replyMessage = Message::create([
@@ -1308,6 +1382,12 @@ class ProcessAutoReply implements ShouldQueue
             $businessProfileContext .= "================\n";
             $businessName = $business->business_name ?? 'our business';
             $businessProfileContext .= "Business Name: {$businessName}\n";
+            if (filled($business->country)) {
+                $businessProfileContext .= "Country: {$business->country}\n";
+            }
+            if (filled($business->currency)) {
+                $businessProfileContext .= "Business currency: {$business->currency}\n";
+            }
 
             if ($bot) {
                 $businessProfileContext .= "Bot Name: {$bot->name}\n";
@@ -1424,7 +1504,7 @@ class ProcessAutoReply implements ShouldQueue
             } catch (\Throwable $e) {
                 Log::warning('ProcessAutoReply: could not reuse saved Salla customer details', [
                     'conversation_id' => $conversation->id,
-                    'error' => $e->getMessage(),
+                    'exception_type' => get_class($e),
                 ]);
             }
         }
@@ -1449,6 +1529,21 @@ class ProcessAutoReply implements ShouldQueue
 
         $checkoutState = $updatedCheckoutState;
         $fieldStatus = $checkoutService->computeFieldStatus($updatedCheckoutState, $sallaCheckoutActive);
+        $hasValidOrderSummary = $this->hasValidOrderSummaryForConfirmation(
+            $conversation,
+            $message,
+            $updatedCheckoutState
+        );
+        $updatedCheckoutState = $checkoutService->updateConfirmationState(
+            $updatedCheckoutState,
+            $message->content,
+            (bool) ($fieldStatus['is_complete'] ?? false),
+            $hasValidOrderSummary
+        );
+        $checkoutState = $updatedCheckoutState;
+        if (!empty($updatedCheckoutState)) {
+            $conversation->update(['checkout_state' => $updatedCheckoutState]);
+        }
 
         // The AI context was assembled before deterministic extraction; refresh
         // its checkout facts so it asks only for information still missing.
@@ -1500,7 +1595,7 @@ class ProcessAutoReply implements ShouldQueue
         } catch (\Throwable $e) {
             Log::warning('ProcessAutoReply: customer resolution failed', [
                 'conversation_id' => $conversation->id,
-                'error'           => $e->getMessage(),
+                'exception_type' => get_class($e),
             ]);
             $customer = null;
         }
@@ -1520,6 +1615,11 @@ class ProcessAutoReply implements ShouldQueue
                 $customerContext = ['name' => null];
             }
         }
+
+        // Keep source identifiers for the owner/manager audit without retaining
+        // retrieved document text or a copy of the prompt.
+        $knowledgeFileIds = [];
+        $knowledgeChunkIds = [];
 
         $context = [
             'business_name'  => $channel->business?->business_name ?? 'our business',
@@ -1542,7 +1642,7 @@ class ProcessAutoReply implements ShouldQueue
                 'type' => $commerceChannel->type, 'name' => $commerceChannel->page_name ?? null,
             ] : null),
             'customer'       => $customerContext,
-            'knowledge_base' => (function() use ($business, $bot, $channel, $message, $isSallaFlow) {
+            'knowledge_base' => (function() use ($business, $bot, $channel, $message, $isSallaFlow, &$knowledgeFileIds, &$knowledgeChunkIds) {
                 if (!$business || $isSallaFlow) {
                     return '';
                 }
@@ -1579,7 +1679,7 @@ class ProcessAutoReply implements ShouldQueue
                         // Fail CLOSED: on infra failure deny bot knowledge rather
                         // than leaking unassigned business files into its context.
                         Log::error('ProcessAutoReply: BotKnowledgeAssignment query failed — denying bot knowledge (fail-closed)', [
-                            'error' => $e->getMessage(),
+                            'exception_type' => get_class($e),
                             'bot_id' => $bot->id,
                         ]);
                         return '';
@@ -1595,6 +1695,10 @@ class ProcessAutoReply implements ShouldQueue
 
                 $knowledgeText = '';
                 foreach ($relevantChunks as $index => $chunk) {
+                    $knowledgeChunkIds[] = (int) $chunk->id;
+                    if ($chunk->business_knowledge_file_id) {
+                        $knowledgeFileIds[] = (int) $chunk->business_knowledge_file_id;
+                    }
                     $fileName = $chunk->file ? $chunk->file->filename : 'Knowledge Base';
                     $knowledgeText .= "\n[Source: {$fileName}] (Relevance Top " . ($index + 1) . ")\n";
                     $knowledgeText .= $chunk->content . "\n";
@@ -1656,6 +1760,10 @@ class ProcessAutoReply implements ShouldQueue
 
         // Step 4: Single AI Call with JSON Output
         $aiResult = AICapabilitiesService::callAIWithJSON($message->content, $context);
+        $auditProvider = $aiResult['provider'] ?? ($context['ai_provider'] ?: config('services.ai.provider', 'gemini'));
+        $auditModel = $aiResult['model'] ?? ($context['ai_model'] ?: ($auditProvider === 'groq'
+            ? config('services.groq.model', 'openai/gpt-oss-120b')
+            : config('services.gemini.model', 'gemini-2.5-flash')));
 
         if (!$aiResult['success']) {
             Log::error('ProcessAutoReply: AI call failed', [
@@ -1691,6 +1799,7 @@ class ProcessAutoReply implements ShouldQueue
                     'escalated_at' => now(),
                     'escalation_reason' => 'ai_failure_fallback'
                 ]);
+                app(\App\Services\HandoffTaskService::class)->openForConversation($conversation, 'ai_failure_fallback');
             }
 
             // Provide a user-friendly fallback message
@@ -1706,6 +1815,25 @@ class ProcessAutoReply implements ShouldQueue
                 'source' => $productBrowseFallback ? 'salla_product_browse' : 'fallback',
                 'send_status' => 'pending',
             ]);
+
+            if ($productBrowseFallback) {
+                try {
+                    app(\App\Services\AiReplyAuditService::class)->record($replyMessage, [
+                        'commerce_connection_id' => $commerceChannel?->id,
+                        'agent_version' => $bot?->updated_at?->toIso8601String(),
+                        'knowledge_file_ids' => $knowledgeFileIds,
+                        'knowledge_chunk_ids' => $knowledgeChunkIds,
+                        'ai_provider' => $auditProvider,
+                        'ai_model' => $auditModel,
+                        'escalation_reason' => 'ai_failure_product_browse_fallback',
+                    ]);
+                } catch (\Throwable $e) {
+                    Log::error('ProcessAutoReply: could not persist AI reply audit', [
+                        'message_id' => $replyMessage->id,
+                        'exception_type' => get_class($e),
+                    ]);
+                }
+            }
 
             if ($channel->user_id) {
                 broadcast(new \App\Events\MessageReceived($replyMessage, $conversation, $channel->user_id));
@@ -1808,6 +1936,7 @@ class ProcessAutoReply implements ShouldQueue
         if (
             $intent === 'place_order'
             && $containsConfirmPhrase
+            && in_array($checkoutState['confirmation_state'] ?? null, ['confirmed', 'order_placed'], true)
             && !empty($fieldStatus['is_complete'])
             && !$sallaChannel
             && !empty($checkoutState['salla_product_id'])
@@ -1929,6 +2058,8 @@ class ProcessAutoReply implements ShouldQueue
                 'escalation_reason' => "{$decisionReason} (intent={$intent}, confidence=" . round($confidenceScore, 2) . ")",
             ]);
 
+            app(\App\Services\HandoffTaskService::class)->openForConversation($conversation, $decisionReason);
+
             // Halt/Pause active sequences for this conversation
             try {
                 if (class_exists(\App\Services\SequenceEnrollmentService::class)) {
@@ -1941,7 +2072,7 @@ class ProcessAutoReply implements ShouldQueue
             } catch (\Exception $seqEx) {
                 Log::warning('ProcessAutoReply: failed to stop sequences on escalation', [
                     'conversation_id' => $conversation->id,
-                    'error' => $seqEx->getMessage(),
+                    'exception_type' => get_class($seqEx),
                 ]);
             }
 
@@ -1962,14 +2093,6 @@ class ProcessAutoReply implements ShouldQueue
 
             if ($channel->user_id) {
                 broadcast(new \App\Events\MessageReceived($replyMessage, $conversation, $channel->user_id));
-
-                // Send email notification about escalation
-                $notificationService = new \App\Services\NotificationService();
-                $notificationService->escalation(
-                    $channel->user_id,
-                    $decisionReason,
-                    $conversation->id
-                );
             }
             $this->sendReply($channel, $conversation, $replyMessage);
             return;
@@ -1978,7 +2101,44 @@ class ProcessAutoReply implements ShouldQueue
         // Step 6: Send AI Response
         $aiResponse = $aiResult['reply'];
 
-        if ($sallaCheckoutActive && $addressGeocodingStatus === 'not_found') {
+        // A complete order summary must be shown for one turn before a
+        // customer's confirmation can authorize an external order. Do not let
+        // an AI success claim bypass that deterministic checkout state.
+        if (
+            $intent === 'place_order'
+            && $containsConfirmPhrase
+            && !empty($fieldStatus['is_complete'])
+            && !in_array($checkoutState['confirmation_state'] ?? null, ['confirmed', 'order_placed'], true)
+        ) {
+            $aiResponse = $detectedLanguage === 'arabic'
+                ? 'هذه تفاصيل طلبك جاهزة. راجعها، ثم أرسل «تأكيد الطلب» لإتمامه.'
+                : 'Your order details are ready. Please review the summary, then reply “confirm order” to place it.';
+        }
+
+        $isOrderSummaryMessage = $intent === 'place_order'
+            && !empty($fieldStatus['is_complete'])
+            && ($checkoutState['confirmation_state'] ?? null) === 'confirmation_pending';
+        if ($isOrderSummaryMessage) {
+            $productName = trim((string) ($checkoutState['product_name'] ?? 'Selected product'));
+            $price = $checkoutState['product_price'] ?? $checkoutState['price'] ?? null;
+            $currency = trim((string) ($checkoutState['product_currency'] ?? $checkoutState['currency'] ?? ''));
+            $priceText = $price !== null && $price !== '' ? trim((string) $price . ' ' . $currency) : 'Not available';
+            $storeName = trim((string) ($commerceChannel?->page_name ?? '')) ?: 'our store';
+            $aiResponse = "Please review your order summary:\n"
+                . "Product: {$productName}\n"
+                . "Price: {$priceText}\n"
+                . "Store: {$storeName}\n"
+                . 'Name: ' . trim((string) ($checkoutState['full_name'] ?? '')) . "\n"
+                . 'Phone: ' . trim((string) ($checkoutState['phone'] ?? $checkoutState['customer_phone'] ?? '')) . "\n"
+                . 'Delivery address: ' . trim((string) ($checkoutState['address'] ?? $checkoutState['customer_address'] ?? '')) . "\n\n"
+                . 'Reply “confirm order” to place it, or “cancel” to stop.';
+        }
+
+        if ($sallaCheckoutActive && $addressGeocodingStatus === 'country_unknown') {
+            $aiResponse = $detectedLanguage === 'arabic'
+                ? 'من فضلك اذكر الدولة والمدينة التي سيتم التوصيل إليها حتى أتمكن من متابعة الطلب.'
+                : 'Please tell me the country and city for delivery so I can continue with the order.';
+        } elseif ($sallaCheckoutActive && $addressGeocodingStatus === 'not_found') {
             $aiResponse = $detectedLanguage === 'arabic'
                 ? 'لم أتمكن من تحديد المدينة. من فضلك أرسل اسم المدينة فقط؛ لا تحتاج إلى إرسال إحداثيات أو رابط خرائط.'
                 : "I couldn't identify the delivery city. Please send the city name only; you don't need to provide coordinates or a map link.";
@@ -2079,11 +2239,31 @@ class ProcessAutoReply implements ShouldQueue
             'is_ai' => true,
             'source' => 'ai',
             'send_status' => 'pending',
+            'metadata' => $isOrderSummaryMessage ? ['order_summary' => true] : null,
             'confidence_score' => self::normalizeConfidenceScore($aiResult['confidence'] ?? null),
             'detected_dialect' => in_array($detectedDialect, ['egyptian', 'gulf', 'msa', 'mixed']) ? $detectedDialect : null,
             'intent' => $intent,
             'detected_language' => $detectedLanguage,
         ]);
+
+        try {
+            app(\App\Services\AiReplyAuditService::class)->record($replyMessage, [
+                'commerce_connection_id' => $commerceChannel?->id,
+                'agent_version' => $bot?->updated_at?->toIso8601String(),
+                'knowledge_file_ids' => $knowledgeFileIds,
+                'knowledge_chunk_ids' => $knowledgeChunkIds,
+                'prompt_version' => config('services.ai.prompt_version', 'v1'),
+                'ai_provider' => $auditProvider,
+                'ai_model' => $auditModel,
+                'escalation_decision' => $shouldEscalate,
+                'escalation_reason' => $decisionReason,
+            ]);
+        } catch (\Throwable $e) {
+            Log::error('ProcessAutoReply: could not persist AI reply audit', [
+                'message_id' => $replyMessage->id,
+                'exception_type' => get_class($e),
+            ]);
+        }
 
         Log::info('ProcessAutoReply: AI reply saved', ['message_id' => $replyMessage->id]);
 
@@ -2106,6 +2286,7 @@ class ProcessAutoReply implements ShouldQueue
         if (
             $intent === 'place_order'
             && $containsConfirmPhrase
+            && in_array($checkoutState['confirmation_state'] ?? null, ['confirmed', 'order_placed'], true)
             && !$isProductBrowseMessage
             && $commerceChannel
             && !empty($fieldStatus['is_complete'])
@@ -2177,9 +2358,16 @@ class ProcessAutoReply implements ShouldQueue
                         [
                             'status'   => 'completed',
                             'order_id' => $realOrderId,
+                            'confirmation_state' => 'order_placed',
+                            'order_fingerprint' => $this->orderFingerprint($orderInput),
+                            'order_product_id' => (string) ($orderInput['commerce_external_id'] ?? $orderInput['salla_product_id'] ?? ''),
+                            'order_connection_id' => (string) $commerceChannel->id,
                         ]
                     );
-                    $conversation->update(['checkout_state' => $completedState]);
+                    $conversation->update(['checkout_state' => $completedState, 'requires_human' => false]);
+                    HandoffTask::where('conversation_id', $conversation->id)
+                        ->where('status', 'open')
+                        ->update(['status' => 'resolved', 'resolved_at' => now()]);
                     $checkoutState = []; // prevent the persistence block below from re-saving it
 
                     // Fire order_status_changed event for workflow automation
@@ -2188,12 +2376,12 @@ class ProcessAutoReply implements ShouldQueue
                         $engine->executeWorkflowsForEvent(
                             \App\Services\AutomationEngine::EVENT_ORDER_STATUS_CHANGED,
                             $conversation,
-                            ['order_id' => $realOrderId, 'status' => 'completed']
+                            ['order_id' => $realOrderId, 'status' => 'completed', 'event_id' => 'order-status:' . $realOrderId . ':completed']
                         );
                     } catch (\Throwable $e) {
                         Log::error('ProcessAutoReply: failed to fire order_status_changed event', [
                             'conversation_id' => $conversation->id,
-                            'error' => $e->getMessage(),
+                            'exception_type' => get_class($e),
                         ]);
                     }
 
@@ -2207,6 +2395,18 @@ class ProcessAutoReply implements ShouldQueue
                         'conversation_id' => $conversation->id,
                         'order_data'      => $orderData,
                     ]);
+
+                    $conversation->update([
+                        'requires_human' => true,
+                        'status' => 'pending_human',
+                        'escalated_at' => now(),
+                        'escalation_reason' => $commerceChannel->type . '_order_creation_failed',
+                    ]);
+                    app(\App\Services\HandoffTaskService::class)->openForConversation(
+                        $conversation,
+                        $commerceChannel->type . '_order_creation_failed',
+                        'high'
+                    );
 
                     if ($detectedLanguage === 'arabic') {
                         $aiResponse = "عذراً، واجهنا مشكلة تقنية في إتمام طلبك الآن 😔\n" .
@@ -2232,6 +2432,7 @@ class ProcessAutoReply implements ShouldQueue
                         ]);
                     } else {
                         $updatedCheckoutState['failed_order_attempts'] = $failedAttempts;
+                        $updatedCheckoutState['confirmation_state'] = 'confirmation_pending';
                         $conversation->update(['checkout_state' => $updatedCheckoutState]);
                     }
                 }
@@ -2296,9 +2497,6 @@ class ProcessAutoReply implements ShouldQueue
         // ── END CHECKOUT STATE PERSISTENCE ─────────────────────────────────
 
 
-        // Increment the monthly counter now that the message is confirmed saved
-        cache()->increment($cacheKey);
-
         if ($channel->user_id) {
             broadcast(new \App\Events\MessageReceived($replyMessage, $message->conversation, $channel->user_id));
         }
@@ -2306,6 +2504,16 @@ class ProcessAutoReply implements ShouldQueue
         // Images (if any) were already sent above, before the text was composed,
         // so sendReply now only needs to deliver the (possibly overridden) text.
         $sendSuccess = $this->sendReply($channel, $message->conversation, $replyMessage);
+
+        if ($sendSuccess && $isOrderSummaryMessage) {
+            $latestCheckoutState = is_array($conversation->fresh()->checkout_state)
+                ? $conversation->fresh()->checkout_state
+                : [];
+            $latestCheckoutState['confirmation_summary_message_id'] = $replyMessage->id;
+            $latestCheckoutState['confirmation_summary_fingerprint'] = $this->orderFingerprint($latestCheckoutState);
+            $latestCheckoutState['confirmation_summary_sent_at'] = now()->toIso8601String();
+            $conversation->update(['checkout_state' => $latestCheckoutState]);
+        }
         
         // If send failed, provide fallback response to user
         if (!$sendSuccess) {
@@ -2347,7 +2555,7 @@ class ProcessAutoReply implements ShouldQueue
                 // Never let sequence scheduling break the reply flow.
                 Log::warning('ProcessAutoReply: failed to schedule no-reply timers', [
                     'conversation_id' => $conversation->id,
-                    'error'           => $e->getMessage(),
+                    'exception_type' => get_class($e),
                 ]);
             }
 
@@ -2358,7 +2566,7 @@ class ProcessAutoReply implements ShouldQueue
                 // Never let workflow evaluation break the reply flow.
                 Log::warning('ProcessAutoReply: failed to evaluate workflows', [
                     'conversation_id' => $conversation->id,
-                    'error'           => $e->getMessage(),
+                    'exception_type' => get_class($e),
                 ]);
             }
         }
@@ -2507,7 +2715,7 @@ class ProcessAutoReply implements ShouldQueue
                 Log::error('ProcessAutoReply: new-user sequence enrollment threw an exception', [
                     'conversation_id' => $conversation->id,
                     'sequence_id'     => $sequence->id,
-                    'error'           => $e->getMessage(),
+                    'exception_type' => get_class($e),
                 ]);
                 // Do NOT silently fall back to AI auto-reply on exception.
                 // The sequence was likely partially set up; better to skip the
@@ -2646,17 +2854,50 @@ class ProcessAutoReply implements ShouldQueue
                 continue;
             }
 
+            // Product images are separate billable outbound messages. Keep
+            // one unit available for the explanatory text reply so a plan
+            // limit cannot allow media while blocking the follow-up message.
+            $business = $conversation->business;
+            if ($business) {
+                $usage = app(\App\Services\UsageMeter::class)->canUse(
+                    $business,
+                    \App\Services\UsageMeter::OUTBOUND_MESSAGES,
+                );
+                if (!$usage['allowed'] || (!$usage['unlimited'] && $usage['used'] >= max(0, $usage['limit'] - 1))) {
+                    Log::info('ProcessAutoReply: product image skipped by outbound plan limit', [
+                        'business_id' => $business->id,
+                        'conversation_id' => $conversation->id,
+                        'used' => $usage['used'],
+                        'limit' => $usage['limit'],
+                    ]);
+                    break;
+                }
+            }
+
             $sentMessageId = null;
+            $imageWasSent = false;
 
             try {
                 if ($channel->type === 'whatsapp') {
-                    $whatsappService = new EvolutionApiService();
-                    // EvolutionApiService::makeRequest() throws on any non-2xx
-                    // response after retries -- reaching the line below without
-                    // an exception means Evolution accepted the send.
-                    $response = $whatsappService->sendMediaMessage($channel->page_id, $recipientId, $imageUrl, '', 'image');
-                    $sentMessageId = $response['key']['id'] ?? null;
-                    $sentCount++;
+                    if (($channel->metadata['whatsapp_provider'] ?? null) === 'cloud') {
+                        $lastInbound = $conversation->messages()->where('direction', 'inbound')->latest('created_at')->first();
+                        if (!$lastInbound || !$lastInbound->created_at->gt(now()->subHours(24))) {
+                            continue;
+                        }
+                        $result = app(\App\Services\WhatsAppCloudApiService::class)
+                            ->sendImage($channel, $recipientId, $imageUrl);
+                        if (!empty($result['success'])) {
+                            $sentMessageId = $result['message_id'] ?? null;
+                            $sentCount++;
+                            $imageWasSent = true;
+                        }
+                    } elseif (($channel->metadata['unofficial_risk_accepted'] ?? false) === true) {
+                        // Evolution throws on non-2xx; a returned response means it accepted the send.
+                        $response = (new EvolutionApiService())->sendMediaMessage($channel->page_id, $recipientId, $imageUrl, '', 'image');
+                        $sentMessageId = $response['key']['id'] ?? null;
+                        $sentCount++;
+                        $imageWasSent = true;
+                    }
                 } elseif (in_array($channel->type, ['facebook', 'instagram'], true)) {
                     $accessToken = $channel->access_token;
                     $response = Http::timeout(10)->post(
@@ -2674,12 +2915,11 @@ class ProcessAutoReply implements ShouldQueue
                     if ($response->successful()) {
                         $sentCount++;
                         $sentMessageId = $response->json()['message_id'] ?? null;
+                        $imageWasSent = true;
                     } else {
                         Log::error('ProcessAutoReply: image send failed (Facebook/Instagram)', [
                             'channel_type' => $channel->type,
-                            'image_url'    => $imageUrl,
                             'status'       => $response->status(),
-                            'body'         => $response->body(),
                         ]);
                     }
                 } else {
@@ -2690,9 +2930,36 @@ class ProcessAutoReply implements ShouldQueue
             } catch (\Exception $e) {
                 Log::error('ProcessAutoReply: image send exception', [
                     'channel_type' => $channel->type,
-                    'image_url'    => $imageUrl,
-                    'error'        => $e->getMessage(),
+                    'exception_type' => get_class($e),
                 ]);
+            }
+
+            if ($imageWasSent) {
+                try {
+                    Message::create([
+                        'conversation_id' => $conversation->id,
+                        'content' => trim((string) ($item['name'] ?? 'Product image')),
+                        'type' => 'image',
+                        'direction' => 'outbound',
+                        'status' => 'sent',
+                        'is_ai' => false,
+                        'source' => 'ai_product_image',
+                        'send_status' => 'sent',
+                        'delivery_status' => 'sent',
+                        'media_url' => $imageUrl,
+                        'media_type' => 'image',
+                        'metadata' => [
+                            'platform_message_id' => $sentMessageId,
+                            'commerce_product_id' => $item['commerce_external_id'] ?? $item['id'] ?? null,
+                        ],
+                    ]);
+                } catch (\Throwable $e) {
+                    Log::error('ProcessAutoReply: sent product image could not be recorded for billing', [
+                        'conversation_id' => $conversation->id,
+                        'platform_message_id' => $sentMessageId,
+                        'exception_type' => get_class($e),
+                    ]);
+                }
             }
 
             // Persist the deterministic message→product mapping ONLY when we
@@ -2733,7 +3000,7 @@ class ProcessAutoReply implements ShouldQueue
                     Log::error('ProcessAutoReply: failed to persist product message map', [
                         'conversation_id' => $conversation->id,
                         'message_id'      => $sentMessageId,
-                        'error'           => $e->getMessage(),
+                        'exception_type' => get_class($e),
                     ]);
                 }
             }
@@ -2747,17 +3014,23 @@ class ProcessAutoReply implements ShouldQueue
         $senderId = $conversation->sender_id;
         $content = $replyMessage->content;
 
+        $business = $conversation->business;
+        if ($business && app(\App\Services\UsageMeter::class)->blockMessageIfOverLimit($business, $replyMessage)) {
+            return false;
+        }
+
         try {
             $success = false;
 
             if ($channel->type === 'facebook') {
-                $success = $this->sendFacebookReply($channel, $senderId, $content, $images);
+                $success = $this->sendFacebookReply($channel, $senderId, $content, $images, $replyMessage);
             } elseif ($channel->type === 'instagram') {
-                $success = $this->sendInstagramReply($channel, $senderId, $content, $images);
+                $success = $this->sendInstagramReply($channel, $senderId, $content, $images, $replyMessage);
             } elseif ($channel->type === 'gmail') {
                 $success = $this->sendGmailReply($channel, $conversation, $content);
             } elseif ($channel->type === 'whatsapp') {
-                $success = $this->sendWhatsAppReply($channel, $senderId, $content, $images);
+                $success = app(\App\Services\ChannelMessageService::class)
+                    ->sendMessage($channel, $conversation, $replyMessage, $images);
             } elseif ($channel->type === 'telegram') {
                 $success = $this->sendTelegramReply($channel, $senderId, $content);
             } elseif ($channel->type === 'web_chat') {
@@ -2768,18 +3041,18 @@ class ProcessAutoReply implements ShouldQueue
             }
 
             if ($success) {
-                $replyMessage->update(['send_status' => 'sent']);
+                $replyMessage->update(['status' => 'sent', 'send_status' => 'sent', 'delivery_status' => 'sent', 'error_details' => null]);
                 Log::info('ProcessAutoReply: reply sent successfully', [
                     'platform' => $channel->type,
                     'message_id' => $replyMessage->id,
                     'ai_replies_count' => $this->aiRepliesCount,
                 ]);
             } else {
-                $replyMessage->update(['send_status' => 'failed']);
-                // Decrement counter since message failed to send
-                if ($this->aiRepliesCount > 0) {
-                    $cacheKey = "user_{$channel->user_id}_ai_replies_" . now()->format('Y-m');
-                    Cache::decrement($cacheKey);
+                if ($replyMessage->fresh()?->send_status !== 'blocked') {
+                    $replyMessage->update([
+                        'status' => 'failed', 'send_status' => 'failed', 'delivery_status' => 'failed',
+                        'error_details' => $replyMessage->fresh()->error_details ?: 'provider_rejected',
+                    ]);
                 }
                 Log::error('ProcessAutoReply: reply send failed', [
                     'platform' => $channel->type,
@@ -2790,27 +3063,38 @@ class ProcessAutoReply implements ShouldQueue
             return $success;
 
         } catch (\Exception $e) {
-            $replyMessage->update(['send_status' => 'failed']);
-            // Decrement counter since message failed to send
-            if ($this->aiRepliesCount > 0) {
-                $cacheKey = "user_{$channel->user_id}_ai_replies_" . now()->format('Y-m');
-                Cache::decrement($cacheKey);
+            if ($replyMessage->fresh()?->send_status !== 'blocked') {
+                $replyMessage->update([
+                    'status' => 'failed',
+                    'send_status' => 'failed',
+                    'delivery_status' => 'failed',
+                    'error_details' => $e->getMessage(),
+                ]);
             }
             Log::error('ProcessAutoReply: send reply exception', [
-                'error' => $e->getMessage(),
+                'exception_type' => get_class($e),
                 'platform' => $channel->type,
             ]);
             return false;
         }
     }
 
-    private function sendFacebookReply(Channel $channel, string $recipientId, string $message, array $images = []): bool
+    private function sendFacebookReply(Channel $channel, string $recipientId, string $message, array $images = [], ?Message $messageRecord = null): bool
     {
         // Phase 4: the Meta Send API wire format was extracted to
         // MetaMessengerService so sequence messages (and any future outbound
         // flow) reuse the EXACT same implementation as AI auto-replies
         // (images first, then text; same token handling; same timeouts).
-        return app(\App\Services\MetaMessengerService::class)->sendText($channel, $recipientId, $message, $images);
+        $result = app(\App\Services\MetaMessengerService::class)->sendTextWithResult($channel, $recipientId, $message, $images);
+        if ($messageRecord) {
+            $metadata = $messageRecord->metadata ?? [];
+            $metadata['provider_message_ids'] = $result['message_ids'] ?? [];
+            if (!empty($result['message_id'])) {
+                $metadata['platform_message_id'] = $result['message_id'];
+            }
+            $messageRecord->update(['metadata' => $metadata, 'error_details' => $result['error'] ?? null]);
+        }
+        return (bool) $result['success'];
     }
 
     /**
@@ -2827,10 +3111,10 @@ class ProcessAutoReply implements ShouldQueue
         return 'english';
     }
 
-    private function sendInstagramReply(Channel $channel, string $recipientId, string $message, array $images = []): bool
+    private function sendInstagramReply(Channel $channel, string $recipientId, string $message, array $images = [], ?Message $messageRecord = null): bool
     {
         // Instagram uses the same API as Facebook with the page access token
-        return $this->sendFacebookReply($channel, $recipientId, $message, $images);
+        return $this->sendFacebookReply($channel, $recipientId, $message, $images, $messageRecord);
     }
 
     private function sendGmailReply(Channel $channel, Conversation $conversation, string $body): bool
@@ -2879,69 +3163,7 @@ class ProcessAutoReply implements ShouldQueue
             return true;
 
         } catch (\Exception $e) {
-            Log::error('ProcessAutoReply: Gmail send exception', ['error' => $e->getMessage()]);
-            return false;
-        }
-    }
-
-    private function sendWhatsAppReply(Channel $channel, string $recipientId, string $message, array $images = []): bool
-    {
-        try {
-            $whatsappService = new EvolutionApiService();
-            $instanceName = $channel->page_id; // We store instance_name in page_id for WhatsApp
-
-            // Send images first
-            foreach ($images as $imageUrl) {
-                $whatsappService->sendMediaMessage(
-                    $instanceName,
-                    $recipientId,
-                    $imageUrl,
-                    '', // No caption, send standalone image
-                    'image'
-                );
-            }
-
-            // Send the actual text message
-            $response = $whatsappService->sendTextMessage($instanceName, $recipientId, $message);
-
-            if (isset($response['key']['id'])) {
-                // Evolution accepted the send (queued it). TRUE does NOT mean
-                // the phone received it yet — delivery confirmation comes via
-                // MESSAGES_UPDATE webhook (SERVER_ACK → DELIVERY_ACK). This is
-                // the correct definition of sendWhatsAppReply "success".
-                $instance = \App\Models\WhatsAppInstance::where('instance_name', $instanceName)->first();
-
-                if ($instance) {
-                    \App\Models\WhatsAppMessage::create([
-                        'whatsapp_instance_id' => $instance->id,
-                        'user_id'              => $channel->user_id,
-                        'message_id'           => $response['key']['id'] ?? null,
-                        'remote_message_id'    => $response['key']['id'] ?? null,
-                        'direction'            => 'outgoing',
-                        'from_phone'           => null,
-                        'from_name'            => null,
-                        'to_phone'             => $recipientId,
-                        'body'                 => $message,
-                        'message_type'         => 'text',
-                        'media'                => null,
-                        'metadata'             => ['evolution_message_id' => $response['key']['id'] ?? null],
-                        'status'               => 'sent',
-                        'sent_at'              => now(),
-                    ]);
-                } else {
-                    Log::warning('ProcessAutoReply: WhatsAppInstance not found for legacy message record — skipping (unified inbox record already saved)', [
-                        'instance_name' => $instanceName,
-                        'channel_id'    => $channel->id,
-                    ]);
-                }
-
-                return true;
-            }
-
-            return false;
-
-        } catch (\Exception $e) {
-            Log::error('ProcessAutoReply: WhatsApp send exception', ['error' => $e->getMessage()]);
+            Log::error('ProcessAutoReply: Gmail send exception', ['exception_type' => get_class($e)]);
             return false;
         }
     }
@@ -2949,7 +3171,7 @@ class ProcessAutoReply implements ShouldQueue
     private function sendTelegramReply(Channel $channel, string $chatId, string $message): bool
     {
         try {
-            $botToken = decrypt($channel->access_token);
+            $botToken = $channel->access_token;
             $telegramService = new \App\Services\TelegramService();
             
             $success = $telegramService->sendMessage($botToken, $chatId, $message);
@@ -2963,7 +3185,7 @@ class ProcessAutoReply implements ShouldQueue
             return $success;
 
         } catch (\Exception $e) {
-            Log::error('ProcessAutoReply: Telegram send exception', ['error' => $e->getMessage()]);
+            Log::error('ProcessAutoReply: Telegram send exception', ['exception_type' => get_class($e)]);
             return false;
         }
     }
@@ -2992,7 +3214,7 @@ class ProcessAutoReply implements ShouldQueue
             return false;
 
         } catch (\Exception $e) {
-            Log::error('ProcessAutoReply: TikTok send exception', ['error' => $e->getMessage()]);
+            Log::error('ProcessAutoReply: TikTok send exception', ['exception_type' => get_class($e)]);
             return false;
         }
     }
@@ -3053,7 +3275,7 @@ class ProcessAutoReply implements ShouldQueue
 
         } catch (\Exception $e) {
             Log::error('Failed to notify business owner about AI failure', [
-                'error' => $e->getMessage(),
+                'exception_type' => get_class($e),
                 'user_id' => $user->id
             ]);
         }
@@ -3079,11 +3301,30 @@ class ProcessAutoReply implements ShouldQueue
             $currentState = is_array($conversation->checkout_state) ? $conversation->checkout_state : [];
 
             if (!empty($currentState['order_id']) && ($currentState['status'] ?? '') === 'completed') {
-                Log::info('ProcessAutoReply: order already created, skipping duplicate creation', [
-                    'conversation_id' => $conversation->id,
-                    'order_id'        => $currentState['order_id'],
-                ]);
-                return $currentState;
+                $requestedFingerprint = $this->orderFingerprint($checkoutState);
+                $storedFingerprint = $currentState['order_fingerprint'] ?? null;
+                $legacyMatches = (string) ($currentState['order_product_id'] ?? $currentState['commerce_external_id'] ?? $currentState['salla_product_id'] ?? '')
+                        === (string) ($checkoutState['commerce_external_id'] ?? $checkoutState['salla_product_id'] ?? '')
+                    && (string) ($currentState['order_connection_id'] ?? $currentState['commerce_channel_id'] ?? '')
+                        === (string) ($checkoutState['commerce_channel_id'] ?? '');
+
+                if (($storedFingerprint && hash_equals($storedFingerprint, $requestedFingerprint))
+                    || (!$storedFingerprint && $legacyMatches)) {
+                    Log::info('ProcessAutoReply: matching order already exists, skipping duplicate creation', [
+                        'conversation_id' => $conversation->id,
+                        'order_id' => $currentState['order_id'],
+                    ]);
+                    return $currentState;
+                }
+
+                // Completed state refers to a different product/store/customer
+                // context. Drop its order identity before proceeding.
+                foreach (['order_id', 'order_number', 'order_fingerprint', 'order_product_id', 'order_connection_id'] as $key) {
+                    unset($currentState[$key]);
+                }
+                $currentState['status'] = 'in_progress';
+                $currentState['confirmation_state'] = 'confirmed';
+                $conversation->update(['checkout_state' => $currentState]);
             }
 
             $commerceContext = app(\App\Services\EcommerceChannelResolver::class)
@@ -3091,6 +3332,68 @@ class ProcessAutoReply implements ShouldQueue
             $commerceChannel = $commerceContext['connection'] ?? null;
             $externalOrderId = null;
             $externalSource  = null;
+
+            if (!$commerceChannel || (int) $commerceChannel->business_id !== (int) $conversation->business_id) {
+                return null;
+            }
+
+            // Persist an order attempt before contacting the provider. The
+            // summary message ID distinguishes a later, intentional checkout
+            // of the same product/customer from a retry of this checkout.
+            $checkoutFingerprint = $this->orderFingerprint($checkoutState);
+            $summaryMessageId = (string) ($checkoutState['confirmation_summary_message_id']
+                ?? $currentState['confirmation_summary_message_id']
+                ?? '');
+            $idempotencyKey = hash('sha256', implode('|', [
+                $conversation->id,
+                $commerceChannel->id,
+                $checkoutFingerprint,
+                $summaryMessageId,
+            ]));
+            $attempt = \App\Models\CommerceOrderAttempt::firstOrCreate(
+                ['idempotency_key' => $idempotencyKey],
+                [
+                    'business_id' => $conversation->business_id,
+                    'conversation_id' => $conversation->id,
+                    'connection_id' => $commerceChannel->id,
+                    'provider' => (string) $commerceChannel->type,
+                    'checkout_fingerprint' => $checkoutFingerprint,
+                    'status' => 'pending',
+                ],
+            );
+
+            if ($attempt->status === 'completed' && $attempt->external_order_id) {
+                return [
+                    'success' => true,
+                    'id' => $attempt->external_order_id,
+                    'order_id' => $attempt->external_order_id,
+                    'order_number' => $attempt->order_number ?: $attempt->external_order_id,
+                    'external_source' => $attempt->provider,
+                    'total' => (float) ($checkoutState['product_price'] ?? 0),
+                    'status' => 'completed',
+                    'currency' => $checkoutState['product_currency'] ?? 'SAR',
+                    'has_order' => true,
+                    'items' => [[
+                        'name' => $checkoutState['product_name'] ?? 'Product',
+                        'price' => (float) ($checkoutState['product_price'] ?? 0),
+                        'quantity' => 1,
+                    ]],
+                    'product_name' => $checkoutState['product_name'] ?? 'Product',
+                ];
+            }
+
+            if (!$attempt->wasRecentlyCreated && $attempt->status === 'pending') {
+                Log::warning('ProcessAutoReply: commerce order attempt is unresolved; suppressing duplicate provider request', [
+                    'conversation_id' => $conversation->id,
+                    'connection_id' => $commerceChannel->id,
+                    'attempt_id' => $attempt->id,
+                ]);
+                return null;
+            }
+
+            if ($attempt->status === 'failed') {
+                $attempt->update(['status' => 'pending', 'external_order_id' => null, 'order_number' => null]);
+            }
 
             // The active conversation connection is authoritative for every
             // order operation; this method never probes other connected stores.
@@ -3112,15 +3415,24 @@ class ProcessAutoReply implements ShouldQueue
                         Log::error('SALLA_ORDER_CREATION_FAILED', [
                             'conversation_id' => $conversation->id,
                             'channel_id'      => $sallaChannel->id,
-                            'response'        => $sallaRes,
+                            'response_keys' => array_keys($sallaRes),
                         ]);
                         return null;
                     }
                 } catch (\Exception $e) {
+                    // A provider HTTP response confirms rejection. Network
+                    // failures stay pending because the provider may have
+                    // accepted the request before the connection dropped.
+                    if (preg_match('/^API call failed: (?:HTTP\s*)?(\d{3})\b/', $e->getMessage(), $statusMatch)
+                        || str_contains(strtolower($e->getMessage()), 'token expired')
+                        || str_contains(strtolower($e->getMessage()), 'scope missing')
+                        || str_contains(strtolower($e->getMessage()), 'rate limited')) {
+                        $attempt->update(['status' => 'failed']);
+                    }
                     Log::error('SALLA_ORDER_CREATION_FAILED', [
                         'conversation_id' => $conversation->id,
                         'channel_id'      => $sallaChannel->id,
-                        'error'           => $e->getMessage(),
+                        'exception_type' => get_class($e),
                     ]);
                     // STRICT RULE: DO NOT generate a fake ID or pretend success when Salla fails!
                     return null;
@@ -3180,17 +3492,17 @@ class ProcessAutoReply implements ShouldQueue
                                 ]);
                             }
                         } else {
+                            $attempt->update(['status' => 'failed']);
                             Log::error('SHOPIFY_ORDER_CREATION_FAILED', [
                                 'conversation_id' => $conversation->id,
                                 'status'          => $response->status(),
-                                'body'            => $response->body(),
                             ]);
                             return null;
                         }
                     } catch (\Exception $e) {
                         Log::error('SHOPIFY_ORDER_CREATION_FAILED', [
                             'conversation_id' => $conversation->id,
-                            'error'           => $e->getMessage(),
+                        'exception_type' => get_class($e),
                         ]);
                         return null;
                 }
@@ -3215,7 +3527,7 @@ class ProcessAutoReply implements ShouldQueue
                     Log::error('WOOCOMMERCE_ORDER_CREATION_FAILED', [
                         'conversation_id' => $conversation->id,
                         'channel_id' => $commerceChannel->id,
-                        'error' => $e->getMessage(),
+                    'exception_type' => get_class($e),
                     ]);
                     return null;
                 }
@@ -3228,6 +3540,15 @@ class ProcessAutoReply implements ShouldQueue
                 ]);
                 return null;
             }
+
+            // Store the provider result before returning to the checkout
+            // caller, which persists conversation state separately. If that
+            // later write fails, the next execution reuses this real order.
+            $attempt->update([
+                'status' => 'completed',
+                'external_order_id' => $externalOrderId,
+                'order_number' => $externalOrderId,
+            ]);
 
             $orderTotal = (float)($checkoutState['product_price'] ?? 0);
             $orderData  = [
@@ -3277,7 +3598,7 @@ class ProcessAutoReply implements ShouldQueue
             } catch (\Exception $e) {
                 Log::error('ORDER_SEQUENCE_TRIGGER_ERROR', [
                     'conversation_id' => $conversation->id,
-                    'error'           => $e->getMessage(),
+                    'exception_type' => get_class($e),
                 ]);
             }
 
@@ -3286,6 +3607,147 @@ class ProcessAutoReply implements ShouldQueue
         } finally {
             $lock->release();
         }
+    }
+
+    /** Stable per-checkout identity used to scope order idempotency. */
+    private function orderFingerprint(array $state): string
+    {
+        return hash('sha256', implode('|', [
+            (string) ($state['commerce_channel_id'] ?? ''),
+            (string) ($state['commerce_external_id'] ?? $state['salla_product_id'] ?? ''),
+            preg_replace('/\D+/', '', (string) ($state['phone'] ?? $state['customer_phone'] ?? '')),
+            mb_strtolower(trim((string) ($state['address'] ?? $state['customer_address'] ?? ''))),
+        ]));
+    }
+
+    private function hasValidOrderSummaryForConfirmation(Conversation $conversation, Message $incoming, array $state): bool
+    {
+        $summaryId = (int) ($state['confirmation_summary_message_id'] ?? 0);
+        if ($summaryId < 1 || empty($state['confirmation_summary_fingerprint'])) {
+            return false;
+        }
+
+        if (!hash_equals((string) $state['confirmation_summary_fingerprint'], $this->orderFingerprint($state))) {
+            return false;
+        }
+
+        $summary = Message::query()
+            ->where('conversation_id', $conversation->id)
+            ->whereKey($summaryId)
+            ->where('direction', 'outbound')
+            ->where('send_status', 'sent')
+            ->first();
+        if (!$summary || empty($summary->metadata['order_summary'])) {
+            return false;
+        }
+
+        $quotedMessageId = (string) ($incoming->metadata['quoted_message_id'] ?? '');
+        if ($quotedMessageId !== '' && in_array($quotedMessageId, [
+            (string) $summary->id,
+            (string) ($summary->metadata['platform_message_id'] ?? ''),
+            (string) ($summary->whatsapp_message_id ?? ''),
+            (string) ($summary->gmail_message_id ?? ''),
+        ], true)) {
+            return true;
+        }
+
+        // If no explicit quote exists, the summary must be the immediately
+        // preceding conversation message, with no intervening turns.
+        return !Message::query()
+            ->where('conversation_id', $conversation->id)
+            ->where('id', '>', $summary->id)
+            ->where('id', '<', $incoming->id)
+            ->exists();
+    }
+
+    /**
+     * Cancel a not-yet-submitted checkout, or hand off cancellation of an
+     * already placed order. Returns true when this inbound message was handled.
+     */
+    private function handleExplicitCheckoutCancellation(
+        Channel $channel,
+        Conversation $conversation,
+        Message $incoming,
+        mixed $checkoutState,
+    ): bool {
+        if ($incoming->direction !== 'inbound' || !is_array($checkoutState) || !$this->isExplicitCheckoutCancellation($incoming->content)) {
+            return false;
+        }
+
+        $hasCheckout = !empty($checkoutState['salla_product_id'])
+            || !empty($checkoutState['commerce_external_id'])
+            || !empty($checkoutState['product_name'])
+            || !empty($checkoutState['order_id']);
+        if (!$hasCheckout) {
+            return false;
+        }
+
+        $orderAlreadyPlaced = !empty($checkoutState['order_id'])
+            || ($checkoutState['confirmation_state'] ?? null) === 'order_placed';
+        if ($orderAlreadyPlaced) {
+            $checkoutState['cancellation_requested_at'] = now()->toIso8601String();
+            $conversation->update([
+                'checkout_state' => $checkoutState,
+                'requires_human' => true,
+                'ai_enabled' => false,
+                'status' => 'pending_human',
+                'escalated_at' => now(),
+                'escalation_reason' => 'order_cancellation_requested',
+            ]);
+            app(\App\Services\HandoffTaskService::class)->openForConversation(
+                $conversation,
+                'order_cancellation_requested',
+                'high'
+            );
+
+            $reply = preg_match('/\p{Arabic}/u', $incoming->content)
+                ? 'تم تسجيل طلب إلغاء الطلب، لكن الطلب تم إنشاؤه بالفعل ولم يتم إلغاؤه بعد. أحلت طلبك إلى أحد أعضاء الفريق لمساعدتك.'
+                : 'Your order has already been placed, so it has not been cancelled yet. I’ve asked a team member to help with your cancellation request.';
+            $source = 'order_cancellation_handoff';
+        } else {
+            $conversation->update(['checkout_state' => null]);
+            $reply = preg_match('/\p{Arabic}/u', $incoming->content)
+                ? 'تم إلغاء عملية الطلب، ولم يتم إرسال أي طلب إلى المتجر. يمكنك بدء طلب جديد في أي وقت.'
+                : 'Checkout cancelled. No order was submitted. You can start a new order whenever you’re ready.';
+            $source = 'checkout_cancelled';
+        }
+
+        $replyMessage = Message::create([
+            'conversation_id' => $conversation->id,
+            'content' => $reply,
+            'direction' => 'outbound',
+            'status' => 'auto',
+            'is_ai' => false,
+            'source' => $source,
+            'send_status' => 'pending',
+            'metadata' => ['checkout_cancellation' => true, 'order_already_placed' => $orderAlreadyPlaced],
+        ]);
+
+        if ($channel->user_id) {
+            broadcast(new \App\Events\MessageReceived($replyMessage, $conversation, $channel->user_id));
+        }
+        $this->sendReply($channel, $conversation, $replyMessage);
+
+        Log::info('ProcessAutoReply: explicit checkout cancellation handled before commerce actions', [
+            'conversation_id' => $conversation->id,
+            'order_already_placed' => $orderAlreadyPlaced,
+            'source' => $source,
+        ]);
+
+        return true;
+    }
+
+    private function isExplicitCheckoutCancellation(string $message): bool
+    {
+        $message = mb_strtolower(trim($message));
+        return (bool) preg_match(
+            '/^(?:(?:please|kindly)\s+)?(?:cancel|stop)(?:\s+(?:(?:my|the)\s+)?(?:order|checkout))?[.!?\s]*$'
+                . '|^(?:i\s+)?(?:want|need)\s+to\s+cancel\s+(?:(?:my|the)\s+)?(?:order|checkout)[.!?\s]*$'
+                . '|^(?:i\s+)?(?:changed\s+my\s+mind|do\s+not\s+proceed|don.t\s+proceed)(?:\s+with\s+(?:the\s+)?order)?[.!?\s]*$'
+                . '|^(?:من\s+فضلك\s+)?(?:إلغاء|الغاء|ألغِ|الغي)(?:\s+(?:الطلب|طلبي|عملية\s+الطلب))?[.!؟\s]*$'
+                . '|^(?:أريد|اريد|عايز|عاوز|أبغى|ابغى)\s+(?:إلغاء|الغاء|ألغي|الغي)\s+(?:الطلب|طلبي)[.!؟\s]*$/u',
+            $message
+        );
     }
 
 

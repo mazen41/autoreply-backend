@@ -21,8 +21,8 @@ class AutomationController extends Controller
      */
     public function getBusinessHours(Request $request, $businessId)
     {
-        $business = BusinessProfile::where('user_id', Auth::id())
-            ->findOrFail($businessId);
+        $business = app(\App\Services\BusinessAccessService::class)
+            ->authorize($request->user(), $businessId, 'automation_read');
 
         $hours = BusinessHour::where('business_id', $businessId)
             ->orderBy('day_of_week')
@@ -44,8 +44,8 @@ class AutomationController extends Controller
             'hours.*.is_active' => 'boolean',
         ]);
 
-        $business = BusinessProfile::where('user_id', Auth::id())
-            ->findOrFail($businessId);
+        $business = app(\App\Services\BusinessAccessService::class)
+            ->authorize($request->user(), $businessId, 'automation_write');
 
         // Delete existing hours
         BusinessHour::where('business_id', $businessId)->delete();
@@ -69,8 +69,8 @@ class AutomationController extends Controller
      */
     public function getAutoMessages(Request $request, $businessId)
     {
-        $business = BusinessProfile::where('user_id', Auth::id())
-            ->findOrFail($businessId);
+        $business = app(\App\Services\BusinessAccessService::class)
+            ->authorize($request->user(), $businessId, 'automation_read');
 
         $messages = AutoMessage::where('business_id', $businessId)->get();
 
@@ -89,8 +89,8 @@ class AutomationController extends Controller
             'timezone' => 'string',
         ]);
 
-        $business = BusinessProfile::where('user_id', Auth::id())
-            ->findOrFail($businessId);
+        $business = app(\App\Services\BusinessAccessService::class)
+            ->authorize($request->user(), $businessId, 'automation_write');
 
         $autoMessage = AutoMessage::updateOrCreate(
             [
@@ -116,8 +116,8 @@ class AutomationController extends Controller
             'timezone' => 'required|string',
         ]);
 
-        $business = BusinessProfile::where('user_id', Auth::id())
-            ->findOrFail($businessId);
+        $business = app(\App\Services\BusinessAccessService::class)
+            ->authorize($request->user(), $businessId, 'automation_write');
 
         $business->update(['timezone' => $request->timezone]);
 
@@ -129,8 +129,8 @@ class AutomationController extends Controller
      */
     public function getCommentSettings(Request $request, $businessId)
     {
-        $business = BusinessProfile::where('user_id', Auth::id())
-            ->findOrFail($businessId);
+        $business = app(\App\Services\BusinessAccessService::class)
+            ->authorize($request->user(), $businessId, 'automation_read');
 
         return response()->json([
             'comment_automation_enabled' => $business->comment_automation_enabled,
@@ -182,8 +182,8 @@ class AutomationController extends Controller
             'emoji_enabled' => 'boolean',
         ]);
 
-        $business = BusinessProfile::where('user_id', Auth::id())
-            ->findOrFail($businessId);
+        $business = app(\App\Services\BusinessAccessService::class)
+            ->authorize($request->user(), $businessId, 'automation_write');
 
         $business->update($request->only([
             'comment_automation_enabled',
@@ -217,19 +217,8 @@ class AutomationController extends Controller
      */
     public function index(Request $request)
     {
-        $user = Auth::user();
-
-        // Get all business IDs the user has access to (as owner or team member)
-        $businessIds = BusinessProfile::where('user_id', $user->id)
-            ->pluck('id')
-            ->merge(
-                \App\Models\TeamMember::where('user_id', $user->id)
-                    ->where('is_active', true)
-                    ->pluck('business_id')
-            )
-            ->unique();
-
-        $query = AutomationWorkflow::whereIn('business_id', $businessIds);
+        $business = $this->getResolvedBusinessProfile($request, 'automation_read');
+        $query = AutomationWorkflow::where('business_id', $business->id);
 
         // Apply bot filter if provided
         if ($request->has('bot_id') && !empty($request->bot_id)) {
@@ -260,37 +249,100 @@ class AutomationController extends Controller
     /**
      * Resolve the business profile for the current request.
      *
-     * Supports multi-business users via X-Business-Id header or business_id input.
-     * Falls back to the user's primary business profile without creating duplicates.
+     * Resolve the explicitly selected, authorized business for this request.
      */
-    private function getResolvedBusinessProfile(Request $request): BusinessProfile
+    private function getResolvedBusinessProfile(Request $request, string $permission = 'automation_read'): BusinessProfile
     {
-        $user = $request->user();
+        return app(\App\Services\ActiveBusiness::class)->resolve($request, permission: $permission);
+    }
 
-        // Check for explicit business ID from header or input
-        $requestedBusinessId = $request->header('X-Business-Id') ?? $request->input('business_id');
-
-        if ($requestedBusinessId) {
-            $requestedBusinessId = (int) $requestedBusinessId;
-
-            // Verify user has access to this business (as owner or team member)
-            $hasAccess = BusinessProfile::where('id', $requestedBusinessId)
-                ->where('user_id', $user->id)
-                ->exists() ||
-                \App\Models\TeamMember::where('business_id', $requestedBusinessId)
-                    ->where('user_id', $user->id)
-                    ->where('is_active', true)
-                    ->exists();
-
-            if ($hasAccess) {
-                return BusinessProfile::findOrFail($requestedBusinessId);
-            }
-
-            // If no access, fall through to default behavior
+    /** Normalize both the dashboard visual-builder format and the API format. */
+    private function normalizeWorkflowTrigger(array $trigger): array
+    {
+        if (is_array($trigger['config'] ?? null)) {
+            $trigger = array_merge($trigger['config'], $trigger);
+            unset($trigger['config']);
         }
 
-        // Fallback: get or create the user's primary business profile
-        return BusinessProfile::firstOrCreate(['user_id' => $user->id]);
+        $type = (string) ($trigger['type'] ?? '');
+        if (!is_array($trigger['conditions'] ?? null)) {
+            $conditions = $trigger;
+            unset($conditions['type']);
+        } else {
+            $conditions = $trigger['conditions'];
+        }
+
+        $sourceType = $type;
+        $type = match ($type) {
+            'new_conversation' => 'first_contact',
+            'new_message' => 'message_received',
+            'customer_tag_added' => 'tag_added',
+            'business_hours' => 'message_received',
+            default => $type,
+        };
+        if ($sourceType === 'business_hours') {
+            $conditions['time_condition'] = 'outside_hours';
+        }
+        if (in_array($type, ['keyword', 'keyword_matched'], true)) {
+            if (isset($conditions['keyword']) && !isset($conditions['keywords'])) {
+                $conditions['keywords'] = [(string) $conditions['keyword']];
+                unset($conditions['keyword']);
+            }
+            $conditions['match_type'] ??= 'any';
+        }
+        if ($type === 'time') {
+            $range = $conditions['time_range'] ?? null;
+            if (!is_array($range)
+                || !preg_match('/^([01]\d|2[0-3]):[0-5]\d$/', (string) ($range['start'] ?? ''))
+                || !preg_match('/^([01]\d|2[0-3]):[0-5]\d$/', (string) ($range['end'] ?? ''))
+                || (string) $range['end'] <= (string) $range['start']) {
+                throw \Illuminate\Validation\ValidationException::withMessages([
+                    'trigger.conditions.time_range' => 'A scheduled workflow requires a valid business-local start and end time.',
+                ]);
+            }
+        }
+
+        return ['type' => $type, 'conditions' => $conditions];
+    }
+
+    private function normalizeWorkflowConditions(array $conditions): array
+    {
+        return collect($conditions)->map(function ($condition): array {
+            if (!is_array($condition)) {
+                return [];
+            }
+
+            $config = is_array($condition['config'] ?? null) ? $condition['config'] : $condition;
+            $type = (string) ($condition['type'] ?? $condition['field'] ?? $config['field'] ?? '');
+            unset($config['field']);
+            $comparison = strtolower((string) ($condition['comparison'] ?? 'equals'));
+            $inputOperator = strtolower((string) ($condition['operator'] ?? 'and'));
+            if (in_array($inputOperator, ['equals', 'not_equals', 'contains'], true)) {
+                $comparison = $inputOperator;
+                $inputOperator = 'and';
+            }
+
+            return [
+                'type' => $type,
+                'config' => $config,
+                'operator' => in_array($inputOperator, ['and', 'or'], true) ? $inputOperator : 'and',
+                'comparison' => $comparison,
+            ];
+        })->values()->all();
+    }
+
+    private function normalizeWorkflowActions(array $actions): array
+    {
+        return collect($actions)->map(function ($action): array {
+            if (!is_array($action)) {
+                return [];
+            }
+            if (is_array($action['config'] ?? null)) {
+                $action = array_merge($action['config'], $action);
+                unset($action['config']);
+            }
+            return $action;
+        })->values()->all();
     }
 
     /**
@@ -302,36 +354,15 @@ class AutomationController extends Controller
             'name' => 'required|string|max:255',
             'description' => 'nullable|string',
             'trigger' => 'required|array',
-            'trigger.type' => 'required|string',
+            'trigger.type' => 'required|in:keyword,keyword_matched,message_received,new_message,first_contact,new_conversation,time,business_hours,tag_added,customer_tag_added,order_status_changed,escalation_triggered,sequence_completed',
             'conditions' => 'nullable|array',
             'actions' => 'required|array|min:1',
             'bot_id' => 'nullable|integer|exists:bots,id',
         ]);
 
         $user = Auth::user();
-
-        // Resolve business_id from request or use user's primary business
-        $businessId = $request->input('business_id');
-        if (!$businessId) {
-            $business = BusinessProfile::where('user_id', $user->id)->first();
-            if (!$business) {
-                return response()->json(['error' => 'No business found for user'], 400);
-            }
-            $businessId = $business->id;
-        }
-
-        // Verify user has access to this business
-        $hasAccess = BusinessProfile::where('id', $businessId)
-            ->where('user_id', $user->id)
-            ->exists() ||
-            \App\Models\TeamMember::where('business_id', $businessId)
-                ->where('user_id', $user->id)
-                ->where('is_active', true)
-                ->exists();
-
-        if (!$hasAccess) {
-            return response()->json(['error' => 'Unauthorized access to business'], 403);
-        }
+        $business = $this->getResolvedBusinessProfile($request, 'automation_write');
+        $businessId = $business->id;
 
         $workflow = AutomationWorkflow::create([
             'user_id' => $user->id,
@@ -339,9 +370,9 @@ class AutomationController extends Controller
             'name' => $request->name,
             'description' => $request->description,
             'active' => true,
-            'trigger_config' => $request->trigger,
-            'conditions' => $request->conditions,
-            'actions_config' => $request->actions,
+            'trigger_config' => $this->normalizeWorkflowTrigger($request->trigger),
+            'conditions' => $this->normalizeWorkflowConditions($request->conditions ?? []),
+            'actions_config' => $this->normalizeWorkflowActions($request->actions),
             'executions_count' => 0,
             'bot_id' => $request->bot_id,
         ]);
@@ -365,18 +396,8 @@ class AutomationController extends Controller
      */
     public function show(Request $request, $id)
     {
-        $user = Auth::user();
-
-        $businessIds = BusinessProfile::where('user_id', $user->id)
-            ->pluck('id')
-            ->merge(
-                \App\Models\TeamMember::where('user_id', $user->id)
-                    ->where('is_active', true)
-                    ->pluck('business_id')
-            )
-            ->unique();
-
-        $workflow = AutomationWorkflow::whereIn('business_id', $businessIds)
+        $business = $this->getResolvedBusinessProfile($request, 'automation_read');
+        $workflow = AutomationWorkflow::where('business_id', $business->id)
             ->findOrFail($id);
 
         return response()->json([
@@ -407,26 +428,16 @@ class AutomationController extends Controller
             'actions' => 'sometimes|required|array|min:1',
         ]);
 
-        $user = Auth::user();
-
-        $businessIds = BusinessProfile::where('user_id', $user->id)
-            ->pluck('id')
-            ->merge(
-                \App\Models\TeamMember::where('user_id', $user->id)
-                    ->where('is_active', true)
-                    ->pluck('business_id')
-            )
-            ->unique();
-
-        $workflow = AutomationWorkflow::whereIn('business_id', $businessIds)
+        $business = $this->getResolvedBusinessProfile($request, 'automation_write');
+        $workflow = AutomationWorkflow::where('business_id', $business->id)
             ->findOrFail($id);
 
         $workflow->update([
             'name' => $request->name ?? $workflow->name,
             'description' => $request->description ?? $workflow->description,
-            'trigger_config' => $request->trigger ?? $workflow->trigger_config,
-            'conditions' => $request->conditions ?? $workflow->conditions,
-            'actions_config' => $request->actions ?? $workflow->actions_config,
+            'trigger_config' => $request->has('trigger') ? $this->normalizeWorkflowTrigger($request->trigger) : $workflow->trigger_config,
+            'conditions' => $request->has('conditions') ? $this->normalizeWorkflowConditions($request->conditions ?? []) : $workflow->conditions,
+            'actions_config' => $request->has('actions') ? $this->normalizeWorkflowActions($request->actions) : $workflow->actions_config,
         ]);
 
         return response()->json([
@@ -448,18 +459,8 @@ class AutomationController extends Controller
      */
     public function destroy(Request $request, $id)
     {
-        $user = Auth::user();
-
-        $businessIds = BusinessProfile::where('user_id', $user->id)
-            ->pluck('id')
-            ->merge(
-                \App\Models\TeamMember::where('user_id', $user->id)
-                    ->where('is_active', true)
-                    ->pluck('business_id')
-            )
-            ->unique();
-
-        $workflow = AutomationWorkflow::whereIn('business_id', $businessIds)
+        $business = $this->getResolvedBusinessProfile($request, 'automation_write');
+        $workflow = AutomationWorkflow::where('business_id', $business->id)
             ->findOrFail($id);
 
         $workflow->delete();
@@ -472,21 +473,17 @@ class AutomationController extends Controller
      */
     public function toggle(Request $request, $id)
     {
-        $user = Auth::user();
-
-        $businessIds = BusinessProfile::where('user_id', $user->id)
-            ->pluck('id')
-            ->merge(
-                \App\Models\TeamMember::where('user_id', $user->id)
-                    ->where('is_active', true)
-                    ->pluck('business_id')
-            )
-            ->unique();
-
-        $workflow = AutomationWorkflow::whereIn('business_id', $businessIds)
+        $business = $this->getResolvedBusinessProfile($request, 'automation_write');
+        $workflow = AutomationWorkflow::where('business_id', $business->id)
             ->findOrFail($id);
 
         $workflow->update(['active' => !$workflow->active]);
+        app(\App\Services\AutomationRunControl::class)->audit(
+            $business,
+            $workflow->active ? 'automation.workflow_resumed' : 'automation.workflow_paused',
+            $workflow::class,
+            (int) $workflow->id
+        );
 
         return response()->json([
             'id' => $workflow->id,
@@ -500,17 +497,8 @@ class AutomationController extends Controller
     public function duplicate(Request $request, $id)
     {
         $user = Auth::user();
-
-        $businessIds = BusinessProfile::where('user_id', $user->id)
-            ->pluck('id')
-            ->merge(
-                \App\Models\TeamMember::where('user_id', $user->id)
-                    ->where('is_active', true)
-                    ->pluck('business_id')
-            )
-            ->unique();
-
-        $original = AutomationWorkflow::whereIn('business_id', $businessIds)
+        $business = $this->getResolvedBusinessProfile($request, 'automation_write');
+        $original = AutomationWorkflow::where('business_id', $business->id)
             ->findOrFail($id);
 
         $duplicate = $original->replicate();
@@ -543,20 +531,11 @@ class AutomationController extends Controller
         ]);
 
         $user = Auth::user();
-
-        $businessIds = BusinessProfile::where('user_id', $user->id)
-            ->pluck('id')
-            ->merge(
-                \App\Models\TeamMember::where('user_id', $user->id)
-                    ->where('is_active', true)
-                    ->pluck('business_id')
-            )
-            ->unique();
-
-        $workflow = AutomationWorkflow::whereIn('business_id', $businessIds)
+        $business = $this->getResolvedBusinessProfile($request, 'automation_write');
+        $workflow = AutomationWorkflow::where('business_id', $business->id)
             ->findOrFail($id);
 
-        $conversation = Conversation::whereIn('business_id', $businessIds)
+        $conversation = Conversation::where('business_id', $business->id)
             ->findOrFail($request->conversation_id);
 
         $automationEngine = app(AutomationEngine::class);
@@ -570,18 +549,8 @@ class AutomationController extends Controller
      */
     public function executions(Request $request, $id)
     {
-        $user = Auth::user();
-
-        $businessIds = BusinessProfile::where('user_id', $user->id)
-            ->pluck('id')
-            ->merge(
-                \App\Models\TeamMember::where('user_id', $user->id)
-                    ->where('is_active', true)
-                    ->pluck('business_id')
-            )
-            ->unique();
-
-        $workflow = AutomationWorkflow::whereIn('business_id', $businessIds)
+        $business = $this->getResolvedBusinessProfile($request, 'automation_read');
+        $workflow = AutomationWorkflow::where('business_id', $business->id)
             ->findOrFail($id);
 
         $executions = WorkflowExecution::where('workflow_id', $workflow->id)
@@ -612,23 +581,27 @@ class AutomationController extends Controller
         ]);
     }
 
+    public function replayExecution(Request $request, $id, $executionId)
+    {
+        $business = $this->getResolvedBusinessProfile($request, 'automation_write');
+        $workflow = AutomationWorkflow::where('business_id', $business->id)->findOrFail($id);
+        $execution = WorkflowExecution::where('workflow_id', $workflow->id)->findOrFail($executionId);
+
+        $result = app(AutomationEngine::class)->replayFailedActions($workflow, $execution);
+        if (!$result['success']) {
+            return response()->json($result, 409);
+        }
+
+        return response()->json($result, 201);
+    }
+
     /**
      * Get workflow stats
      */
     public function getStats(Request $request, $id)
     {
-        $user = Auth::user();
-
-        $businessIds = BusinessProfile::where('user_id', $user->id)
-            ->pluck('id')
-            ->merge(
-                \App\Models\TeamMember::where('user_id', $user->id)
-                    ->where('is_active', true)
-                    ->pluck('business_id')
-            )
-            ->unique();
-
-        $workflow = AutomationWorkflow::whereIn('business_id', $businessIds)
+        $business = $this->getResolvedBusinessProfile($request, 'automation_read');
+        $workflow = AutomationWorkflow::where('business_id', $business->id)
             ->findOrFail($id);
 
         $stats = [

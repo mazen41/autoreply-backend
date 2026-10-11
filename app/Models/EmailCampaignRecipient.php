@@ -10,6 +10,7 @@ class EmailCampaignRecipient extends Model
         'email_campaign_id',
         'conversation_id',
         'tracking_token',
+        'tracking_links',
         'email',
         'status',
         'error_message',
@@ -22,6 +23,7 @@ class EmailCampaignRecipient extends Model
         'sent_at' => 'datetime',
         'opened_at' => 'datetime',
         'clicked_at' => 'datetime',
+        'tracking_links' => 'array',
     ];
 
     public function campaign()

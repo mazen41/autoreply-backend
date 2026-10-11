@@ -64,6 +64,6 @@ class MessageReceived implements ShouldBroadcast
      */
     public function broadcastWith(): array
     {
-        return InboxBroadcastPayload::messageReceived($this->message, $this->conversation);
+        return InboxBroadcastPayload::messageReceived($this->message, $this->conversation, $this->userId);
     }
 }

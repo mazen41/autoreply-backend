@@ -11,7 +11,7 @@ use App\Models\WorkflowExecution;
 use App\Services\SequenceTriggerService;
 use App\Services\SequenceEnrollmentService;
 use App\Services\ChannelMessageService;
-use Illuminate\Support\Facades\Http;
+use App\Services\WebhookService;
 use Illuminate\Support\Facades\Log;
 
 class AutomationEngine
@@ -25,6 +25,8 @@ class AutomationEngine
     public const EVENT_TAG_ADDED = 'tag_added';
     public const EVENT_SEQUENCE_COMPLETED = 'sequence_completed';
     public const EVENT_ORDER_STATUS_CHANGED = 'order_status_changed';
+    public const EVENT_TIME_TRIGGER = 'time_trigger';
+    public const EVENT_ESCALATION_TRIGGERED = 'escalation_triggered';
 
     /**
      * Which workflow trigger_config['type'] values are compatible with each
@@ -34,17 +36,13 @@ class AutomationEngine
      * InboxController::addTag() instead).
      */
     private const EVENT_TRIGGER_TYPES = [
-        self::EVENT_MESSAGE_RECEIVED => ['keyword', 'keyword_matched', 'message_received', 'first_contact', 'time'],
+        self::EVENT_MESSAGE_RECEIVED => ['keyword', 'keyword_matched', 'message_received', 'first_contact'],
         self::EVENT_TAG_ADDED        => ['tag_added'],
         self::EVENT_SEQUENCE_COMPLETED => ['sequence_completed'],
         self::EVENT_ORDER_STATUS_CHANGED => ['order_status_changed'],
+        self::EVENT_TIME_TRIGGER => ['time'],
+        self::EVENT_ESCALATION_TRIGGERED => ['escalation_triggered'],
     ];
-
-    /**
-     * Idempotency window in seconds. Prevents duplicate workflow executions
-     * for the same workflow + conversation + event within this time window.
-     */
-    private const IDEMPOTENCY_WINDOW_SECONDS = 300; // 5 minutes
 
     /**
      * Execute every active workflow for a business that is compatible with
@@ -64,6 +62,9 @@ class AutomationEngine
     {
         $businessId = $conversation->business_id;
         if (!$businessId) {
+            return [];
+        }
+        if (!$testMode && app(AutomationRunControl::class)->isBusinessPaused((int) $businessId)) {
             return [];
         }
 
@@ -100,12 +101,90 @@ class AutomationEngine
                     'workflow_id'     => $workflow->id,
                     'conversation_id' => $conversation->id,
                     'event_type'      => $eventType,
-                    'error'           => $e->getMessage(),
+                    'exception_type' => get_class($e),
                 ]);
             }
         }
 
         return $results;
+    }
+
+    public function replayFailedActions(AutomationWorkflow $workflow, WorkflowExecution $source): array
+    {
+        if (app(AutomationRunControl::class)->isBusinessPaused((int) $workflow->business_id)) {
+            return ['success' => false, 'error' => 'automation_paused'];
+        }
+        if ($source->workflow_id !== $workflow->id || $source->test_mode || $source->status !== 'failed') {
+            return ['success' => false, 'error' => 'execution_not_replayable'];
+        }
+        if (!$workflow->active) {
+            return ['success' => false, 'error' => 'workflow_inactive'];
+        }
+
+        $conversation = $source->conversation;
+        if (!$conversation || (int) $conversation->business_id !== (int) $workflow->business_id) {
+            return ['success' => false, 'error' => 'conversation_unavailable'];
+        }
+
+        $failedRows = collect(data_get($source->results, 'actions_executed', []))
+            ->filter(fn ($row) => is_array($row) && ($row['success'] ?? false) === false && isset($row['action_index']))
+            ->values();
+        if ($failedRows->isEmpty()) {
+            return ['success' => false, 'error' => 'no_failed_actions_to_replay'];
+        }
+
+        $actions = $this->normalizedActions($workflow);
+        $replayActions = [];
+        foreach ($failedRows as $row) {
+            $index = (int) $row['action_index'];
+            $action = $actions[$index] ?? null;
+            if (!$action || !hash_equals((string) ($row['action_hash'] ?? ''), hash('sha256', json_encode($action, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES) ?: ''))) {
+                return ['success' => false, 'error' => 'workflow_action_changed_since_failure'];
+            }
+            $replayActions[$index] = $action;
+        }
+
+        try {
+            $replay = WorkflowExecution::create([
+                'workflow_id' => $workflow->id,
+                'conversation_id' => $conversation->id,
+                'business_id' => $conversation->business_id,
+                'event_id' => 'replay:' . $source->id,
+                'status' => 'running',
+                'test_mode' => false,
+                'trigger_data' => [
+                    'event_type' => 'manual_replay',
+                    'replay_of_execution_id' => $source->id,
+                    'conversation_id' => $conversation->id,
+                ],
+                'started_at' => now(),
+            ]);
+        } catch (\Illuminate\Database\QueryException $exception) {
+            if ($this->isDuplicateWorkflowEvent($exception)) {
+                return ['success' => false, 'error' => 'failed_actions_already_replayed'];
+            }
+            throw $exception;
+        }
+
+        $results = ['triggered' => true, 'replay_of_execution_id' => $source->id, 'actions_executed' => [], 'errors' => []];
+        foreach ($replayActions as $index => $action) {
+            $actionResult = $this->executeAction($action, $conversation, false);
+            $actionResult['action_index'] = $index;
+            $actionResult['action_hash'] = hash('sha256', json_encode($action, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES) ?: '');
+            $actionResult['replayed'] = true;
+            $results['actions_executed'][] = $actionResult;
+            if (!$actionResult['success']) {
+                $results['errors'][] = $actionResult['error'] ?? 'unknown_action_failure';
+            }
+        }
+
+        $replay->update([
+            'status' => empty($results['errors']) ? 'completed' : 'failed',
+            'results' => $results,
+            'completed_at' => now(),
+        ]);
+
+        return ['success' => empty($results['errors']), 'execution' => $replay->fresh(), 'results' => $results];
     }
 
     public static function triggerTypeOf(AutomationWorkflow $workflow): string
@@ -135,6 +214,9 @@ class AutomationEngine
         ];
 
         try {
+            if (!$testMode && app(AutomationRunControl::class)->isBusinessPaused((int) $workflow->business_id)) {
+                return $results;
+            }
             // Event compatibility gate — never run a workflow whose trigger
             // type cannot fire on this event.
             if ($eventType !== null) {
@@ -151,47 +233,81 @@ class AutomationEngine
             if (!$this->checkTriggerConditions($workflow->trigger_config, $conversation, $eventContext)) {
                 return $results;
             }
+            if (!$this->checkWorkflowConditions($workflow->conditions ?? [], $conversation, $eventContext)) {
+                return $results;
+            }
 
-            // Deduplication: prevent duplicate execution for same workflow +
-            // conversation + event within idempotency window.
-            if (!$testMode && $eventType !== null) {
-                $recentExecution = WorkflowExecution::where('workflow_id', $workflow->id)
-                    ->where('conversation_id', $conversation->id)
-                    ->where('status', 'completed')
-                    ->where('created_at', '>=', now()->subSeconds(self::IDEMPOTENCY_WINDOW_SECONDS))
-                    ->whereJsonContains('trigger_data->event_type', $eventType)
-                    ->first();
+            $triggerType = self::triggerTypeOf($workflow);
+            $configuredConditions = $workflow->conditions ?? [];
+            $triggerConditions = $this->triggerConditionsOf($workflow->trigger_config ?? []);
+            $hasSendMessageAction = collect($this->normalizedActions($workflow))->contains(fn (array $action) => ($action['type'] ?? null) === 'send_message');
+            if ($eventType === self::EVENT_MESSAGE_RECEIVED
+                && $triggerType === 'message_received'
+                && $hasSendMessageAction
+                && empty($triggerConditions)
+                && empty($configuredConditions)) {
+                Log::notice('AutomationEngine: blocked unconditional message_received send_message workflow', [
+                    'workflow_id' => $workflow->id,
+                    'conversation_id' => $conversation->id,
+                ]);
+                return $results;
+            }
 
-                if ($recentExecution) {
-                    Log::info('AutomationEngine: duplicate execution skipped (idempotency window)', [
-                        'workflow_id' => $workflow->id,
-                        'conversation_id' => $conversation->id,
-                        'event_type' => $eventType,
-                        'existing_execution_id' => $recentExecution->id,
-                    ]);
-                    return $results;
-                }
+            $eventId = $eventType !== null ? $this->resolveEventId($eventType, $conversation, $eventContext) : null;
+
+            if (!$testMode && WorkflowExecution::query()
+                ->where('conversation_id', $conversation->id)
+                ->where('test_mode', false)
+                ->where('created_at', '>=', now()->subHour())
+                ->count() >= 5) {
+                Log::warning('AutomationEngine: hourly chained workflow run cap reached', [
+                    'conversation_id' => $conversation->id,
+                    'workflow_id' => $workflow->id,
+                ]);
+                return $results;
             }
 
             $results['triggered'] = true;
 
-            $execution = WorkflowExecution::create([
-                'workflow_id' => $workflow->id,
-                'conversation_id' => $conversation->id,
-                'business_id' => $conversation->business_id,
-                'status' => 'running',
-                'test_mode' => $testMode,
-                'trigger_data' => [
-                    'trigger_config' => $workflow->trigger_config,
+            try {
+                $execution = WorkflowExecution::create([
+                    'workflow_id' => $workflow->id,
                     'conversation_id' => $conversation->id,
-                    'event_type' => $eventType ?? self::triggerTypeOf($workflow),
-                ],
-                'started_at' => now(),
-            ]);
+                    'business_id' => $conversation->business_id,
+                    'event_id' => $eventId,
+                    'status' => 'running',
+                    'test_mode' => $testMode,
+                    'trigger_data' => [
+                        'trigger_config' => $workflow->trigger_config,
+                        'workflow_conditions' => $workflow->conditions ?? [],
+                        'conversation_id' => $conversation->id,
+                        'event_type' => $eventType ?? self::triggerTypeOf($workflow),
+                        'event_id' => $eventId,
+                        'chain' => array_values(array_slice((array) ($eventContext['workflow_chain'] ?? []), -5)),
+                    ],
+                    'started_at' => now(),
+                ]);
+            } catch (\Illuminate\Database\QueryException $exception) {
+                if ($eventId !== null && $this->isDuplicateWorkflowEvent($exception)) {
+                    $results['triggered'] = false;
+                    Log::info('AutomationEngine: duplicate source event skipped', [
+                        'workflow_id' => $workflow->id,
+                        'conversation_id' => $conversation->id,
+                        'event_type' => $eventType,
+                        'event_id' => $eventId,
+                    ]);
+                    return $results;
+                }
+                throw $exception;
+            }
 
             // Execute each action
-            foreach ($workflow->actions_config as $action) {
-                $actionResult = $this->executeAction($action, $conversation, $testMode);
+            foreach ($this->normalizedActions($workflow) as $index => $action) {
+                $actionResult = $this->blockedSequenceLoop($workflow, $action)
+                    ? ['type' => 'start_sequence', 'success' => false, 'error' => 'workflow_loop_guard_24h']
+                    : $this->executeAction($action, $conversation, $testMode);
+                $actionResult['action_index'] = $index;
+                $actionResult['action_hash'] = hash('sha256', json_encode($action, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES) ?: '');
                 $results['actions_executed'][] = $actionResult;
 
                 if (!$actionResult['success']) {
@@ -206,7 +322,7 @@ class AutomationEngine
             }
 
             $execution->update([
-                'status' => 'completed',
+                'status' => empty($results['errors']) ? 'completed' : 'failed',
                 'results' => $results,
                 'completed_at' => now(),
             ]);
@@ -215,14 +331,18 @@ class AutomationEngine
                 'workflow_id' => $workflow->id,
                 'conversation_id' => $conversation->id,
                 'test_mode' => $testMode,
-                'results' => $results
+                'action_count' => count($results['actions_executed'] ?? []),
+                'failed_action_count' => count(array_filter(
+                    $results['actions_executed'] ?? [],
+                    fn ($result) => !is_array($result) || empty($result['success']),
+                )),
             ]);
 
         } catch (\Throwable $e) {
             Log::error('Automation workflow execution failed', [
                 'workflow_id' => $workflow->id,
                 'conversation_id' => $conversation->id,
-                'error' => $e->getMessage()
+                'exception_type' => get_class($e),
             ]);
 
             if (isset($execution)) {
@@ -240,13 +360,68 @@ class AutomationEngine
         return $results;
     }
 
+    private function normalizedActions(AutomationWorkflow $workflow): array
+    {
+        return collect($workflow->actions_config ?? [])->map(function ($action) {
+            if (!is_array($action)) {
+                return [];
+            }
+            if (is_array($action['config'] ?? null)) {
+                $action = array_merge($action['config'], $action);
+                unset($action['config']);
+            }
+            return $action;
+        })->values()->all();
+    }
+
+    private function blockedSequenceLoop(AutomationWorkflow $workflow, array $action): bool
+    {
+        if (($action['type'] ?? null) !== 'start_sequence') {
+            return false;
+        }
+
+        $configuredSequenceId = data_get($workflow->trigger_config, 'conditions.sequence_id');
+        return self::triggerTypeOf($workflow) === 'sequence_completed'
+            && $configuredSequenceId !== null
+            && (string) $configuredSequenceId === (string) ($action['sequence_id'] ?? '');
+    }
+
+    private function resolveEventId(string $eventType, Conversation $conversation, array $eventContext): string
+    {
+        $explicit = $eventContext['event_id'] ?? null;
+        if (is_scalar($explicit) && (string) $explicit !== '') {
+            return (string) $explicit;
+        }
+
+        return match ($eventType) {
+            self::EVENT_MESSAGE_RECEIVED => isset($eventContext['message'])
+                ? 'message:' . $eventContext['message']->id
+                : 'message:' . $conversation->id . ':' . (string) ($eventContext['message_id'] ?? 'unknown'),
+            self::EVENT_TAG_ADDED => 'tag:' . $conversation->id . ':' . (string) ($eventContext['tag_event_id'] ?? $eventContext['tag'] ?? 'unknown'),
+            self::EVENT_SEQUENCE_COMPLETED => 'sequence-enrollment:' . (string) ($eventContext['sequence_enrollment_id'] ?? ($eventContext['sequence_id'] ?? 'unknown')),
+            self::EVENT_ORDER_STATUS_CHANGED => 'order-status:' . (string) ($eventContext['order_id'] ?? 'unknown') . ':' . (string) ($eventContext['status'] ?? 'unknown'),
+            self::EVENT_TIME_TRIGGER => 'time:' . now()->utc()->format('Y-m-d'),
+            self::EVENT_ESCALATION_TRIGGERED => 'handoff:' . (string) ($eventContext['handoff_task_id'] ?? 'unknown') . ':' . (string) ($eventContext['opened_at'] ?? 'unknown'),
+            default => $eventType . ':' . $conversation->id . ':' . (string) ($eventContext['source_id'] ?? 'unknown'),
+        };
+    }
+
+    private function isDuplicateWorkflowEvent(\Illuminate\Database\QueryException $exception): bool
+    {
+        $message = strtolower($exception->getMessage());
+        return str_contains($message, 'workflow_executions_workflow_conversation_event_unique')
+            || (str_contains($message, 'workflow_executions.workflow_id')
+                && str_contains($message, 'workflow_executions.conversation_id')
+                && str_contains($message, 'workflow_executions.event_id'));
+    }
+
     /**
      * Check if trigger conditions are met
      */
     private function checkTriggerConditions(array $triggerConfig, Conversation $conversation, array $eventContext = []): bool
     {
-        $triggerType = $triggerConfig['type'];
-        $conditions = $triggerConfig['conditions'] ?? [];
+        $triggerType = (string) ($triggerConfig['type'] ?? '');
+        $conditions = $this->triggerConditionsOf($triggerConfig);
 
         switch ($triggerType) {
             case 'keyword':
@@ -263,12 +438,23 @@ class AutomationEngine
             case 'order_status_changed':
                 return $this->checkOrderStatusTrigger($conditions, $conversation, $eventContext);
             case 'escalation_triggered':
-                return $this->checkEscalationTrigger($conditions, $conversation);
+                return $this->checkEscalationTrigger($conditions, $conversation, $eventContext);
             case 'sequence_completed':
                 return $this->checkSequenceCompletedTrigger($conditions, $conversation);
             default:
                 return false;
         }
+    }
+
+    private function triggerConditionsOf(array $triggerConfig): array
+    {
+        if (is_array($triggerConfig['conditions'] ?? null)) {
+            return $triggerConfig['conditions'];
+        }
+
+        $conditions = $triggerConfig;
+        unset($conditions['type']);
+        return $conditions;
     }
 
     /**
@@ -291,11 +477,9 @@ class AutomationEngine
                 ->orderBy('id', 'desc')
                 ->value('content') ?? '');
         }
-        $messageTextLower = mb_strtolower($messageText);
-
         $matchedKeywords = [];
         foreach ($keywords as $keyword) {
-            if (str_contains($messageTextLower, mb_strtolower((string) $keyword))) {
+            if ($this->containsKeyword($messageText, (string) $keyword)) {
                 $matchedKeywords[] = $keyword;
             }
         }
@@ -307,12 +491,96 @@ class AutomationEngine
         }
     }
 
+    private function checkWorkflowConditions(array $conditions, Conversation $conversation, array $eventContext): bool
+    {
+        if ($conditions === []) {
+            return true;
+        }
+
+        $messageText = $eventContext['message'] instanceof Message
+            ? (string) $eventContext['message']->content
+            : (string) ($conversation->messages()->where('direction', 'inbound')->latest('id')->value('content') ?? '');
+        $hasResult = false;
+        $result = true;
+
+        foreach ($conditions as $condition) {
+            if (!is_array($condition)) {
+                return false;
+            }
+
+            $config = is_array($condition['config'] ?? null) ? $condition['config'] : $condition;
+            $type = strtolower((string) ($condition['type'] ?? $condition['field'] ?? $config['field'] ?? ''));
+            $value = $config['value'] ?? $condition['value'] ?? null;
+            $comparison = strtolower((string) ($condition['comparison'] ?? 'equals'));
+            if (!is_scalar($value) || trim((string) $value) === '') {
+                return false;
+            }
+
+            $matched = match ($type) {
+                'customer_tag' => $comparison === 'contains'
+                    ? $conversation->tags()->where('tag', 'like', '%' . addcslashes((string) $value, '%_') . '%')->exists()
+                    : $conversation->tags()->where('tag', (string) $value)->exists(),
+                'conversation_status' => strtolower((string) $conversation->status) === strtolower((string) $value),
+                'message_contains' => $comparison === 'equals'
+                    ? $this->normalizeKeywordText($messageText) === $this->normalizeKeywordText((string) $value)
+                    : str_contains($this->normalizeKeywordText($messageText), $this->normalizeKeywordText((string) $value)),
+                default => false,
+            };
+
+            if ($comparison === 'not_equals') {
+                $matched = !$matched;
+            } elseif (!in_array($comparison, ['equals', 'contains'], true)) {
+                return false;
+            }
+
+            $operator = strtolower((string) ($condition['operator'] ?? 'and'));
+            if (!$hasResult) {
+                $result = $matched;
+                $hasResult = true;
+            } elseif ($operator === 'or') {
+                $result = $result || $matched;
+            } elseif ($operator === 'and') {
+                $result = $result && $matched;
+            } else {
+                return false;
+            }
+        }
+
+        return $hasResult && $result;
+    }
+
+    private function containsKeyword(string $text, string $keyword): bool
+    {
+        $text = $this->normalizeKeywordText($text);
+        $keyword = $this->normalizeKeywordText($keyword);
+        if ($keyword === '') {
+            return false;
+        }
+
+        $pattern = '/(?<![\\p{L}\\p{N}_])' . preg_quote($keyword, '/') . '(?![\\p{L}\\p{N}_])/u';
+        return preg_match($pattern, $text) === 1;
+    }
+
+    private function normalizeKeywordText(string $text): string
+    {
+        $text = mb_strtolower(trim($text), 'UTF-8');
+        $text = preg_replace('/[\\x{0640}\\p{M}]/u', '', $text) ?? $text;
+        return strtr($text, [
+            'أ' => 'ا', 'إ' => 'ا', 'آ' => 'ا',
+            'ى' => 'ي', 'ة' => 'ه',
+        ]);
+    }
+
     /**
      * Check time trigger conditions
      */
     private function checkTimeTrigger(array $conditions, Conversation $conversation): bool
     {
-        $currentTime = now();
+        try {
+            $currentTime = now()->setTimezone($conversation->business?->timezone ?: 'UTC');
+        } catch (\Throwable) {
+            $currentTime = now()->setTimezone('UTC');
+        }
         $currentDay = strtolower($currentTime->format('l'));
         $currentTimeHours = $currentTime->format('H:i');
 
@@ -327,6 +595,11 @@ class AutomationEngine
         if (!empty($conditions['time_range'])) {
             $startTime = $conditions['time_range']['start'] ?? '00:00';
             $endTime = $conditions['time_range']['end'] ?? '23:59';
+
+            if (!preg_match('/^([01]\d|2[0-3]):[0-5]\d$/', (string) $startTime)
+                || !preg_match('/^([01]\d|2[0-3]):[0-5]\d$/', (string) $endTime)) {
+                return false;
+            }
 
             if ($currentTimeHours < $startTime || $currentTimeHours > $endTime) {
                 return false;
@@ -451,8 +724,19 @@ class AutomationEngine
     /**
      * Check escalation triggered
      */
-    private function checkEscalationTrigger(array $conditions, Conversation $conversation): bool
+    private function checkEscalationTrigger(array $conditions, Conversation $conversation, array $eventContext = []): bool
     {
+        if (isset($eventContext['handoff_task'])) {
+            $task = $eventContext['handoff_task'];
+            if (!empty($conditions['priority']) && ($task->priority ?? null) !== $conditions['priority']) {
+                return false;
+            }
+            if (!empty($conditions['reason']) && ($task->reason ?? null) !== $conditions['reason']) {
+                return false;
+            }
+            return true;
+        }
+
         // Check if conversation is currently escalated
         if ($conversation->requires_human) {
             return true;
@@ -499,7 +783,7 @@ class AutomationEngine
      */
     private function executeAction(array $action, Conversation $conversation, bool $testMode): array
     {
-        $actionType = $action['type'];
+        $actionType = (string) ($action['type'] ?? '');
         $result = [
             'type' => $actionType,
             'success' => false,
@@ -549,8 +833,7 @@ class AutomationEngine
             $result['error'] = $e->getMessage();
             Log::error('AutomationEngine: action execution error', [
                 'action_type' => $actionType,
-                'error' => $e->getMessage(),
-                'trace' => $e->getTraceAsString(),
+                'exception_type' => get_class($e),
             ]);
         }
 
@@ -562,14 +845,6 @@ class AutomationEngine
      */
     private function executeSendMessage(array $action, Conversation $conversation, bool $testMode): array
     {
-        if ($testMode) {
-            return [
-                'type' => 'send_message',
-                'success' => true,
-                'message' => 'Would send: ' . $action['message']
-            ];
-        }
-
         $channel = $conversation->channel;
         if (!$channel) {
             return [
@@ -579,12 +854,41 @@ class AutomationEngine
             ];
         }
 
+        $workflowReplySafetyEnabled = \App\Models\FeatureFlag::isEnabled(
+            'phase5_workflow_reply_safety',
+            (int) $conversation->business_id,
+        );
+        if (!$conversation->ai_enabled || ($workflowReplySafetyEnabled && $conversation->requires_human)) {
+            return [
+                'type' => 'send_message',
+                'success' => false,
+                'error' => $conversation->requires_human ? 'human_takeover' : 'ai_disabled',
+            ];
+        }
+
+        $consent = app(ConsentGate::class)->checkConversation($conversation, 'marketing');
+        if (!$consent->allowed) {
+            return [
+                'type' => 'send_message',
+                'success' => false,
+                'error' => 'Marketing send blocked: ' . $consent->reason,
+            ];
+        }
+
+        if ($testMode) {
+            return [
+                'type' => 'send_message',
+                'success' => true,
+                'message' => 'Would send: ' . $action['message']
+            ];
+        }
+
         // Create message record first with pending status
         $message = Message::create([
             'conversation_id' => $conversation->id,
             'content' => $action['message'],
             'direction' => 'outbound',
-            'status' => 'sent',
+            'status' => 'pending',
             'is_ai' => false,
             'source' => 'automation',
             'send_status' => 'pending',
@@ -683,19 +987,26 @@ class AutomationEngine
      */
     private function executeWebhook(array $action, Conversation $conversation, bool $testMode): array
     {
+        $webhookService = app(WebhookService::class);
+        $url = (string) ($action['url'] ?? '');
+        $webhookService->validateDestination($url);
+
         if ($testMode) {
             return [
                 'type' => 'webhook',
                 'success' => true,
-                'url' => $action['url']
+                'url' => $url,
             ];
         }
 
-        $response = Http::timeout(10)->post($action['url'], [
-            'conversation_id' => $conversation->id,
-            'conversation_data' => $conversation->toArray(),
-            'triggered_at' => now()->toIso8601String()
-        ]);
+        $payload = [
+            'event_type' => 'workflow.action',
+            'timestamp' => now()->toIso8601String(),
+            'business_id' => (int) $conversation->business_id,
+            'conversation_id' => (int) $conversation->id,
+        ];
+        $signingSecret = (string) ($action['secret'] ?? config('app.key'));
+        $response = $webhookService->postSignedJson($url, $payload, $signingSecret);
 
         return [
             'type' => 'webhook',
@@ -795,8 +1106,7 @@ class AutomationEngine
             ];
         } catch (\Exception $e) {
             Log::error('AutomationEngine: start_sequence exception', [
-                'error' => $e->getMessage(),
-                'trace' => $e->getTraceAsString(),
+                'exception_type' => get_class($e),
             ]);
             return [
                 'type' => 'start_sequence',

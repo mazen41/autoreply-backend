@@ -7,7 +7,6 @@ use App\Models\Conversation;
 use App\Models\ConversationTag;
 use App\Models\Message;
 use App\Models\MessageFeedback;
-use App\Models\User;
 use Carbon\Carbon;
 
 /**
@@ -29,20 +28,14 @@ use Carbon\Carbon;
  */
 class TrainingStatsService
 {
-    private User $user;
-    private ?int $businessId;
+    private int $businessId;
 
 
-    public function statistics(string $preset = 'last_30_days', ?int $businessId = null): array
+    public function statistics(int $businessId, string $preset = 'last_30_days'): array
     {
-        $this->user = auth()->user();
         $this->businessId = $businessId;
 
-        if ($businessId) {
-            BusinessProfile::where('user_id', $this->user->id)
-                ->where('id', $businessId)
-                ->firstOrFail();
-        }
+        BusinessProfile::whereKey($businessId)->firstOrFail();
 
         [$start, $end] = $this->resolveRange($preset);
 
@@ -160,25 +153,14 @@ class TrainingStatsService
         return Message::query()
             ->where('is_ai', true)
             ->where('direction', 'outbound')
-            ->whereHas('conversation.channel', function ($q) {
-                $q->where('user_id', $this->user->id);
-                if ($this->businessId) {
-                    $q->where('business_id', $this->businessId);
-                }
-            })
+            ->whereHas('conversation', fn ($q) => $q->where('business_id', $this->businessId))
             ->when($start, fn ($q) => $q->whereBetween('created_at', [$start, $end]));
     }
 
     private function conversationsQuery(?Carbon $start, ?Carbon $end)
     {
         return Conversation::query()
-            ->whereHas('channel', function ($q) {
-                $q->where('user_id', $this->user->id);
-                if ($this->businessId) {
-                    $q->where('business_id', $this->businessId);
-                }
-            })
-            ->when($this->businessId, fn ($q) => $q->where('business_id', $this->businessId))
+            ->where('business_id', $this->businessId)
             ->when($start, fn ($q) => $q->whereBetween('created_at', [$start, $end]));
     }
 
@@ -205,12 +187,7 @@ class TrainingStatsService
         // never double-count a conversation that has both a tag and message intent.
         if (array_sum($byMessage) === 0) {
             return ConversationTag::query()
-                ->whereHas('conversation.channel', function ($q) {
-                    $q->where('user_id', $this->user->id);
-                    if ($this->businessId) {
-                        $q->where('business_id', $this->businessId);
-                    }
-                })
+                ->whereHas('conversation', fn ($q) => $q->where('business_id', $this->businessId))
                 ->whereNotNull('intent')
                 ->selectRaw('intent, COUNT(*) AS count')
                 ->groupBy('intent')
@@ -228,8 +205,7 @@ class TrainingStatsService
             ->where('messages.direction', 'outbound')
             ->join('conversations', 'messages.conversation_id', '=', 'conversations.id')
             ->join('channels', 'conversations.channel_id', '=', 'channels.id')
-            ->where('channels.user_id', $this->user->id)
-            ->when($this->businessId, fn ($q) => $q->where('channels.business_id', $this->businessId))
+            ->where('channels.business_id', $this->businessId)
             ->when($start, fn ($q) => $q->whereBetween('messages.created_at', [$start, $end]))
             ->selectRaw('channels.type, COUNT(*) AS count')
             ->groupBy('channels.type')
@@ -286,12 +262,7 @@ class TrainingStatsService
     private function feedbackStats(?Carbon $start, ?Carbon $end, int $aiMessages): array
     {
         $query = MessageFeedback::query()
-            ->whereHas('message.conversation.channel', function ($q) {
-                $q->where('user_id', $this->user->id);
-                if ($this->businessId) {
-                    $q->where('business_id', $this->businessId);
-                }
-            })
+            ->whereHas('message.conversation', fn ($q) => $q->where('business_id', $this->businessId))
             ->when($start, fn ($q) => $q->whereBetween('created_at', [$start, $end]));
 
         $total    = (clone $query)->count();

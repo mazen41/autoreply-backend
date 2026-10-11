@@ -11,7 +11,11 @@ use App\Models\BusinessProfile;
 use App\Models\User;
 use App\Models\Message;
 use App\Models\Channel;
+use App\Models\ContactConsent;
 use App\Models\Bot;
+use App\Models\FeatureFlag;
+use App\Models\BusinessFeatureFlagAssignment;
+use App\Models\TeamMember;
 use App\Jobs\ExecuteSequenceStep;
 use App\Services\SequenceExecutionService;
 use App\Services\SequenceEnrollmentService;
@@ -20,6 +24,8 @@ use Illuminate\Foundation\Testing\RefreshDatabase;
 use Illuminate\Support\Facades\Http;
 use Illuminate\Support\Facades\Queue;
 use Illuminate\Support\Facades\Bus;
+use Illuminate\Support\Facades\Cache;
+use Carbon\Carbon;
 use Tests\TestCase;
 
 class SequenceHardeningTest extends TestCase
@@ -37,7 +43,7 @@ class SequenceHardeningTest extends TestCase
         parent::setUp();
 
         $this->user = User::factory()->create();
-        $this->business = BusinessProfile::factory()->create();
+        $this->business = BusinessProfile::factory()->create(['user_id' => $this->user->id]);
         $this->user->business_id = $this->business->id;
         $this->user->save();
 
@@ -47,6 +53,7 @@ class SequenceHardeningTest extends TestCase
             'type'         => 'whatsapp',
             'status'       => 'connected',
             'connected_at' => now(),
+            'metadata'     => ['whatsapp_provider' => 'evolution', 'unofficial_risk_accepted' => true],
         ]);
 
         $this->sequence = Sequence::factory()->create([
@@ -58,6 +65,11 @@ class SequenceHardeningTest extends TestCase
         $this->conversation = Conversation::factory()->create([
             'business_id' => $this->business->id,
             'channel_id'  => $this->channel->id,
+        ]);
+        ContactConsent::create([
+            'business_id' => $this->business->id, 'channel' => 'whatsapp',
+            'contact_identifier' => app(\App\Services\ConsentGate::class)->normalizeIdentifier($this->conversation->sender_id, 'whatsapp'),
+            'scope' => 'marketing', 'status' => 'opted_in', 'source' => 'form', 'captured_at' => now(),
         ]);
     }
 
@@ -154,6 +166,366 @@ class SequenceHardeningTest extends TestCase
         $this->assertEquals(1, $messageCount);
     }
 
+    public function test_sequence_job_releases_when_another_worker_holds_the_lock(): void
+    {
+        $step = SequenceStep::factory()->create([
+            'sequence_id' => $this->sequence->id,
+            'step_order' => 1,
+            'step_type' => 'message',
+            'message' => 'Lock contention message',
+        ]);
+        $enrollment = SequenceEnrollment::factory()->create([
+            'sequence_id' => $this->sequence->id,
+            'conversation_id' => $this->conversation->id,
+            'status' => 'active',
+            'current_step' => 1,
+        ]);
+        $execution = SequenceStepExecution::factory()->create([
+            'sequence_id' => $this->sequence->id,
+            'sequence_enrollment_id' => $enrollment->id,
+            'sequence_step_id' => $step->id,
+            'status' => 'pending',
+        ]);
+        $lock = Cache::lock("sequence_step_execution:{$enrollment->id}:{$step->id}", 60);
+        $this->assertTrue($lock->get());
+
+        $job = (new ExecuteSequenceStep($execution->id))->withFakeQueueInteractions();
+        $job->handle(app(SequenceExecutionService::class));
+
+        $job->assertReleased(15);
+        $this->assertSame('pending', $execution->fresh()->status);
+        $lock->release();
+    }
+
+    public function test_sequence_retry_reuses_provider_accepted_message_id_without_sending_again(): void
+    {
+        Http::fake([
+            '*/message/sendText/*' => Http::response([
+                'key' => ['id' => 'a-new-provider-id'],
+                'status' => 'PENDING',
+            ], 200),
+            '*' => Http::response([], 200),
+        ]);
+
+        $step = SequenceStep::factory()->create([
+            'sequence_id' => $this->sequence->id,
+            'step_order' => 1,
+            'step_type' => 'message',
+            'message' => 'Previously accepted message',
+        ]);
+        $enrollment = SequenceEnrollment::factory()->create([
+            'sequence_id' => $this->sequence->id,
+            'conversation_id' => $this->conversation->id,
+            'status' => 'active',
+            'current_step' => 1,
+        ]);
+        $message = Message::create([
+            'conversation_id' => $this->conversation->id,
+            'content' => 'Previously accepted message',
+            'direction' => 'outbound',
+            'status' => 'sent',
+            'send_status' => 'sent',
+            'delivery_status' => 'sent',
+            'source' => 'sequence',
+            'metadata' => [
+                'sequence_automated' => true,
+                'provider_message_ids' => ['accepted-by-provider-123'],
+                'platform_message_id' => 'accepted-by-provider-123',
+            ],
+        ]);
+        $execution = SequenceStepExecution::factory()->create([
+            'sequence_id' => $this->sequence->id,
+            'sequence_enrollment_id' => $enrollment->id,
+            'sequence_step_id' => $step->id,
+            'message_id' => $message->id,
+            'status' => 'processing',
+            'updated_at' => now()->subSeconds(190),
+        ]);
+
+        (new ExecuteSequenceStep($execution->id))->handle(app(SequenceExecutionService::class));
+
+        $this->assertSame(1, Message::where('conversation_id', $this->conversation->id)
+            ->where('content', 'Previously accepted message')->count());
+        $this->assertSame('executed', $execution->fresh()->status);
+        $this->assertCount(0, Http::recorded(fn ($request) => str_contains($request->url(), '/message/sendText/')));
+    }
+
+    public function test_recent_processing_sequence_execution_is_released_for_the_current_worker(): void
+    {
+        $step = SequenceStep::factory()->create([
+            'sequence_id' => $this->sequence->id,
+            'step_order' => 1,
+            'step_type' => 'message',
+            'message' => 'Currently processing',
+        ]);
+        $enrollment = SequenceEnrollment::factory()->create([
+            'sequence_id' => $this->sequence->id,
+            'conversation_id' => $this->conversation->id,
+            'status' => 'active',
+            'current_step' => 1,
+        ]);
+        $execution = SequenceStepExecution::factory()->create([
+            'sequence_id' => $this->sequence->id,
+            'sequence_enrollment_id' => $enrollment->id,
+            'sequence_step_id' => $step->id,
+            'status' => 'processing',
+            'updated_at' => now(),
+        ]);
+        $job = (new ExecuteSequenceStep($execution->id))->withFakeQueueInteractions();
+
+        $job->handle(app(SequenceExecutionService::class));
+
+        $job->assertReleased(15);
+        $this->assertSame('processing', $execution->fresh()->status);
+        $this->assertSame(0, Message::where('conversation_id', $this->conversation->id)->count());
+    }
+
+    public function test_sequence_loop_is_capped_after_fifty_execution_records(): void
+    {
+        Queue::fake();
+        $firstStep = SequenceStep::factory()->create([
+            'sequence_id' => $this->sequence->id,
+            'step_order' => 1,
+            'step_type' => 'message',
+            'message' => 'Loop target',
+        ]);
+        SequenceStep::factory()->create([
+            'sequence_id' => $this->sequence->id,
+            'step_order' => 2,
+            'step_type' => 'condition',
+            'condition_config' => ['type' => 'customer_replied'],
+        ]);
+        $enrollment = SequenceEnrollment::factory()->create([
+            'sequence_id' => $this->sequence->id,
+            'conversation_id' => $this->conversation->id,
+            'status' => 'active',
+            'current_step' => 2,
+        ]);
+        $base = now();
+
+        try {
+            for ($i = 0; $i < 51; $i++) {
+                Carbon::setTestNow($base->copy()->addSeconds($i));
+                app(SequenceExecutionService::class)->jumpToStep($enrollment->fresh(), $firstStep->step_order);
+            }
+        } finally {
+            Carbon::setTestNow();
+        }
+
+        $this->assertLessThanOrEqual(50, SequenceStepExecution::where('sequence_enrollment_id', $enrollment->id)->count());
+        $this->assertSame(range(1, 50), SequenceStepExecution::where('sequence_enrollment_id', $enrollment->id)
+            ->orderBy('execution_index')->pluck('execution_index')->all());
+        $lastVisit = SequenceStepExecution::where('sequence_enrollment_id', $enrollment->id)
+            ->where('sequence_step_id', $firstStep->id)
+            ->orderByDesc('execution_index')
+            ->firstOrFail();
+        $this->assertSame(50, $lastVisit->metadata['visit_count']);
+        $this->assertSame('stopped', $enrollment->fresh()->status);
+        $this->assertSame('max_step_executions_reached', $enrollment->fresh()->metadata['stop_reason'] ?? null);
+    }
+
+    public function test_sequence_never_falls_back_to_another_connected_channel_for_a_disconnected_conversation(): void
+    {
+        Http::fake([
+            '*/message/sendText/*' => Http::response(['key' => ['id' => 'wrong-channel-id'], 'status' => 'PENDING'], 200),
+            '*' => Http::response([], 200),
+        ]);
+        $this->channel->update(['status' => 'disconnected']);
+        $replacement = Channel::factory()->create([
+            'business_id' => $this->business->id,
+            'user_id' => $this->user->id,
+            'type' => 'whatsapp',
+            'status' => 'connected',
+            'connected_at' => now()->addMinute(),
+            'page_id' => 'different-instance',
+            'metadata' => ['whatsapp_provider' => 'evolution', 'unofficial_risk_accepted' => true],
+        ]);
+        $step = SequenceStep::factory()->create([
+            'sequence_id' => $this->sequence->id,
+            'step_order' => 1,
+            'step_type' => 'message',
+            'message' => 'Must not use replacement instance',
+        ]);
+        $enrollment = SequenceEnrollment::factory()->create([
+            'sequence_id' => $this->sequence->id,
+            'conversation_id' => $this->conversation->id,
+            'status' => 'active',
+            'current_step' => 1,
+        ]);
+        $execution = SequenceStepExecution::factory()->create([
+            'sequence_id' => $this->sequence->id,
+            'sequence_enrollment_id' => $enrollment->id,
+            'sequence_step_id' => $step->id,
+            'status' => 'pending',
+        ]);
+
+        (new ExecuteSequenceStep($execution->id))->handle(app(SequenceExecutionService::class));
+
+        $this->assertSame('disconnected', $this->conversation->fresh()->channel->status);
+        $this->assertSame('paused', $enrollment->fresh()->status);
+        $this->assertSame('channel_disconnected', $enrollment->fresh()->metadata['pause_reason'] ?? null);
+        $this->assertDatabaseHas('handoff_tasks', [
+            'conversation_id' => $this->conversation->id,
+            'reason' => 'channel_disconnected',
+            'status' => 'open',
+        ]);
+        Http::assertNotSent(fn ($request) => str_contains($request->url(), 'different-instance'));
+        Http::assertNotSent(fn ($request) => str_contains($request->url(), '/message/sendText/'));
+        $this->assertNotNull($replacement->id);
+    }
+
+    public function test_sequence_telegram_uses_encrypted_channel_access_token_and_persists_provider_id(): void
+    {
+        Http::fake([
+            'api.telegram.org/*' => Http::response(['ok' => true, 'result' => ['message_id' => 8812]], 200),
+        ]);
+        $telegramChannel = Channel::factory()->create([
+            'business_id' => $this->business->id,
+            'user_id' => $this->user->id,
+            'type' => 'telegram',
+            'status' => 'connected',
+            'access_token' => '123456:encrypted-channel-token',
+            'metadata' => ['bot_token' => 'stale-metadata-token'],
+        ]);
+        $this->conversation->update(['channel_id' => $telegramChannel->id]);
+        $this->sequence->update(['channel' => 'telegram']);
+        ContactConsent::create([
+            'business_id' => $this->business->id,
+            'channel' => 'telegram',
+            'contact_identifier' => app(\App\Services\ConsentGate::class)->normalizeIdentifier($this->conversation->sender_id, 'telegram'),
+            'scope' => 'marketing',
+            'status' => 'opted_in',
+            'source' => 'form',
+            'captured_at' => now(),
+        ]);
+        $step = SequenceStep::factory()->create([
+            'sequence_id' => $this->sequence->id,
+            'step_order' => 1,
+            'step_type' => 'message',
+            'message' => 'Telegram sequence message',
+        ]);
+        $enrollment = SequenceEnrollment::factory()->create([
+            'sequence_id' => $this->sequence->id,
+            'conversation_id' => $this->conversation->id,
+            'status' => 'active',
+            'current_step' => 1,
+        ]);
+        $execution = SequenceStepExecution::factory()->create([
+            'sequence_id' => $this->sequence->id,
+            'sequence_enrollment_id' => $enrollment->id,
+            'sequence_step_id' => $step->id,
+            'status' => 'pending',
+        ]);
+
+        (new ExecuteSequenceStep($execution->id))->handle(app(SequenceExecutionService::class));
+
+        Http::assertSent(fn ($request) => str_contains($request->url(), '/bot123456:encrypted-channel-token/sendMessage'));
+        Http::assertNotSent(fn ($request) => str_contains($request->url(), 'stale-metadata-token'));
+        $outbound = Message::query()->where('conversation_id', $this->conversation->id)
+            ->where('content', 'Telegram sequence message')->firstOrFail();
+        $this->assertSame('8812', $outbound->metadata['platform_message_id'] ?? null);
+        $this->assertSame('sent', $outbound->send_status);
+    }
+
+    public function test_email_sequence_routes_to_the_conversation_gmail_channel(): void
+    {
+        $gmailChannel = Channel::factory()->create([
+            'business_id' => $this->business->id,
+            'user_id' => $this->user->id,
+            'type' => 'gmail',
+            'status' => 'connected',
+        ]);
+        $this->conversation->update([
+            'channel_id' => $gmailChannel->id,
+            'sender_id' => 'gmail-thread-1',
+            'sender_email' => 'reader@example.test',
+        ]);
+        $this->sequence->update(['channel' => 'email']);
+        ContactConsent::create([
+            'business_id' => $this->business->id,
+            'channel' => 'email',
+            'contact_identifier' => 'reader@example.test',
+            'scope' => 'marketing',
+            'status' => 'opted_in',
+            'source' => 'form',
+            'captured_at' => now(),
+        ]);
+        $step = SequenceStep::factory()->create([
+            'sequence_id' => $this->sequence->id,
+            'step_order' => 1,
+            'step_type' => 'message',
+            'message' => 'Gmail follow-up',
+        ]);
+        $enrollment = SequenceEnrollment::factory()->create([
+            'sequence_id' => $this->sequence->id,
+            'conversation_id' => $this->conversation->id,
+            'status' => 'active',
+            'current_step' => 1,
+        ]);
+        $execution = SequenceStepExecution::factory()->create([
+            'sequence_id' => $this->sequence->id,
+            'sequence_enrollment_id' => $enrollment->id,
+            'sequence_step_id' => $step->id,
+            'status' => 'pending',
+        ]);
+        $this->mock(\App\Services\ChannelMessageService::class, function ($mock) use ($gmailChannel, $step): void {
+            $mock->shouldReceive('sendMessage')->once()->withArgs(function ($channel, $conversation, $message) use ($gmailChannel, $step) {
+                return $channel->id === $gmailChannel->id
+                    && $conversation->sender_email === 'reader@example.test'
+                    && $message->content === $step->message;
+            })->andReturnUsing(function ($channel, $conversation, $message): bool {
+                $message->update(['status' => 'sent', 'send_status' => 'sent', 'delivery_status' => 'sent']);
+                return true;
+            });
+        });
+
+        app(SequenceExecutionService::class)->executeStep($execution, $enrollment, $step);
+
+        $this->assertSame('executed', $execution->fresh()->status);
+        $this->assertSame('sent', Message::where('conversation_id', $this->conversation->id)
+            ->where('content', 'Gmail follow-up')->firstOrFail()->send_status);
+    }
+
+    public function test_sequence_send_stops_when_a_human_has_taken_over_the_conversation(): void
+    {
+        $flag = FeatureFlag::where('key', 'phase5_sequence_takeover_guard')->firstOrFail();
+        BusinessFeatureFlagAssignment::create([
+            'business_id' => $this->business->id,
+            'feature_flag_id' => $flag->id,
+            'enabled' => true,
+        ]);
+        Http::fake([
+            '*/message/sendText/*' => Http::response(['key' => ['id' => 'must-not-send'], 'status' => 'PENDING'], 200),
+            '*' => Http::response([], 200),
+        ]);
+        $this->conversation->update(['requires_human' => true]);
+        $step = SequenceStep::factory()->create([
+            'sequence_id' => $this->sequence->id,
+            'step_order' => 1,
+            'step_type' => 'message',
+            'message' => 'Do not send after takeover',
+        ]);
+        $enrollment = SequenceEnrollment::factory()->create([
+            'sequence_id' => $this->sequence->id,
+            'conversation_id' => $this->conversation->id,
+            'status' => 'active',
+            'current_step' => 1,
+        ]);
+        $execution = SequenceStepExecution::factory()->create([
+            'sequence_id' => $this->sequence->id,
+            'sequence_enrollment_id' => $enrollment->id,
+            'sequence_step_id' => $step->id,
+            'status' => 'pending',
+        ]);
+
+        (new ExecuteSequenceStep($execution->id))->handle(app(SequenceExecutionService::class));
+
+        $this->assertSame('stopped', $enrollment->fresh()->status);
+        $this->assertSame('human_takeover', $enrollment->fresh()->metadata['stop_reason'] ?? null);
+        $this->assertSame('skipped', $execution->fresh()->status);
+        Http::assertNotSent(fn ($request) => str_contains($request->url(), '/message/sendText/'));
+    }
+
     // ── PROVIDER FAILURE RECORDING AND RETRY ─────────────────────────────────
 
     public function test_provider_failure_is_recorded_and_retried()
@@ -198,7 +570,8 @@ class SequenceHardeningTest extends TestCase
         $execution->refresh();
         $this->assertEquals('failed', $execution->status);
         $this->assertNotNull($execution->error);
-        $this->assertStringContainsString('Provider timeout', $execution->error);
+        $this->assertStringContainsString('status: 500', $execution->error);
+        $this->assertStringNotContainsString('Provider timeout', $execution->error);
 
         // Verify message was created but marked as failed
         $this->assertDatabaseHas('messages', [
@@ -518,6 +891,19 @@ class SequenceHardeningTest extends TestCase
             'channel_id'  => $this->channel->id,
             'bot_id'      => $bot1->id,
         ]);
+        ContactConsent::create([
+            'business_id' => $this->business->id,
+            'channel' => 'whatsapp',
+            'contact_identifier' => app(\App\Services\ConsentGate::class)->normalizeIdentifier($conversation1->sender_id, 'whatsapp'),
+            'scope' => 'marketing',
+            'status' => 'opted_in',
+            'source' => 'form',
+            'captured_at' => now(),
+        ]);
+        Message::factory()->create([
+            'conversation_id' => $conversation1->id,
+            'direction' => 'inbound',
+        ]);
 
         // Enroll bot1's conversation
         $triggerService = app(SequenceTriggerService::class);
@@ -529,6 +915,70 @@ class SequenceHardeningTest extends TestCase
             'conversation_id' => $conversation1->id,
             'status'          => 'active',
         ]);
+    }
+
+    public function test_manual_enrollment_is_blocked_without_marketing_consent(): void
+    {
+        ContactConsent::query()->where('business_id', $this->business->id)->delete();
+        SequenceStep::factory()->create(['sequence_id' => $this->sequence->id, 'step_order' => 1]);
+
+        $service = app(SequenceEnrollmentService::class);
+
+        $this->assertFalse($service->canEnroll($this->sequence, $this->conversation));
+        try {
+            $service->enrollConversation($this->sequence, $this->conversation);
+            $this->fail('Enrollment should be rejected without opt-in.');
+        } catch (\Illuminate\Validation\ValidationException $exception) {
+            $this->assertStringContainsString('no_consent', $exception->getMessage());
+        }
+
+        $this->assertSame(0, SequenceEnrollment::where('conversation_id', $this->conversation->id)->count());
+    }
+
+    public function test_customer_reply_stops_only_sequences_configured_to_stop_on_reply(): void
+    {
+        Queue::fake();
+        $stopSequence = Sequence::factory()->create([
+            'business_id' => $this->business->id,
+            'trigger_type' => 'new_user',
+            'settings' => ['stop_on_reply' => true],
+        ]);
+        $continueSequence = Sequence::factory()->create([
+            'business_id' => $this->business->id,
+            'trigger_type' => 'new_user',
+            'settings' => ['stop_on_reply' => false],
+        ]);
+        $step = SequenceStep::factory()->create([
+            'sequence_id' => $stopSequence->id,
+            'step_order' => 1,
+            'step_type' => 'message',
+            'message' => 'Follow up',
+        ]);
+        $stopEnrollment = SequenceEnrollment::factory()->create([
+            'sequence_id' => $stopSequence->id,
+            'conversation_id' => $this->conversation->id,
+            'status' => 'active',
+            'current_step' => 1,
+        ]);
+        $continueEnrollment = SequenceEnrollment::factory()->create([
+            'sequence_id' => $continueSequence->id,
+            'conversation_id' => $this->conversation->id,
+            'status' => 'active',
+            'current_step' => 1,
+        ]);
+        $pending = SequenceStepExecution::factory()->create([
+            'sequence_id' => $stopSequence->id,
+            'sequence_enrollment_id' => $stopEnrollment->id,
+            'sequence_step_id' => $step->id,
+            'status' => 'pending',
+        ]);
+
+        app(SequenceTriggerService::class)->cancelNoReplySequencesOnCustomerReply($this->conversation);
+
+        $this->assertSame('stopped', $stopEnrollment->fresh()->status);
+        $this->assertSame('customer_replied', $stopEnrollment->fresh()->metadata['stop_reason'] ?? null);
+        $this->assertSame('skipped', $pending->fresh()->status);
+        $this->assertSame('active', $continueEnrollment->fresh()->status);
     }
 
     // ── DELAYED STEP SURVIVES WORKER RESTART ─────────────────────────────────
@@ -608,6 +1058,26 @@ class SequenceHardeningTest extends TestCase
         $this->assertEquals(1, $executionCount);
     }
 
+    public function test_team_member_sequence_action_uses_selected_business_without_mutating_user(): void
+    {
+        $member = User::factory()->create();
+        TeamMember::factory()->create([
+            'business_id' => $this->business->id,
+            'user_id' => $member->id,
+            'role' => 'manager',
+            'is_active' => true,
+        ]);
+        $originalBusinessId = $member->business_id;
+
+        $this->actingAs($member, 'sanctum')
+            ->withHeader('X-Business-Id', (string) $this->business->id)
+            ->putJson("/api/sequences/{$this->sequence->id}", ['name' => 'Selected Business Sequence'])
+            ->assertOk();
+
+        $this->assertSame($originalBusinessId, $member->fresh()->business_id);
+        $this->assertSame('Selected Business Sequence', $this->sequence->fresh()->name);
+    }
+
     // ── CONVERSATION CLOSE CANCELS ENROLLMENT ────────────────────────────────
 
     public function test_conversation_close_cancels_enrollment()
@@ -621,6 +1091,7 @@ class SequenceHardeningTest extends TestCase
 
         // Close conversation via API
         $response = $this->actingAs($this->user)
+            ->withHeader('X-Business-Id', (string) $this->business->id)
             ->patchJson("/api/inbox/{$this->conversation->id}/status", [
                 'status' => 'closed',
             ]);

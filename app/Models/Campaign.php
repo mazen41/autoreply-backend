@@ -9,8 +9,10 @@ class Campaign extends Model
     protected $fillable = [
         'business_id',
         'channel_id',
+        'whatsapp_cloud_template_id',
         'name',
         'message',
+        'whatsapp_template_components',
         'status',
         'scheduled_at',
         'sent_at',
@@ -19,12 +21,15 @@ class Campaign extends Model
         'sent_count',
         'failed_count',
         'error_message',
+        'paused_at',
     ];
 
     protected $casts = [
         'filters' => 'array',
+        'whatsapp_template_components' => 'array',
         'scheduled_at' => 'datetime',
         'sent_at' => 'datetime',
+        'paused_at' => 'datetime',
     ];
 
     public function business()
@@ -35,6 +40,11 @@ class Campaign extends Model
     public function channel()
     {
         return $this->belongsTo(Channel::class);
+    }
+
+    public function whatsappCloudTemplate()
+    {
+        return $this->belongsTo(WhatsAppCloudTemplate::class, 'whatsapp_cloud_template_id');
     }
 
     public function logs()

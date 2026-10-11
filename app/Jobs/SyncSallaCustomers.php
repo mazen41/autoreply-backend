@@ -90,8 +90,7 @@ class SyncSallaCustomers implements ShouldQueue
         } catch (\Exception $e) {
             Log::error('Failed to sync Salla customers', [
                 'channel_id' => $this->channelId,
-                'error' => $e->getMessage(),
-                'trace' => $e->getTraceAsString(),
+                'exception_type' => get_class($e),
             ]);
             throw $e;
         }

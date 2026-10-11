@@ -10,8 +10,14 @@ class WhatsAppInstance extends Model
 {
     protected $table = 'whatsapp_instances';
 
+    protected $hidden = [
+        'evolution_api_token',
+        'metadata',
+    ];
+
     protected $fillable = [
         'user_id',
+        'business_id',
         'instance_name',
         'phone_number',
         'profile_name',
@@ -35,6 +41,11 @@ class WhatsAppInstance extends Model
     public function user(): BelongsTo
     {
         return $this->belongsTo(User::class);
+    }
+
+    public function business(): BelongsTo
+    {
+        return $this->belongsTo(BusinessProfile::class, 'business_id');
     }
 
     public function messages(): HasMany

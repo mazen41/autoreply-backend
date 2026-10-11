@@ -20,6 +20,10 @@ class ProductAwarenessService
                 ->active()
                 ->inStock();
 
+            if (isset($filters['commerce_channel_id'])) {
+                $query->where('commerce_channel_id', (int) $filters['commerce_channel_id']);
+            }
+
             // Apply filters
             if (isset($filters['category'])) {
                 $query->whereJsonContains('metadata', ['category' => $filters['category']]);
@@ -41,7 +45,10 @@ class ProductAwarenessService
 
             return $products->map(function ($product) {
                 return [
-                    'id' => $product->id,
+                    'id' => $product->commerce_external_id ?: $product->id,
+                    'internal_id' => $product->id,
+                    'commerce_channel_id' => $product->commerce_channel_id,
+                    'commerce_external_id' => $product->commerce_external_id,
                     'name' => $product->name,
                     'description' => $product->description,
                     'price' => (float) $product->price,
@@ -169,13 +176,20 @@ class ProductAwarenessService
      * does a foreach() over $context['products'] and expects an array, not a
      * pre-formatted string.
      */
-    public function buildProductContextArray(int $businessId): array
+    public function buildProductContextArray(int $businessId, ?int $commerceConnectionId = null): array
     {
-        $products = $this->getProductsForContext($businessId, ['limit' => 10]);
+        $filters = ['limit' => 10];
+        if ($commerceConnectionId !== null) {
+            $filters['commerce_channel_id'] = $commerceConnectionId;
+        }
+        $products = $this->getProductsForContext($businessId, $filters);
 
         return array_map(function ($product) {
             return [
                 'id'        => $product['id'] ?? null,
+                'internal_id' => $product['internal_id'] ?? null,
+                'commerce_channel_id' => $product['commerce_channel_id'] ?? null,
+                'commerce_external_id' => $product['commerce_external_id'] ?? null,
                 'name'      => $product['name'] ?? 'Unknown',
                 'price'     => $product['price'] ?? '?',
                 'currency'  => $product['currency'] ?? 'SAR',

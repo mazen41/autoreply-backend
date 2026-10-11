@@ -8,11 +8,13 @@ use App\Models\Message;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\Http;
 use Illuminate\Support\Facades\Log;
+use App\Services\IncomingMediaStorage;
 
 class TelegramController extends Controller
 {
     public function connect(Request $request)
     {
+        $businessProfile = app(\App\Services\ActiveBusiness::class)->resolve($request, permission: 'write');
         $botToken = $request->bot_token ?? env('TELEGRAM_BOT_TOKEN');
         
         if (!$botToken) {
@@ -29,7 +31,6 @@ class TelegramController extends Controller
                 Log::error('Telegram bot token verification failed', [
                     'user_id' => $userId,
                     'status' => $response->status(),
-                    'body' => $response->json(),
                 ]);
                 return response()->json(['error' => 'Invalid bot token. Please check and try again.'], 422);
             }
@@ -43,8 +44,6 @@ class TelegramController extends Controller
             // (/api/telegram/webhook/{userId} with no channel id) cannot tell
             // two bots for the same user apart, so it must not be used for
             // new connections.
-            $businessProfile = \App\Models\BusinessProfile::where('user_id', $userId)->first();
-
             $channel = Channel::updateOrCreate(
                 [
                     'user_id' => $userId,
@@ -75,15 +74,13 @@ class TelegramController extends Controller
                 Log::error('Telegram webhook registration failed', [
                     'user_id' => $userId,
                     'channel_id' => $channel->id,
-                    'bot_username' => $botUsername,
-                    'response' => $webhookResponse->json(),
+                    'status' => $webhookResponse->status(),
                 ]);
                 return response()->json(['error' => 'Failed to register webhook'], 500);
             }
 
             Log::info('Telegram channel connected', [
                 'user_id' => $userId,
-                'bot_username' => $botUsername,
                 'channel_id' => $channel->id,
             ]);
 
@@ -102,7 +99,7 @@ class TelegramController extends Controller
         } catch (\Exception $e) {
             Log::error('Telegram connection error', [
                 'user_id' => $userId,
-                'error' => $e->getMessage(),
+                'exception_type' => get_class($e),
             ]);
             return response()->json(['error' => 'Failed to connect Telegram bot'], 500);
         }
@@ -120,7 +117,7 @@ class TelegramController extends Controller
 
             $message = $update['message'];
             $chatId = $message['chat']['id'];
-            $text = $message['text'] ?? '[Media message]';
+            $text = trim((string) ($message['text'] ?? $message['caption'] ?? ''));
             $from = $message['from'] ?? [];
             $messageId = $message['message_id'] ?? null;
 
@@ -171,6 +168,17 @@ class TelegramController extends Controller
             $username = $from['username'] ?? '';
             $senderName = trim($firstName . ' ' . $lastName) ?: $username ?: 'Unknown';
 
+            $media = $this->downloadInboundMedia($channel, $message);
+            if ($text === '') {
+                $text = match ($media['type'] ?? null) {
+                    'image' => 'Customer sent an image.',
+                    'audio' => 'Customer sent an audio message.',
+                    'video' => 'Customer sent a video.',
+                    'document' => 'Customer sent a document.',
+                    default => '[Unsupported Telegram media message]',
+                };
+            }
+
             // Create or get conversation
             $conversation = Conversation::firstOrCreate(
                 ['channel_id' => $channel->id, 'sender_id' => (string)$chatId],
@@ -191,7 +199,7 @@ class TelegramController extends Controller
             } catch (\Throwable $e) {
                 Log::warning('Telegram webhook: customer resolution failed', [
                     'conversation_id' => $conversation->id,
-                    'error'           => $e->getMessage(),
+                    'exception_type' => get_class($e),
                 ]);
             }
 
@@ -199,10 +207,24 @@ class TelegramController extends Controller
             $messageModel = Message::create([
                 'conversation_id' => $conversation->id,
                 'content' => $text,
+                'type' => $media['type'] ?? 'text',
                 'direction' => 'inbound',
                 'platform_message_id' => (string)$messageId,
                 'is_ai' => false,
                 'status' => 'received',
+                'media_url' => $media['url'] ?? null,
+                'media_type' => $media['type'] ?? null,
+                'mime_type' => $media['mime_type'] ?? null,
+                'file_name' => $media['file_name'] ?? null,
+                'file_size' => $media['file_size'] ?? null,
+                'duration' => $media['duration'] ?? null,
+                'media_processing_status' => $media === null
+                    ? null
+                    : (($media['storage_status'] ?? null) === 'stored' ? 'pending' : 'failed'),
+                'media_processing_reason' => $media !== null && ($media['storage_status'] ?? null) !== 'stored'
+                    ? 'Media download or private storage failed.'
+                    : null,
+                'metadata' => $media !== null ? ['media' => $media] : null,
             ]);
 
             // Broadcast real-time event
@@ -217,10 +239,102 @@ class TelegramController extends Controller
 
         } catch (\Exception $e) {
             Log::error('Telegram webhook error', [
-                'error' => $e->getMessage(),
-                'trace' => $e->getTraceAsString(),
+                'exception_type' => get_class($e),
             ]);
             return response('OK', 200); // Always return 200 to avoid retries
+        }
+    }
+
+    /** Download Telegram media to private storage; never persist provider URLs or tokens. */
+    private function downloadInboundMedia(Channel $channel, array $message): ?array
+    {
+        $mediaType = null;
+        $fileId = null;
+        $mimeType = null;
+        $fileName = null;
+        $duration = null;
+
+        if (!empty($message['photo']) && is_array($message['photo'])) {
+            $photo = end($message['photo']);
+            $mediaType = 'image';
+            $fileId = $photo['file_id'] ?? null;
+            $mimeType = 'image/jpeg';
+        } elseif (!empty($message['voice'])) {
+            $mediaType = 'audio';
+            $fileId = $message['voice']['file_id'] ?? null;
+            $mimeType = $message['voice']['mime_type'] ?? 'audio/ogg';
+            $duration = $message['voice']['duration'] ?? null;
+        } elseif (!empty($message['audio'])) {
+            $mediaType = 'audio';
+            $fileId = $message['audio']['file_id'] ?? null;
+            $mimeType = $message['audio']['mime_type'] ?? 'audio/mpeg';
+            $fileName = $message['audio']['file_name'] ?? null;
+            $duration = $message['audio']['duration'] ?? null;
+        } elseif (!empty($message['video'])) {
+            $mediaType = 'video';
+            $fileId = $message['video']['file_id'] ?? null;
+            $mimeType = $message['video']['mime_type'] ?? 'video/mp4';
+            $fileName = $message['video']['file_name'] ?? null;
+            $duration = $message['video']['duration'] ?? null;
+        } elseif (!empty($message['document'])) {
+            $mediaType = 'document';
+            $fileId = $message['document']['file_id'] ?? null;
+            $mimeType = $message['document']['mime_type'] ?? 'application/octet-stream';
+            $fileName = $message['document']['file_name'] ?? null;
+        }
+
+        if ($mediaType === null) {
+            return null;
+        }
+        $failed = ['type' => $mediaType, 'storage_status' => 'failed', 'mime_type' => $mimeType];
+        if (!is_string($fileId) || $fileId === '') {
+            return $failed;
+        }
+
+        try {
+            $token = (string) $channel->access_token;
+            $apiBase = 'https://api.telegram.org/bot' . $token;
+            $fileInfo = Http::timeout(15)->get($apiBase . '/getFile', ['file_id' => $fileId]);
+            $filePath = $fileInfo->json('result.file_path');
+            $reportedSize = (int) ($fileInfo->json('result.file_size') ?? 0);
+            if (!$fileInfo->successful() || !is_string($filePath) || $filePath === '' || $reportedSize > 50 * 1024 * 1024
+                || str_contains($filePath, '..') || str_starts_with($filePath, '/')) {
+                return $failed;
+            }
+
+            $downloadUrl = 'https://api.telegram.org/file/bot' . $token . '/' . ltrim($filePath, '/');
+            $download = Http::timeout(30)->withoutRedirecting()->get($downloadUrl);
+            if (!$download->successful() || strlen($download->body()) > 50 * 1024 * 1024) {
+                return $failed;
+            }
+
+            $mime = strtolower(trim(explode(';', (string) $mimeType)[0]));
+            $extension = match ($mime) {
+                'image/jpeg' => 'jpg', 'image/png' => 'png', 'image/webp' => 'webp',
+                'audio/ogg' => 'ogg', 'audio/mpeg' => 'mp3', 'audio/mp4' => 'm4a',
+                'video/mp4' => 'mp4', 'application/pdf' => 'pdf',
+                default => strtolower(pathinfo($fileName ?? $filePath, PATHINFO_EXTENSION)) ?: 'bin',
+            };
+            $storage = app(IncomingMediaStorage::class);
+            $path = $storage->store($download->body(), $extension);
+
+            return [
+                'type' => $mediaType,
+                'url' => $path,
+                'storage_disk' => $storage->diskName(),
+                'storage_status' => 'stored',
+                'mime_type' => $mimeType,
+                'file_name' => $fileName,
+                'file_size' => strlen($download->body()),
+                'duration' => $duration,
+            ];
+        } catch (\Throwable $exception) {
+            Log::warning('Telegram inbound media could not be stored', [
+                'channel_id' => $channel->id,
+                'media_type' => $mediaType,
+                'error_class' => get_class($exception),
+            ]);
+            return $failed;
         }
     }
 
@@ -236,7 +350,7 @@ class TelegramController extends Controller
             return response()->json(['error' => 'Not a Telegram channel'], 400);
         }
 
-        $botToken = decrypt($channel->access_token);
+        $botToken = $channel->access_token;
         $webhookUrl = env('APP_URL') . "/api/telegram/webhook/{$channel->user_id}/{$channel->id}";
 
         try {
@@ -247,13 +361,12 @@ class TelegramController extends Controller
             if ($response->successful()) {
                 Log::info('Telegram webhook set successfully', [
                     'channel_id' => $channel->id,
-                    'webhook_url' => $webhookUrl,
                 ]);
                 return response()->json(['success' => true]);
             } else {
                 Log::error('Failed to set Telegram webhook', [
                     'channel_id' => $channel->id,
-                    'response' => $response->json(),
+                    'status' => $response->status(),
                 ]);
                 return response()->json(['error' => 'Failed to set webhook'], 500);
             }
@@ -261,7 +374,7 @@ class TelegramController extends Controller
         } catch (\Exception $e) {
             Log::error('Telegram webhook set error', [
                 'channel_id' => $channel->id,
-                'error' => $e->getMessage(),
+                'exception_type' => get_class($e),
             ]);
             return response()->json(['error' => 'Failed to set webhook'], 500);
         }
@@ -279,7 +392,7 @@ class TelegramController extends Controller
         }
 
         try {
-            $botToken = decrypt($channel->access_token);
+            $botToken = $channel->access_token;
             
             // Delete webhook
             Http::timeout(10)->post("https://api.telegram.org/bot{$botToken}/deleteWebhook");
@@ -288,7 +401,7 @@ class TelegramController extends Controller
         } catch (\Exception $e) {
             Log::warning('Failed to delete Telegram webhook', [
                 'channel_id' => $channel->id,
-                'error' => $e->getMessage(),
+                'exception_type' => get_class($e),
             ]);
         }
 

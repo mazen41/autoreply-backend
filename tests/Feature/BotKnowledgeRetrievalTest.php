@@ -8,13 +8,17 @@ use App\Models\BotKnowledgeAssignment;
 use App\Models\BusinessKnowledgeChunk;
 use App\Models\BusinessKnowledgeFile;
 use App\Models\BusinessProfile;
+use App\Models\BusinessFeatureFlagAssignment;
 use App\Models\Channel;
 use App\Models\Conversation;
+use App\Models\FeatureFlag;
+use App\Models\HandoffTask;
 use App\Models\Message;
 use App\Models\Package;
 use App\Models\User;
 use App\Services\EmbeddingsService;
 use Illuminate\Foundation\Testing\RefreshDatabase;
+use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\Http;
 use Tests\TestCase;
 
@@ -38,8 +42,107 @@ class BotKnowledgeRetrievalTest extends TestCase
 {
     use RefreshDatabase;
 
+    protected function setUp(): void
+    {
+        parent::setUp();
+        config(['features.fail_closed_no_agent' => false]);
+        Cache::flush();
+    }
+
     private const UNIQUE_A = 'XYZUNIQUE-SALES-PLAYBOOK-RETURN-POLICY-30-DAYS';
     private const UNIQUE_B = 'XYZUNIQUE-INTERNAL-HR-SALARY-CONFIDENTIAL';
+
+    public function test_inactive_assigned_bot_fails_closed_and_marks_conversation_for_human(): void
+    {
+        $fixture = $this->makeFixture();
+        $this->enableNoAgentFailClosed($fixture['business']->id);
+        $inactiveBot = Bot::create([
+            'business_profile_id' => $fixture['business']->id,
+            'name' => 'Paused bot',
+            'status' => 'inactive',
+        ]);
+        $inactiveBot->channels()->attach($fixture['channel']->id, ['is_primary' => true]);
+        $fixture['conversation']->update(['bot_id' => $inactiveBot->id]);
+
+        (new ProcessAutoReply($fixture['message']->id))->handle();
+
+        $conversation = $fixture['conversation']->fresh();
+        $this->assertTrue((bool) $conversation->requires_human);
+        $this->assertFalse((bool) $conversation->ai_enabled);
+        $this->assertSame('pending_human', $conversation->status);
+        $this->assertDatabaseMissing('messages', [
+            'conversation_id' => $conversation->id,
+            'direction' => 'outbound',
+            'is_ai' => true,
+        ]);
+        $this->assertDatabaseHas('handoff_tasks', [
+            'conversation_id' => $conversation->id,
+            'reason' => 'conversation_agent_inactive_or_invalid',
+            'status' => 'open',
+        ]);
+    }
+
+    public function test_channel_without_an_assigned_agent_fails_closed_when_feature_is_enabled(): void
+    {
+        Http::fake(['*' => Http::response([], 200)]);
+        $fixture = $this->makeFixture();
+        $this->enableNoAgentFailClosed($fixture['business']->id);
+
+        (new ProcessAutoReply($fixture['message']->id))->handle();
+
+        $conversation = $fixture['conversation']->fresh();
+        $this->assertTrue((bool) $conversation->requires_human);
+        $this->assertFalse((bool) $conversation->ai_enabled);
+        $this->assertSame('pending_human', $conversation->status);
+        $this->assertDatabaseHas('handoff_tasks', [
+            'conversation_id' => $conversation->id,
+            'reason' => 'no_bot_assigned',
+            'status' => 'open',
+        ]);
+        $this->assertDatabaseMissing('messages', [
+            'conversation_id' => $conversation->id,
+            'direction' => 'outbound',
+            'is_ai' => true,
+        ]);
+        Http::assertNotSent(fn ($request) => str_contains($request->url(), 'chat/completions')
+            || str_contains($request->url(), 'generateContent'));
+    }
+
+    public function test_multiple_active_agents_without_primary_fail_closed_and_create_one_handoff_task(): void
+    {
+        $fixture = $this->makeFixture();
+        $first = $this->makeBot($fixture['business']->id);
+        $second = $this->makeBot($fixture['business']->id);
+        $fixture['channel']->bots()->attach($first->id, ['is_primary' => false]);
+        $fixture['channel']->bots()->attach($second->id, ['is_primary' => false]);
+        $this->enableNoAgentFailClosed($fixture['business']->id);
+        Http::fake(['*' => Http::response([], 200)]);
+
+        (new ProcessAutoReply($fixture['message']->id))->handle();
+        (new ProcessAutoReply($fixture['message']->id))->handle();
+
+        $this->assertSame(1, HandoffTask::where('conversation_id', $fixture['conversation']->id)->count());
+        $this->assertDatabaseHas('handoff_tasks', [
+            'conversation_id' => $fixture['conversation']->id,
+            'reason' => 'channel_multiple_bots_no_primary',
+            'status' => 'open',
+        ]);
+        $this->assertDatabaseMissing('messages', [
+            'conversation_id' => $fixture['conversation']->id,
+            'direction' => 'outbound',
+            'is_ai' => true,
+        ]);
+    }
+
+    private function enableNoAgentFailClosed(int $businessId): void
+    {
+        $flag = FeatureFlag::where('key', 'phase3_no_agent_fail_closed')->firstOrFail();
+        BusinessFeatureFlagAssignment::create([
+            'business_id' => $businessId,
+            'feature_flag_id' => $flag->id,
+            'enabled' => true,
+        ]);
+    }
 
     private function makeFixture(?Bot $bot = null, array $channelOverrides = []): array
     {
@@ -137,6 +240,7 @@ class BotKnowledgeRetrievalTest extends TestCase
      */
     private function runAndCaptureSystemPrompt(array $fixture): string
     {
+        config(['features.fail_closed_no_agent' => false]);
         $captured = null;
 
         Http::fake([
@@ -289,15 +393,26 @@ class BotKnowledgeRetrievalTest extends TestCase
         $this->assertStringNotContainsString(self::UNIQUE_B, $prompt);
     }
 
-    public function test_no_bot_preserves_global_business_knowledge(): void
+    public function test_no_bot_fails_closed_instead_of_running_ai_on_global_business_knowledge(): void
     {
         $fixture = $this->makeFixture();
-        [$fileA, $fileB] = $this->seedKnowledgeFiles($fixture['business']->id);
-        $this->fakeEmbeddings();
+        Http::fake(['*' => Http::response([], 200)]);
 
-        // No bot on the conversation, no bots assigned to the channel.
-        $prompt = $this->runAndCaptureSystemPrompt($fixture);
+        // With the owner-enabled global fail-closed rollout, no bot means no
+        // provider call; business knowledge remains inaccessible to an
+        // unassigned conversation.
+        (new ProcessAutoReply($fixture['message']->id))->handle();
 
-        $this->assertStringContainsString(self::UNIQUE_A, $prompt, 'Without a resolved bot, global business knowledge must still be available');
+        $this->assertDatabaseHas('handoff_tasks', [
+            'conversation_id' => $fixture['conversation']->id,
+            'reason' => 'no_bot_assigned',
+            'status' => 'open',
+        ]);
+        $this->assertDatabaseMissing('messages', [
+            'conversation_id' => $fixture['conversation']->id,
+            'direction' => 'outbound',
+            'is_ai' => true,
+        ]);
+        Http::assertNothingSent();
     }
 }

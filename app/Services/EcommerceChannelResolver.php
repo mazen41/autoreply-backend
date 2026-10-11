@@ -58,11 +58,27 @@ class EcommerceChannelResolver
                 $source = 'channel';
             }
 
-            // Communication-channel routing is explicit and takes precedence
-            // over the Bot default, but only for a Bot-authorized account.
-            if (!$chosen && $channel?->default_ecommerce_connection_id) {
-                $candidate = $this->connectedAccount((int) $channel->default_ecommerce_connection_id, $businessId);
+            // Routing belongs to the Bot/channel assignment so two Bots sharing
+            // one social account can still use different commerce stores.
+            $botChannelRoute = $bot && $channel
+                ? DB::table('bot_channels')
+                    ->where('bot_id', $bot->id)
+                    ->where('channel_id', $channel->id)
+                    ->value('ecommerce_connection_id')
+                : null;
+            if (!$chosen && $botChannelRoute) {
+                $candidate = $this->connectedAccount((int) $botChannelRoute, $businessId);
                 if ($candidate && in_array($candidate->id, $eligibleIds, true)) {
+                    $chosen = $candidate;
+                    $source = 'channel';
+                }
+            }
+
+            // Retain global channel routing only for legacy conversations with
+            // no resolved Bot; it must never override a Bot-specific route.
+            if (!$chosen && !$bot && $channel?->default_ecommerce_connection_id) {
+                $candidate = $this->connectedAccount((int) $channel->default_ecommerce_connection_id, $businessId);
+                if ($candidate) {
                     $chosen = $candidate;
                     $source = 'channel';
                 }
@@ -134,9 +150,14 @@ class EcommerceChannelResolver
         }
 
         $businessId = (int) ($conversationChannel->business_id ?? $bot?->business_profile_id);
-        if ($bot && $bot->ecommerce_channel_id) {
-            $assigned = $this->connectedAccount((int) $bot->ecommerce_channel_id, $businessId);
-            return $assigned && $assigned->type === $type ? $assigned : null;
+        if ($bot) {
+            foreach ($this->eligibleConnectionIds($bot, $businessId) as $connectionId) {
+                $eligible = $this->connectedAccount($connectionId, $businessId);
+                if ($eligible && $eligible->type === $type) {
+                    return $eligible;
+                }
+            }
+            return null;
         }
 
         if ($conversationChannel->type === $type && $conversationChannel->status === 'connected') {
@@ -148,7 +169,7 @@ class EcommerceChannelResolver
 
     private function eligibleConnectionIds(?Bot $bot, int $businessId): array
     {
-        if ($bot && (int) $bot->business_profile_id !== $businessId) {
+        if ($bot && ((int) $bot->business_profile_id !== $businessId || $bot->status !== 'active')) {
             return [];
         }
 

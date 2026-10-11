@@ -28,6 +28,9 @@ class OrderCheckoutService
         }
 
         $country = $this->deliveryCountryForAddress($normalizedAddress, $phone);
+        if (!$country) {
+            return ['status' => 'country_unknown', 'coordinates' => null];
+        }
         $city = $this->extractDeliveryCity($normalizedAddress);
         if (!$city) {
             return ['status' => 'not_found', 'coordinates' => null];
@@ -118,7 +121,7 @@ class OrderCheckoutService
             Cache::put($cacheKey, $result, now()->addDays(30));
             return $result;
         } catch (\Throwable $e) {
-            Log::warning('Nominatim address lookup unavailable', ['error' => $e->getMessage()]);
+            Log::warning('Nominatim address lookup unavailable', ['exception_type' => get_class($e)]);
             return ['status' => 'unavailable', 'coordinates' => null];
         }
     }
@@ -202,7 +205,7 @@ class OrderCheckoutService
     }
 
     /** Determine the English country name to append to the geocoding query. */
-    private function deliveryCountryForAddress(string $address, ?string $phone): array
+    private function deliveryCountryForAddress(string $address, ?string $phone): ?array
     {
         $countries = [
             'sa' => ['name' => 'Saudi Arabia', 'aliases' => ['saudi arabia', 'ksa', 'السعودية'], 'dial' => '966'],
@@ -255,7 +258,7 @@ class OrderCheckoutService
             }
         }
 
-        return $countries['sa'];
+        return null;
     }
 
     /**
@@ -264,6 +267,32 @@ class OrderCheckoutService
     public function extractAndMergeState(Conversation $conversation, string $incomingText, ?array $referencedProduct = null): array
     {
         $existingState = is_array($conversation->checkout_state) ? $conversation->checkout_state : [];
+
+        // A completed order belongs to the exact product and store that were
+        // confirmed. Starting checkout for another referenced product must
+        // discard the old order identity before the new product is merged.
+        if ($referencedProduct) {
+            $newProductId = (string) ($referencedProduct['commerce_external_id']
+                ?? $referencedProduct['salla_product_id'] ?? '');
+            $oldProductId = (string) ($existingState['order_product_id']
+                ?? $existingState['commerce_external_id'] ?? $existingState['salla_product_id'] ?? '');
+            $newConnectionId = (string) ($referencedProduct['commerce_channel_id'] ?? '');
+            $oldConnectionId = (string) ($existingState['order_connection_id']
+                ?? $existingState['commerce_channel_id'] ?? '');
+            $productChanged = ($newProductId !== '' && $oldProductId !== '' && $newProductId !== $oldProductId)
+                || ($newConnectionId !== '' && $oldConnectionId !== '' && $newConnectionId !== $oldConnectionId);
+
+            if ($productChanged) {
+                foreach ([
+                    'order_id', 'order_number', 'order_fingerprint', 'order_product_id',
+                    'order_connection_id', 'status', 'confirmation_state', 'external_source',
+                    'failed_order_attempts', 'confirmation_summary_message_id',
+                    'confirmation_summary_fingerprint', 'confirmation_summary_sent_at',
+                ] as $key) {
+                    unset($existingState[$key]);
+                }
+            }
+        }
 
         // Normalize legacy field names to canonical standard (phone, full_name)
         if (empty($existingState['phone']) && !empty($existingState['customer_phone'])) {
@@ -283,8 +312,18 @@ class OrderCheckoutService
         $explicitPhoneContext = preg_match('/\b(?:phone|mobile|telephone|tel)\b/i', $incomingText)
             || preg_match('/(?:رقم الهاتف|رقم الجوال|رقمي)/u', $incomingText)
             || preg_match('/^\s*(?:\+|00)/', $incomingText);
-        if ((!$hasKnownPhone || $explicitPhoneContext) && preg_match('/(?:\+?[0-9]{8,15})/', preg_replace('/\s+/', '', $phoneSearchText), $pm)) {
-            $extractedPhone = $pm[0];
+        if ((!$hasKnownPhone || $explicitPhoneContext)
+            && preg_match('/(?:\+|00)?[0-9][0-9().\s-]{6,22}/', $phoneSearchText, $pm)) {
+            $candidate = trim($pm[0]);
+            $digits = preg_replace('/\D+/', '', $candidate);
+            $international = str_starts_with($candidate, '+') || str_starts_with($candidate, '00');
+            $knownNationalFormat = preg_match('/^01[0125][0-9]{8}$/', $digits)
+                || preg_match('/^05[0-9]{8}$/', $digits);
+            $knownInternationalPrefix = preg_match('/^(?:966|971|965|974|973|968|967|962|961|964|20)[0-9]{7,12}$/', $digits);
+            if (strlen($digits) >= 8 && strlen($digits) <= 15
+                && ($international || $knownNationalFormat || $knownInternationalPrefix)) {
+                $extractedPhone = $candidate;
+            }
         }
 
         // Contact and delivery data that Salla requires at order submission.
@@ -404,7 +443,9 @@ class OrderCheckoutService
         // Phone: NEVER use sender_id (Instagram/Meta ID) as phone number.
         // Only use explicitly extracted phone or previously stored phone.
         $existingPhone = $existingState['phone'] ?? null;
-        $existingName  = $existingState['full_name'] ?? ($conversation->sender_name !== $conversation->sender_id ? $conversation->sender_name : null);
+        // A platform display name is not a verified delivery name. Only keep
+        // a name the customer explicitly supplied in checkout state.
+        $existingName  = $existingState['full_name'] ?? null;
 
         // Merge fields: preserve existing values if new extraction is null (NO OVERWRITING WITH NULL!)
         $mergedState = array_merge($existingState, array_filter([
@@ -616,7 +657,7 @@ class OrderCheckoutService
      * - 'confirmed': customer sent an explicit confirmation message
      * - 'order_placed': external order created successfully
      */
-    public function updateConfirmationState(array $state, string $incomingText, bool $isComplete): array
+    public function updateConfirmationState(array $state, string $incomingText, bool $isComplete, bool $hasValidSummary = false): array
     {
         $currentState = $state['confirmation_state'] ?? null;
         $orderId = $state['order_id'] ?? null;
@@ -635,11 +676,18 @@ class OrderCheckoutService
         $incomingLower = mb_strtolower(trim($incomingText));
         $confirmPatterns = '/^(?:yes|yeah|yep|sure|ok|okay|confirm|please confirm|place order|نعم|أكد|اكد|تأكيد|تم|موافق|تم التأكيد|اعتمد|اشتري|اطلب)$/ui';
         $containsConfirmPhrase = (bool)preg_match($confirmPatterns, $incomingLower)
-            || (bool)preg_match('/(?:yes confirm|confirm please|confirm order|place the order|نعم أكد|تأكيد الطلب|اعتمد الطلب|أكد الطلب)/ui', $incomingLower);
+            || (bool)preg_match('/(?:yes[\s,]+(?:please\s+)?confirm|yeah[\s,]+(?:please\s+)?confirm|yes confirm|confirm please|confirm order|place the order|نعم أكد|تأكيد الطلب|اعتمد الطلب|أكد الطلب)/ui', $incomingLower);
 
-        if ($containsConfirmPhrase) {
+        // A confirmation is valid only after a prior turn presented the
+        // complete summary and persisted confirmation_pending.
+        if (
+            $containsConfirmPhrase
+            && $currentState === 'confirmation_pending'
+            && $hasValidSummary
+            && !empty($state['confirmation_summary_message_id'])
+        ) {
             $state['confirmation_state'] = 'confirmed';
-        } elseif (empty($currentState) || $currentState === 'collecting_info') {
+        } elseif (!in_array($currentState, ['confirmation_pending', 'confirmed'], true)) {
             $state['confirmation_state'] = 'confirmation_pending';
         }
 

@@ -17,7 +17,6 @@ use Illuminate\Queue\InteractsWithQueue;
 use Illuminate\Queue\SerializesModels;
 use Illuminate\Support\Facades\Http;
 use Illuminate\Support\Facades\Log;
-use Illuminate\Support\Facades\Cache;
 
 class ProcessAutoReplyWithRetry implements ShouldQueue
 {
@@ -26,6 +25,9 @@ class ProcessAutoReplyWithRetry implements ShouldQueue
     public $tries = 5; // Increased from 3 to 5 attempts
     public $backoff = [10, 30, 60, 120, 300]; // Progressive backoff: 10s, 30s, 1m, 2m, 5m
     public $timeout = 120; // 2 minutes timeout per attempt
+
+    private ?string $lastAIProvider = null;
+    private ?string $lastAIModel = null;
 
     public function __construct(public int $messageId)
     {
@@ -65,38 +67,28 @@ class ProcessAutoReplyWithRetry implements ShouldQueue
             return;
         }
 
-        // Check subscription limits using cached counter
         $user = $channel->user;
         if (!$user) {
             Log::warning('ProcessAutoReplyWithRetry: channel has no user', ['channel_id' => $channel->id]);
             return;
         }
 
-        $subscription = $user->activeSubscription;
-        $package = $subscription ? $subscription->package : \App\Models\Package::where('name', 'Free')->first();
-
-        if (!$package) {
-            Log::error('ProcessAutoReplyWithRetry: no package found', ['user_id' => $user->id]);
+        $business = $conversation->business;
+        if (!$business) {
+            Log::warning('ProcessAutoReplyWithRetry: business unavailable for usage enforcement', [
+                'conversation_id' => $conversation->id,
+            ]);
             return;
         }
 
-        // Use cached counter for AI replies limit check
-        $cacheKey = "user_{$user->id}_ai_replies_" . now()->format('Y-m');
-        $aiRepliesThisMonth = cache()->remember($cacheKey, now()->endOfMonth(), function () use ($user) {
-            return Message::where('is_ai', true)
-                ->where('created_at', '>=', now()->startOfMonth())
-                ->whereHas('conversation.channel', function ($query) use ($user) {
-                    $query->where('user_id', $user->id);
-                })
-                ->count();
-        });
-
-        // Check limit
-        if ($package->ai_replies_limit !== -1 && $aiRepliesThisMonth >= $package->ai_replies_limit) {
-            Log::info('ProcessAutoReplyWithRetry: AI replies limit reached', [
-                'user_id' => $user->id,
-                'limit' => $package->ai_replies_limit,
-                'used' => $aiRepliesThisMonth
+        $usageMeter = app(\App\Services\UsageMeter::class);
+        $aiUsage = $usageMeter->canUse($business, \App\Services\UsageMeter::AI_REPLIES);
+        $outboundUsage = $usageMeter->canUse($business, \App\Services\UsageMeter::OUTBOUND_MESSAGES);
+        if (!$aiUsage['allowed'] || !$outboundUsage['allowed']) {
+            Log::info('ProcessAutoReplyWithRetry: business plan usage limit reached', [
+                'business_id' => $business->id,
+                'conversation_id' => $conversation->id,
+                'metric' => !$aiUsage['allowed'] ? 'ai_replies' : 'outbound_messages',
             ]);
             return;
         }
@@ -135,10 +127,21 @@ class ProcessAutoReplyWithRetry implements ShouldQueue
                 'send_status' => 'pending',
             ]);
 
-            Log::info('ProcessAutoReplyWithRetry: AI reply saved', ['message_id' => $replyMessage->id]);
+            try {
+                app(\App\Services\AiReplyAuditService::class)->record($replyMessage, [
+                    'prompt_version' => 'legacy-retry',
+                    'ai_provider' => $this->lastAIProvider,
+                    'ai_model' => $this->lastAIModel,
+                    'escalation_reason' => 'legacy_retry_processor',
+                ]);
+            } catch (\Throwable $e) {
+                Log::error('ProcessAutoReplyWithRetry: could not persist AI reply audit', [
+                    'message_id' => $replyMessage->id,
+                    'exception_type' => get_class($e),
+                ]);
+            }
 
-            // Increment cached AI replies counter
-            cache()->increment($cacheKey);
+            Log::info('ProcessAutoReplyWithRetry: AI reply saved', ['message_id' => $replyMessage->id]);
 
             if ($channel->user_id) {
                 broadcast(new \App\Events\MessageReceived($replyMessage, $message->conversation, $channel->user_id));
@@ -151,8 +154,7 @@ class ProcessAutoReplyWithRetry implements ShouldQueue
             Log::error('ProcessAutoReplyWithRetry: error during processing', [
                 'message_id' => $this->messageId,
                 'attempt' => $this->attempts(),
-                'error' => $e->getMessage(),
-                'trace' => $e->getTraceAsString()
+                'exception_type' => get_class($e),
             ]);
 
             // Mark message as failed if this is the last attempt
@@ -257,6 +259,9 @@ class ProcessAutoReplyWithRetry implements ShouldQueue
 
     private function callConfiguredAI(string $systemPrompt, array $contextMessages): ?string
     {
+        $this->lastAIProvider = null;
+        $this->lastAIModel = null;
+
         // Try OpenAI first
         $openaiKey = config('services.openai.api_key');
         if ($openaiKey) {
@@ -278,14 +283,18 @@ class ProcessAutoReplyWithRetry implements ShouldQueue
 
                 if ($response->successful()) {
                     $data = $response->json();
+                    $this->lastAIProvider = 'openai';
+                    $this->lastAIModel = config('services.openai.model', 'gpt-3.5-turbo');
                     return $data['choices'][0]['message']['content'] ?? null;
                 }
             } catch (\Exception $e) {
-                Log::warning('OpenAI API call failed', ['error' => $e->getMessage()]);
+                Log::warning('OpenAI API call failed', ['exception_type' => get_class($e)]);
             }
         }
 
         // Fallback to a simple rule-based response
+        $this->lastAIProvider = 'rule_fallback';
+        $this->lastAIModel = 'keyword_rules';
         return $this->getFallbackResponse($contextMessages);
     }
 
@@ -316,68 +325,7 @@ class ProcessAutoReplyWithRetry implements ShouldQueue
 
     private function sendReply(Channel $channel, Conversation $conversation, Message $replyMessage): void
     {
-        try {
-            if ($channel->type === 'whatsapp') {
-                $this->sendWhatsAppReply($channel, $conversation, $replyMessage);
-            } elseif ($channel->type === 'gmail') {
-                $this->sendGmailReply($channel, $conversation, $replyMessage);
-            } elseif (in_array($channel->type, ['facebook', 'instagram'])) {
-                $this->sendMetaReply($channel, $conversation, $replyMessage);
-            }
-
-            // Update send status
-            $replyMessage->update(['send_status' => 'sent']);
-        } catch (\Exception $e) {
-            Log::error('Failed to send reply', [
-                'channel_type' => $channel->type,
-                'message_id' => $replyMessage->id,
-                'error' => $e->getMessage()
-            ]);
-            $replyMessage->update(['send_status' => 'failed']);
-        }
-    }
-
-    private function sendWhatsAppReply(Channel $channel, Conversation $conversation, Message $replyMessage): void
-    {
-        $instanceName = $channel->page_id; // For WhatsApp, page_id stores instance name
-        $recipientId = $conversation->sender_id;
-
-        $response = Http::timeout(10)
-            ->post(config('services.evolution_api.url') . "/message/sendText/{$instanceName}", [
-                'number' => $recipientId,
-                'text' => $replyMessage->content,
-            ]);
-
-        if ($response->successful()) {
-            Log::info('WhatsApp reply sent successfully', ['recipient' => $recipientId]);
-        } else {
-            throw new \Exception('WhatsAPI failed: ' . $response->body());
-        }
-    }
-
-    private function sendGmailReply(Channel $channel, Conversation $conversation, Message $replyMessage): void
-    {
-        // Implementation similar to existing GmailController
-        // This would need the Gmail service to be injected
-        Log::info('Gmail reply would be sent here', ['message_id' => $replyMessage->id]);
-    }
-
-    private function sendMetaReply(Channel $channel, Conversation $conversation, Message $replyMessage): void
-    {
-        $accessToken = decrypt($channel->access_token);
-        $url = "https://graph.facebook.com/v19.0/me/messages?access_token={$accessToken}";
-
-        $response = Http::timeout(10)
-            ->post($url, [
-                'recipient' => ['id' => $conversation->sender_id],
-                'message'   => ['text' => $replyMessage->content],
-            ]);
-
-        if ($response->successful()) {
-            Log::info('Meta reply sent successfully', ['recipient' => $conversation->sender_id]);
-        } else {
-            throw new \Exception('Meta API failed: ' . $response->body());
-        }
+        app(\App\Services\ChannelMessageService::class)->sendMessage($channel, $conversation, $replyMessage);
     }
 
     public function failed(\Throwable $exception): void
@@ -385,8 +333,7 @@ class ProcessAutoReplyWithRetry implements ShouldQueue
         Log::error('ProcessAutoReplyWithRetry job failed permanently', [
             'message_id' => $this->messageId,
             'attempts' => $this->attempts(),
-            'error' => $exception->getMessage(),
-            'trace' => $exception->getTraceAsString()
+            'exception_type' => get_class($exception),
         ]);
 
         // Optionally notify admin or send to dead letter queue

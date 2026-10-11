@@ -8,6 +8,7 @@ use App\Models\Sequence;
 use App\Models\Conversation;
 use App\Models\SequenceEnrollment;
 use App\Services\SequenceEnrollmentService;
+use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Log;
 
 class SequenceTriggerService
@@ -99,16 +100,36 @@ class SequenceTriggerService
                     $delaySeconds = 60; // 1-minute safety floor
                 }
 
-                // Determine the current cycle number for this sequence+conversation.
-                // Incrementing it here (before dispatch) means any *previous* pending
-                // CheckNoReplyForMessage job for an older cycle will see
-                // $currentCycle > $expectedCycle and exit silently — effectively
-                // cancelling the old timer without needing to touch the queue.
-                $lastCycle = SequenceEnrollment::where('sequence_id', $sequence->id)
-                    ->where('conversation_id', $conversation->id)
-                    ->max('no_reply_cycle') ?? 0;
+                // Persist the cycle before dispatch. Enrollment rows do not
+                // exist until the timer fires, so they cannot safely gate newer
+                // timers on their own.
+                $newCycle = DB::transaction(function () use ($sequence, $conversation, $aiReplyMessage) {
+                    DB::table('sequence_no_reply_cycles')->insertOrIgnore([
+                        'sequence_id' => $sequence->id,
+                        'conversation_id' => $conversation->id,
+                        'cycle' => 0,
+                        'created_at' => now(),
+                        'updated_at' => now(),
+                    ]);
 
-                $newCycle = $lastCycle + 1;
+                    $state = DB::table('sequence_no_reply_cycles')
+                        ->where('sequence_id', $sequence->id)
+                        ->where('conversation_id', $conversation->id)
+                        ->lockForUpdate()
+                        ->first();
+                    $cycle = (int) $state->cycle + 1;
+
+                    DB::table('sequence_no_reply_cycles')
+                        ->where('id', $state->id)
+                        ->update([
+                            'cycle' => $cycle,
+                            'ai_reply_message_id' => $aiReplyMessage->id,
+                            'processed_at' => null,
+                            'updated_at' => now(),
+                        ]);
+
+                    return $cycle;
+                });
 
                 Log::info('SequenceTriggerService: scheduling no-reply timer', [
                     'sequence_id'     => $sequence->id,
@@ -126,13 +147,13 @@ class SequenceTriggerService
                     $conversation->id,
                     $aiReplyMessage->id,
                     $newCycle,
-                )->delay($delaySeconds);
+                )->delay($delaySeconds)->afterCommit();
 
             } catch (\Exception $e) {
                 Log::error('SequenceTriggerService: failed to schedule no-reply timer', [
                     'sequence_id'     => $sequence->id,
                     'conversation_id' => $conversation->id,
-                    'error'           => $e->getMessage(),
+                    'exception_type' => get_class($e),
                 ]);
             }
         }
@@ -148,14 +169,22 @@ class SequenceTriggerService
      */
     public function cancelNoReplySequencesOnCustomerReply(Conversation $conversation): void
     {
+        $enrollmentService = app(SequenceEnrollmentService::class);
         $stopped = SequenceEnrollment::where('conversation_id', $conversation->id)
             ->where('status', 'active')
-            ->whereHas('sequence', fn($q) => $q->where('trigger_type', 'no_reply'))
+            ->with('sequence', 'executions')
             ->get();
 
         foreach ($stopped as $enrollment) {
-            $enrollment->stop('customer_replied');
-            Log::info('SequenceTriggerService: stopped no-reply enrollment on customer reply', [
+            $sequence = $enrollment->sequence;
+            $stopOnReply = $sequence?->trigger_type === 'no_reply'
+                || (bool) data_get($sequence?->settings, 'stop_on_reply', false);
+            if (!$stopOnReply) {
+                continue;
+            }
+
+            $enrollmentService->unenrollConversation($enrollment, 'customer_replied');
+            Log::info('SequenceTriggerService: stopped configured sequence on customer reply', [
                 'enrollment_id'   => $enrollment->id,
                 'sequence_id'     => $enrollment->sequence_id,
                 'conversation_id' => $conversation->id,
@@ -175,12 +204,17 @@ class SequenceTriggerService
             return;
         }
 
-        // Find active sequences with manual or new_user triggers, scoped to
-        // the conversation's bot (global sequences always eligible).
+        // Manual sequences are started only by an explicit manual enrollment.
+        // A new_user sequence is eligible only for the conversation's first
+        // inbound message.
+        if ($conversation->messages()->where('direction', 'inbound')->count() !== 1) {
+            return;
+        }
+
         $autoEnrollSequences = Sequence::forBusiness($businessId)
             ->active()
             ->forBotScope($conversation->bot_id ? (int) $conversation->bot_id : null)
-            ->whereIn('trigger_type', ['new_user', 'manual'])
+            ->where('trigger_type', 'new_user')
             ->get();
 
         foreach ($autoEnrollSequences as $sequence) {
@@ -190,7 +224,7 @@ class SequenceTriggerService
                 Log::error('Failed to auto-enroll conversation in sequence', [
                     'sequence_id' => $sequence->id,
                     'conversation_id' => $conversation->id,
-                    'error' => $e->getMessage(),
+                    'exception_type' => get_class($e),
                 ]);
             }
         }
@@ -215,7 +249,7 @@ class SequenceTriggerService
             Log::error('Failed to enroll conversation in sequence', [
                 'sequence_id' => $sequence->id,
                 'conversation_id' => $conversation->id,
-                'error' => $e->getMessage(),
+                'exception_type' => get_class($e),
             ]);
             throw $e;
         }
@@ -264,8 +298,7 @@ class SequenceTriggerService
                 Log::error('Failed to enroll conversation in tag-triggered sequence', [
                     'sequence_id' => $sequence->id,
                     'conversation_id' => $conversation->id,
-                    'tag' => $tag,
-                    'error' => $e->getMessage(),
+                    'exception_type' => get_class($e),
                 ]);
             }
         }
@@ -312,7 +345,7 @@ class SequenceTriggerService
                 Log::error('Failed to enroll conversation in no-reply sequence', [
                     'sequence_id' => $sequence->id,
                     'conversation_id' => $conversation->id,
-                    'error' => $e->getMessage(),
+                    'exception_type' => get_class($e),
                 ]);
             }
         }
@@ -370,8 +403,7 @@ class SequenceTriggerService
                 Log::error('Failed to enroll conversation in order-triggered sequence', [
                     'sequence_id' => $sequence->id,
                     'conversation_id' => $conversation->id,
-                    'order_id' => $orderData['id'] ?? null,
-                    'error' => $e->getMessage(),
+                    'exception_type' => get_class($e),
                 ]);
             }
         }

@@ -10,9 +10,12 @@ use App\Models\Product;
 use App\Models\User;
 use App\Jobs\ProcessAutoReply;
 use App\Services\EcommerceChannelResolver;
+use App\Services\ActionExecutor;
+use App\Services\ProductAwarenessService;
 use App\Services\WooCommerceService;
 use Illuminate\Foundation\Testing\RefreshDatabase;
 use Illuminate\Support\Facades\Http;
+use Illuminate\Support\Facades\DB;
 use Tests\TestCase;
 
 class CommerceContextResolverTest extends TestCase
@@ -88,13 +91,52 @@ class CommerceContextResolverTest extends TestCase
             $salla->id => ['is_enabled' => true, 'is_default' => true],
             $shopify->id => ['is_enabled' => true, 'is_default' => false],
         ]);
-        $storefront->update(['default_ecommerce_connection_id' => $shopify->id]);
+        $bot->channels()->attach($storefront->id, [
+            'is_primary' => true,
+            'ecommerce_connection_id' => $shopify->id,
+        ]);
         $conversation = $this->makeConversation($business, $bot, $storefront);
 
         $context = app(EcommerceChannelResolver::class)->resolveConversation($conversation, $bot);
 
         $this->assertSame('channel', $context['source']);
         $this->assertSame($shopify->id, $context['connection']->id);
+    }
+
+    public function test_each_agent_channel_route_is_independent_on_a_shared_channel(): void
+    {
+        [$user, $business] = $this->makeBusiness();
+        $channel = $this->makeChannel($user, $business, 'instagram', 'Shared Instagram');
+        $storeA = $this->makeChannel($user, $business, 'salla', 'Agent A Store');
+        $storeB = $this->makeChannel($user, $business, 'shopify', 'Agent B Store');
+        $agentA = Bot::create(['business_profile_id' => $business->id, 'name' => 'Agent A', 'status' => 'active']);
+        $agentB = Bot::create(['business_profile_id' => $business->id, 'name' => 'Agent B', 'status' => 'active']);
+        foreach ([$agentA, $agentB] as $agent) {
+            $agent->ecommerceConnections()->attach([
+                $storeA->id => ['is_enabled' => true, 'is_default' => false],
+                $storeB->id => ['is_enabled' => true, 'is_default' => false],
+            ]);
+        }
+        $agentA->channels()->attach($channel->id, ['is_primary' => true, 'ecommerce_connection_id' => $storeA->id]);
+        $agentB->channels()->attach($channel->id, ['is_primary' => false, 'ecommerce_connection_id' => $storeB->id]);
+        $conversationA = $this->makeConversation($business, $agentA, $channel);
+        $conversationB = Conversation::create([
+            'business_id' => $business->id,
+            'bot_id' => $agentB->id,
+            'channel_id' => $channel->id,
+            'sender_id' => 'test-customer-b',
+            'status' => 'open',
+        ]);
+
+        $resolvedA = app(EcommerceChannelResolver::class)->resolveConversation($conversationA, $agentA);
+        $resolvedB = app(EcommerceChannelResolver::class)->resolveConversation($conversationB, $agentB);
+        DB::table('bot_channels')->where('bot_id', $agentA->id)->where('channel_id', $channel->id)
+            ->update(['ecommerce_connection_id' => $storeB->id]);
+        $resolvedBAfterChange = app(EcommerceChannelResolver::class)->resolveConversation($conversationB->fresh(), $agentB);
+
+        $this->assertSame($storeA->id, $resolvedA['connection']->id);
+        $this->assertSame($storeB->id, $resolvedB['connection']->id);
+        $this->assertSame($storeB->id, $resolvedBAfterChange['connection']->id);
     }
 
     public function test_resolved_conversation_context_stays_sticky(): void
@@ -138,6 +180,123 @@ class CommerceContextResolverTest extends TestCase
         $this->assertSame('unresolved', $context['status']);
         $this->assertNull($context['connection']);
         $this->assertNull($conversation->fresh()->ecommerce_connection_id);
+    }
+
+    public function test_product_context_can_be_scoped_to_one_commerce_connection_and_uses_external_ids(): void
+    {
+        [$user, $business] = $this->makeBusiness();
+        $storeA = $this->makeChannel($user, $business, 'shopify', 'Shopify A');
+        $storeB = $this->makeChannel($user, $business, 'shopify', 'Shopify B');
+        Product::create([
+            'business_id' => $business->id,
+            'commerce_channel_id' => $storeA->id,
+            'commerce_external_id' => 'gid://shopify/Product/101',
+            'name' => 'Store A dress', 'price' => 100, 'stock_quantity' => 3,
+            'is_active' => true,
+        ]);
+        Product::create([
+            'business_id' => $business->id,
+            'commerce_channel_id' => $storeB->id,
+            'commerce_external_id' => 'gid://shopify/Product/202',
+            'name' => 'Store B dress', 'price' => 120, 'stock_quantity' => 4,
+            'is_active' => true,
+        ]);
+
+        $context = app(ProductAwarenessService::class)->buildProductContextArray($business->id, $storeB->id);
+
+        $this->assertCount(1, $context);
+        $this->assertSame('Store B dress', $context[0]['name']);
+        $this->assertSame('gid://shopify/Product/202', $context[0]['id']);
+        $this->assertSame($storeB->id, $context[0]['commerce_channel_id']);
+    }
+
+    public function test_ai_get_products_uses_only_the_resolved_store_and_returns_external_ids(): void
+    {
+        [$user, $business] = $this->makeBusiness();
+        $chat = $this->makeChannel($user, $business, 'instagram', 'Instagram');
+        $storeA = $this->makeChannel($user, $business, 'shopify', 'Shopify A');
+        $storeB = $this->makeChannel($user, $business, 'shopify', 'Shopify B');
+        $bot = Bot::create(['business_profile_id' => $business->id, 'name' => 'Bot', 'status' => 'active']);
+        $bot->ecommerceConnections()->attach([
+            $storeB->id => ['is_enabled' => true, 'is_default' => true],
+        ]);
+        $conversation = $this->makeConversation($business, $bot, $chat);
+        foreach ([[$storeA, 'gid://shopify/Product/101', 'Store A'], [$storeB, 'gid://shopify/Product/202', 'Store B']] as [$store, $externalId, $name]) {
+            Product::create([
+                'business_id' => $business->id,
+                'commerce_channel_id' => $store->id,
+                'commerce_external_id' => $externalId,
+                'name' => $name,
+                'price' => 100,
+                'stock_quantity' => 2,
+                'is_active' => true,
+            ]);
+        }
+
+        $result = app(ActionExecutor::class)->executeAction(
+            // A model/tool payload must never select another connection.
+            ['action' => 'get_products', 'data' => ['commerce_channel_id' => $storeA->id, 'store_id' => $storeA->id]],
+            $conversation->id,
+            0,
+            false,
+        );
+
+        $this->assertTrue($result['success']);
+        $this->assertCount(1, $result['products']);
+        $this->assertSame('gid://shopify/Product/202', $result['products'][0]['id']);
+        $this->assertSame($storeB->id, $result['products'][0]['commerce_channel_id']);
+    }
+
+    public function test_ai_get_products_fails_closed_when_multiple_stores_are_unresolved(): void
+    {
+        [$user, $business] = $this->makeBusiness();
+        $chat = $this->makeChannel($user, $business, 'instagram', 'Instagram');
+        $storeA = $this->makeChannel($user, $business, 'salla', 'Salla A');
+        $storeB = $this->makeChannel($user, $business, 'woocommerce', 'Woo B');
+        $bot = Bot::create(['business_profile_id' => $business->id, 'name' => 'Bot', 'status' => 'active']);
+        $bot->ecommerceConnections()->attach([
+            $storeA->id => ['is_enabled' => true, 'is_default' => false],
+            $storeB->id => ['is_enabled' => true, 'is_default' => false],
+        ]);
+        $conversation = $this->makeConversation($business, $bot, $chat);
+        Product::create([
+            'business_id' => $business->id,
+            'commerce_channel_id' => $storeA->id,
+            'commerce_external_id' => 'store-a-product',
+            'name' => 'Store A product', 'price' => 100, 'stock_quantity' => 2, 'is_active' => true,
+        ]);
+
+        $result = app(ActionExecutor::class)->executeAction(
+            ['action' => 'get_products', 'data' => []],
+            $conversation->id,
+            0,
+            false,
+        );
+
+        $this->assertFalse($result['success']);
+        $this->assertArrayNotHasKey('products', $result);
+        $this->assertSame('unresolved', $conversation->fresh()->commerce_context_status);
+    }
+
+    public function test_inactive_agent_cannot_access_its_commerce_connections(): void
+    {
+        [$user, $business] = $this->makeBusiness();
+        $chat = $this->makeChannel($user, $business, 'instagram', 'Instagram');
+        $store = $this->makeChannel($user, $business, 'shopify', 'Shopify');
+        $bot = Bot::create(['business_profile_id' => $business->id, 'name' => 'Paused Bot', 'status' => 'inactive']);
+        $bot->ecommerceConnections()->attach($store->id, ['is_enabled' => true, 'is_default' => true]);
+        $conversation = $this->makeConversation($business, $bot, $chat);
+
+        $result = app(ActionExecutor::class)->executeAction(
+            ['action' => 'get_products', 'data' => []],
+            $conversation->id,
+            0,
+            false,
+        );
+
+        $this->assertFalse($result['success']);
+        $this->assertArrayNotHasKey('products', $result);
+        $this->assertSame('unresolved', $conversation->fresh()->commerce_context_status);
     }
 
     public function test_single_enabled_store_is_automatically_resolved(): void

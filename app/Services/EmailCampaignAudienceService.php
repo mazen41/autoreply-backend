@@ -17,7 +17,50 @@ class EmailCampaignAudienceService
      */
     public function previewCount(BusinessProfile $business, array $criteria): int
     {
-        return count($this->resolveEmailsFromCriteria($business, $criteria));
+        return $this->previewStats($business, $criteria)['count'];
+    }
+
+    public function previewStats(BusinessProfile $business, array $criteria): array
+    {
+        $candidates = $this->candidateEmails($business, $criteria);
+        $excludedAutomated = 0;
+        $excludedNoConsent = 0;
+        $excludedOptedOut = 0;
+        $excludedSuppression = 0;
+        $eligible = [];
+
+        foreach ($candidates as $email) {
+            if ($this->isAutomatedEmail($email)) {
+                $excludedAutomated++;
+                continue;
+            }
+            $decision = app(ConsentGate::class)->check($business, $email, 'email', 'marketing');
+            if (!$decision->allowed) {
+                if ($decision->reason === 'suppressed') {
+                    $excludedSuppression++;
+                } elseif ($decision->reason === 'opted_out') {
+                    $excludedOptedOut++;
+                } else {
+                    $excludedNoConsent++;
+                }
+                continue;
+            }
+            $eligible[] = $email;
+        }
+
+        return [
+            'count' => count($eligible),
+            'total_matched' => count($candidates),
+            'excluded_no_consent' => $excludedNoConsent,
+            'excluded_opted_out' => $excludedOptedOut,
+            'excluded_suppression' => $excludedSuppression,
+            'excluded_automated_sender' => $excludedAutomated,
+            'sender' => [
+                'name' => (string) config('mail.from.name', ''),
+                'address' => (string) config('mail.from.address', ''),
+                'configured' => (string) config('mail.from.address', '') !== '',
+            ],
+        ];
     }
 
     /**
@@ -43,13 +86,25 @@ class EmailCampaignAudienceService
      */
     public function resolveEmailsFromCriteria(BusinessProfile $business, array $criteria): array
     {
-        $mode = $criteria['mode'] ?? 'manual';
+        $candidates = $this->candidateEmails($business, $criteria);
+        return array_values(array_filter($candidates, function (string $email) use ($business) {
+            return !$this->isAutomatedEmail($email)
+                && app(ConsentGate::class)->check($business, $email, 'email', 'marketing')->allowed;
+        }));
+    }
 
-        return match ($mode) {
-            'gmail'    => $this->resolveGmailEmails($business),
+    private function candidateEmails(BusinessProfile $business, array $criteria): array
+    {
+        $mode = $criteria['mode'] ?? 'manual';
+        $emails = match ($mode) {
+            'gmail' => $this->resolveGmailEmails($business),
             'contacts' => $this->resolveContactEmails($business, $criteria),
-            default    => $this->resolveManualEmails($criteria['recipients'] ?? []),
+            default => $this->resolveManualEmails($criteria['recipients'] ?? []),
         };
+
+        return collect($emails)->map(fn ($email) => mb_strtolower(trim((string) $email)))
+            ->filter(fn ($email) => filter_var($email, FILTER_VALIDATE_EMAIL))
+            ->unique()->values()->all();
     }
 
     // ── Manual ───────────────────────────────────────────────────────────────
@@ -64,72 +119,22 @@ class EmailCampaignAudienceService
 
     // ── Gmail ────────────────────────────────────────────────────────────────
 
-    /**
-     * Automated/transactional sender patterns to exclude from Gmail campaigns.
-     * These are people you never actually had a conversation with.
-     */
+    /** Whole local-part tokens that identify clear automated senders. */
     private const AUTOMATED_PATTERNS = [
-        // Local-part patterns (before the @)
         'noreply', 'no-reply', 'donotreply', 'do-not-reply',
-        'mailer-daemon', 'postmaster', 'bounce', 'bounces',
-        'notification', 'notifications', 'alert', 'alerts',
-        'newsletter', 'newsletters', 'news', 'digest',
-        'automated', 'auto', 'automailer', 'system',
-        'daemon', 'robot', 'bot', 'service', 'services',
-        'support-noreply', 'reply-noreply', 'account-noreply',
-        'updates', 'update', 'info-noreply',
-    ];
-
-    /**
-     * Domains that only ever send transactional / marketing email.
-     * Any address @these domains is never a real contact.
-     */
-    private const AUTOMATED_DOMAINS = [
-        // Google
-        'accounts.google.com', 'mail.google.com',
-        'googleplay.com', 'google.com',
-        // Meta
-        'metamail.com', 'facebookmail.com', 'instagram.com',
-        // Commerce
-        'commerce.temuemail.com', 'email.shein.com', 'us.email.shein.com',
-        'news.us.shein.com',
-        // Streaming / subscriptions
-        'spotify.com',
-        // Ride share / delivery
-        'eg.didiglobal.com', 'didiglobal.com',
-        // Sports / media newsletters
-        'email.premierleague.com',
-        // Tech automated
-        'account3.oppo.com',
-        // Generic mailing platforms (add more as you see them)
-        'sendgrid.net', 'mailchimp.com', 'mandrillapp.com',
-        'amazonses.com', 'mailgun.org', 'sendpulse.com',
-        'klaviyo.com', 'constantcontact.com', 'hubspot.com',
-        'salesforce.com', 'marketo.com', 'eloqua.com',
+        'bounce', 'mailer-daemon', 'postmaster',
     ];
 
     private function isAutomatedEmail(string $email): bool
     {
-        [$local, $domain] = explode('@', $email, 2);
+        [$local] = explode('@', $email, 2);
 
-        // Block by full domain
-        if (in_array($domain, self::AUTOMATED_DOMAINS, true)) {
-            return true;
-        }
-
-        // Block by local-part keywords (noreply, bounce, etc.)
+        // Match complete local-part tokens only; ordinary words containing
+        // "auto" or other substrings remain eligible contacts.
         foreach (self::AUTOMATED_PATTERNS as $pattern) {
-            if (str_contains($local, $pattern)) {
+            if (preg_match('/(?:^|[._+\\-])' . preg_quote($pattern, '/') . '(?:$|[._+\\-])/i', $local)) {
                 return true;
             }
-        }
-
-        // Block addresses that are clearly sub-domain mailers:
-        // e.g. anything@mail.something.com, anything@email.something.com
-        // but allow normal sub-domains like @support.company.com
-        $domainParts = explode('.', $domain);
-        if (count($domainParts) >= 3 && in_array($domainParts[0], ['mail', 'email', 'bounce', 'send', 'em', 'e', 'news', 'list', 'lists', 'reply'], true)) {
-            return true;
         }
 
         return false;
@@ -153,7 +158,6 @@ class EmailCampaignAudienceService
                 }
                 return $candidates;
             })
-            ->filter(fn ($email) => !$this->isAutomatedEmail($email))
             ->unique()->values()->all();
     }
 

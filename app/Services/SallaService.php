@@ -75,7 +75,6 @@ class SallaService
         if (!$response->successful()) {
             Log::error('Salla token exchange failed', [
                 'status' => $response->status(),
-                'body'   => $response->body(),
             ]);
             throw new \Exception('Failed to exchange authorization code for token');
         }
@@ -84,7 +83,6 @@ class SallaService
 
         Log::info('[SALLA OAuth Token Response]', [
             'status'         => $response->status(),
-            'body'           => '[redacted]',
             'granted_scopes' => $tokenData['scope'] ?? 'none',
         ]);
 
@@ -106,7 +104,6 @@ class SallaService
         if (!$response->successful()) {
             Log::error('Salla getUserInfo failed', [
                 'status' => $response->status(),
-                'body'   => $response->body(),
             ]);
             throw new \Exception('Failed to get Salla user info: ' . $response->status());
         }
@@ -132,7 +129,6 @@ class SallaService
         if (!$response->successful()) {
             Log::error('Salla token refresh failed', [
                 'status' => $response->status(),
-                'body'   => $response->body(),
             ]);
             throw new \Exception('Failed to refresh access token');
         }
@@ -156,7 +152,6 @@ class SallaService
         if (!$response->successful()) {
             Log::error("Salla API call failed: {$method} {$url}", [
                 'status' => $response->status(),
-                'body'   => $response->body(),
             ]);
 
             if ($response->status() === 429) {
@@ -168,13 +163,13 @@ class SallaService
                 $responseBody = $response->body();
 
                 if ($this->isMissingScopeError($responseBody)) {
-                    throw new \Exception('Salla API scope missing: ' . $responseBody);
+                    throw new \Exception('Salla API scope missing');
                 }
 
                 throw new \Exception('Access token expired');
             }
 
-            throw new \Exception("API call failed: {$response->status()} — " . $response->body());
+            throw new \Exception("API call failed: {$response->status()}");
         }
 
         return $response->json();
@@ -197,7 +192,7 @@ class SallaService
                 Log::error('Salla API request denied because the connected store is missing a required scope; reconnect required', [
                     'channel_id' => $channel->id,
                     'endpoint' => $endpoint,
-                    'error' => $e->getMessage(),
+                    'exception_type' => get_class($e),
                 ]);
 
                 // Refreshing a token cannot add scopes that were not granted during OAuth.
@@ -239,7 +234,7 @@ class SallaService
                         Log::error('Salla API request still denied after token refresh because the store is missing a required scope; reconnect required', [
                             'channel_id' => $channel->id,
                             'endpoint' => $endpoint,
-                            'error' => $refreshEx->getMessage(),
+                            'exception_type' => get_class($refreshEx),
                         ]);
 
                         // The token refresh succeeded, but its grant still lacks the needed scope.
@@ -249,7 +244,7 @@ class SallaService
 
                     Log::error('Salla: token refresh failed — marking channel as token_expired', [
                         'channel_id' => $channel->id,
-                        'error'      => $refreshEx->getMessage(),
+                        'exception_type' => get_class($refreshEx),
                     ]);
                     $channel->update(['status' => 'token_expired']);
                     throw new \Exception("Salla token refresh failed for channel {$channel->id}: " . $refreshEx->getMessage());
@@ -266,7 +261,9 @@ class SallaService
      */
     protected function isMissingScopeError(string $message): bool
     {
-        return str_contains(strtolower($message), 'should have access to one of those scopes');
+        $message = strtolower($message);
+        return str_contains($message, 'should have access to one of those scopes')
+            || str_contains($message, 'salla api scope missing');
     }
 
     /**
@@ -285,8 +282,7 @@ class SallaService
         // Unwrap the standard Salla envelope
         if (isset($response['data']) && is_array($response['data'])) {
             Log::info('Salla store info fetched successfully', [
-                'store_id'   => $response['data']['id']   ?? null,
-                'store_name' => $response['data']['name'] ?? null,
+                'store_id' => $response['data']['id'] ?? null,
             ]);
             return $response['data'];
         }
@@ -296,7 +292,7 @@ class SallaService
             return $response;
         }
 
-        Log::error('Salla getStoreInfo: unexpected response shape', ['response' => $response]);
+        Log::error('Salla getStoreInfo: unexpected response shape', ['response_keys' => array_keys($response)]);
         throw new \Exception('Unexpected response shape from Salla store/info endpoint');
     }
 
@@ -392,7 +388,7 @@ class SallaService
                 // Bug 5 fix: skip known placeholder/test records
                 if (in_array($storedRaw, $placeholderPhones) || in_array($storedLast9, ['555555555'])) {
                     Log::info('Salla: skipping placeholder/test phone customer', [
-                        'returned_phone' => $candidate['mobile'] ?? 'N/A',
+                        'phone_present' => !empty($candidate['mobile']),
                         'customer_id'    => $candidate['id'] ?? 'N/A',
                     ]);
                     continue;
@@ -401,29 +397,23 @@ class SallaService
                 if ($storedLast9 === $last9) {
                     $customer = $candidate;
                     Log::info('Salla: customer phone verified', [
-                        'searched'    => $searchPhone,
-                        'stored'      => $candidate['mobile'] ?? 'N/A',
+                        'phone_match' => true,
                         'customer_id' => $candidate['id'],
                     ]);
                     break 2; // found a verified match — stop searching
                 }
 
-                // Bug 5 fix: log the full raw record so mismatches are debuggable
                 Log::warning('Salla: customer phone mismatch — skipping', [
-                    'searched'        => $searchPhone,
-                    'returned_phone'  => $candidate['mobile'] ?? 'N/A',
-                    'returned_last9'  => $storedLast9,
-                    'expected_last9'  => $last9,
+                    'phone_match' => false,
                     'customer_id'     => $candidate['id'] ?? 'N/A',
-                    'customer_record' => json_encode(array_intersect_key($candidate, array_flip(['id', 'mobile', 'first_name', 'last_name', 'email']))),
                 ]);
             }
         }
 
         if (!$customer) {
             Log::info('Salla: no verified customer found for phone', [
-                'phone'    => $cleanPhone,
-                'variants' => $acceptedVariants,
+                'phone_present' => $cleanPhone !== '',
+                'search_variant_count' => count($acceptedVariants),
             ]);
             return null;
         }
@@ -437,7 +427,6 @@ class SallaService
         if ($order) {
             Log::info('Salla: latest order found for verified customer', [
                 'customer_id'    => $customer['id'],
-                'customer_phone' => $customer['mobile'] ?? 'N/A',
                 'order_id'       => $order['id'] ?? null,
             ]);
         } else {
@@ -482,11 +471,8 @@ class SallaService
                 }
 
                 Log::warning('Salla: customer phone mismatch (channel-aware) — skipping', [
-                    'searched'        => $searchPhone,
-                    'returned_phone'  => $candidate['mobile'] ?? 'N/A',
-                    'returned_last9'  => $storedLast9,
-                    'expected_last9'  => $last9,
-                    'customer_record' => json_encode(array_intersect_key($candidate, array_flip(['id', 'mobile', 'first_name', 'last_name']))),
+                    'channel_id' => $channel->id,
+                    'phone_match' => false,
                 ]);
             }
         }
@@ -550,7 +536,7 @@ class SallaService
                 return (int)$customerId;
             }
         } catch (\Exception $e) {
-            Log::warning('SallaService: POST /customers failed', ['error' => $e->getMessage()]);
+            Log::warning('SallaService: POST /customers failed', ['exception_type' => get_class($e)]);
         }
 
         return null;
@@ -582,7 +568,7 @@ class SallaService
             } catch (\Exception $e) {
                 Log::warning('SallaService: customer profile lookup failed', [
                     'channel_id' => $channel->id,
-                    'error' => $e->getMessage(),
+                    'exception_type' => get_class($e),
                 ]);
             }
         }
@@ -601,7 +587,7 @@ class SallaService
         } catch (\Throwable $e) {
             Log::warning('SallaService: cache read failed; fetching API response without cache', [
                 'cache_key' => $cacheKey,
-                'error' => $e->getMessage(),
+                'exception_type' => get_class($e),
             ]);
         }
 
@@ -615,7 +601,7 @@ class SallaService
             Log::warning('SallaService: cache write failed; continuing with live API response', [
                 'cache_key' => $cacheKey,
                 'endpoint' => $endpoint,
-                'error' => $e->getMessage(),
+                'exception_type' => get_class($e),
             ]);
         }
 
@@ -783,8 +769,36 @@ class SallaService
             '+974' => 'QA', '+973' => 'BH', '+968' => 'OM', '+967' => 'YE',
             '+962' => 'JO', '+961' => 'LB', '+964' => 'IQ', '+1' => 'US',
             '+44' => 'GB', '+90' => 'TR', '+91' => 'IN', '+33' => 'FR',
-            '+49' => 'DE', default => 'SA',
+            '+49' => 'DE', default => null,
         };
+
+        if (!$countryCode) {
+            $addressLower = mb_strtolower($freeformAddress);
+            foreach ([
+                'EG' => ['egypt', 'مصر'], 'SA' => ['saudi arabia', 'ksa', 'السعودية'],
+                'AE' => ['united arab emirates', 'uae', 'الإمارات'], 'KW' => ['kuwait', 'الكويت'],
+                'QA' => ['qatar', 'قطر'], 'BH' => ['bahrain', 'البحرين'], 'OM' => ['oman', 'عمان'],
+                'YE' => ['yemen', 'اليمن'], 'IQ' => ['iraq', 'العراق'], 'SY' => ['syria', 'سوريا'],
+                'JO' => ['jordan', 'الأردن'], 'LB' => ['lebanon', 'لبنان'], 'PS' => ['palestine', 'فلسطين'],
+                'LY' => ['libya', 'ليبيا'], 'TN' => ['tunisia', 'تونس'], 'DZ' => ['algeria', 'الجزائر'],
+                'MA' => ['morocco', 'المغرب'], 'SD' => ['sudan', 'السودان'], 'SO' => ['somalia', 'الصومال'],
+                'DJ' => ['djibouti', 'جيبوتي'], 'KM' => ['comoros', 'جزر القمر'], 'MR' => ['mauritania', 'موريتانيا'],
+            ] as $code => $aliases) {
+                foreach ($aliases as $alias) {
+                    if (mb_stripos($addressLower, mb_strtolower($alias)) !== false) {
+                        $countryCode = $code;
+                        break 2;
+                    }
+                }
+            }
+        }
+
+        if (!$countryCode) {
+            Log::info('SallaService: country could not be determined for shipping address', [
+                'channel_id' => $channel->id,
+            ]);
+            return null;
+        }
 
         $cities = DB::table('salla_cities')
             ->where('channel_id', $channel->id)
@@ -895,7 +909,7 @@ class SallaService
         if (!$customerId) {
             Log::warning('SallaService: unable to resolve or create customer_id for order creation', [
                 'channel_id' => $channel->id,
-                'phone'      => $phone,
+                'phone_present' => $phone !== '',
             ]);
             return null;
         }
@@ -953,7 +967,7 @@ class SallaService
                     ]);
                 }
             } catch (\Exception $e) {
-                Log::warning('SallaService: product lookup by name failed', ['error' => $e->getMessage()]);
+                Log::warning('SallaService: product lookup by name failed', ['exception_type' => get_class($e)]);
             }
         }
 
@@ -999,6 +1013,12 @@ class SallaService
         }
 
         $phoneData = $this->normalizePhoneForCustomer($phone);
+        if (empty($phoneData['mobile_code_country'])) {
+            Log::info('SallaService: phone country could not be determined for customer', [
+                'channel_id' => $channel->id,
+            ]);
+            return null;
+        }
         $internationalMobile = $phoneData['mobile_code_country'] . $phoneData['mobile'];
         $countryCode = match ($phoneData['mobile_code_country']) {
             '+20' => 'EG', '+966' => 'SA', '+971' => 'AE', '+965' => 'KW',
@@ -1091,7 +1111,7 @@ class SallaService
         Log::info('SALLA_ORDER_CREATE_START', ['channel_id' => $channel->id]);
         Log::info('SALLA_ORDER_CREATE_REQUEST', [
             'channel_id' => $channel->id,
-            'payload'    => $data,
+            'field_names' => array_keys($data),
         ]);
 
         try {
@@ -1100,7 +1120,7 @@ class SallaService
             Log::info('SALLA_ORDER_CREATE_RESPONSE', [
                 'channel_id' => $channel->id,
                 'status'     => 200,
-                'response'   => $res,
+                'has_order_id' => !empty($res['data']['reference_id'] ?? $res['data']['id'] ?? $res['id'] ?? null),
             ]);
 
             $orderId = (string)($res['data']['reference_id'] ?? $res['data']['id'] ?? $res['id'] ?? null);
@@ -1115,8 +1135,7 @@ class SallaService
         } catch (\Exception $e) {
             Log::error('SALLA_ORDER_CREATE_FAILED', [
                 'channel_id' => $channel->id,
-                'error'      => $e->getMessage(),
-                'payload'    => $data,
+                'exception_type' => get_class($e),
             ]);
             throw $e;
         }
@@ -1328,7 +1347,7 @@ class SallaService
         }
 
         // Default to Saudi calling code because Salla is Saudi-based.
-        return ['mobile_code_country' => '+966', 'mobile' => $digits];
+        return ['mobile_code_country' => null, 'mobile' => $digits];
     }
 
     /**

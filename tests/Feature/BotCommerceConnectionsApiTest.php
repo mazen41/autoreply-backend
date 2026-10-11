@@ -36,7 +36,7 @@ class BotCommerceConnectionsApiTest extends TestCase
         $shopB = $this->commerceChannel($user, $business, 'shopify', 'Shopify Saudi');
         Sanctum::actingAs($user);
 
-        $response = $this->postJson('/api/bots', [
+        $response = $this->withHeader('X-Business-Id', (string) $business->id)->postJson('/api/bots', [
             'name' => 'Fashion Bot',
             'status' => 'active',
             'ecommerce_connection_ids' => [$shopA->id, $shopB->id],
@@ -71,7 +71,7 @@ class BotCommerceConnectionsApiTest extends TestCase
         $foreignStore = $this->commerceChannel($foreignOwner, $foreignBusiness, 'woocommerce', 'Foreign Store');
         Sanctum::actingAs($owner);
 
-        $this->postJson('/api/bots', [
+        $this->withHeader('X-Business-Id', (string) $business->id)->postJson('/api/bots', [
             'name' => 'Bot',
             'ecommerce_connection_ids' => [$foreignStore->id],
             'default_ecommerce_connection_id' => $foreignStore->id,

@@ -108,6 +108,28 @@ class CheckoutOrderFlowTest extends TestCase
         $this->assertSame('confirmed', $secondConfirmation['confirmation_state']);
     }
 
+    public function test_order_intent_does_not_confirm_and_stale_confirmation_requires_fresh_summary(): void
+    {
+        $service = app(\App\Services\OrderCheckoutService::class);
+
+        $this->assertFalse(\App\Services\OrderCheckoutService::isExplicitOrderConfirmation('i wanna place order for this please'));
+        $this->assertTrue(\App\Services\OrderCheckoutService::isExplicitOrderConfirmation('confirm order'));
+        $this->assertTrue(\App\Services\OrderCheckoutService::isExplicitOrderConfirmation('yes'));
+
+        $staleConfirmed = [
+            'confirmation_state' => 'confirmed',
+            'confirmation_summary_message_id' => 123,
+            'confirmation_summary_fingerprint' => 'old-fingerprint',
+            'confirmation_summary_sent_at' => '2026-10-11T20:00:00Z',
+        ];
+        $reset = $service->updateConfirmationState($staleConfirmed, 'i wanna place order for this please', true, false);
+
+        $this->assertSame('confirmation_pending', $reset['confirmation_state']);
+        $this->assertArrayNotHasKey('confirmation_summary_message_id', $reset);
+        $this->assertArrayNotHasKey('confirmation_summary_fingerprint', $reset);
+        $this->assertArrayNotHasKey('confirmation_summary_sent_at', $reset);
+    }
+
     public function test_shopify_order_failure_details_are_useful_without_logging_checkout_pii(): void
     {
         $job = new ProcessAutoReply(1);

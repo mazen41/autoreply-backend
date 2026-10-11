@@ -68,6 +68,16 @@ class ShopifyOrderPayloadTest extends TestCase
         $this->assertSame('+201001234567', ShopifyOrderPayload::normalizePhone('00201001234567'));
     }
 
+    public function test_egyptian_local_mobile_is_converted_to_international_format(): void
+    {
+        $this->assertSame('+201152879755', ShopifyOrderPayload::normalizePhone('01152879755'));
+    }
+
+    public function test_saudi_local_mobile_is_converted_to_international_format(): void
+    {
+        $this->assertSame('+966551234567', ShopifyOrderPayload::normalizePhone('0551234567'));
+    }
+
     public function test_optional_address_parts_are_omitted_when_unknown(): void
     {
         $body = ShopifyOrderPayload::build(555, 1, $this->checkout(['postal_code' => null, 'city' => null, 'country' => null]));

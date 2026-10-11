@@ -708,14 +708,20 @@ class OrderCheckoutService
         }
 
         // All fields complete — check if customer message explicitly confirms
-        $incomingLower = mb_strtolower(trim($incomingText));
-        $confirmPatterns = '/^(?:yes|yeah|yep|sure|ok|okay|confirm|please confirm|place order|نعم|أكد|اكد|تأكيد|تم|موافق|تم التأكيد|اعتمد|اشتري|اطلب)$/ui';
-        $containsConfirmPhrase = (bool)preg_match($confirmPatterns, $incomingLower)
-            || (bool)preg_match('/(?:yes[\s,]+(?:please\s+)?confirm|yeah[\s,]+(?:please\s+)?confirm|yes confirm|confirm please|confirm order|place the order|نعم أكد|تأكيد الطلب|اعتمد الطلب|أكد الطلب)/ui', $incomingLower);
+        $containsConfirmPhrase = self::isExplicitOrderConfirmation($incomingText);
 
         // A confirmation is valid only after a prior turn presented the
         // complete summary and persisted confirmation_pending.
-        if (
+        if ($currentState === 'confirmed' && (!$containsConfirmPhrase || !$hasValidSummary)) {
+            // A prior confirmation becomes stale after a new customer turn or
+            // when its summary can no longer be verified. Require a fresh summary.
+            $state['confirmation_state'] = 'confirmation_pending';
+            unset(
+                $state['confirmation_summary_message_id'],
+                $state['confirmation_summary_fingerprint'],
+                $state['confirmation_summary_sent_at']
+            );
+        } elseif (
             $containsConfirmPhrase
             && $currentState === 'confirmation_pending'
             && $hasValidSummary
@@ -727,6 +733,17 @@ class OrderCheckoutService
         }
 
         return $state;
+    }
+
+    public static function isExplicitOrderConfirmation(string $text): bool
+    {
+        $normalized = mb_strtolower(trim($text));
+        $normalized = preg_replace('/[,.!]*\s+please[.!]*$/u', '', $normalized) ?? $normalized;
+
+        return (bool) preg_match(
+            '/^(?:(?:yes|yeah|yep|sure|ok|okay)(?:[,.!\\s]+confirm(?:\\s+(?:the\\s+)?order|\\s+(?:it|this))?)?|confirm(?:\\s+(?:the\\s+)?order|\\s+(?:it|this))?|please\\s+confirm(?:\\s+(?:the\\s+)?order)?|submit\\s+(?:the\\s+)?order|نعم(?:\\s+(?:أكد|اكد|تأكيد|موافق))?|(?:أكد|اكد|تأكيد|موافق|اعتمد)\\s+(?:الطلب|الاوردر)|تأكيد الطلب|تم التأكيد)[.!\\s]*$/ui',
+            $normalized
+        );
     }
 
     /** A phone must be a real number: 8-15 digits with only phone formatting around them. */

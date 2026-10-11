@@ -15,6 +15,7 @@ use App\Services\ArabicDialectService;
 use App\Services\BusinessHoursService;
 use App\Services\ProductAwarenessService;
 use App\Services\SequenceTriggerService;
+use App\Services\OrderCheckoutService;
 use Google\Service\Gmail;
 use Google\Service\Gmail\Message as GmailMessage;
 use Illuminate\Bus\Queueable;
@@ -1634,11 +1635,7 @@ class ProcessAutoReply implements ShouldQueue
             : (bool) ($business?->auto_order_confirmation_enabled ?? true);
 
         // Explicit confirmation is necessary; complete checkout fields alone never authorize an order.
-        $incomingLower = mb_strtolower(trim($message->content));
-        $containsConfirmPhrase = (bool) preg_match(
-            '/(?:\\b(?:yes|yeah|yep|sure|ok|okay|confirm|order\\s+this|i\\s+want\\s+(?:to\\s+order\\s+)?this|i\\s+wanna\\s+order\\s+this|place\\s+(?:the\\s+)?order)\\b|نعم|أكد|اكد|تأكيد|موافق|تأكيد الطلب|اعتمد الطلب)/ui',
-            $incomingLower
-        );
+        $containsConfirmPhrase = OrderCheckoutService::isExplicitOrderConfirmation($message->content);
         if ($containsConfirmPhrase || $hasValidOrderSummary) {
             Log::info('ProcessAutoReply: checkout confirmation gate evaluated', [
                 'conversation_id' => $conversation->id,
@@ -1901,6 +1898,7 @@ class ProcessAutoReply implements ShouldQueue
 
             $confirmedCheckoutReady = $containsConfirmPhrase
                 && in_array($checkoutState['confirmation_state'] ?? null, ['confirmed', 'order_placed'], true)
+                && $hasValidOrderSummary
                 && !$isProductBrowseMessage
                 && $commerceChannel
                 && !empty($fieldStatus['is_complete'])
@@ -2144,6 +2142,7 @@ class ProcessAutoReply implements ShouldQueue
         // Salla store. Never claim a confirmed checkout was submitted in that case.
         $orderCreationGateFailures = [];
         if (!$containsConfirmPhrase) $orderCreationGateFailures[] = 'no_confirmation_phrase';
+        if (!$hasValidOrderSummary) $orderCreationGateFailures[] = 'no_valid_current_summary';
         if (!in_array($checkoutState['confirmation_state'] ?? null, ['confirmed', 'order_placed'], true)) $orderCreationGateFailures[] = 'confirmation_state_not_confirmed';
         if ($isProductBrowseMessage) $orderCreationGateFailures[] = 'product_browse_message';
         if (!$commerceChannel) $orderCreationGateFailures[] = 'commerce_connection_unresolved';
@@ -2168,6 +2167,7 @@ class ProcessAutoReply implements ShouldQueue
         }
         if (
             $containsConfirmPhrase
+            && $hasValidOrderSummary
             && in_array($checkoutState['confirmation_state'] ?? null, ['confirmed', 'order_placed'], true)
             && !empty($fieldStatus['is_complete'])
             && !$commerceChannel
@@ -2598,6 +2598,7 @@ $aiResponse = $intro
         // clear the checkout state and escalate after the second attempt.
         if (
             $containsConfirmPhrase
+            && $hasValidOrderSummary
             && in_array($checkoutState['confirmation_state'] ?? null, ['confirmed', 'order_placed'], true)
             && !$isProductBrowseMessage
             && $commerceChannel
@@ -4235,10 +4236,8 @@ $aiResponse = $intro
 
     private function hasValidOrderSummaryForConfirmation(Conversation $conversation, Message $incoming, array $state): bool
     {
-        $shouldLogValidation = (bool) preg_match(
-            '/(?:\\b(?:yes|yeah|yep|sure|ok|okay|confirm|place\\s+(?:the\\s+)?order)\\b|نعم|أكد|اكد|تأكيد|موافق|اعتمد الطلب)/ui',
-            mb_strtolower(trim((string) $incoming->content))
-        ) || ($state['confirmation_state'] ?? null) === 'confirmation_pending';
+        $shouldLogValidation = OrderCheckoutService::isExplicitOrderConfirmation((string) $incoming->content)
+            || in_array($state['confirmation_state'] ?? null, ['confirmation_pending', 'confirmed'], true);
         $summaryId = (int) ($state['confirmation_summary_message_id'] ?? 0);
         if ($summaryId < 1 || empty($state['confirmation_summary_fingerprint'])) {
             if ($shouldLogValidation) Log::info('ProcessAutoReply: order summary validation failed', [

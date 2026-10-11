@@ -203,6 +203,10 @@ class TelegramController extends Controller
                 ]);
             }
 
+            // Telegram message IDs are unique within a chat; use a composite key.
+            $referencedPlatformMessageId = app(\App\Services\ReferencedMessageNormalizer::class)
+                ->telegram($message, $chatId);
+
             // Create message
             $messageModel = Message::create([
                 'conversation_id' => $conversation->id,
@@ -224,7 +228,11 @@ class TelegramController extends Controller
                 'media_processing_reason' => $media !== null && ($media['storage_status'] ?? null) !== 'stored'
                     ? 'Media download or private storage failed.'
                     : null,
-                'metadata' => $media !== null ? ['media' => $media] : null,
+                'metadata' => array_filter([
+                    'media' => $media,
+                    'referenced_platform_message_id' => $referencedPlatformMessageId,
+                    'quoted_message_id' => $referencedPlatformMessageId,
+                ], fn ($value) => $value !== null),
             ]);
 
             // Broadcast real-time event

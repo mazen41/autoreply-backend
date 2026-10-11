@@ -1,0 +1,1 @@
+{"fixture_kind":"synthetic_provider_shape","object":"instagram","entry":[{"id":"IG_ACCOUNT_ID","messaging":[{"sender":{"id":"SENDER_ID"},"recipient":{"id":"IG_ACCOUNT_ID"},"message":{"mid":"INBOUND_MID","text":"I want to order this","reply_to":{"mid":"OUTBOUND_PRODUCT_MID"}}}]}]}

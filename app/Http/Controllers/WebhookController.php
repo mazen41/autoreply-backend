@@ -197,7 +197,7 @@ class WebhookController extends Controller
                     }
 
                     $senderName = collect($value['contacts'] ?? [])->firstWhere('wa_id', $senderId)['profile']['name'] ?? null;
-                    $this->processMessage($channel, $senderId, $text, $messageId, null, $senderName, $media);
+                    $this->processMessage($channel, $senderId, $text, $messageId, app(\App\Services\ReferencedMessageNormalizer::class)->whatsappCloud($incoming), $senderName, $media);
                 }
             }
         }
@@ -271,7 +271,7 @@ class WebhookController extends Controller
                     $messageText = $this->metaMediaFallbackText($media['type'] ?? null);
                 }
                 if ($messageText === '' && $media === null) continue;
-                $this->processMessage($channel, $senderId, $messageText, $incoming['mid'] ?? null, null, null, $media);
+                $this->processMessage($channel, $senderId, $messageText, $incoming['mid'] ?? null, app(\App\Services\ReferencedMessageNormalizer::class)->meta($incoming), null, $media);
             }
 
             // Handle comments
@@ -343,7 +343,7 @@ class WebhookController extends Controller
 
                 $senderId    = $event['sender']['id'];
                 $platformMessageId = $incomingMessage['mid'] ?? null;
-                $replyToMid = $incomingMessage['reply_to']['mid'] ?? null;
+                $replyToMid = app(\App\Services\ReferencedMessageNormalizer::class)->meta($incomingMessage);
 
                 if (str_starts_with($senderId, 'TEST_')) continue;
 
@@ -522,6 +522,7 @@ class WebhookController extends Controller
             $metadata['platform_message_id'] = $platformMessageId;
         }
         if ($replyToMid) {
+            $metadata['referenced_platform_message_id'] = $replyToMid;
             $metadata['quoted_message_id'] = $replyToMid;
             $metadata['reply_to_platform'] = $channel->type;
         }
@@ -1067,6 +1068,8 @@ Reply:";
             $from = $headers['From'] ?? '';
             $subject = $headers['Subject'] ?? '';
             $threadId = $message->getThreadId();
+            $gmailInReplyTo = app(\App\Services\ReferencedMessageNormalizer::class)
+                ->gmail($headers['In-Reply-To'] ?? null);
 
             // Parse sender email
             preg_match('/<(.+)>/', $from, $matches);
@@ -1140,6 +1143,11 @@ Reply:";
                 'is_ai' => false,
                 'status' => 'received',
                 'gmail_message_id' => $messageId,
+                'metadata' => array_filter([
+                    'gmail_thread_id' => $threadId,
+                    'gmail_in_reply_to' => $gmailInReplyTo,
+                    'referenced_platform_message_id' => $gmailInReplyTo,
+                ], fn ($value) => is_string($value) && $value !== ''),
             ]);
 
             Log::info('Gmail message saved', [

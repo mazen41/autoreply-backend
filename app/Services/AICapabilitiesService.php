@@ -393,32 +393,35 @@ ROLE;
             $p .= "intent = order_status, needs_escalation = false\n\n";
         }
 
-        // ── DETERMINISTIC PRODUCT REFERENCE (reply-to-product-image) ───────────
-        // CRITICAL ISSUE — REPLY-TO-PRODUCT CONTEXT / PRODUCT SELECTION: when
-        // present, this was resolved by the backend from the WhatsApp message
-        // the customer directly replied to — it is NOT a guess and must never
-        // be second-guessed, re-asked, or overridden by the AI.
+        // ── DETERMINISTIC PRODUCT REFERENCE ──────────────────────────────────
+        $referenceResolution = $context['referenced_product_resolution'] ?? 'none';
+        $referenceInstruction = $context['referenced_product_instruction'] ?? null;
+        if ($referenceResolution === 'ambiguous' && !empty($context['referenced_product_candidates'])) {
+            $p .= "\nPRODUCT REFERENCE IS AMBIGUOUS\n";
+            $p .= "Ask the customer to choose one product by number. Do not guess or begin checkout. List these exact options with prices:\n";
+            foreach (array_values($context['referenced_product_candidates']) as $index => $candidate) {
+                $p .= ($index + 1) . '. ' . ($candidate['name'] ?? 'Product') . ' — '
+                    . ($candidate['price'] ?? '?') . ' ' . ($candidate['currency'] ?? '') . "\n";
+            }
+            $p .= "Set intent=question and needs_escalation=false.\n\n";
+        } elseif ($referenceInstruction) {
+            $p .= "\nPRODUCT REFERENCE INSTRUCTION\n" . $referenceInstruction . "\n\n";
+        }
+
         if ($hasReferencedProduct) {
             $rp = $context['referenced_product'];
-            $p .= "\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n";
-            $p .= "⚠️ DETERMINISTIC PRODUCT REFERENCE (customer replied to a specific product photo)\n";
-            $p .= "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n";
-            $p .= "The customer's message is a WhatsApp reply directly to one specific product photo\n";
-            $p .= "sent earlier in this conversation. This was resolved by the backend from the exact\n";
-            $p .= "message they replied to — it is certain, not a guess.\n\n";
-            $p .= "Whenever the customer says things like \"this one\", \"this\", \"order this\",\n";
-            $p .= "\"how much is this\", \"add this to my order\", or \"show me more details\", they mean\n";
-            $p .= "EXACTLY this product — never a different one, and never ask them to identify the\n";
-            $p .= "product again or re-list the catalogue:\n\n";
-            $p .= "• Product: " . ($rp['name'] ?? 'Unknown') . "\n";
-            $p .= "• Price: " . ($rp['price'] ?? '?') . " " . ($rp['currency'] ?? 'SAR') . "\n";
+            $p .= "\nDETERMINISTIC PRODUCT REFERENCE\n";
+            $p .= "RESOLVED PRODUCT CONTEXT\n";
+            $p .= "Use only this product when answering this reference; do not ask which product again.\n";
+            $p .= '• Product: ' . ($rp['name'] ?? 'Unknown') . "\n";
+            $p .= '• Price: ' . ($rp['price'] ?? '?') . ' ' . ($rp['currency'] ?? 'SAR') . "\n";
             if (!empty($rp['sku'])) {
-                $p .= "• SKU: {$rp['sku']}\n";
+                $p .= '• SKU: ' . $rp['sku'] . "\n";
             }
-            $p .= "\nIf the customer wants to buy it, skip straight to collecting order details — do NOT\n";
-            $p .= "ask \"which product are you interested in?\" (see ORDER COLLECTION FLOW Step 1 below).\n";
-            $p .= "If they're just asking a question about it (price, details), answer using only the\n";
-            $p .= "data above.\n\n";
+            if ($referenceResolution === 'resolved_recent') {
+                $p .= "This was inferred from one recent product message, not an explicit quote. Ask the customer to confirm this product before starting checkout.\n";
+            }
+            $p .= "\n";
         }
 
         // ── PLACE AN ORDER ────────────────────────────────────────────────────

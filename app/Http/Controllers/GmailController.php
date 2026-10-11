@@ -289,6 +289,8 @@ class GmailController extends Controller
                 $subject     = $headers->get('Subject')?->getValue()     ?? '(no subject)';
                 $gmailMsgId  = $headers->get('Message-ID')?->getValue()  ?? $msgId;
                 $threadId    = $full->getThreadId();
+                $gmailInReplyTo = app(\App\Services\ReferencedMessageNormalizer::class)
+                    ->gmail($headers->get('In-Reply-To')?->getValue());
 
                 // Real sent timestamp from Gmail (milliseconds)
                 $sentAt = \Carbon\Carbon::createFromTimestampMs($full->getInternalDate());
@@ -349,6 +351,11 @@ class GmailController extends Controller
                     'is_ai'            => false,
                     'status'           => 'received',
                     'gmail_message_id' => $gmailMsgId,
+                    'metadata' => array_filter([
+                        'gmail_thread_id' => $threadId,
+                        'gmail_in_reply_to' => $gmailInReplyTo,
+                        'referenced_platform_message_id' => $gmailInReplyTo,
+                    ], fn ($value) => is_string($value) && $value !== ''),
                     'created_at'       => $sentAt,
                     'updated_at'       => $sentAt,
                 ]);

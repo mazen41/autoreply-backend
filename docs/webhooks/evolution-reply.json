@@ -1,0 +1,1 @@
+{"fixture_kind":"synthetic_provider_shape_from_existing_adapter_contract","data":{"key":{"id":"INBOUND_MESSAGE_ID","remoteJid":"CHAT_ID","fromMe":false},"message":{"conversation":"I want to order this"},"contextInfo":{"stanzaId":"OUTBOUND_PRODUCT_ID"}}}

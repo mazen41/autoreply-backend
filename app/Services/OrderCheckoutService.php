@@ -312,9 +312,20 @@ class OrderCheckoutService
         $explicitPhoneContext = preg_match('/\b(?:phone|mobile|telephone|tel)\b/i', $incomingText)
             || preg_match('/(?:رقم الهاتف|رقم الجوال|رقمي)/u', $incomingText)
             || preg_match('/^\s*(?:\+|00)/', $incomingText);
-        if ((!$hasKnownPhone || $explicitPhoneContext)
-            && preg_match('/(?:\+|00)?[0-9][0-9().\s-]{6,22}/', $phoneSearchText, $pm)) {
-            $candidate = trim($pm[0]);
+        $phoneCandidates = [];
+        if (!$hasKnownPhone || $explicitPhoneContext) {
+            // Prefer a number explicitly labeled as the phone. A long customer
+            // message can contain building, postal, and coordinate numbers
+            // before the phone, so taking the first numeric substring is unsafe.
+            if (preg_match('/\b(?:phone|mobile|telephone|tel)\b\s*(?:(?:number|is|no\.)\s*|[:#-]\s*)?((?:\+|00)?[0-9][0-9().\s-]{6,22})/i', $phoneSearchText, $labeledPhone)) {
+                $phoneCandidates[] = trim($labeledPhone[1]);
+            }
+            if (preg_match('/(?:\+|00)?[0-9][0-9().\s-]{6,22}/', $phoneSearchText, $pm)) {
+                $phoneCandidates[] = trim($pm[0]);
+            }
+        }
+
+        foreach (array_unique($phoneCandidates) as $candidate) {
             $digits = preg_replace('/\D+/', '', $candidate);
             $international = str_starts_with($candidate, '+') || str_starts_with($candidate, '00');
             $knownNationalFormat = preg_match('/^01[0125][0-9]{8}$/', $digits)
@@ -323,6 +334,7 @@ class OrderCheckoutService
             if (strlen($digits) >= 8 && strlen($digits) <= 15
                 && ($international || $knownNationalFormat || $knownInternationalPrefix)) {
                 $extractedPhone = $candidate;
+                break;
             }
         }
 

@@ -39,6 +39,32 @@ class TelegramService
         }
     }
 
+    /** Send a product photo and return Telegram's chat-scoped message ID. */
+    public function sendPhoto(string $botToken, string $chatId, string $photo, string $caption = ''): array
+    {
+        try {
+            $response = Http::timeout(15)->post("https://api.telegram.org/bot{$botToken}/sendPhoto", [
+                'chat_id' => $chatId,
+                'photo' => $photo,
+                'caption' => mb_substr($caption, 0, 1024),
+            ]);
+
+            if (!$response->successful() || !$response->json('ok')) {
+                Log::warning('Telegram product photo send failed', ['status' => $response->status()]);
+                return ['success' => false];
+            }
+
+            $messageId = $response->json('result.message_id');
+            return [
+                'success' => true,
+                'message_id' => $messageId !== null ? (string) $messageId : null,
+            ];
+        } catch (\Throwable $exception) {
+            Log::warning('Telegram product photo send failed', ['exception_type' => get_class($exception)]);
+            return ['success' => false];
+        }
+    }
+
     /**
      * Set webhook for Telegram bot
      */

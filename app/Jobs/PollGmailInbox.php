@@ -98,6 +98,8 @@ class PollGmailInbox implements ShouldQueue
         $from     = $headers->firstWhere('name', 'From')?->getValue() ?? 'unknown';
         $threadId = $msg->getThreadId();
         $msgId    = $msg->getId();
+        $inReplyTo = $headers->firstWhere('name', 'In-Reply-To')?->getValue();
+        $inReplyTo = app(\App\Services\ReferencedMessageNormalizer::class)->gmail($inReplyTo);
 
         preg_match('/<(.+?)>/', $from, $m);
         $senderEmail = $m[1] ?? $from;
@@ -150,6 +152,11 @@ class PollGmailInbox implements ShouldQueue
             'is_ai'            => false,
             'status'           => 'received',
             'gmail_message_id' => $msgId,
+            'metadata' => array_filter([
+                'gmail_thread_id' => $threadId,
+                'gmail_in_reply_to' => $inReplyTo,
+                'referenced_platform_message_id' => $inReplyTo,
+            ], fn ($value) => is_string($value) && $value !== ''),
         ]);
 
         // Implement message debounce for Gmail polling

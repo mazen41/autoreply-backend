@@ -124,6 +124,8 @@ class WebChatController extends Controller
         $request->validate([
             'session_id' => 'required|string',
             'message' => 'required|string',
+            'referenced_message_id' => 'nullable|string|max:255',
+            'referenced_platform_message_id' => 'nullable|string|max:255',
         ]);
 
         $session = WebChatSession::where('session_id', $request->session_id)->first();
@@ -138,6 +140,26 @@ class WebChatController extends Controller
             return response()->json(['error' => 'Conversation not found'], 404);
         }
 
+        $reference = $request->input('referenced_platform_message_id')
+            ?? $request->input('referenced_message_id');
+        $validatedReference = null;
+        if (is_string($reference) && $reference !== '') {
+            $referencedMessage = ctype_digit($reference)
+                ? Message::query()->where('conversation_id', $conversation->id)->whereKey((int) $reference)->first()
+                : null;
+            if ($referencedMessage) {
+                $validatedReference = data_get($referencedMessage->metadata, 'platform_message_id')
+                    ?? $referencedMessage->whatsapp_message_id
+                    ?? $referencedMessage->gmail_message_id
+                    ?? ('internal:' . $referencedMessage->id);
+            } elseif (\App\Models\ProductMessageMap::query()
+                ->where('conversation_id', $conversation->id)
+                ->where('platform_message_id', $reference)
+                ->exists()) {
+                $validatedReference = $reference;
+            }
+        }
+
         // Create message
         $message = Message::create([
             'conversation_id' => $conversation->id,
@@ -147,6 +169,10 @@ class WebChatController extends Controller
             'is_ai' => false,
             'source' => 'web_chat',
             'send_status' => 'sent',
+            'metadata' => $validatedReference ? [
+                'referenced_platform_message_id' => (string) $validatedReference,
+                'quoted_message_id' => (string) $validatedReference,
+            ] : null,
         ]);
 
         // Update conversation

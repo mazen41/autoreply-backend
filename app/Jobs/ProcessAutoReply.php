@@ -439,6 +439,97 @@ class ProcessAutoReply implements ShouldQueue
             return;
         }
 
+        // ── BOT RESOLUTION (Deterministic Hierarchy) ──────────────────────────
+        $bot = null;
+        $botResolutionSource = 'none';
+        $invalidStickyBot = false;
+        if ($business) {
+            try {
+                // Priority 1: Existing conversation bot (sticky)
+                if (!empty($conversation->bot_id)) {
+                    $bot = \App\Models\Bot::where('id', $conversation->bot_id)
+                        ->where('business_profile_id', $business->id)
+                        ->where('status', 'active')
+                        ->first();
+                    if ($bot) {
+                        $botResolutionSource = 'conversation_snapshot';
+                    } else {
+                        // Bot exists on conversation but is inactive or from another business
+                        $invalidStickyBot = true;
+                        Log::warning('ProcessAutoReply: conversation bot_id is invalid or inactive, clearing', [
+                            'conversation_id' => $conversation->id,
+                            'invalid_bot_id' => $conversation->bot_id,
+                            'business_id' => $business->id,
+                        ]);
+                        $conversation->update(['bot_id' => null]);
+                    }
+                }
+
+                // Priority 2-4: Resolve from channel's assigned bots
+                if (!$bot && method_exists($channel, 'bots')) {
+                    $activeBots = $channel->bots()
+                        ->where('status', 'active')
+                        ->where('business_profile_id', $business->id)
+                        ->get();
+
+                    if ($activeBots->count() === 1) {
+                        // Priority 3: Exactly one active bot
+                        $bot = $activeBots->first();
+                        $botResolutionSource = 'channel_assignment';
+                    } elseif ($activeBots->count() > 1) {
+                        // Priority 2: Check for primary bot
+                        $primaryBot = $activeBots->first(function ($b) {
+                            return (bool)($b->pivot->is_primary ?? false);
+                        });
+
+                        if ($primaryBot) {
+                            $bot = $primaryBot;
+                            $botResolutionSource = 'channel_primary_bot';
+                        } else {
+                            // Priority 4: Multiple bots, no primary — DO NOT make arbitrary choice
+                            $botResolutionSource = 'channel_multiple_bots_no_primary';
+                            Log::error('ProcessAutoReply: multiple active bots assigned to channel without explicit primary — no bot selected', [
+                                'channel_id' => $channel->id,
+                                'business_id' => $business->id,
+                                'all_bot_ids' => $activeBots->pluck('id')->toArray(),
+                                'all_bot_names' => $activeBots->pluck('name')->toArray(),
+                                'conversation_id' => $conversation->id,
+                            ]);
+                        }
+                    } else {
+                        // Priority 5: No bot assigned
+                        $botResolutionSource = 'no_bot_assigned';
+                    }
+                }
+
+                // Persist bot snapshot on conversation (only for new assignments)
+                if ($bot && empty($conversation->bot_id)) {
+                    $conversation->update(['bot_id' => $bot->id]);
+                }
+            } catch (\Throwable $e) {
+                Log::warning('ProcessAutoReply: Bot resolution skipped (legacy fallback)', [
+                    'exception_type' => get_class($e),
+                    'channel_id' => $channel->id ?? null,
+                    'business_id' => $business->id,
+                ]);
+                $botResolutionSource = 'error_fallback';
+                $bot = null;
+            }
+        }
+
+        // Audit: Bot resolution result
+        Log::info('ProcessAutoReply: Bot resolution', [
+            'conversation_id' => $conversation->id,
+            'channel_id' => $channel->id ?? null,
+            'business_id' => $business->id ?? null,
+            'resolved_bot_id' => $bot?->id,
+            'resolved_bot_name' => $bot?->name,
+            'resolution_source' => $botResolutionSource,
+            'ecommerce_channel_id' => $bot?->ecommerce_channel_id,
+            'ai_provider' => !empty($bot?->ai_provider) ? $bot->ai_provider : ($business?->ai_provider ?? env('AI_PROVIDER', 'groq')),
+            'ai_model' => !empty($bot?->ai_model) ? $bot->ai_model : ($business?->ai_model ?? env('AI_MODEL')),
+        ]);
+
         // Apply tone/persona customization — Bot overrides BusinessProfile
         $effectiveToneStyle = !empty($bot?->ai_tone_style) ? $bot->ai_tone_style : ($channel->business?->ai_tone_style ?? [
             'tone' => 'friendly',
@@ -446,63 +537,22 @@ class ProcessAutoReply implements ShouldQueue
             'focus' => 'support'
         ]);
         
-        // ── CRITICAL ISSUE — REPLY-TO-PRODUCT CONTEXT / PRODUCT SELECTION ──────
-        // If this incoming message is a WhatsApp reply to a specific product
-        // image we previously sent, resolve the EXACT product deterministically
-        // from the persisted message→product mapping. This must happen BEFORE
-        // any keyword/AI intent classification and must NEVER be left to AI
-        // inference — see ProductMessageMap / EvolutionApiService::extractQuotedMessageId().
-        //
-        // Priority order for product identification (per spec):
-        //   1. Replied-to product message (this block)
-        //   2. Active checkout_state on the conversation (persisted across turns)
-        //   3. Explicit product ID/SKU supplied by user (left to existing AI/product context)
-        //   4. AI inference (last resort only)
-        $referencedProduct = null;
-        $quotedMessageId = $message->metadata['quoted_message_id'] ?? null;
+        // Resolve the store once before reference or intent handling. References must
+        // be validated against the same deterministic conversation commerce context.
+        $commerceContext = app(\App\Services\EcommerceChannelResolver::class)
+            ->resolveConversation($conversation, $bot);
+        $commerceChannel = $commerceContext['connection'];
+        $sallaChannel = $commerceChannel?->type === 'salla' ? $commerceChannel : null;
 
-        if ($quotedMessageId) {
-            $productMap = \App\Models\ProductMessageMap::where('conversation_id', $message->conversation_id)
-                ->where('platform_message_id', $quotedMessageId)
-                ->latest('id')
-                ->first();
+        $referencedProductResolver = app(\App\Services\ReferencedProductResolver::class);
+        $referenceResolution = $referencedProductResolver->resolve($message, $conversation, $commerceChannel);
+        $referencedProduct = $referenceResolution['product'];
+        $quotedMessageId = $referenceResolution['referenced_platform_message_id'];
+        $referenceIntent = $referencedProductResolver->intentFor($message->content, $referenceResolution);
 
-            if ($productMap) {
-                $referencedProduct = [
-                    'salla_product_id' => $productMap->salla_product_id ?? $productMap->commerce_external_id,
-                    'commerce_channel_id' => $productMap->commerce_channel_id,
-                    'commerce_external_id' => $productMap->commerce_external_id,
-                    'sku'              => $productMap->sku,
-                    'name'             => $productMap->product_name,
-                    'price'            => $productMap->product_price,
-                    'currency'         => $productMap->currency ?? 'SAR',
-                    'image'            => $productMap->image_url,
-                ];
-
-                Log::info('ProcessAutoReply: resolved referenced product from replied-to message', [
-                    'conversation_id'   => $message->conversation_id,
-                    'quoted_message_id' => $quotedMessageId,
-                    'product_id'        => $referencedProduct['salla_product_id'],
-                ]);
-            } else {
-                Log::info('ProcessAutoReply: message replies to a quoted message but no product mapping was found for it', [
-                    'conversation_id'   => $message->conversation_id,
-                    'quoted_message_id' => $quotedMessageId,
-                ]);
-            }
-        }
-
-        // ── CHECKOUT STATE RECOVERY ─────────────────────────────────────────
-        // If the customer is mid-way through an order collection flow (they have
-        // already identified a product and the bot is collecting name/phone/address),
-        // their follow-up messages (providing those details) will NOT have a
-        // quoted_message_id — so referencedProduct would be null above, causing
-        // the place_order branch to re-fetch products, time out on an expired
-        // token, and show a "product catalogue not available" apology.
-        //
-        // Fix: persist a checkout_state JSON on the conversation every time a
-        // product is confirmed during place_order, then load it back here so the
-        // product identity is never lost between turns.
+        // A referenced product is evidence about identity, not permission to
+        // place an order. Ordering language is required; pointer-only messages
+        // remain product questions and still pass through the order summary flow.
         $checkoutState = $conversation->checkout_state ?? null;
 
         // Handle explicit checkout cancellation before product recovery, AI
@@ -702,25 +752,34 @@ class ProcessAutoReply implements ShouldQueue
             $isPlaceOrder  = false;
         }
 
-        // ── REPLY-TO-PRODUCT "THIS ONE" INTENT ──────────────────────────────
-        // When a specific product was deterministically resolved from a
-        // replied-to image (see block above), phrases like "I want this one",
-        // "order this", "give me this one" unambiguously mean BUY that exact
-        // product — never a generic browse/aggregate request, and never
-        // something the AI should re-classify by guessing. Only fires when a
-        // product was actually resolved, so it can't misfire on ordinary text.
-        if ($referencedProduct) {
-            $thisProductOrderPattern = '/\b(i want this( one)?|i wanna (order|buy) this|order this( one)?|buy this( one)?|this one|give me this( one)?|i\'?ll take this|i will take this|add this to (my )?(order|cart))\b/iu';
-            if (preg_match($thisProductOrderPattern, $msgLower)) {
-                $isPlaceOrder      = true;
-                $isProductAggregate = false;
-                $isOrderAggregate   = false;
-                $isOrderStatus      = false;
-                Log::info('ProcessAutoReply: "this one" reply-to-product phrasing detected — forcing place_order intent', [
-                    'conversation_id' => $conversation->id,
-                    'product_id'      => $referencedProduct['salla_product_id'],
-                ]);
-            }
+        // Capture intent before applying the explicit reference policy for logs.
+        $intentBefore = $isOrderStatus ? 'order_status' : ($isPlaceOrder ? 'place_order' : ($isProductAggregate ? 'product_inquiry' : 'question'));
+
+        // A resolved pointer becomes an order only when ordering language is
+        // present. A pointer alone asks about that product.
+        if ($referenceIntent === 'place_order') {
+            $isPlaceOrder = true;
+            $isProductAggregate = false;
+            $isOrderAggregate = false;
+            $isOrderStatus = false;
+        } elseif ($referenceIntent === 'question') {
+            $isPlaceOrder = false;
+        }
+
+        if ($referenceResolution['is_pointer'] || $quotedMessageId) {
+            $intentAfter = $referenceIntent ?? ($referenceResolution['resolution'] === 'ambiguous' ? 'clarify_product' : $intentBefore);
+            Log::info('Reference resolution', [
+                'message_id' => $message->id,
+                'conversation_id' => $conversation->id,
+                'channel_type' => $channel->type,
+                'referenced_platform_message_id_present' => !empty($quotedMessageId),
+                'match_method' => $referenceResolution['match_method'],
+                'resolution' => $referenceResolution['resolution'],
+                'product_external_id' => $referencedProduct['commerce_external_id'] ?? null,
+                'store_id' => $commerceChannel?->id,
+                'intent_before' => $intentBefore,
+                'intent_after' => $intentAfter,
+            ]);
         }
 
         // Bug 6 fix: detect bare order-number follow-up replies like "#276817444" or "276817444".
@@ -758,97 +817,6 @@ class ProcessAutoReply implements ShouldQueue
             }
         }
 
-        // ── BOT RESOLUTION (Deterministic Hierarchy) ──────────────────────────
-        $bot = null;
-        $botResolutionSource = 'none';
-        $invalidStickyBot = false;
-        if ($business) {
-            try {
-                // Priority 1: Existing conversation bot (sticky)
-                if (!empty($conversation->bot_id)) {
-                    $bot = \App\Models\Bot::where('id', $conversation->bot_id)
-                        ->where('business_profile_id', $business->id)
-                        ->where('status', 'active')
-                        ->first();
-                    if ($bot) {
-                        $botResolutionSource = 'conversation_snapshot';
-                    } else {
-                        // Bot exists on conversation but is inactive or from another business
-                        $invalidStickyBot = true;
-                        Log::warning('ProcessAutoReply: conversation bot_id is invalid or inactive, clearing', [
-                            'conversation_id' => $conversation->id,
-                            'invalid_bot_id' => $conversation->bot_id,
-                            'business_id' => $business->id,
-                        ]);
-                        $conversation->update(['bot_id' => null]);
-                    }
-                }
-
-                // Priority 2-4: Resolve from channel's assigned bots
-                if (!$bot && method_exists($channel, 'bots')) {
-                    $activeBots = $channel->bots()
-                        ->where('status', 'active')
-                        ->where('business_profile_id', $business->id)
-                        ->get();
-
-                    if ($activeBots->count() === 1) {
-                        // Priority 3: Exactly one active bot
-                        $bot = $activeBots->first();
-                        $botResolutionSource = 'channel_assignment';
-                    } elseif ($activeBots->count() > 1) {
-                        // Priority 2: Check for primary bot
-                        $primaryBot = $activeBots->first(function ($b) {
-                            return (bool)($b->pivot->is_primary ?? false);
-                        });
-
-                        if ($primaryBot) {
-                            $bot = $primaryBot;
-                            $botResolutionSource = 'channel_primary_bot';
-                        } else {
-                            // Priority 4: Multiple bots, no primary — DO NOT make arbitrary choice
-                            $botResolutionSource = 'channel_multiple_bots_no_primary';
-                            Log::error('ProcessAutoReply: multiple active bots assigned to channel without explicit primary — no bot selected', [
-                                'channel_id' => $channel->id,
-                                'business_id' => $business->id,
-                                'all_bot_ids' => $activeBots->pluck('id')->toArray(),
-                                'all_bot_names' => $activeBots->pluck('name')->toArray(),
-                                'conversation_id' => $conversation->id,
-                            ]);
-                        }
-                    } else {
-                        // Priority 5: No bot assigned
-                        $botResolutionSource = 'no_bot_assigned';
-                    }
-                }
-
-                // Persist bot snapshot on conversation (only for new assignments)
-                if ($bot && empty($conversation->bot_id)) {
-                    $conversation->update(['bot_id' => $bot->id]);
-                }
-            } catch (\Throwable $e) {
-                Log::warning('ProcessAutoReply: Bot resolution skipped (legacy fallback)', [
-                    'exception_type' => get_class($e),
-                    'channel_id' => $channel->id ?? null,
-                    'business_id' => $business->id,
-                ]);
-                $botResolutionSource = 'error_fallback';
-                $bot = null;
-            }
-        }
-
-        // Audit: Bot resolution result
-        Log::info('ProcessAutoReply: Bot resolution', [
-            'conversation_id' => $conversation->id,
-            'channel_id' => $channel->id ?? null,
-            'business_id' => $business->id ?? null,
-            'resolved_bot_id' => $bot?->id,
-            'resolved_bot_name' => $bot?->name,
-            'resolution_source' => $botResolutionSource,
-            'ecommerce_channel_id' => $bot?->ecommerce_channel_id,
-            'ai_provider' => !empty($bot?->ai_provider) ? $bot->ai_provider : ($business?->ai_provider ?? env('AI_PROVIDER', 'groq')),
-            'ai_model' => !empty($bot?->ai_model) ? $bot->ai_model : ($business?->ai_model ?? env('AI_MODEL')),
-        ]);
-
         // Find Salla channel — Priority 1: Bot's explicit ecommerce_channel_id if set
         // Priority 2: Conversation's own channel if it IS a Salla channel
         // Priority 3: Fall back to resolveUniqueConnectedChannel
@@ -872,13 +840,6 @@ class ProcessAutoReply implements ShouldQueue
             ]);
             return;
         }
-
-        // Resolve commerce once for this processing cycle. Provider-specific
-        // paths below receive only this backend-authorized connection.
-        $commerceContext = app(\App\Services\EcommerceChannelResolver::class)
-            ->resolveConversation($conversation, $bot);
-        $commerceChannel = $commerceContext['connection'];
-        $sallaChannel = $commerceChannel?->type === 'salla' ? $commerceChannel : null;
 
         // Product context must follow the same resolved store as commerce
         // tools. If connected stores exist but routing is unresolved, expose
@@ -991,7 +952,7 @@ class ProcessAutoReply implements ShouldQueue
             try {
                 if ($commerceChannel->type === 'shopify' && $phone !== '') {
                     $response = Http::withToken($commerceChannel->access_token)
-                        ->get("https://{$commerceChannel->page_id}/admin/api/2026-07/orders.json", [
+                        ->get("https://{$commerceChannel->page_id}/admin/api/" . config('services.shopify.api_version', '2026-07') . "/orders.json", [
                             'status' => 'any',
                             'limit' => 1,
                             'order' => 'created_at desc',
@@ -1135,7 +1096,7 @@ class ProcessAutoReply implements ShouldQueue
 
                                 if ($shopifyChannel && $phoneMatch) {
                                     $shopifyResponse = Http::withToken($shopifyChannel->access_token)
-                                        ->get("https://{$shopifyChannel->page_id}/admin/api/2024-01/orders.json", [
+                                        ->get("https://{$shopifyChannel->page_id}/admin/api/" . config('services.shopify.api_version', '2026-07') . "/orders.json", [
                                             'customer_phone' => $phoneMatch,
                                             'status' => 'any',
                                             'limit' => 1,
@@ -1338,7 +1299,9 @@ class ProcessAutoReply implements ShouldQueue
         // Precedence: Bot setting overrides BusinessProfile default fallback
         $effectiveAiInstructions = !empty($bot?->ai_instructions) ? $bot->ai_instructions : ($business?->ai_instructions ?? null);
         $effectiveReplyStyle     = !empty($bot?->reply_style) ? $bot->reply_style : ($business?->reply_style ?? null);
-        $effectiveConfidenceThreshold = !empty($bot?->ai_confidence_threshold) ? $bot->ai_confidence_threshold : ($business?->ai_confidence_threshold ?? 0.80);
+        $effectiveConfidenceThreshold = self::normalizeConfidenceScore(
+            !empty($bot?->ai_confidence_threshold) ? $bot->ai_confidence_threshold : ($business?->ai_confidence_threshold ?? 0.80)
+        ) ?? 0.80;
         $effectiveEscalationConfig = !empty($bot?->escalation_config) ? $bot->escalation_config : ($business?->escalation_config ?? null);
 
         // ── COMPUTE EXISTING CHECKOUT FIELD STATUS FOR STRUCTURED STATE ──────
@@ -1737,6 +1700,14 @@ class ProcessAutoReply implements ShouldQueue
             // if any. See getUltimateSystemPrompt() — when present, the AI
             // must never ask "which product" again.
             'referenced_product'       => $referencedProduct,
+            'referenced_product_resolution' => $referenceResolution['resolution'],
+            'referenced_product_candidates' => $referenceResolution['candidates'],
+            'referenced_product_instruction' => match ($referenceResolution['resolution']) {
+                'ambiguous' => 'Ask the customer to choose one of the numbered recent products below. Include each product name and price. Do not start checkout until one is selected.',
+                'resolved_recent' => 'This product was inferred from one recent product message, not an explicit quote. Confirm the product with the customer before placing an order.',
+                'resolved' => $referenceIntent === 'place_order' ? 'The exact quoted product is resolved. Collect missing order details and show the order summary before creating the order.' : 'Answer the product question using only this resolved product.',
+                default => $referenceResolution['is_pointer'] ? 'No recent product can be safely resolved. Ask which product they mean and offer to show the catalog.' : null,
+            },
             // Active partial order state (persisted across turns so the AI
             // knows which fields have already been collected and won't re-ask).
             'cart'                     => !empty($updatedCheckoutState) ? $updatedCheckoutState : null,
@@ -1871,6 +1842,55 @@ class ProcessAutoReply implements ShouldQueue
             }
         }
 
+        if (!$isProductBrowseMessage && $commerceChannel) {
+            if ($referenceResolution['resolution'] === 'ambiguous') {
+                $options = [];
+                foreach (array_values($referenceResolution['candidates']) as $index => $candidate) {
+                    $options[] = ($index + 1) . '. ' . ($candidate['name'] ?? 'Product') . ' — '
+                        . ($candidate['price'] ?? '?') . ' ' . ($candidate['currency'] ?? '');
+                }
+                if ($options) {
+                    $aiResult['reply'] = $detectedLanguage === 'arabic'
+                        ? "تقصد أي منتج؟ اختار رقم المنتج:\n" . implode("\n", $options)
+                        : "Which product do you mean? Please choose one:\n" . implode("\n", $options);
+                } else {
+                    $aiResult['reply'] = $detectedLanguage === 'arabic'
+                        ? 'أي منتج تقصد؟ أقدر أعرض لك المنتجات المتاحة.'
+                        : 'Which product do you mean? I can show you the available products.';
+                }
+                $intent = 'question';
+                $isPlaceOrder = false;
+                $needsEscalation = false;
+                $aiResult['intent'] = 'question';
+                $aiResult['needs_escalation'] = false;
+                $escalationReason = 'none';
+            } elseif ($referenceResolution['resolution'] === 'resolved_recent' && $referenceIntent === 'place_order') {
+                $productName = $referencedProduct['name'] ?? 'this product';
+                $aiResult['reply'] = $detectedLanguage === 'arabic'
+                    ? "تقصد {$productName}؟ أكد لي من فضلك قبل ما نبدأ الطلب."
+                    : "Do you mean {$productName}? Please confirm before I start the order.";
+                $intent = 'question';
+                $isPlaceOrder = false;
+                $aiResult['intent'] = 'question';
+                $needsEscalation = false;
+                $aiResult['needs_escalation'] = false;
+                $escalationReason = 'none';
+            } elseif ($referenceResolution['resolution'] === 'none' && $referenceResolution['is_pointer']) {
+                $aiResult['reply'] = $detectedLanguage === 'arabic'
+                    ? 'أي منتج تقصد؟ أقدر أعرض لك المنتجات المتاحة.'
+                    : 'Which product do you mean? I can show you the available products.';
+                $intent = 'question';
+                $isPlaceOrder = false;
+                $aiResult['intent'] = 'question';
+                $needsEscalation = false;
+                $aiResult['needs_escalation'] = false;
+                $escalationReason = 'none';
+            } elseif ($referenceResolution['resolution'] === 'resolved' && $referenceIntent !== null) {
+                $intent = $referenceIntent;
+                $aiResult['intent'] = $referenceIntent;
+            }
+        }
+
         // A Maps URL is a delivery-detail answer during an active checkout,
         // even if the model labels the bare link as an unclear question.
         $isCheckoutMapsLink = !$isProductBrowseMessage
@@ -1934,8 +1954,7 @@ class ProcessAutoReply implements ShouldQueue
         // A missing OAuth grant can leave this conversation without a connected
         // Salla store. Never claim a confirmed checkout was submitted in that case.
         if (
-            $intent === 'place_order'
-            && $containsConfirmPhrase
+            $containsConfirmPhrase
             && in_array($checkoutState['confirmation_state'] ?? null, ['confirmed', 'order_placed'], true)
             && !empty($fieldStatus['is_complete'])
             && !$sallaChannel
@@ -2166,7 +2185,7 @@ class ProcessAutoReply implements ShouldQueue
 
         $imagesActuallySent = 0;
         if (!empty($productImageItems)) {
-            $imagesActuallySent = $this->sendImagesToCustomer($channel, $conversation, $productImageItems);
+            $imagesActuallySent = $this->sendImagesToCustomer($channel, $conversation, $productImageItems, $commerceChannel);
             Log::info('ProcessAutoReply: image send attempt result', [
                 'conversation_id' => $conversation->id,
                 'attempted'       => count($productImageItems),
@@ -2239,7 +2258,14 @@ class ProcessAutoReply implements ShouldQueue
             'is_ai' => true,
             'source' => 'ai',
             'send_status' => 'pending',
-            'metadata' => $isOrderSummaryMessage ? ['order_summary' => true] : null,
+            'metadata' => $isOrderSummaryMessage
+                ? ['order_summary' => true]
+                : (($referenceResolution['resolution'] === 'resolved_recent' && $referenceIntent === 'place_order')
+                    ? ['pending_product_confirmation' => [
+                        'commerce_channel_id' => $referencedProduct['commerce_channel_id'] ?? null,
+                        'commerce_external_id' => $referencedProduct['commerce_external_id'] ?? null,
+                    ]]
+                    : null),
             'confidence_score' => self::normalizeConfidenceScore($aiResult['confidence'] ?? null),
             'detected_dialect' => in_array($detectedDialect, ['egyptian', 'gulf', 'msa', 'mixed']) ? $detectedDialect : null,
             'intent' => $intent,
@@ -2273,19 +2299,17 @@ class ProcessAutoReply implements ShouldQueue
         // returns a real order ID. If Salla fails, we override the reply with
         // an honest failure message and escalate to a human agent.
         //
-        // Trigger conditions (ALL must be true for us to attempt creation):
-        //   1. intent is place_order
-        //   2. A Salla channel is connected for this user
-        //   3. checkout_state has the 4 required fields collected by the AI:
-        //      salla_product_id, customer_phone, address, full_name
-        //   4. The AI reply is NOT still collecting info (no trailing question)
+        // Trigger only after the customer explicitly confirms a valid summary,
+        // the backend has resolved an active commerce connection, and the
+        // checkout state contains the scoped product and required customer data.
+        // The deterministic state is authoritative; the LLM intent label and
+        // reply wording cannot veto a valid confirmation.
         //
         // This block runs BEFORE the checkout-state-persistence block so that
         // when the order succeeds we persist its real ID; repeated failures
         // clear the checkout state and escalate after the second attempt.
         if (
-            $intent === 'place_order'
-            && $containsConfirmPhrase
+            $containsConfirmPhrase
             && in_array($checkoutState['confirmation_state'] ?? null, ['confirmed', 'order_placed'], true)
             && !$isProductBrowseMessage
             && $commerceChannel
@@ -2295,22 +2319,11 @@ class ProcessAutoReply implements ShouldQueue
             && !empty($checkoutState['address'] ?? $checkoutState['customer_address'] ?? '')
             && !empty($checkoutState['full_name'] ?? $checkoutState['customer_name'] ?? '')
         ) {
-            $aiReplyLower  = mb_strtolower($aiResponse);
-            $stillAsking   = str_contains($aiReplyLower, '?')
-                || str_contains($aiReplyLower, 'what is your')
-                || str_contains($aiReplyLower, 'please provide')
-                || str_contains($aiReplyLower, 'could you')
-                || str_contains($aiReplyLower, 'اسمك')
-                || str_contains($aiReplyLower, 'عنوانك')
-                || str_contains($aiReplyLower, 'رقمك')
-                || str_contains($aiReplyLower, 'من فضلك');
-
-            if (!$stillAsking) {
-                Log::info('ProcessAutoReply: triggering real Salla order creation', [
-                    'conversation_id' => $conversation->id,
-                    'product_id'      => $checkoutState['salla_product_id'],
-                    'customer_phone'  => $checkoutState['customer_phone'] ?? $checkoutState['phone'] ?? '',
-                ]);
+            Log::info('ProcessAutoReply: triggering real commerce order creation after validated confirmation', [
+                'conversation_id' => $conversation->id,
+                'product_id'      => $checkoutState['salla_product_id'],
+                'customer_phone_present' => !empty($checkoutState['customer_phone'] ?? $checkoutState['phone'] ?? ''),
+            ]);
 
                 // Normalise checkout_state keys to what SallaService expects
                 $orderInput = [
@@ -2436,11 +2449,6 @@ class ProcessAutoReply implements ShouldQueue
                         $conversation->update(['checkout_state' => $updatedCheckoutState]);
                     }
                 }
-            } else {
-                Log::info('ProcessAutoReply: place_order intent but AI still collecting info — skipping Salla API call', [
-                    'conversation_id' => $conversation->id,
-                ]);
-            }
         }
         // ── END REAL SALLA ORDER CREATION ────────────────────────────────────
 
@@ -2843,7 +2851,7 @@ class ProcessAutoReply implements ShouldQueue
      *
      * @param array $productItems Each item: ['id','name','price','currency','quantity','image_url','sku'?]
      */
-    private function sendImagesToCustomer(Channel $channel, Conversation $conversation, array $productItems): int
+    private function sendImagesToCustomer(Channel $channel, Conversation $conversation, array $productItems, ?Channel $commerceChannel = null): int
     {
         $sentCount = 0;
         $recipientId = $conversation->sender_id;
@@ -2898,6 +2906,15 @@ class ProcessAutoReply implements ShouldQueue
                         $sentCount++;
                         $imageWasSent = true;
                     }
+                } elseif ($channel->type === 'telegram') {
+                    $telegramResponse = app(\App\Services\TelegramService::class)
+                        ->sendPhoto((string) $channel->access_token, $recipientId, $imageUrl, (string) ($item['name'] ?? ''));
+                    if (!empty($telegramResponse['success'])) {
+                        $providerMessageId = $telegramResponse['message_id'] ?? null;
+                        $sentMessageId = $providerMessageId !== null ? $recipientId . ':' . $providerMessageId : null;
+                        $sentCount++;
+                        $imageWasSent = true;
+                    }
                 } elseif (in_array($channel->type, ['facebook', 'instagram'], true)) {
                     $accessToken = $channel->access_token;
                     $response = Http::timeout(10)->post(
@@ -2934,9 +2951,10 @@ class ProcessAutoReply implements ShouldQueue
                 ]);
             }
 
+            $productImageMessageId = null;
             if ($imageWasSent) {
                 try {
-                    Message::create([
+                    $productImageMessage = Message::create([
                         'conversation_id' => $conversation->id,
                         'content' => trim((string) ($item['name'] ?? 'Product image')),
                         'type' => 'image',
@@ -2951,8 +2969,11 @@ class ProcessAutoReply implements ShouldQueue
                         'metadata' => [
                             'platform_message_id' => $sentMessageId,
                             'commerce_product_id' => $item['commerce_external_id'] ?? $item['id'] ?? null,
+                            'commerce_channel_id' => $commerceChannel?->id,
+                            'commerce_provider' => $commerceChannel?->type,
                         ],
                     ]);
+                    $productImageMessageId = $productImageMessage->id;
                 } catch (\Throwable $e) {
                     Log::error('ProcessAutoReply: sent product image could not be recorded for billing', [
                         'conversation_id' => $conversation->id,
@@ -2962,48 +2983,73 @@ class ProcessAutoReply implements ShouldQueue
                 }
             }
 
-            // Persist the deterministic message→product mapping ONLY when we
-            // actually have the outgoing message id — without it a later reply
-            // can never be traced back to this specific image.
-            if ($sentMessageId) {
-                try {
-                    \App\Models\ProductMessageMap::updateOrCreate(
-                        [
-                            'conversation_id'      => $conversation->id,
-                            'platform_message_id'  => $sentMessageId,
-                        ],
-                        [
-                            'channel_id'       => $channel->id,
-                            'salla_product_id' => ($conversation->ecommerceConnection?->type === 'salla' && isset($item['id'])) ? (string) $item['id'] : null,
-                            'commerce_channel_id' => $item['commerce_channel_id'] ?? $conversation->ecommerce_connection_id,
-                            'commerce_external_id' => $item['commerce_external_id'] ?? null,
-                            'sku'              => $item['sku'] ?? null,
-                            'product_name'     => $item['name'] ?? null,
-                            'product_price'    => isset($item['price']) ? (string) $item['price'] : null,
-                            'currency'         => $item['currency'] ?? null,
-                            'image_url'        => $imageUrl,
-                        ]
-                    );
+            // Product references are usable only when both the resolved store
+            // and provider product identity are persisted. Telegram IDs include
+            // chat ID so per-chat message IDs cannot collide.
+            if ($imageWasSent) {
+                $externalProductId = $item['commerce_external_id'] ?? $item['id'] ?? null;
+                if ($commerceChannel && $externalProductId !== null && (string) $externalProductId !== '') {
+                    try {
+                        $internalProductId = \App\Models\Product::query()
+                            ->where('business_id', $conversation->business_id)
+                            ->where('commerce_channel_id', $commerceChannel->id)
+                            ->where('commerce_external_id', (string) $externalProductId)
+                            ->value('id');
+                        $mapValues = [
+                            'channel_id' => $channel->id,
+                            'provider' => $channel->type,
+                            'commerce_provider' => $commerceChannel->type,
+                            'recipient_id' => (string) $recipientId,
+                            'sent_at' => now(),
+                            'internal_message_id' => $productImageMessageId,
+                            'salla_product_id' => $commerceChannel->type === 'salla' ? (string) $externalProductId : null,
+                            'internal_product_id' => $internalProductId,
+                            'commerce_channel_id' => $commerceChannel->id,
+                            'commerce_external_id' => (string) $externalProductId,
+                            'sku' => $item['sku'] ?? null,
+                            'product_name' => $item['name'] ?? null,
+                            'product_price' => isset($item['price']) ? (string) $item['price'] : null,
+                            'currency' => $item['currency'] ?? null,
+                            'image_url' => $imageUrl,
+                        ];
 
-                    // Deliberate INFO-level success log: its absence was what
-                    // made the original bug hard to diagnose from production
-                    // logs alone (image sends looked "successful" with no way
-                    // to tell whether the mapping was actually persisted).
-                    Log::info('ProcessAutoReply: persisted product message map', [
-                        'conversation_id'     => $conversation->id,
-                        'platform_message_id' => $sentMessageId,
-                        'salla_product_id'    => isset($item['id']) ? (string) $item['id'] : null,
-                        'commerce_channel_id' => $item['commerce_channel_id'] ?? null,
-                        'commerce_external_id' => $item['commerce_external_id'] ?? null,
-                    ]);
-                } catch (\Exception $e) {
-                    Log::error('ProcessAutoReply: failed to persist product message map', [
+                        if ($sentMessageId !== null) {
+                            \App\Models\ProductMessageMap::updateOrCreate(
+                                ['conversation_id' => $conversation->id, 'platform_message_id' => $sentMessageId],
+                                $mapValues,
+                            );
+                        } else {
+                            \App\Models\ProductMessageMap::create([
+                                'conversation_id' => $conversation->id,
+                                'platform_message_id' => null,
+                                ...$mapValues,
+                            ]);
+                        }
+
+                        Log::info('ProcessAutoReply: persisted product message map', [
+                            'conversation_id' => $conversation->id,
+                            'platform_message_id_present' => $sentMessageId !== null,
+                            'commerce_channel_id' => $commerceChannel->id,
+                            'provider' => $channel->type,
+                            'commerce_provider' => $commerceChannel->type,
+                            'commerce_external_id' => (string) $externalProductId,
+                            'internal_product_id' => $internalProductId,
+                        ]);
+                    } catch (\Throwable $e) {
+                        Log::error('ProcessAutoReply: failed to persist product message map', [
+                            'conversation_id' => $conversation->id,
+                            'exception_type' => get_class($e),
+                        ]);
+                    }
+                } else {
+                    Log::warning('ProcessAutoReply: product image sent without safe commerce identity; reference disabled', [
                         'conversation_id' => $conversation->id,
-                        'message_id'      => $sentMessageId,
-                        'exception_type' => get_class($e),
+                        'store_id_present' => $commerceChannel !== null,
+                        'external_product_id_present' => $externalProductId !== null && (string) $externalProductId !== '',
                     ]);
                 }
             }
+
         }
 
         return $sentCount;
@@ -3461,25 +3507,7 @@ class ProcessAutoReply implements ShouldQueue
                         $nameParts = preg_split('/\s+/', trim((string) ($checkoutState['full_name'] ?? '')), 2) ?: [];
                         $shop  = $shopifyChannel->page_id;
                         $token = $shopifyChannel->access_token;
-                        $response = Http::withToken($token)->post("https://{$shop}/admin/api/2026-07/orders.json", [
-                            'order' => [
-                                'line_items' => [
-                                    [
-                                        'variant_id' => (int) $variantMatch[1],
-                                        'quantity' => max(1, (int) ($checkoutState['quantity'] ?? 1)),
-                                    ]
-                                ],
-                                'customer' => [
-                                    'first_name' => $nameParts[0] ?? '',
-                                    'last_name'  => $nameParts[1] ?? ($nameParts[0] ?? ''),
-                                    'phone'      => $checkoutState['phone'] ?? $conversation->sender_id,
-                                    'email'      => $checkoutState['email'] ?? null,
-                                ],
-                                'shipping_address' => [
-                                    'address1' => $checkoutState['address'] ?? '',
-                                ]
-                            ]
-                        ]);
+                        $response = Http::withToken($token)->post("https://{$shop}/admin/api/" . config('services.shopify.api_version', '2026-07') . "/orders.json", \App\Services\ShopifyOrderPayload::build((int) $variantMatch[1], (int) ($checkoutState['quantity'] ?? 1), $checkoutState));
 
                         if ($response->successful()) {
                             $resJson = $response->json();

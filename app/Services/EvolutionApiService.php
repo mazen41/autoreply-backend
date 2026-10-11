@@ -650,6 +650,7 @@ class EvolutionApiService
                     // or null when this message isn't a reply. ProcessAutoReply
                     // uses this to deterministically resolve which product a
                     // reply like "I want this one" refers to.
+                    'referenced_platform_message_id' => $quotedMessageId,
                     'quoted_message_id' => $quotedMessageId,
                 ],
             ]);
@@ -1141,36 +1142,7 @@ class EvolutionApiService
      */
     protected function extractQuotedMessageId(array $data, array $messageContent = []): ?string
     {
-        // REAL location, confirmed against production payloads: sibling of
-        // `message` at the top level of `data`.
-        if (isset($data['contextInfo']['stanzaId'])) {
-            return $data['contextInfo']['stanzaId'];
-        }
-
-        // Fallback: some normalizations flatten contextInfo directly onto
-        // the message-content object itself.
-        if (isset($messageContent['contextInfo']['stanzaId'])) {
-            return $messageContent['contextInfo']['stanzaId'];
-        }
-
-        // Fallback: nested inside a specific message-type key (raw Baileys shape).
-        $typeKeys = [
-            'extendedTextMessage',
-            'imageMessage',
-            'videoMessage',
-            'audioMessage',
-            'documentMessage',
-            'stickerMessage',
-            'conversation',
-        ];
-
-        foreach ($typeKeys as $key) {
-            if (isset($messageContent[$key]['contextInfo']['stanzaId'])) {
-                return $messageContent[$key]['contextInfo']['stanzaId'];
-            }
-        }
-
-        return null;
+        return app(ReferencedMessageNormalizer::class)->evolution($data, $messageContent);
     }
 
     /**

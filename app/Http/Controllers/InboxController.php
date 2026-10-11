@@ -36,8 +36,9 @@ class InboxController extends Controller
                 'channel:id,type,page_name,page_id',
                 'bot:id,name',
                 'latestMessage',
+                'latestCommerceOrderAttempt',
             ])
-            ->select(['id', 'channel_id', 'business_id', 'bot_id', 'sender_id', 'sender_name', 'sender_email', 'subject', 'status', 'ai_enabled', 'requires_human', 'escalated_at', 'escalation_reason', 'last_message_at', 'assigned_agent_id', 'assigned_at'])
+            ->select(['id', 'channel_id', 'business_id', 'bot_id', 'sender_id', 'sender_name', 'sender_email', 'subject', 'status', 'ai_enabled', 'requires_human', 'escalated_at', 'escalation_reason', 'last_message_at', 'assigned_agent_id', 'assigned_at', 'checkout_state'])
             // Unread count within the 24h unread window — matches the
             // `unread` filter below and the realtime contract's
             // unread_count (InboxBroadcastPayload::unreadCount).
@@ -138,6 +139,11 @@ class InboxController extends Controller
         }
 
         $conversations = $query->paginate(50);
+        $conversations->getCollection()->transform(function (Conversation $conversation): Conversation {
+            $conversation->setAttribute('checkout_summary', $this->checkoutSummary($conversation));
+            $conversation->makeHidden(['checkout_state']);
+            return $conversation;
+        });
 
         return response()->json($conversations);
     }
@@ -148,8 +154,11 @@ class InboxController extends Controller
     public function messages(Request $request, $conversationId)
     {
         $conversation = $this->conversationQuery($request, 'conversation_read')
-            ->with('channel:id,type,page_name')
+            ->with(['channel:id,type,page_name', 'latestCommerceOrderAttempt'])
             ->findOrFail($conversationId);
+
+        $conversation->setAttribute('checkout_summary', $this->checkoutSummary($conversation));
+        $conversation->makeHidden(['checkout_state']);
 
         $messages = Message::where('conversation_id', $conversationId)
             ->orderBy('created_at', 'asc')
@@ -159,6 +168,22 @@ class InboxController extends Controller
             'conversation' => $conversation,
             'messages'     => $messages,
         ]);
+    }
+
+    private function checkoutSummary(Conversation $conversation): array
+    {
+        $state = is_array($conversation->checkout_state) ? $conversation->checkout_state : [];
+        $status = app(\App\Services\OrderCheckoutService::class)->computeFieldStatus($state);
+        $attempt = $conversation->latestCommerceOrderAttempt;
+
+        return [
+            'confirmation_state' => $state['confirmation_state'] ?? null,
+            'missing_fields' => $status['missing_fields'] ?? [],
+            'is_complete' => (bool) ($status['is_complete'] ?? false),
+            'order_attempt_status' => $attempt?->status,
+            'external_order_id' => $attempt?->external_order_id,
+            'order_number' => $attempt?->order_number,
+        ];
     }
 
     /** Mark this user's inbox view as read without changing another agent's state. */

@@ -98,4 +98,14 @@ class Conversation extends Model
     {
         return $this->hasOne(HandoffTask::class);
     }
+
+    public function commerceOrderAttempts()
+    {
+        return $this->hasMany(CommerceOrderAttempt::class);
+    }
+
+    public function latestCommerceOrderAttempt()
+    {
+        return $this->hasOne(CommerceOrderAttempt::class)->latestOfMany('created_at');
+    }
 }

@@ -493,11 +493,9 @@ class ChannelController extends Controller
                 );
                 \Log::info('Instagram channel saved', ['account_id' => $igAccountId]);
 
-                // Store page_id on instagram channel for webhook routing
-                Channel::where('user_id', $userId)
-                    ->where('type', 'instagram')
-                    ->where('instagram_account_id', $igAccountId)
-                    ->update(['page_id' => $pageId]);
+                  // The Instagram row is identified by instagram_account_id only.
+                  // It must never carry the Facebook page ID: Messenger events would then route
+                  // to the Instagram channel and its store.
             }
 
             // Subscribe to supported Facebook and Instagram webhook fields.
@@ -511,13 +509,6 @@ class ChannelController extends Controller
                 'access_token'      => $longLivedToken,
             ]);
 
-            // Also store page_id on the Instagram channel so webhook routing works
-            if ($igAccountId) {
-                Channel::where('user_id', $userId)
-                    ->where('type', 'instagram')
-                    ->where('instagram_account_id', $igAccountId)
-                    ->update(['page_id' => $pageId]);
-            }
         }
 
         \Log::info('=== FACEBOOK CALLBACK SUCCESS ===');

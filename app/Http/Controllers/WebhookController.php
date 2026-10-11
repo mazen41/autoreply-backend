@@ -85,7 +85,7 @@ class WebhookController extends Controller
                 $igIds = \App\Models\Channel::where('type', 'instagram')
                     ->where('status', 'connected')
                     ->get(['instagram_account_id', 'page_id'])
-                    ->flatMap(fn($c) => array_filter([$c->instagram_account_id, $c->page_id]))
+                    ->flatMap(fn($c) => array_filter([$c->instagram_account_id]))
                     ->toArray();
 
                 $hasInstagramEntry = false;
@@ -360,49 +360,8 @@ class WebhookController extends Controller
                     ->latest('connected_at')
                     ->first();
 
-                // Strategy 2: entry ID matches page_id stored on instagram channel
-                if (!$channel) {
-                    $channel = Channel::where('page_id', $entryId)
-                        ->where('type', 'instagram')
-                        ->where('status', 'connected')
-                        ->latest('connected_at')
-                        ->first();
-                }
-
-                // Strategy 3: find facebook channel by page_id, then get instagram for same user.
-                // Only safe when the user has exactly one Instagram channel — if they have multiple
-                // we cannot guess which one this webhook is for, and we refuse to route blindly.
-                // This fallback covers accounts connected before instagram_account_id was stored.
-                if (!$channel) {
-                    $fbChannel = Channel::where('page_id', $entryId)
-                        ->where('type', 'facebook')
-                        ->where('status', 'connected')
-                        ->latest('connected_at')
-                        ->first();
-
-                    if ($fbChannel) {
-                        $igCandidates = Channel::where('type', 'instagram')
-                            ->where('status', 'connected')
-                            ->where('user_id', $fbChannel->user_id)
-                            ->get();
-
-                        if ($igCandidates->count() === 1) {
-                            $channel = $igCandidates->first();
-
-                            // Cache page_id so Strategy 2 works next time
-                            if ($channel && empty($channel->page_id)) {
-                                $channel->update(['page_id' => $entryId]);
-                            }
-                        } elseif ($igCandidates->count() > 1) {
-                            Log::warning('WebhookController: ambiguous Instagram routing — multiple accounts for same user, cannot use Strategy 3', [
-                                'entry_id' => $entryId,
-                                'user_id'  => $fbChannel->user_id,
-                                'count'    => $igCandidates->count(),
-                            ]);
-                        }
-                    }
-                }
-
+                  // Instagram rows are routed only by instagram_account_id. There is no page_id or
+                  // same-user guessing fallback: an unmatched event is logged and skipped below.
                 if (!$channel) {
                     Log::error('No Instagram channel found', [
                         'entry_id'  => $entryId,
@@ -445,23 +404,7 @@ class WebhookController extends Controller
                     ->where('type', 'instagram')->where('status', 'connected')
                     ->latest('connected_at')->first();
 
-                if (!$channel) {
-                    $channel = Channel::where('page_id', $entryId)
-                        ->where('type', 'instagram')->where('status', 'connected')
-                        ->latest('connected_at')->first();
-                }
-
-                if (!$channel) {
-                    $fbChannel = Channel::where('page_id', $entryId)
-                        ->where('type', 'facebook')->where('status', 'connected')
-                        ->latest('connected_at')->first();
-                    if ($fbChannel) {
-                        $channel = Channel::where('type', 'instagram')
-                            ->where('status', 'connected')
-                            ->where('user_id', $fbChannel->user_id)
-                            ->latest('connected_at')->first();
-                    }
-                }
+                // Comments are routed only by instagram_account_id (no page_id or same-user fallback).
 
                 if (!$channel) {
                     Log::warning('No Instagram channel found for comment', ['entry_id' => $entryId]);

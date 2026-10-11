@@ -64,10 +64,10 @@ class FetchSenderName implements ShouldQueue
                 ]);
 
             if (!$response->successful()) {
+                $responseData = $response->json();
                 Log::warning('FetchSenderName: Graph API request failed', [
-                    'sender_id' => $this->senderId,
-                    'status'    => $response->status(),
-                    'body'      => $response->json(),
+                    'status' => $response->status(),
+                    'response_keys' => is_array($responseData) ? array_keys($responseData) : [],
                 ]);
                 
                 // If it's a 400/404, it's a permanent failure (e.g. user blocked app, invalid PSID).
@@ -102,8 +102,7 @@ class FetchSenderName implements ShouldQueue
             }
         } catch (\Exception $e) {
             Log::error('FetchSenderName: exception', [
-                'error' => $e->getMessage(),
-                'sender_id' => $this->senderId,
+                'exception_type' => get_class($e),
                 'conversation_id' => $this->conversationId,
             ]);
             
@@ -118,8 +117,7 @@ class FetchSenderName implements ShouldQueue
         Log::error('FetchSenderName job failed permanently', [
             'conversation_id' => $this->conversationId,
             'channel_id' => $this->channelId,
-            'sender_id' => $this->senderId,
-            'error' => $exception->getMessage(),
+            'exception_type' => get_class($exception),
         ]);
     }
 }

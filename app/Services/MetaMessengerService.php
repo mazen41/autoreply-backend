@@ -16,15 +16,22 @@ use Illuminate\Support\Facades\Log;
  * future outbound flow reuse the exact same wire behavior:
  *   • images first, then the text message
  *   • the Channel accessor decrypts access_token — never decrypt() again
- *   • returns true only when the TEXT send got a 2xx (image failures are
- *     logged but do not fail the text send — matches existing behavior)
+ *   • reports partial failure when any requested image or the text is rejected
  */
 class MetaMessengerService
 {
     public function sendText(Channel $channel, string $recipientId, string $message, array $images = []): bool
     {
+        return $this->sendTextWithResult($channel, $recipientId, $message, $images)['success'];
+    }
+
+    /** Return the provider result so callers can persist status, ID, and errors. */
+    public function sendTextWithResult(Channel $channel, string $recipientId, string $message, array $images = []): array
+    {
         $accessToken = $channel->access_token;
         $baseUrl = "https://graph.facebook.com/v19.0/me/messages?access_token={$accessToken}";
+        $messageIds = [];
+        $firstError = null;
 
         foreach ($images as $imageUrl) {
             $imageResponse = Http::timeout(10)->post($baseUrl, [
@@ -41,13 +48,14 @@ class MetaMessengerService
             ]);
 
             if (!$imageResponse->successful()) {
+                $firstError ??= $imageResponse->json('error.message') ?: 'image_rejected';
                 Log::error('MetaMessengerService: image send failed', [
                     'channel_id' => $channel->id,
                     'channel_type' => $channel->type,
                     'status' => $imageResponse->status(),
-                    'body' => $imageResponse->json(),
-                    'recipient' => $recipientId,
                 ]);
+            } elseif ($imageMessageId = $imageResponse->json('message_id')) {
+                $messageIds[] = (string) $imageMessageId;
             }
         }
 
@@ -58,15 +66,25 @@ class MetaMessengerService
             ]);
 
         if (!$response->successful()) {
+            $firstError ??= $response->json('error.message') ?: 'text_rejected';
             Log::error('MetaMessengerService: text send failed', [
                 'channel_id' => $channel->id,
                 'channel_type' => $channel->type,
                 'status' => $response->status(),
-                'body' => $response->json(),
-                'recipient' => $recipientId,
             ]);
         }
 
-        return $response->successful();
+        $textMessageId = $response->successful() ? $response->json('message_id') : null;
+        if ($textMessageId) {
+            $messageIds[] = (string) $textMessageId;
+        }
+
+        return [
+            'success' => $response->successful() && $firstError === null,
+            'message_id' => $textMessageId ? (string) $textMessageId : null,
+            'message_ids' => $messageIds,
+            'error' => $firstError,
+            'status_code' => $response->status(),
+        ];
     }
 }

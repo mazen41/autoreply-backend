@@ -11,15 +11,15 @@ use Illuminate\Support\Facades\Log;
 class KnowledgeController extends Controller
 {
     /** Get or create this user's profile (one per user) */
-    private function profile(Request $request): BusinessProfile
+    private function profile(Request $request, string $permission): BusinessProfile
     {
-        return BusinessProfile::firstOrCreate(['user_id' => $request->user()->id]);
+        return app(\App\Services\ActiveBusiness::class)->resolve($request, permission: $permission);
     }
 
     /** Get all knowledge files for the user */
     public function index(Request $request)
     {
-        $profile = $this->profile($request);
+        $profile = $this->profile($request, 'read');
         $files = $profile->knowledgeFiles()
             ->orderBy('uploaded_at', 'desc')
             ->get(['id', 'filename', 'file_type', 'uploaded_at', 'status', 'error_message'])
@@ -59,36 +59,42 @@ class KnowledgeController extends Controller
                 return response()->json(['error' => 'Could not extract text from file'], 400);
             }
 
-            // Store file record
-            $profile = $this->profile($request);
-            $knowledgeFile = BusinessKnowledgeFile::create([
-                'business_profile_id' => $profile->id,
-                'filename' => $file->getClientOriginalName(),
-                'file_type' => $file->getClientOriginalExtension(),
-                'extracted_text' => $extractedText,
-                'status' => 'pending',
-            ]);
+            $profile = $this->profile($request, 'write');
+            $ingestion = app(\App\Services\KnowledgeFileIngestionService::class)->ingest(
+                $profile,
+                $file->getClientOriginalName(),
+                $file->getClientOriginalExtension(),
+                $extractedText,
+                $file->getSize()
+            );
+            $knowledgeFile = $ingestion['file'];
 
-            \App\Jobs\ProcessKnowledgeFile::dispatch($knowledgeFile->id);
+            if ($ingestion['duplicate']) {
+                return response()->json([
+                    'message' => 'This document has already been uploaded to this business.',
+                    'duplicate' => true,
+                    'file' => $knowledgeFile,
+                ], 200);
+            }
 
             return response()->json([
-                'message' => 'File processed successfully',
+                'message' => 'File uploaded and queued for indexing.',
+                'duplicate' => false,
                 'file' => $knowledgeFile,
                 'extracted_length' => strlen($extractedText),
             ]);
         } catch (\Exception $e) {
             Log::error('File extraction failed', [
-                'error' => $e->getMessage(),
-                'file' => $file->getClientOriginalName(),
+                'exception_type' => get_class($e),
             ]);
-            return response()->json(['error' => 'Failed to process file: ' . $e->getMessage()], 500);
+            return response()->json(['error' => 'Failed to process file. Please try again or contact support.'], 500);
         }
     }
 
     /** Delete a knowledge file */
     public function delete(Request $request, $id)
     {
-        $profile = $this->profile($request);
+        $profile = $this->profile($request, 'write');
         $file = $profile->knowledgeFiles()->findOrFail($id);
         
         $file->delete();
@@ -103,7 +109,7 @@ class KnowledgeController extends Controller
             'ai_instructions' => 'nullable|string|max:10000',
         ]);
 
-        $this->profile($request)->update([
+        $this->profile($request, 'write')->update([
             'ai_instructions' => $request->ai_instructions,
         ]);
 
@@ -127,7 +133,7 @@ class KnowledgeController extends Controller
             'reply_style' => 'nullable|string|max:255',
         ]);
 
-        $profile = $this->profile($request);
+        $profile = $this->profile($request, 'write');
         $profile->update($request->only([
             'business_name',
             'business_type',
@@ -157,7 +163,7 @@ class KnowledgeController extends Controller
             'test_question' => 'required|string|max:1000',
         ]);
 
-        $profile = $this->profile($request);
+        $profile = $this->profile($request, 'write');
 
         // Build system prompt using the same logic as ProcessAutoReply
         $systemPrompt = $this->buildTestSystemPrompt($profile, $request->test_question);
@@ -171,6 +177,11 @@ class KnowledgeController extends Controller
             return response()->json(['error' => 'Failed to generate test response'], 500);
         }
 
+        $profile->forceFill([
+            'ai_setup_tested_at' => now(),
+            'ai_setup_tested_config_hash' => app(\App\Services\AiSetupVerificationService::class)->configurationFingerprint($profile),
+        ])->save();
+
         return response()->json([
             'test_response' => $testResponse,
         ]);
@@ -179,7 +190,7 @@ class KnowledgeController extends Controller
     /** Reindex knowledge files (regenerate chunks/indices) */
     public function reindex(Request $request)
     {
-        $profile = $this->profile($request);
+        $profile = $this->profile($request, 'write');
         $files = $profile->knowledgeFiles()->get();
 
         foreach ($files as $file) {
@@ -201,7 +212,7 @@ class KnowledgeController extends Controller
             'limit' => 'nullable|integer|min:1|max:20',
         ]);
 
-        $profile = $this->profile($request);
+        $profile = $this->profile($request, 'read');
         $queryStr = $request->input('query', '');
         $limit = $request->input('limit', 5);
 
@@ -416,7 +427,7 @@ class KnowledgeController extends Controller
                 return $response->json('content.0.text');
             }
         } catch (\Exception $e) {
-            Log::error('Claude API call failed', ['error' => $e->getMessage()]);
+            Log::error('Claude API call failed', ['exception_type' => get_class($e)]);
         }
 
         return null;
@@ -458,7 +469,7 @@ class KnowledgeController extends Controller
                 return $response->json('candidates.0.content.parts.0.text');
             }
         } catch (\Exception $e) {
-            Log::error('Gemini API call failed', ['error' => $e->getMessage()]);
+            Log::error('Gemini API call failed', ['exception_type' => get_class($e)]);
         }
 
         return null;

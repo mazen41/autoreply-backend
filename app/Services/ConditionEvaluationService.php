@@ -14,6 +14,23 @@ use Illuminate\Support\Facades\Log;
 
 class ConditionEvaluationService
 {
+    private const SUPPORTED_CONDITION_TYPES = [
+        'customer_tag', 'has_tag', 'tag', 'customer_does_not_have_tag',
+        'customer_field', 'customer_field_equals', 'customer_field_does_not_equal', 'customer_field_contains', 'customer_exists',
+        'customer_replied', 'conversation_status', 'status_equals', 'last_message_from_customer', 'last_message_from_ai',
+        'is_escalated', 'has_been_escalated', 'is_not_escalated', 'has_not_been_escalated',
+        'message_text', 'message_contains', 'message_does_not_contain', 'message_equals', 'message_does_not_equal',
+        'message_language', 'language_equals', 'message_intent', 'intent_equals',
+        'ai_confidence', 'ai_confidence_greater_than', 'ai_confidence_less_than', 'ai_confidence_equals',
+        'ai_intent', 'ai_intent_equals', 'ai_escalation', 'needs_escalation', 'ai_needs_escalation',
+        'does_not_need_escalation', 'ai_does_not_need_escalation',
+        'has_order', 'does_not_have_order', 'order_status', 'order_status_equals', 'order_status_does_not_equal',
+        'order_total', 'order_total_greater_than', 'order_total_less_than', 'product_exists',
+        'channel', 'channel_equals_whatsapp', 'channel_equals_instagram', 'channel_equals_facebook',
+        'channel_equals_telegram', 'channel_equals_gmail', 'within_business_hours', 'outside_business_hours',
+        'day_of_week', 'time_of_day',
+    ];
+
     public function __construct(
         protected BusinessHoursService $businessHoursService
     ) {}
@@ -24,20 +41,34 @@ class ConditionEvaluationService
     public function evaluate(SequenceEnrollment $enrollment, SequenceStep $step, array $conditionConfig): bool
     {
         if (empty($conditionConfig)) {
-            return true;
+            Log::warning('ConditionEvaluationService: empty condition configuration fails closed', [
+                'enrollment_id' => $enrollment->id,
+                'step_id' => $step->id,
+            ]);
+            return false;
         }
 
         // Support group conditions with "match": "all" (AND) or "any" (OR)
         if (isset($conditionConfig['match']) && is_array($conditionConfig['conditions'] ?? null)) {
-            $matchMode = strtolower($conditionConfig['match']) === 'any' ? 'any' : 'all';
+            $matchMode = strtolower((string) $conditionConfig['match']);
+            if (!in_array($matchMode, ['all', 'any'], true)) {
+                return $this->logUnknownCondition($matchMode, $enrollment, $step);
+            }
             $conditions = $conditionConfig['conditions'];
 
             if (empty($conditions)) {
-                return true;
+                Log::warning('ConditionEvaluationService: empty condition group fails closed', [
+                    'enrollment_id' => $enrollment->id,
+                    'step_id' => $step->id,
+                ]);
+                return false;
             }
 
             if ($matchMode === 'any') {
                 foreach ($conditions as $subCond) {
+                    if (!is_array($subCond)) {
+                        return $this->logUnknownCondition('', $enrollment, $step);
+                    }
                     if ($this->evaluateSingle($enrollment, $step, $subCond)) {
                         return true;
                     }
@@ -45,6 +76,9 @@ class ConditionEvaluationService
                 return false;
             } else { // 'all' (AND)
                 foreach ($conditions as $subCond) {
+                    if (!is_array($subCond)) {
+                        return $this->logUnknownCondition('', $enrollment, $step);
+                    }
                     if (!$this->evaluateSingle($enrollment, $step, $subCond)) {
                         return false;
                     }
@@ -72,7 +106,11 @@ class ConditionEvaluationService
         $targetValue = $config['value'] ?? $config['target'] ?? null;
 
         if (!$type) {
-            return true;
+            return $this->logUnknownCondition('', $enrollment, $step);
+        }
+
+        if (!in_array((string) $type, self::SUPPORTED_CONDITION_TYPES, true)) {
+            return $this->logUnknownCondition((string) $type, $enrollment, $step);
         }
 
         $conversation = $enrollment->conversation;
@@ -127,9 +165,9 @@ class ConditionEvaluationService
             'channel' => $this->evaluateChannel($conversation, $operator, $targetValue),
             'channel_equals_whatsapp'  => strtolower($conversation->channel?->type ?? '') === 'whatsapp',
             'channel_equals_instagram' => strtolower($conversation->channel?->type ?? '') === 'instagram',
-            'channel_equals_facebook'  => strtolower($conversation->channel?->type ?? '') === 'messenger',
+            'channel_equals_facebook'  => strtolower($conversation->channel?->type ?? '') === 'facebook',
             'channel_equals_telegram'  => strtolower($conversation->channel?->type ?? '') === 'telegram',
-            'channel_equals_gmail'     => strtolower($conversation->channel?->type ?? '') === 'email',
+            'channel_equals_gmail'     => strtolower($conversation->channel?->type ?? '') === 'gmail',
 
             // ── 7. TIME CONDITIONS ───────────────────────────────────────────
             'within_business_hours' => $this->evaluateBusinessHours($enrollment, true),
@@ -137,8 +175,49 @@ class ConditionEvaluationService
             'day_of_week' => $this->evaluateDayOfWeek($enrollment, $operator, $targetValue),
             'time_of_day' => $this->evaluateTimeOfDay($enrollment, $operator, $targetValue),
 
-            default => true,
+            default => $this->logUnknownCondition((string) $type, $enrollment, $step),
         };
+    }
+
+    private function logUnknownCondition(string $type, SequenceEnrollment $enrollment, SequenceStep $step): bool
+    {
+        Log::warning('ConditionEvaluationService: unknown or malformed condition fails closed', [
+            'condition_type' => $type,
+            'enrollment_id' => $enrollment->id,
+            'step_id' => $step->id,
+        ]);
+
+        return false;
+    }
+
+    /** Return configuration errors for sequence-save validation. */
+    public function validateConditionConfig(array $config): array
+    {
+        $errors = [];
+        if (isset($config['match']) || isset($config['conditions'])) {
+            $match = strtolower((string) ($config['match'] ?? ''));
+            $conditions = $config['conditions'] ?? null;
+            if (!in_array($match, ['all', 'any'], true) || !is_array($conditions) || $conditions === []) {
+                return ['Condition groups require match=all|any and at least one condition.'];
+            }
+            foreach ($conditions as $index => $child) {
+                if (!is_array($child)) {
+                    $errors[] = "Condition {$index} must be an object.";
+                    continue;
+                }
+                foreach ($this->validateConditionConfig($child) as $error) {
+                    $errors[] = "Condition {$index}: {$error}";
+                }
+            }
+            return $errors;
+        }
+
+        $type = $config['type'] ?? $config['field'] ?? null;
+        if (!is_string($type) || !in_array($type, self::SUPPORTED_CONDITION_TYPES, true)) {
+            $errors[] = 'Condition type is missing or unsupported.';
+        }
+
+        return $errors;
     }
 
     /**

@@ -123,20 +123,14 @@ class EvolutionApiService
             ],
         ];
 
-        // Diagnostic: log exactly what we send to Evolution (no message content,
-        // only routing metadata) so we can verify recipient + instance in logs.
         Log::info('EvolutionApiService: sendTextMessage', [
-            'instance' => $instanceName,
-            'recipient' => $cleanNumber,
-            'endpoint' => $url,
+            'recipient_present' => $cleanNumber !== '',
         ]);
 
         $response = $this->makeRequest('POST', $url, $payload);
 
         // Log the Evolution response key so we can correlate with MESSAGES_UPDATE.
         Log::info('EvolutionApiService: sendTextMessage response', [
-            'instance'    => $instanceName,
-            'recipient'   => $cleanNumber,
             'response_key_id' => $response['key']['id'] ?? null,
             'status'          => $response['status'] ?? null,
         ]);
@@ -236,7 +230,7 @@ class EvolutionApiService
             $response = $this->fetchInstance($instanceName);
             return isset($response[0]) && $response[0]['instance']['instanceName'] === $instanceName;
         } catch (Exception $e) {
-            Log::error("Failed to check instance existence: {$e->getMessage()}");
+            Log::error('Failed to check instance existence', ['exception_type' => get_class($e)]);
             return false;
         }
     }
@@ -304,19 +298,11 @@ class EvolutionApiService
                     return $response->json();
                 }
 
-                // Log the actual response body so we can see WHY Evolution
-                // rejected the request (validation errors, bad media URL, etc.)
-                // — previously only the status code was kept, which hid the
-                // real reason for every 400/422 failure.
                 Log::error('Evolution API returned non-success response', [
-                    'url'    => $url,
                     'status' => $response->status(),
-                    'body'   => $response->body(),
-                    // NOTE: payload intentionally NOT logged here to avoid
-                    // exposing media URLs, phone numbers, or message content.
                 ]);
 
-                throw new Exception("HTTP request failed with status: {$response->status()} — body: {$response->body()}");
+                throw new Exception("HTTP request failed with status: {$response->status()}");
             } catch (Exception $e) {
                 $attempt++;
                 $lastException = $e;
@@ -324,12 +310,16 @@ class EvolutionApiService
                 if ($attempt < $this->maxRetries) {
                     $delay = min(pow(2, $attempt), 10); // Exponential backoff, max 10 seconds
                     sleep($delay);
-                    Log::warning("Retrying request (attempt {$attempt}/{$this->maxRetries}) after {$delay}s delay: {$url}");
+                    Log::warning('Retrying Evolution API request', [
+                        'attempt' => $attempt,
+                        'max_retries' => $this->maxRetries,
+                        'delay_seconds' => $delay,
+                    ]);
                 }
             }
         }
 
-        Log::error("Failed to complete request after {$this->maxRetries} attempts: {$url}");
+        Log::error('Failed to complete Evolution API request', ['attempts' => $this->maxRetries]);
         throw $lastException ?? new Exception('Request failed after maximum retries');
     }
 
@@ -384,7 +374,10 @@ class EvolutionApiService
                     Log::info("Unhandled webhook event type: {$eventType} (raw: {$rawEventType})");
             }
         } catch (Exception $e) {
-            Log::error("Failed to process webhook event: {$e->getMessage()}", ['event' => $event]);
+            Log::error('Failed to process webhook event', [
+                'event' => is_string($event) ? $event : 'unknown',
+                'exception' => get_class($e),
+            ]);
         }
     }
 
@@ -416,20 +409,16 @@ class EvolutionApiService
             $fromName = $event['data']['pushName'] ?? null;
         }
         
-        // Log the name we received for debugging
-        Log::info("WhatsApp webhook received contact info", [
-            'from_phone' => $fromPhone,
-            'push_name' => $fromName,
-            'instance' => $instanceName,
+        Log::info('WhatsApp webhook received contact info', [
+            'instance_id' => $instance->id,
+            'has_sender_phone' => is_string($fromPhone) && $fromPhone !== '',
+            'has_sender_name' => is_string($fromName) && $fromName !== '',
         ]);
         
         // If pushName is empty or just a dot, use the phone number instead
         if (empty($fromName) || $fromName === '.') {
             $fromName = $this->formatPhoneNumber($fromPhone);
-            Log::info("Using phone number as name since pushName is empty", [
-                'from_phone' => $fromPhone,
-                'formatted_name' => $fromName,
-            ]);
+            Log::info('Using phone fallback as WhatsApp sender display name', ['sender_name_source' => 'phone_fallback']);
         }
         
         // Skip messages sent FROM this WhatsApp instance (our own outgoing messages).
@@ -444,8 +433,7 @@ class EvolutionApiService
         // dispatch that caused the AI to reply to itself.
         if ($fromMe) {
             Log::info("Skipping fromMe=true MESSAGES_UPSERT (already stored by sender)", [
-                'instance'   => $instanceName,
-                'message_id' => $message['id'] ?? null,
+                'instance_id' => $instance->id,
             ]);
             return;
         }
@@ -508,7 +496,12 @@ class EvolutionApiService
         // Also save to unified inbox system
         $this->saveToUnifiedInbox($instance, $fromPhone, $fromName, $body, $messageType, $media, $message, $fromMe, $quotedMessageId);
 
-        Log::info("Message saved from {$fromPhone} for instance {$instanceName} (fromMe: " . ($fromMe ? 'true' : 'false') . ")");
+        Log::info('WhatsApp message received', [
+            'instance_id' => $instance->id,
+            'from_me' => $fromMe,
+            'message_type' => $messageType,
+            'has_text' => is_string($body) && $body !== '',
+        ]);
     }
 
     /**
@@ -532,8 +525,7 @@ class EvolutionApiService
                 $isFirst = \Illuminate\Support\Facades\Cache::add($lockKey, 1, now()->addMinutes(5));
                 if (!$isFirst) {
                     Log::info('Duplicate WhatsApp message skipped (already processed by another instance)', [
-                        'message_id' => $waMessageId,
-                        'instance'   => $instance->instance_name,
+                        'instance_id' => $instance->id,
                     ]);
                     return;
                 }
@@ -543,6 +535,14 @@ class EvolutionApiService
                 ->where('type', 'whatsapp')
                 ->where('page_id', $instance->instance_name)
                 ->first();
+
+            if (($channel?->metadata['whatsapp_provider'] ?? null) === 'cloud') {
+                Log::error('ensureWhatsAppChannel: refusing to overwrite a Cloud API channel with an Evolution session', [
+                    'channel_id' => $channel->id,
+                    'instance_id' => $instance->id,
+                ]);
+                return;
+            }
 
             if (!$channel) {
                 Log::warning("WhatsApp channel not found for unified inbox", [
@@ -555,14 +555,10 @@ class EvolutionApiService
             // Format sender name if empty or just a dot
             if (empty($fromName) || $fromName === '.') {
                 $fromName = $this->formatPhoneNumber($fromPhone);
-                Log::info("Using phone number as name in unified inbox", [
-                    'from_phone' => $fromPhone,
-                    'formatted_name' => $fromName,
-                ]);
+                Log::info('Using phone fallback as WhatsApp sender display name', ['sender_name_source' => 'phone_fallback']);
             } else {
                 Log::info("Using pushName from WhatsApp", [
-                    'from_phone' => $fromPhone,
-                    'push_name' => $fromName,
+                    'sender_name_source' => 'provider_profile',
                 ]);
             }
 
@@ -580,14 +576,12 @@ class EvolutionApiService
                     'sender_email' => null,
                     'subject'      => null,
                     'status'       => 'active',
-                    'ai_enabled'   => true,   // must be explicit — model default is not DB default
+                    'ai_enabled'   => false,
                     'last_message_at' => now(),
                 ]);
 
                 Log::info("Created new conversation for WhatsApp", [
                     'conversation_id' => $conversation->id,
-                    'sender_id' => $fromPhone,
-                    'sender_name' => $fromName,
                 ]);
             } else {
                 // Update conversation metadata
@@ -604,8 +598,7 @@ class EvolutionApiService
                     $updateData['sender_name'] = $fromName;
                     Log::info("Updating conversation sender_name", [
                         'conversation_id' => $conversation->id,
-                        'old_name' => $conversation->sender_name,
-                        'new_name' => $fromName,
+                        'sender_name_updated' => true,
                     ]);
                 }
                 
@@ -620,7 +613,7 @@ class EvolutionApiService
             } catch (\Throwable $e) {
                 Log::warning('WhatsApp: customer resolution failed', [
                     'conversation_id' => $conversation->id,
-                    'error'           => $e->getMessage(),
+                    'exception_type' => get_class($e),
                 ]);
             }
 
@@ -636,6 +629,12 @@ class EvolutionApiService
                 'send_status' => 'delivered',
                 'media_url' => $media['url'] ?? null,
                 'media_type' => $media['type'] ?? null,
+                'media_processing_status' => !$fromMe && !empty($media)
+                    ? (($media['storage_status'] ?? null) === 'stored' ? 'pending' : 'failed')
+                    : null,
+                'media_processing_reason' => !$fromMe && ($media['storage_status'] ?? null) === 'failed'
+                    ? 'Media download or private storage failed.'
+                    : null,
                 'mime_type' => $media['mimetype'] ?? null,
                 'file_name' => is_string($media['filename'] ?? null) ? $media['filename'] : null,
                 'file_size' => is_int($media['file_size'] ?? null) ? $media['file_size'] : null,
@@ -686,9 +685,9 @@ class EvolutionApiService
             ]);
 
         } catch (\Exception $e) {
-            Log::error("Failed to save WhatsApp message to unified inbox: {$e->getMessage()}", [
+            Log::error('Failed to save WhatsApp message to unified inbox', [
                 'instance_id' => $instance->id,
-                'from_phone' => $fromPhone,
+                'exception' => get_class($e),
             ]);
         }
     }
@@ -798,8 +797,13 @@ class EvolutionApiService
             // Without this update, ERROR always looked like 'sent'.
             $inboxMessage = Message::where('whatsapp_message_id', $remoteMessageId)->first();
             if ($inboxMessage) {
-                $inboxMessage->send_status = $mappedStatus;
-                $inboxMessage->save();
+                $sendStatus = $mappedStatus === 'pending' ? 'queued' : $mappedStatus;
+                $inboxMessage->update([
+                    'status' => $mappedStatus,
+                    'send_status' => $sendStatus,
+                    'delivery_status' => in_array($mappedStatus, ['delivered', 'read'], true) ? 'delivered' : $mappedStatus,
+                    'error_details' => $status === 'ERROR' ? 'WhatsApp delivery failed' : null,
+                ]);
 
                 if ($status === 'ERROR') {
                     Log::error('ProcessAutoReply: WhatsApp delivery FAILED (Evolution reported ERROR)', [
@@ -872,8 +876,7 @@ class EvolutionApiService
 
         if (!$message) {
             Log::warning('Reaction target message not found', [
-                'target_id' => $targetId,
-                'remote_jid' => $remoteJid,
+                'has_target_id' => $targetId !== '',
             ]);
             return;
         }
@@ -989,11 +992,20 @@ class EvolutionApiService
     protected function ensureWhatsAppChannel(WhatsAppInstance $instance): void
     {
         try {
-            // Look up the user's business profile so we can link it to the channel.
-            // This was previously hardcoded as null, causing ProcessAutoReply to abort
-            // with "channel has no linked business profile".
-            $businessProfile = \App\Models\BusinessProfile::where('user_id', $instance->user_id)->first();
-            $businessId = $businessProfile?->id;
+            // Keep the legacy instance attached to the business selected when
+            // it was connected. Falling back to the first profile can route a
+            // multi-business account into the wrong tenant.
+            $businessId = $instance->business_id
+                ?: \App\Models\User::whereKey($instance->user_id)->value('business_id');
+            if (!$businessId) {
+                $ownedBusinessIds = \App\Models\BusinessProfile::where('user_id', $instance->user_id)
+                    ->orderBy('id')->limit(2)->pluck('id');
+                $businessId = $ownedBusinessIds->count() === 1 ? $ownedBusinessIds->first() : null;
+            }
+
+            if ($businessId && !$instance->business_id) {
+                $instance->forceFill(['business_id' => $businessId])->save();
+            }
 
             if (!$businessId) {
                 Log::warning("ensureWhatsAppChannel: no BusinessProfile found for user — channel will have business_id=null", [
@@ -1017,7 +1029,12 @@ class EvolutionApiService
                     'access_token' => '', // WhatsApp uses instance_name in page_id, not an OAuth token
                     'status'       => 'connected',
                     'connected_at' => now(),
-                    'ai_enabled'   => true,  // fixed: was false, meaning AI never ran after connect
+                    'ai_enabled'   => false,
+                    'metadata'     => [
+                        'whatsapp_provider' => 'evolution',
+                        'unofficial_risk_accepted' => (bool) data_get($instance->metadata, 'unofficial_risk_accepted', false),
+                        'unofficial_risk_accepted_at' => data_get($instance->metadata, 'unofficial_risk_accepted_at'),
+                    ],
                 ]);
 
                 Log::info("Created WhatsApp channel for instance", [
@@ -1032,6 +1049,11 @@ class EvolutionApiService
                     'status'       => 'connected',
                     'connected_at' => now(),
                     'page_name'    => $instance->profile_name ?? $instance->instance_name,
+                    'metadata'     => array_merge($channel->metadata ?? [], [
+                        'whatsapp_provider' => 'evolution',
+                        'unofficial_risk_accepted' => (bool) data_get($instance->metadata, 'unofficial_risk_accepted', false),
+                        'unofficial_risk_accepted_at' => data_get($instance->metadata, 'unofficial_risk_accepted_at'),
+                    ]),
                 ];
 
                 if ($businessId && !$channel->business_id) {
@@ -1064,8 +1086,9 @@ class EvolutionApiService
             // separate webhook and updates THAT instance's channel via
             // updateConnectionStatus(), which already keys on instance_name.
         } catch (\Exception $e) {
-            Log::error("Failed to ensure WhatsApp channel: {$e->getMessage()}", [
+            Log::error('Failed to ensure WhatsApp channel', [
                 'instance_id' => $instance->id,
+                'exception_type' => get_class($e),
             ]);
         }
     }
@@ -1223,6 +1246,11 @@ class EvolutionApiService
         if ($storedUrl) {
             $media['remote_url'] = $media['url'] ?? null;
             $media['url'] = $storedUrl;
+            $media['storage_disk'] = app(IncomingMediaStorage::class)->diskName();
+            $media['storage_status'] = 'stored';
+        } else {
+            $media['url'] = null;
+            $media['storage_status'] = 'failed';
         }
 
         return $media;
@@ -1272,9 +1300,8 @@ class EvolutionApiService
                 }
             } catch (Exception $e) {
                 Log::warning('Failed to fetch WhatsApp media base64 from Evolution', [
-                    'instance' => $instanceName,
-                    'message_id' => $messageKey['id'] ?? null,
-                    'error' => $e->getMessage(),
+                    'message_id_present' => !empty($messageKey['id']),
+                    'exception_type' => get_class($e),
                 ]);
             }
         }
@@ -1293,8 +1320,8 @@ class EvolutionApiService
                 }
             } catch (Exception $e) {
                 Log::warning('Failed to download WhatsApp media', [
-                    'url' => $media['url'],
-                    'error' => $e->getMessage(),
+                    'url_present' => !empty($media['url']),
+                    'exception_type' => get_class($e),
                 ]);
             }
         }
@@ -1303,11 +1330,7 @@ class EvolutionApiService
             return $media['url'] ?? null;
         }
 
-        $path = 'whatsapp/' . now()->format('Y/m') . '/' . Str::uuid() . '.' . $extension;
-        $disk = config('services.evolution.media_disk', 'public');
-        Storage::disk($disk)->put($path, $binary);
-
-        return Storage::disk($disk)->url($path);
+        return app(IncomingMediaStorage::class)->store($binary, $extension);
     }
 
     protected function extensionFromMime(string $mimeType, ?string $filename = null): string

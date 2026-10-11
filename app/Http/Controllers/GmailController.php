@@ -8,6 +8,8 @@ use App\Models\Message;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\Log;
 use Illuminate\Support\Facades\Cache;
+use App\Services\OAuthStateService;
+use App\Support\SensitiveLogContext;
 use Google\Client as GoogleClient;
 use Google\Service\Gmail;
 
@@ -28,16 +30,34 @@ class GmailController extends Controller
 
     public function connect(Request $request)
     {
+        $business = app(\App\Services\ActiveBusiness::class)->resolve($request, permission: 'write');
         $client = $this->makeClient();
-        $client->setState($request->user()->id);
+        $client->setState(app(OAuthStateService::class)->issue('gmail', (int) $request->user()->id, [
+            'business_id' => $business->id,
+        ]));
         $url = $client->createAuthUrl();
         return response()->json(['url' => $url]);
     }
 
     public function callback(Request $request)
     {
+        $stateData = app(OAuthStateService::class)->consume('gmail', $request->query('state'));
+        $userId = $stateData['user_id'] ?? null;
+        if (!$userId || !\App\Models\User::whereKey($userId)->exists()) {
+            return redirect(env('FRONTEND_URL') . '/dashboard/channels?error=gmail_invalid_state');
+        }
+        try {
+            $businessProfile = app(\App\Services\BusinessAccessService::class)->authorize(
+                \App\Models\User::findOrFail($userId),
+                (int) ($stateData['context']['business_id'] ?? 0),
+                'write',
+                hideUnauthorized: false,
+            );
+        } catch (\Throwable) {
+            return redirect(env('FRONTEND_URL') . '/dashboard/channels?error=gmail_invalid_state');
+        }
+
         $code   = $request->get('code');
-        $userId = $request->get('state');
 
         if (!$code) {
             return redirect(env('FRONTEND_URL') . '/dashboard/channels?error=gmail_denied');
@@ -49,7 +69,7 @@ class GmailController extends Controller
             $token = $client->fetchAccessTokenWithAuthCode($code);
 
             if (isset($token['error'])) {
-                Log::error('Gmail token error', $token);
+                Log::error('Gmail token exchange failed', SensitiveLogContext::redact($token));
                 return redirect(env('FRONTEND_URL') . '/dashboard/channels?error=gmail_token');
             }
 
@@ -59,8 +79,6 @@ class GmailController extends Controller
             $gmail   = new Gmail($client);
             $profile = $gmail->users->getProfile('me');
             $email   = $profile->getEmailAddress();
-
-            $businessProfile = \App\Models\BusinessProfile::where('user_id', $userId)->first();
 
             $channel = Channel::updateOrCreate(
                 ['user_id' => $userId, 'type' => 'gmail', 'page_id' => $email],
@@ -80,11 +98,11 @@ class GmailController extends Controller
             // Sync historical messages in the background
             \App\Jobs\SyncGmailHistory::dispatch($channel->id);
 
-            Log::info('Gmail channel connected', ['user_id' => $userId, 'email' => $email]);
+            Log::info('Gmail channel connected', ['user_id' => $userId, 'email_present' => $email !== '']);
             return redirect(env('FRONTEND_URL') . '/dashboard/channels?success=gmail');
 
         } catch (\Exception $e) {
-            Log::error('Gmail callback exception', ['error' => $e->getMessage()]);
+            Log::error('Gmail callback exception', ['exception_type' => get_class($e)]);
             return redirect(env('FRONTEND_URL') . '/dashboard/channels?error=gmail_exception');
         }
     }
@@ -148,7 +166,7 @@ class GmailController extends Controller
 
             return $client;
         } catch (\Exception $e) {
-            Log::error('Gmail client error', ['error' => $e->getMessage(), 'channel_id' => $channel->id]);
+            Log::error('Gmail client error', ['exception_type' => get_class($e), 'channel_id' => $channel->id]);
             return null;
         }
     }
@@ -192,7 +210,7 @@ class GmailController extends Controller
 
         } catch (\Exception $e) {
             Log::error('Gmail watch setup failed', [
-                'error' => $e->getMessage(),
+                'exception_type' => get_class($e),
                 'channel_id' => $channel->id,
             ]);
         }
@@ -317,7 +335,7 @@ class GmailController extends Controller
                 } catch (\Throwable $e) {
                     Log::warning('Gmail sync: customer resolution failed', [
                         'conversation_id' => $conversation->id,
-                        'error'           => $e->getMessage(),
+                        'exception_type' => get_class($e),
                     ]);
                 }
 
@@ -354,7 +372,7 @@ class GmailController extends Controller
             return response()->json(['fetched' => $newCount]);
 
         } catch (\Exception $e) {
-            Log::error('Gmail fetch error', ['error' => $e->getMessage()]);
+            Log::error('Gmail fetch error', ['exception_type' => get_class($e)]);
             return response()->json(['message' => 'Fetch failed: ' . $e->getMessage()], 500);
         }
     }

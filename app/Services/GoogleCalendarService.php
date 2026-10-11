@@ -55,7 +55,7 @@ class GoogleCalendarService
 
         if (!$response->successful()) {
             Log::error('Google OAuth token exchange failed', [
-                'error' => $response->body(),
+                'http_status' => $response->status(),
             ]);
             return ['success' => false, 'error' => 'Token exchange failed'];
         }
@@ -82,7 +82,7 @@ class GoogleCalendarService
 
         if (!$response->successful()) {
             Log::error('Google OAuth token refresh failed', [
-                'error' => $response->body(),
+                'http_status' => $response->status(),
             ]);
             return ['success' => false, 'error' => 'Token refresh failed'];
         }
@@ -132,7 +132,7 @@ class GoogleCalendarService
 
         if (!$response->successful()) {
             Log::error('Google Calendar event creation failed', [
-                'error' => $response->body(),
+                'http_status' => $response->status(),
             ]);
             return ['success' => false, 'error' => 'Event creation failed'];
         }

@@ -4,6 +4,7 @@ namespace App\Http\Controllers\Api;
 
 use App\Http\Controllers\Controller;
 use App\Models\AiActionLog;
+use App\Services\BusinessAccessService;
 use Illuminate\Http\Request;
 
 class AiActionsController extends Controller
@@ -13,6 +14,7 @@ class AiActionsController extends Controller
      */
     public function index(Request $request, $businessId)
     {
+        app(BusinessAccessService::class)->authorize($request->user(), $businessId, 'read');
         $actions = AiActionLog::whereHas('conversation', function ($q) use ($businessId) {
                 $q->where('business_id', $businessId);
             })
@@ -28,6 +30,7 @@ class AiActionsController extends Controller
      */
     public function pending(Request $request, $businessId)
     {
+        app(BusinessAccessService::class)->authorize($request->user(), $businessId, 'read');
         $actions = AiActionLog::whereHas('conversation', function ($q) use ($businessId) {
                 $q->where('business_id', $businessId);
             })
@@ -44,6 +47,7 @@ class AiActionsController extends Controller
      */
     public function approve(Request $request, $businessId, $actionId)
     {
+        app(BusinessAccessService::class)->authorize($request->user(), $businessId, 'write');
         $action = AiActionLog::whereHas('conversation', function ($q) use ($businessId) {
                 $q->where('business_id', $businessId);
             })
@@ -53,27 +57,35 @@ class AiActionsController extends Controller
             return response()->json(['error' => 'Action is not pending'], 400);
         }
 
-        $action->update([
+        $claimed = AiActionLog::whereKey($action->id)
+            ->where('status', 'pending')
+            ->update([
             'status' => 'approved',
             'approved_by' => auth()->id(),
             'approved_at' => now(),
         ]);
+        if ($claimed !== 1) {
+            return response()->json(['error' => 'Action is not pending'], 400);
+        }
+        $action->refresh();
 
         // Execute the approved action
         $actionExecutor = new \App\Services\ActionExecutor();
         $result = $actionExecutor->executeAction(
             $action->action_payload,
             $action->conversation_id,
-            $action->message_id
+            $action->message_id,
+            false
         );
 
         $action->update([
-            'status' => 'executed',
+            'status' => !empty($result['success']) ? 'executed' : 'failed',
             'result' => $result,
+            'error_message' => $result['error'] ?? null,
             'executed_at' => now(),
         ]);
 
-        return response()->json(['success' => true, 'result' => $result]);
+        return response()->json(['success' => !empty($result['success']), 'result' => $result]);
     }
 
     /**
@@ -81,6 +93,7 @@ class AiActionsController extends Controller
      */
     public function reject(Request $request, $businessId, $actionId)
     {
+        app(BusinessAccessService::class)->authorize($request->user(), $businessId, 'write');
         $action = AiActionLog::whereHas('conversation', function ($q) use ($businessId) {
                 $q->where('business_id', $businessId);
             })
@@ -90,11 +103,16 @@ class AiActionsController extends Controller
             return response()->json(['error' => 'Action is not pending'], 400);
         }
 
-        $action->update([
+        $rejected = AiActionLog::whereKey($action->id)
+            ->where('status', 'pending')
+            ->update([
             'status' => 'rejected',
             'approved_by' => auth()->id(),
             'approved_at' => now(),
         ]);
+        if ($rejected !== 1) {
+            return response()->json(['error' => 'Action is not pending'], 400);
+        }
 
         return response()->json(['success' => true]);
     }
@@ -104,6 +122,7 @@ class AiActionsController extends Controller
      */
     public function statistics(Request $request, $businessId)
     {
+        app(BusinessAccessService::class)->authorize($request->user(), $businessId, 'read');
         $total = AiActionLog::whereHas('conversation', function ($q) use ($businessId) {
                 $q->where('business_id', $businessId);
             })->count();

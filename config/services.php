@@ -59,6 +59,7 @@ return [
     'meta' => [
         'app_secret' => env('META_APP_SECRET'),
         'webhook_verify_token' => env('META_WEBHOOK_VERIFY_TOKEN'),
+        'graph_version' => env('META_GRAPH_API_VERSION', 'v26.0'),
     ],
 
     'nominatim' => [
@@ -73,12 +74,27 @@ return [
         'timeout' => env('EVOLUTION_TIMEOUT', 30),
         'max_retries' => env('EVOLUTION_MAX_RETRIES', 3),
         'media_disk' => env('EVOLUTION_MEDIA_DISK', 'public'),
+        'incoming_media_disk' => env('INCOMING_MEDIA_DISK', 'private_media'),
+        'incoming_media_retention_days' => (int) env('INCOMING_MEDIA_RETENTION_DAYS', 30),
+    ],
+
+    'openai' => [
+        'api_key' => env('OPENAI_API_KEY', ''),
+    ],
+
+    'vision' => [
+        'provider' => env('VISION_PROVIDER', 'openai'),
+        'openai_api_key' => env('OPENAI_API_KEY', ''),
+        'openai_model' => env('VISION_OPENAI_MODEL', 'gpt-4o'),
+        'gemini_api_key' => env('GEMINI_API_KEY', ''),
+        'gemini_model' => env('VISION_GEMINI_MODEL', 'gemini-3.8-flash'),
     ],
 
     'myfatoorah' => [
         'api_key'        => env('MYFATOORAH_API_KEY'),
         'base_url'       => env('MYFATOORAH_BASE_URL', 'https://api.myfatoorah.com'),
         'webhook_secret' => env('MYFATOORAH_WEBHOOK_SECRET'),
+        'recurring_enabled' => env('MYFATOORAH_RECURRING_ENABLED', false),
     ],
 
     'paymob' => [
@@ -93,6 +109,7 @@ return [
     'ai' => [
         'provider' => env('AI_PROVIDER', 'gemini'),
         'fallback_provider' => env('AI_FALLBACK_PROVIDER', 'claude'),
+        'prompt_version' => env('AI_PROMPT_VERSION', 'v1'),
         'temperature' => (float) env('AI_TEMPERATURE', 0.7),
         'max_tokens' => (int) env('AI_MAX_TOKENS', 500),
         'timeout' => (int) env('AI_TIMEOUT', 30),
@@ -115,6 +132,16 @@ return [
         'model' => env('CLAUDE_MODEL', 'claude-haiku-4-5-20251001'),
     ],
     'frontend_url' => env('FRONTEND_URL'),
+
+    'operations' => [
+        'alert_email' => env('OPERATIONS_ALERT_EMAIL'),
+        'queue_backlog_threshold' => (int) env('QUEUE_BACKLOG_ALERT_THRESHOLD', 1000),
+        'failed_job_alert_threshold' => (int) env('FAILED_JOB_ALERT_THRESHOLD', 1),
+        'send_failure_rate_percent' => (int) env('SEND_FAILURE_RATE_ALERT_PERCENT', 20),
+        'send_failure_min_sample' => (int) env('SEND_FAILURE_RATE_MIN_SAMPLE', 10),
+        'webhook_signature_failure_threshold' => (int) env('WEBHOOK_SIGNATURE_FAILURE_ALERT_THRESHOLD', 5),
+        'alert_dedup_minutes' => (int) env('OPERATIONS_ALERT_DEDUP_MINUTES', 60),
+    ],
 
     'metrics' => [
         'avg_manual_reply_time' => (int) env('AVG_MANUAL_REPLY_TIME', 3), // minutes

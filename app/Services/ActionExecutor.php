@@ -15,7 +15,7 @@ class ActionExecutor
     /**
      * Execute an AI-triggered action
      */
-    public function executeAction(array $actionData, int $conversationId, int $messageId): array
+    public function executeAction(array $actionData, int $conversationId, int $messageId, bool $logAction = true): array
     {
         $actionType = $actionData['action'] ?? null;
         $payload = $actionData['data'] ?? [];
@@ -29,21 +29,21 @@ class ActionExecutor
         }
 
         // Log the action attempt
-        $actionLog = AiActionLog::create([
+        $actionLog = $logAction ? AiActionLog::create([
             'conversation_id' => $conversationId,
             'message_id' => $messageId,
             'action_type' => $actionType,
             'action_payload' => $payload,
             'status' => 'pending',
-        ]);
+        ]) : null;
 
         try {
             // Execute based on action type
             $result = $this->executeActionByType($actionType, $payload, $conversationId);
 
             // Update action log
-            $actionLog->update([
-                'status' => $result['success'] ? 'executed' : 'failed',
+            $actionLog?->update([
+                'status' => !empty($result['success']) ? 'executed' : 'failed',
                 'result' => $result,
                 'error_message' => $result['error'] ?? null,
                 'executed_at' => now(),
@@ -53,10 +53,10 @@ class ActionExecutor
         } catch (\Exception $e) {
             Log::error('ActionExecutor: Exception', [
                 'action_type' => $actionType,
-                'error' => $e->getMessage(),
+                'exception_type' => get_class($e),
             ]);
 
-            $actionLog->update([
+            $actionLog?->update([
                 'status' => 'failed',
                 'error_message' => $e->getMessage(),
                 'executed_at' => now(),
@@ -112,7 +112,7 @@ class ActionExecutor
         }
         $business = $conversation->business;
 
-        $commerceContext = app(EcommerceChannelResolver::class)->resolveConversation($conversation);
+        $commerceContext = app(EcommerceChannelResolver::class)->resolveConversation($conversation, $conversation->bot);
         $connection = $commerceContext['connection'] ?? null;
         if (($commerceContext['status'] ?? 'unresolved') !== 'resolved'
             || !$connection
@@ -143,7 +143,13 @@ class ActionExecutor
             'success' => true,
             'products' => $products->map(function ($product) {
                 return [
-                    'id' => $product->id,
+                    // The AI-facing identifier must be the provider's ID so
+                    // it cannot accidentally pass a local database key to a
+                    // store API. Retain the local key only as metadata.
+                    'id' => $product->commerce_external_id ?: (string) $product->id,
+                    'internal_id' => $product->id,
+                    'commerce_channel_id' => $product->commerce_channel_id,
+                    'commerce_external_id' => $product->commerce_external_id,
                     'name' => $product->name,
                     'price' => $product->price,
                     'stock' => $product->stock_quantity,
@@ -168,7 +174,7 @@ class ActionExecutor
             return ['success' => false, 'error' => 'Conversation business context is unavailable.'];
         }
 
-        $commerceContext = app(EcommerceChannelResolver::class)->resolveConversation($conversation);
+        $commerceContext = app(EcommerceChannelResolver::class)->resolveConversation($conversation, $conversation->bot);
         $connection = $commerceContext['connection'] ?? null;
         if (($commerceContext['status'] ?? 'unresolved') !== 'resolved' || !$connection) {
             return ['success' => false, 'error' => 'No authorized commerce store is resolved for this conversation.'];
@@ -214,6 +220,9 @@ class ActionExecutor
         }
 
         $conversation = Conversation::find($conversationId);
+        if (!$conversation || !$conversation->business) {
+            return ['success' => false, 'error' => 'Conversation business context is unavailable.'];
+        }
         $business = $conversation->business;
 
         // Create calendar event

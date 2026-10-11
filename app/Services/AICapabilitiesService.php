@@ -10,6 +10,9 @@ use Illuminate\Support\Facades\Redis;
 
 class AICapabilitiesService
 {
+    private static ?string $lastRequestProvider = null;
+    private static ?string $lastRequestModel = null;
+
     private static function getAIProvider(array $context = []): string
     {
         if (!empty($context['ai_provider'])) {
@@ -134,6 +137,21 @@ ROLE;
         }
 
         // ── Customer Profile (name/tags only — no internal identifiers) ───────
+        // This instruction is supplied by the backend commerce resolver. Keep
+        // unresolved conversations from guessing a catalog or store, and keep
+        // resolved conversations pinned to their authorized connection.
+        if (!empty($context['commerce_context_instruction'])) {
+            $commerceContext = $context['commerce_context'] ?? [];
+            $p .= "COMMERCE CONNECTION CONTEXT\n";
+            if (($commerceContext['status'] ?? null) === 'resolved') {
+                $p .= 'Resolved store: ' . ($commerceContext['store_name'] ?? 'connected store')
+                    . ' (' . ($commerceContext['provider'] ?? 'commerce provider') . ").\n";
+            } else {
+                $p .= "No store is resolved for this conversation.\n";
+            }
+            $p .= $context['commerce_context_instruction'] . "\n\n";
+        }
+
         if (!empty($context['customer']) && is_array($context['customer'])) {
             $cu = $context['customer'];
             $p .= "\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n";
@@ -651,46 +669,43 @@ JSON;
      */
     public static function checkRateLimit(string $userId, string $tenantId = 'default'): array
     {
-        $redisKey = "rate_limit:{$tenantId}:{$userId}";
+        $cacheKey = "rate_limit:{$tenantId}:{$userId}";
         $windowSeconds = 60;
         $maxRequests = 10;
 
         try {
-            $currentCount = Redis::get($redisKey);
-
-            if ($currentCount === null) {
-                Redis::setex($redisKey, $windowSeconds, 1);
+            $expiresKey = $cacheKey . ':expires_at';
+            $expiresAt = now()->addSeconds($windowSeconds)->timestamp;
+            if (Cache::add($cacheKey, 1, now()->addSeconds($windowSeconds))) {
+                Cache::add($expiresKey, $expiresAt, now()->addSeconds($windowSeconds));
                 return [
                     'rate_limited' => false,
                     'remaining' => $maxRequests - 1,
-                    'reset_in' => $windowSeconds
+                    'reset_in' => $windowSeconds,
                 ];
             }
 
-            $count = (int)$currentCount;
-
-            if ($count >= $maxRequests) {
-                $ttl = Redis::ttl($redisKey);
+            $count = (int) Cache::increment($cacheKey);
+            $retryAfter = max(1, (int) Cache::get($expiresKey, $expiresAt) - now()->timestamp);
+            if ($count > $maxRequests) {
                 return [
                     'rate_limited' => true,
                     'reason' => 'too_many_requests',
                     'limit' => $maxRequests,
                     'window' => $windowSeconds,
-                    'reset_in' => $ttl,
-                    'retry_after' => $ttl
+                    'reset_in' => $retryAfter,
+                    'retry_after' => $retryAfter,
                 ];
             }
 
-            Redis::incr($redisKey);
-
             return [
                 'rate_limited' => false,
-                'remaining' => $maxRequests - ($count + 1),
-                'reset_in' => Redis::ttl($redisKey)
+                'remaining' => $maxRequests - $count,
+                'reset_in' => $retryAfter,
             ];
 
-        } catch (\Exception $e) {
-            Log::error('Rate limiting failed', ['error' => $e->getMessage()]);
+        } catch (\Throwable $e) {
+            Log::error('Rate limiting failed', ['exception_type' => get_class($e)]);
             return ['rate_limited' => false, 'remaining' => $maxRequests];
         }
     }
@@ -717,7 +732,7 @@ JSON;
             ];
 
         } catch (\Exception $e) {
-            Log::error('Conversation memory check failed', ['error' => $e->getMessage()]);
+            Log::error('Conversation memory check failed', ['exception_type' => get_class($e)]);
             return [
                 'phone_provided' => false,
                 'order_number_provided' => false,
@@ -743,7 +758,7 @@ JSON;
             Redis::setex($redisKey, 3600, json_encode($newState));
 
         } catch (\Exception $e) {
-            Log::error('Conversation memory update failed', ['error' => $e->getMessage()]);
+            Log::error('Conversation memory update failed', ['exception_type' => get_class($e)]);
         }
     }
 
@@ -804,6 +819,8 @@ JSON;
     public static function callAIWithJSON(string $message, array $context = []): array
     {
         try {
+            self::$lastRequestProvider = null;
+            self::$lastRequestModel = null;
             $systemPrompt = self::getUltimateSystemPrompt($context);
 
             $messages = [
@@ -964,12 +981,15 @@ JSON;
                 'confidence'        => $aiResult['confidence'] ?? 0.7,
                 'escalation_reason' => $aiResult['escalation_reason'] ?? 'none',
                 'validation'        => $validation,
+                'provider'          => self::$lastRequestProvider,
+                'model'             => self::$lastRequestModel,
             ];
 
         } catch (\Exception $e) {
             Log::error('AI call failed', [
-                'message' => $message,
-                'error'   => $e->getMessage(),
+                'provider' => self::$lastRequestProvider,
+                'model' => self::$lastRequestModel,
+                'exception_type' => get_class($e),
             ]);
             return self::getFallbackResponse();
         }
@@ -1073,7 +1093,7 @@ JSON;
             ]);
         } catch (\Throwable $e) {
             // Never let metric logging break the AI flow
-            Log::warning('Failed to log AI metrics: ' . $e->getMessage());
+            Log::warning('Failed to log AI metrics', ['exception_type' => get_class($e)]);
         }
     }
 
@@ -1119,7 +1139,7 @@ JSON;
                 return self::callGroqChat($messages, $context);
             } catch (\Exception $e) {
                 // If Groq fails (e.g. invalid API key), try Gemini as a fallback if configured
-                Log::warning('Groq API failed. Falling back to Gemini.', ['error' => $e->getMessage()]);
+            Log::warning('Groq API failed. Falling back to Gemini.', ['exception_type' => get_class($e)]);
                 return self::callGeminiChat($messages, $context);
             }
         }
@@ -1143,6 +1163,9 @@ JSON;
             throw new \Exception('Groq API Key is not configured (GROQ_API_KEY).');
         }
 
+        self::$lastRequestProvider = 'groq';
+        self::$lastRequestModel = $model;
+
         $payload = [
             'model'       => $model,
             'messages'    => $messages,
@@ -1159,9 +1182,8 @@ JSON;
         if (!$response->successful()) {
             Log::error('Groq API error', [
                 'status' => $response->status(),
-                'body'   => $response->body(),
             ]);
-            throw new \Exception('Groq API error (HTTP ' . $response->status() . '): ' . $response->body());
+            throw new \Exception('Groq API error (HTTP ' . $response->status() . ')');
         }
 
         $data = $response->json();
@@ -1181,6 +1203,9 @@ JSON;
     {
         $apiKey = self::getAIAPIKey($context);
         $model  = self::getAIModel($context);
+
+        self::$lastRequestProvider = 'gemini';
+        self::$lastRequestModel = $model;
 
         // Separate system prompt from chat turns
         $systemText = '';
@@ -1229,7 +1254,7 @@ JSON;
         );
 
         if (!$response->successful()) {
-            throw new \Exception('Gemini API error: ' . $response->body());
+            throw new \Exception('Gemini API error (HTTP ' . $response->status() . ')');
         }
 
         $data = $response->json();

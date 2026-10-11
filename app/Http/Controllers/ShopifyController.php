@@ -6,11 +6,10 @@ use App\Jobs\SyncCommerceStore;
 use App\Models\Channel;
 use App\Models\CommerceOrder;
 use Illuminate\Http\Request;
-use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Http;
 use Illuminate\Support\Facades\Log;
-use Illuminate\Support\Str;
+use App\Services\OAuthStateService;
 
 class ShopifyController extends Controller
 {
@@ -34,12 +33,11 @@ class ShopifyController extends Controller
             ], 409);
         }
 
-        $state = Str::random(48);
-        Cache::put('shopify_oauth_state:' . hash('sha256', $state), [
-            'user_id' => (int) $request->user()->id,
+        $business = app(\App\Services\ActiveBusiness::class)->resolve($request, permission: 'write');
+        $state = app(OAuthStateService::class)->issue('shopify', (int) $request->user()->id, [
             'shop' => $shop,
-            'created_at' => now()->timestamp,
-        ], now()->addMinutes(10));
+            'business_id' => $business->id,
+        ]);
 
         $params = [
             'client_id' => $clientId,
@@ -59,9 +57,8 @@ class ShopifyController extends Controller
         $secret = config('services.shopify.client_secret');
         $shop = $this->normalizeShop((string) $request->query('shop', ''));
         if ($request->query('error')) {
-            $state = (string) $request->query('state', '');
-            $stateData = $state !== '' ? Cache::pull('shopify_oauth_state:' . hash('sha256', $state)) : null;
-            if ($stateData && ($stateData['shop'] ?? null) === $shop) {
+            $stateData = app(OAuthStateService::class)->consume('shopify', (string) $request->query('state', ''));
+            if ($stateData && ($stateData['context']['shop'] ?? null) === $shop) {
                 return redirect($this->frontendUrl() . '/dashboard/channels?error=shopify_cancelled');
             }
         }
@@ -74,16 +71,27 @@ class ShopifyController extends Controller
             return redirect($this->frontendUrl() . '/dashboard/channels?error=shopify_expired_callback');
         }
 
-        $state = (string) $request->query('state', '');
-        $stateData = $state !== '' ? Cache::pull('shopify_oauth_state:' . hash('sha256', $state)) : null;
-        if (!$stateData || ($stateData['shop'] ?? null) !== $shop || empty($stateData['user_id'])
-            || now()->timestamp - (int) ($stateData['created_at'] ?? 0) > 600) {
+        $stateData = app(OAuthStateService::class)->consume('shopify', (string) $request->query('state', ''));
+        if (!$stateData || ($stateData['context']['shop'] ?? null) !== $shop || empty($stateData['user_id'])
+            || !\App\Models\User::whereKey($stateData['user_id'])->exists()) {
             return redirect($this->frontendUrl() . '/dashboard/channels?error=shopify_invalid_state');
         }
 
         $code = $request->query('code');
         if (!$code || $request->query('error')) {
             return redirect($this->frontendUrl() . '/dashboard/channels?error=shopify_cancelled');
+        }
+
+        $businessId = (int) ($stateData['context']['business_id'] ?? 0);
+        try {
+            $business = app(\App\Services\BusinessAccessService::class)->authorize(
+                \App\Models\User::findOrFail($stateData['user_id']),
+                $businessId,
+                'write',
+                hideUnauthorized: false,
+            );
+        } catch (\Throwable) {
+            return redirect($this->frontendUrl() . '/dashboard/channels?error=shopify_invalid_state');
         }
 
         try {
@@ -107,7 +115,6 @@ class ShopifyController extends Controller
                 return redirect($this->frontendUrl() . '/dashboard/channels?error=shopify_verification_failed');
             }
 
-            $business = \App\Models\BusinessProfile::firstOrCreate(['user_id' => $stateData['user_id']]);
             $channel = Channel::updateOrCreate(
                 ['user_id' => $stateData['user_id'], 'type' => 'shopify', 'page_id' => $shop],
                 [
@@ -131,7 +138,7 @@ class ShopifyController extends Controller
 
             return redirect($this->frontendUrl() . '/dashboard/channels?success=shopify_connected');
         } catch (\Throwable $e) {
-            Log::error('Shopify connection failed', ['shop' => $shop, 'error' => $e->getMessage()]);
+            Log::error('Shopify connection failed', ['shop' => $shop, 'exception_type' => get_class($e)]);
             return redirect($this->frontendUrl() . '/dashboard/channels?error=shopify_connection_failed');
         }
     }
@@ -236,7 +243,7 @@ class ShopifyController extends Controller
             $existingEdges = [];
             Log::warning('Shopify existing webhook lookup failed; attempting registration anyway', [
                 'channel_id' => $channel->id,
-                'error' => $e->getMessage(),
+                'exception_type' => get_class($e),
             ]);
         }
 
@@ -279,11 +286,11 @@ class ShopifyController extends Controller
                     ]);
                 }
             } catch (\Throwable $e) {
-                $failures[$topic] = ['error' => $e->getMessage()];
+                $failures[$topic] = ['exception_type' => get_class($e)];
                 Log::warning('Shopify webhook subscription failed', [
                     'channel_id' => $channel->id,
                     'topic' => $topic,
-                    'error' => $e->getMessage(),
+                    'exception_type' => get_class($e),
                 ]);
             }
         }

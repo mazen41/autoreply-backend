@@ -8,58 +8,50 @@ use App\Models\Message;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\Http;
 use Illuminate\Support\Facades\Log;
+use App\Services\OAuthStateService;
 
 class TikTokController extends Controller
 {
     public function connect(Request $request)
     {
-        $token = $request->query('token');
-        $accessToken = \Laravel\Sanctum\PersonalAccessToken::findToken($token);
-        if (!$accessToken) {
-            return redirect(env('FRONTEND_URL') . '/dashboard/channels?error=unauthorized');
-        }
-        $user = $accessToken->tokenable;
-        $state = $user->id . ':' . $request->query('redirect', 'dashboard');
-
-        $clientId = env('TIKTOK_CLIENT_KEY');
-        $redirectUri = env('TIKTOK_REDIRECT_URI');
-
-        $scopes = implode(',', [
-            'user.info.basic',
-            'user.video.list',
-            'video.list',
-            'video.comments',
-        ]);
-
-        $url = 'https://open.tiktokapis.com/v2/oauth/authorize/?' . http_build_query([
-            'client_key' => $clientId,
-            'redirect_uri' => $redirectUri,
-            'scope' => $scopes,
-            'response_type' => 'code',
-            'state' => $state,
-        ]);
-
-        return redirect($url);
+        return response()->json([
+            'message' => 'TikTok messaging is disabled because this integration has no supported customer messaging API.',
+        ], 410);
     }
 
     public function callback(Request $request)
     {
+        return redirect(env('FRONTEND_URL') . '/dashboard/channels?error=tiktok_messaging_unavailable');
+
         Log::info('=== TIKTOK CALLBACK START ===');
-        Log::info('All request params', $request->all());
+        Log::info('TikTok OAuth callback received', [
+            'has_code' => $request->filled('code'),
+            'has_state' => $request->filled('state'),
+            'has_provider_error' => $request->filled('error'),
+        ]);
+
+        $stateData = app(OAuthStateService::class)->consume('tiktok', $request->query('state'));
+        $userId = $stateData['user_id'] ?? null;
+        if (!$userId || !\App\Models\User::whereKey($userId)->exists()) {
+            return redirect(env('FRONTEND_URL') . '/dashboard/channels?error=tiktok_invalid_state');
+        }
+        try {
+            $businessProfile = app(\App\Services\BusinessAccessService::class)->authorize(
+                \App\Models\User::findOrFail($userId),
+                (int) ($stateData['context']['business_id'] ?? 0),
+                'write',
+                hideUnauthorized: false,
+            );
+        } catch (\Throwable) {
+            return redirect(env('FRONTEND_URL') . '/dashboard/channels?error=tiktok_invalid_state');
+        }
 
         $code = $request->get('code');
-        $stateParts = explode(':', $request->get('state') ?? '');
-        $userId = $stateParts[0] ?? null;
         $error = $request->get('error');
 
         if ($error || !$code) {
-            Log::error('TikTok OAuth denied or no code', ['error' => $error]);
+            Log::error('TikTok OAuth denied or no code', ['has_provider_error' => !empty($error)]);
             return redirect(env('FRONTEND_URL') . '/dashboard/channels?error=tiktok_denied');
-        }
-
-        if (!$userId) {
-            Log::error('No user ID in TikTok state');
-            return redirect(env('FRONTEND_URL') . '/dashboard/channels?error=session_expired');
         }
 
         $clientId = env('TIKTOK_CLIENT_KEY');
@@ -79,7 +71,6 @@ class TikTokController extends Controller
             if (!$tokenResponse->successful()) {
                 Log::error('TikTok token exchange failed', [
                     'status' => $tokenResponse->status(),
-                    'body' => $tokenResponse->json(),
                 ]);
                 return redirect(env('FRONTEND_URL') . '/dashboard/channels?error=token_failed');
             }
@@ -99,7 +90,7 @@ class TikTokController extends Controller
             if (!$userResponse->successful()) {
                 Log::error('Failed to get TikTok user info', [
                     'status' => $userResponse->status(),
-                    'body' => $userResponse->json(),
+                    'has_response' => $userResponse->body() !== '',
                 ]);
                 return redirect(env('FRONTEND_URL') . '/dashboard/channels?error=user_info_failed');
             }
@@ -111,8 +102,6 @@ class TikTokController extends Controller
             $openId = $tiktokUser['open_id'] ?? '';
 
             // Save channel
-            $businessProfile = \App\Models\BusinessProfile::where('user_id', $userId)->first();
-
             $channel = Channel::updateOrCreate(
                 [
                     'user_id' => $userId,
@@ -143,8 +132,7 @@ class TikTokController extends Controller
         } catch (\Exception $e) {
             Log::error('TikTok connection error', [
                 'user_id' => $userId,
-                'error' => $e->getMessage(),
-                'trace' => $e->getTraceAsString(),
+                'exception_type' => get_class($e),
             ]);
             return redirect(env('FRONTEND_URL') . '/dashboard/channels?error=connection_failed');
         }

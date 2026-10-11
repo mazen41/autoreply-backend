@@ -127,7 +127,7 @@ class ChurnDetectionService
                 $riskData
             );
         } catch (\Exception $e) {
-            Log::warning('Failed to send churn risk notification: ' . $e->getMessage());
+            Log::warning('Failed to send churn risk notification', ['exception_type' => get_class($e)]);
         }
     }
 

@@ -182,7 +182,7 @@ class NotificationService
         } catch (\Exception $e) {
             Log::error('Failed to send escalation email', [
                 'user_id' => $userId,
-                'error' => $e->getMessage(),
+                'exception_type' => get_class($e),
             ]);
         }
     }

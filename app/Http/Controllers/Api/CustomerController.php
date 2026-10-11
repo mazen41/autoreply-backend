@@ -14,27 +14,9 @@ class CustomerController extends Controller
     /**
      * Resolve the business profile for the current request.
      */
-    private function getResolvedBusinessProfile(Request $request): \App\Models\BusinessProfile
+    private function getResolvedBusinessProfile(Request $request, string $permission = 'read'): \App\Models\BusinessProfile
     {
-        $user = $request->user();
-        $requestedBusinessId = $request->header('X-Business-Id') ?? $request->input('business_id');
-
-        if ($requestedBusinessId) {
-            $requestedBusinessId = (int) $requestedBusinessId;
-            $hasAccess = \App\Models\BusinessProfile::where('id', $requestedBusinessId)
-                ->where('user_id', $user->id)
-                ->exists() ||
-                \App\Models\TeamMember::where('business_id', $requestedBusinessId)
-                    ->where('user_id', $user->id)
-                    ->where('is_active', true)
-                    ->exists();
-
-            if ($hasAccess) {
-                return \App\Models\BusinessProfile::findOrFail($requestedBusinessId);
-            }
-        }
-
-        return \App\Models\BusinessProfile::firstOrCreate(['user_id' => $user->id]);
+        return app(\App\Services\ActiveBusiness::class)->resolve($request, permission: $permission);
     }
 
     /**
@@ -42,7 +24,7 @@ class CustomerController extends Controller
      */
     public function index(Request $request)
     {
-        $business = $this->getResolvedBusinessProfile($request);
+        $business = $this->getResolvedBusinessProfile($request, 'read');
 
         $query = Customer::where('business_profile_id', $business->id);
 
@@ -73,7 +55,7 @@ class CustomerController extends Controller
      */
     public function show(Request $request, $id)
     {
-        $business = $this->getResolvedBusinessProfile($request);
+        $business = $this->getResolvedBusinessProfile($request, 'read');
 
         $customer = Customer::where('business_profile_id', $business->id)
             ->with([
@@ -112,7 +94,7 @@ class CustomerController extends Controller
      */
     public function storeNote(Request $request, $customerId)
     {
-        $business = $this->getResolvedBusinessProfile($request);
+        $business = $this->getResolvedBusinessProfile($request, 'write');
 
         $customer = Customer::where('business_profile_id', $business->id)->findOrFail($customerId);
 
@@ -145,7 +127,7 @@ class CustomerController extends Controller
      */
     public function updateTags(Request $request, $customerId)
     {
-        $business = $this->getResolvedBusinessProfile($request);
+        $business = $this->getResolvedBusinessProfile($request, 'write');
 
         $customer = Customer::where('business_profile_id', $business->id)->findOrFail($customerId);
 

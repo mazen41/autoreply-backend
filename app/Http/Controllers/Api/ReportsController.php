@@ -6,6 +6,8 @@ use App\Http\Controllers\Controller;
 use App\Models\Conversation;
 use App\Models\Message;
 use App\Models\Channel;
+use App\Models\BusinessProfile;
+use Carbon\CarbonImmutable;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\Auth;
 use Illuminate\Support\Facades\DB;
@@ -17,12 +19,72 @@ class ReportsController extends Controller
      * belongs to the current user. The messages table has no user_id column
      * of its own, so this join is required for every report below.
      */
+    private function businessId(): int
+    {
+        $request = request();
+        $business = $request->attributes->get('active_business');
+        if (!$business) {
+            $business = app(\App\Services\ActiveBusiness::class)->resolve($request, permission: 'read');
+            $request->attributes->set('active_business', $business);
+        }
+
+        return (int) $business->id;
+    }
+
     private function userMessages()
     {
-        $user = Auth::user();
-        return Message::whereHas('conversation.channel', function ($q) use ($user) {
-            $q->where('user_id', $user->id);
-        });
+        $businessId = $this->businessId();
+        return Message::whereHas('conversation', fn ($q) => $q->where('business_id', $businessId));
+    }
+
+    private function dashboardRange(Request $request, int $defaultDays = 7): array
+    {
+        $validated = $request->validate([
+            'days' => 'sometimes|integer|min:1|max:365',
+            'timezone' => 'sometimes|string|max:64',
+        ]);
+        $days = (int) ($validated['days'] ?? $defaultDays);
+        $business = $request->attributes->get('active_business')
+            ?? BusinessProfile::find($this->businessId());
+        $businessTimezone = $business?->timezone;
+        $timezone = $businessTimezone && in_array($businessTimezone, timezone_identifiers_list(), true)
+            ? $businessTimezone
+            : (($validated['timezone'] ?? null) && in_array($validated['timezone'], timezone_identifiers_list(), true)
+                ? $validated['timezone']
+                : 'UTC');
+
+        $nowLocal = CarbonImmutable::now($timezone);
+        $startLocal = $nowLocal->startOfDay()->subDays($days - 1);
+        $startUtc = $startLocal->setTimezone('UTC');
+        $endUtc = $nowLocal->setTimezone('UTC');
+        $previousStartUtc = $startUtc->subDays($days);
+        $previousEndUtc = $startUtc->subMicrosecond();
+
+        return [
+            'days' => $days,
+            'timezone' => $timezone,
+            'start_utc' => $startUtc,
+            'end_utc' => $endUtc,
+            'previous_start_utc' => $previousStartUtc,
+            'previous_end_utc' => $previousEndUtc,
+            'period_start' => $startLocal->toDateString(),
+            'period_end' => $nowLocal->toDateString(),
+        ];
+    }
+
+    private function messagesForRange(array $range)
+    {
+        return $this->userMessages()->whereBetween('created_at', [$range['start_utc'], $range['end_utc']]);
+    }
+
+    private function rangeResponseFields(array $range): array
+    {
+        return [
+            'range_days' => $range['days'],
+            'timezone' => $range['timezone'],
+            'period_start' => $range['period_start'],
+            'period_end' => $range['period_end'],
+        ];
     }
 
     /**
@@ -30,28 +92,23 @@ class ReportsController extends Controller
      */
     public function dailyMessages(Request $request)
     {
-        $days = $request->get('days', 30); // Default to last 30 days
-
-        $data = $this->userMessages()
-            ->where('created_at', '>=', now()->subDays($days))
-            ->select(DB::raw('DATE(created_at) as date'), DB::raw('COUNT(*) as count'))
-            ->groupBy('date')
-            ->orderBy('date')
-            ->get()
-            ->pluck('count', 'date')
-            ->toArray();
-
-        // Fill in missing days with 0
+        $range = $this->dashboardRange($request, 30);
+        $counts = $this->messagesForRange($range)->get(['created_at'])
+            ->groupBy(fn ($message) => $message->created_at->setTimezone($range['timezone'])->toDateString())
+            ->map(fn ($messages) => $messages->count());
         $result = [];
-        for ($i = $days - 1; $i >= 0; $i--) {
-            $date = now()->subDays($i)->format('Y-m-d');
-            $result[] = $data[$date] ?? 0;
+        $dates = [];
+        for ($i = 0; $i < $range['days']; $i++) {
+            $date = CarbonImmutable::parse($range['period_start'], $range['timezone'])->addDays($i)->toDateString();
+            $dates[] = $date;
+            $result[] = (int) ($counts[$date] ?? 0);
         }
 
         return response()->json([
             'data' => $result,
+            'dates' => $dates,
             'total' => array_sum($result),
-        ]);
+        ] + $this->rangeResponseFields($range));
     }
 
     /**
@@ -59,9 +116,7 @@ class ReportsController extends Controller
      */
     public function channelBreakdown(Request $request)
     {
-        $user = Auth::user();
-
-        $channels = Channel::where('user_id', $user->id)
+        $channels = Channel::where('business_id', $this->businessId())
             ->withCount('messages as messages_count')
             ->get()
             ->map(function ($channel) {
@@ -85,42 +140,13 @@ class ReportsController extends Controller
      * the gap between them. There's no stored response_time column, so this
      * is calculated on the fly from real timestamps.
      */
-    private function averageResponseTimeSeconds(): float
+    private function averageResponseTimeSeconds(array $range): float
     {
-        $user = Auth::user();
-
-        $conversationIds = Conversation::whereHas('channel', function ($q) use ($user) {
-            $q->where('user_id', $user->id);
-        })->pluck('id');
-
-        if ($conversationIds->isEmpty()) {
-            return 0;
-        }
-
-        $gaps = [];
-
-        Message::whereIn('conversation_id', $conversationIds)
-            ->orderBy('conversation_id')
-            ->orderBy('created_at')
-            ->get(['conversation_id', 'direction', 'created_at'])
-            ->groupBy('conversation_id')
-            ->each(function ($messages) use (&$gaps) {
-                $pendingInboundAt = null;
-                foreach ($messages as $m) {
-                    if ($m->direction === 'inbound') {
-                        $pendingInboundAt = $m->created_at;
-                    } elseif ($m->direction === 'outbound' && $pendingInboundAt) {
-                        $gaps[] = $m->created_at->diffInSeconds($pendingInboundAt);
-                        $pendingInboundAt = null;
-                    }
-                }
-            });
-
-        if (empty($gaps)) {
-            return 0;
-        }
-
-        return array_sum($gaps) / count($gaps);
+        return app(\App\Services\AnalyticsService::class)->medianResponseTimeSeconds(
+            $this->businessId(),
+            $range['start_utc'],
+            $range['end_utc']
+        ) ?? 0.0;
     }
 
     /**
@@ -128,30 +154,49 @@ class ReportsController extends Controller
      */
     public function aiPerformance(Request $request)
     {
-        $totalMessages = $this->userMessages()->count();
-        $autoReplies = $this->userMessages()
+        $range = $this->dashboardRange($request, 30);
+        $automatedSources = ['campaign', 'email_campaign', 'sequence', 'automation', 'proactive'];
+        $customerReplyMessages = fn () => $this->messagesForRange($range)
+            ->where('direction', 'outbound')
+            ->where(fn ($query) => $query->whereNull('source')->orWhereNotIn('source', $automatedSources));
+        $totalReplies = $customerReplyMessages()->count();
+        $autoReplies = $this->messagesForRange($range)
+            ->where('direction', 'outbound')
             ->where('is_ai', true)
+            ->where(fn ($query) => $query->whereNull('source')->orWhereNotIn('source', $automatedSources))
             ->count();
 
-        $manualInterventions = $this->userMessages()
+        $manualInterventions = $this->messagesForRange($range)
             ->where('is_ai', false)
             ->where('direction', 'outbound')
+            ->where(fn ($query) => $query->whereNull('source')->orWhereNotIn('source', $automatedSources))
             ->count();
 
-        $avgResponseTime = $this->averageResponseTimeSeconds();
-
-        $responseRate = $totalMessages > 0 ? ($autoReplies / $totalMessages) * 100 : 0;
+        $avgResponseTime = $this->averageResponseTimeSeconds($range);
+        $shareOfReplies = $totalReplies > 0 ? ($autoReplies / $totalReplies) * 100 : 0;
+        $aiConversations = Conversation::where('business_id', $this->businessId())
+            ->whereHas('messages', fn ($query) => $query->where('direction', 'outbound')->where('is_ai', true)
+                ->where(fn ($source) => $source->whereNull('source')->orWhereNotIn('source', $automatedSources))
+                ->whereBetween('created_at', [$range['start_utc'], $range['end_utc']]))
+            ->count();
 
         return response()->json([
-            'total_messages' => $totalMessages,
+            'total_messages' => $this->messagesForRange($range)->count(), // deprecated compatibility field
+            'total_replies' => $totalReplies,
             'auto_replies' => $autoReplies,
-            'auto_reply_rate' => round($responseRate, 1),
+            'ai_share_of_replies' => round($shareOfReplies, 1),
+            'auto_reply_rate' => round($shareOfReplies, 1), // deprecated compatibility alias
             'manual_interventions' => $manualInterventions,
-            'avg_response_time_seconds' => round($avgResponseTime, 1),
+            'ai_conversations' => $aiConversations,
+            'median_response_time_seconds' => round($avgResponseTime, 1),
+            'median_response_time_formatted' => $avgResponseTime < 60
+                ? round($avgResponseTime, 1) . 's'
+                : round($avgResponseTime / 60, 1) . 'm',
+            'avg_response_time_seconds' => round($avgResponseTime, 1), // deprecated compatibility alias
             'avg_response_time_formatted' => $avgResponseTime < 60
                 ? round($avgResponseTime, 1) . 's'
                 : round($avgResponseTime / 60, 1) . 'm',
-        ]);
+        ] + $this->rangeResponseFields($range));
     }
 
     /**
@@ -159,10 +204,15 @@ class ReportsController extends Controller
      */
     public function topQuestions(Request $request)
     {
-        $limit = $request->get('limit', 10);
+        $validated = $request->validate([
+            'limit' => 'sometimes|integer|min:1|max:100',
+            'days' => 'sometimes|integer|min:1|max:365',
+            'timezone' => 'sometimes|string|max:64',
+        ]);
+        $limit = (int) ($validated['limit'] ?? 10);
+        $range = $this->dashboardRange($request, 30);
 
-        // Get all inbound messages for analysis
-        $messages = $this->userMessages()
+        $messages = $this->messagesForRange($range)
             ->where('direction', 'inbound')
             ->select('content')
             ->get()
@@ -177,11 +227,9 @@ class ReportsController extends Controller
                 // Standard question marks (English + Arabic question mark)
                 '/\?|؟/u',
                 // Question words at start (English)
-                '/^(what|where|when|why|how|who|which|whose|is|are|do|does|did|can|could|would|should|will)/i',
+                '/^(what|where|when|why|how|who|which|whose|is|are|do|does|did|can|could|would|should|will)\b/iu',
                 // Question words at start (Arabic)
-                '/^(ما|متى|أين|كيف|لماذا|من|كم|هل|هل يمكن|هل كان)/i',
-                // Short queries (less than 100 chars)
-                '/^.{1,100}$/',
+                '/^(ما|متى|أين|كيف|لماذا|من|كم|هل)(?:\s|$)/u',
             ];
 
             $isQuestion = false;
@@ -201,6 +249,7 @@ class ReportsController extends Controller
 
         // Sort by frequency and limit results
         arsort($questions);
+        $questions = array_filter($questions, fn ($count) => $count >= 2);
         $topQuestions = array_slice($questions, 0, $limit, true);
 
         // Format for response
@@ -247,25 +296,60 @@ class ReportsController extends Controller
      */
     public function timeSaved(Request $request)
     {
-        $autoReplies = $this->userMessages()
+        $range = $this->dashboardRange($request, 30);
+        $business = BusinessProfile::findOrFail($this->businessId());
+        $autoReplies = $this->messagesForRange($range)
             ->where('is_ai', true)
+            ->where('direction', 'outbound')
+            ->where(fn ($query) => $query->whereNull('source')->orWhereNotIn('source', ['campaign', 'email_campaign', 'sequence', 'automation', 'proactive']))
             ->count();
 
         // Use configurable values or defaults
-        $manualReplyTimeMinutes = config('services.metrics.avg_manual_reply_time', 3);
+        $manualReplyTimeMinutes = $business->estimated_manual_reply_minutes
+            ?? config('services.metrics.avg_manual_reply_time', 3);
         $totalTimeSavedMinutes = $autoReplies * $manualReplyTimeMinutes;
-        $totalTimeSavedHours = round($totalTimeSavedMinutes / 60, 1);
+        $totalTimeSavedHoursRaw = $totalTimeSavedMinutes / 60;
+        $totalTimeSavedHours = round($totalTimeSavedHoursRaw, 1);
 
         // Estimate value using configurable hourly rate
-        $hourlyRate = config('services.metrics.hourly_rate', 100);
-        $estimatedValue = round($totalTimeSavedHours * $hourlyRate);
+        $hourlyRate = $business->estimated_hourly_rate
+            ?? config('services.metrics.hourly_rate', 100);
+        $estimatedValue = round($totalTimeSavedHoursRaw * $hourlyRate);
+        $currency = $business->estimated_hourly_rate_currency ?: 'SAR';
 
         return response()->json([
             'messages_handled' => $autoReplies,
             'avg_manual_reply_time' => $manualReplyTimeMinutes . ' ' . ($request->get('lang') === 'ar' ? 'دقائق' : 'min'),
             'time_saved_hours' => $totalTimeSavedHours,
             'estimated_value' => $estimatedValue,
-            'estimated_value_formatted' => $estimatedValue . ' ' . ($request->get('lang') === 'ar' ? 'ريال' : 'SAR'),
+            'estimated_value_formatted' => $estimatedValue . ' ' . $currency,
+            'estimate_inputs' => [
+                'minutes_per_reply' => $manualReplyTimeMinutes,
+                'hourly_rate' => $hourlyRate,
+                'hourly_rate_currency' => $business->estimated_hourly_rate_currency ?: 'SAR',
+                'is_estimate' => true,
+            ],
+        ] + $this->rangeResponseFields($range));
+    }
+
+    public function updateTimeSavedSettings(Request $request)
+    {
+        $validated = $request->validate([
+            'minutes_per_reply' => 'required|integer|min:1|max:60',
+            'hourly_rate' => 'required|numeric|min:0|max:1000000',
+            'currency' => ['required', 'string', 'regex:/^[A-Z]{3}$/'],
+        ]);
+        $business = app(\App\Services\ActiveBusiness::class)->resolve($request, permission: 'write');
+        $business->forceFill([
+            'estimated_manual_reply_minutes' => $validated['minutes_per_reply'],
+            'estimated_hourly_rate' => $validated['hourly_rate'],
+            'estimated_hourly_rate_currency' => $validated['currency'],
+        ])->save();
+
+        return response()->json([
+            'minutes_per_reply' => $business->estimated_manual_reply_minutes,
+            'hourly_rate' => (float) $business->estimated_hourly_rate,
+            'currency' => $business->estimated_hourly_rate_currency,
         ]);
     }
 
@@ -288,48 +372,47 @@ class ReportsController extends Controller
      */
     public function dashboardStats(Request $request)
     {
-        $totalMessages = $this->userMessages()->count();
-        $aiReplies = $this->userMessages()
+        $range = $this->dashboardRange($request);
+        $totalMessages = $this->messagesForRange($range)->count();
+        $automatedSources = ['campaign', 'email_campaign', 'sequence', 'automation', 'proactive'];
+        $aiReplies = $this->messagesForRange($range)
+            ->where('direction', 'outbound')
             ->where('is_ai', true)
+            ->where(fn ($query) => $query->whereNull('source')->orWhereNotIn('source', $automatedSources))
             ->count();
-        $responseRate = $totalMessages > 0 ? round(($aiReplies / $totalMessages) * 100, 1) : 0;
+        $totalReplies = $this->messagesForRange($range)
+            ->where('direction', 'outbound')
+            ->where(fn ($query) => $query->whereNull('source')->orWhereNotIn('source', $automatedSources))
+            ->count();
+        $responseRate = $totalReplies > 0 ? round(($aiReplies / $totalReplies) * 100, 1) : 0;
 
         // Time saved: use configurable reply time
         $replyTimeMinutes = config('services.metrics.avg_manual_reply_time', 3);
         $hoursSaved = round(($aiReplies * $replyTimeMinutes) / 60, 1);
 
-        // Week-over-week message trend
-        $thisWeek = $this->userMessages()
-            ->where('created_at', '>=', now()->subDays(7))
-            ->count();
-        $lastWeek = $this->userMessages()
-            ->whereBetween('created_at', [now()->subDays(14), now()->subDays(7)])
-            ->count();
+        $thisWeek = $this->messagesForRange($range)->count();
+        $lastWeek = $this->userMessages()->whereBetween('created_at', [
+            $range['previous_start_utc'], $range['previous_end_utc'],
+        ])->count();
         $messagesTrend = null;
         if ($lastWeek > 0) {
             $change = round((($thisWeek - $lastWeek) / $lastWeek) * 100, 1);
             $messagesTrend = ['value' => abs($change), 'isPositive' => $change >= 0];
         }
 
-        // Top question this week (simple heuristic: incoming messages ending in '?')
-        $topQuestionRow = $this->userMessages()
-            ->where('direction', 'inbound')
-            ->where('created_at', '>=', now()->subDays(7))
-            ->where('content', 'like', '%?')
-            ->select(DB::raw('content'), DB::raw('COUNT(*) as count'))
-            ->groupBy('content')
-            ->orderByDesc('count')
-            ->first();
+        $topQuestionRow = $this->topQuestions($request)->getData(true)['questions'][0] ?? null;
 
         return response()->json([
             'total_messages' => $totalMessages,
             'ai_replies' => $aiReplies,
+            'total_replies' => $totalReplies,
+            'ai_share_of_replies' => $responseRate,
             'response_rate' => $responseRate,
             'hours_saved' => $hoursSaved,
             'messages_trend' => $messagesTrend,
-            'top_question' => $topQuestionRow->content ?? null,
-            'question_count' => $topQuestionRow->count ?? 0,
-        ]);
+            'top_question' => $topQuestionRow['question'] ?? null,
+            'question_count' => $topQuestionRow['count'] ?? 0,
+        ] + $this->rangeResponseFields($range));
     }
 
     /**
@@ -337,8 +420,12 @@ class ReportsController extends Controller
      */
     public function exportCsv(Request $request)
     {
-        $user = Auth::user();
-        $type = $request->get('type', 'messages'); // messages, channels, ai_performance
+        $validated = $request->validate([
+            'type' => ['sometimes', 'in:messages,channels,ai_performance'],
+            'days' => ['sometimes', 'integer', 'min:1', 'max:365'],
+        ]);
+        $type = $validated['type'] ?? 'messages';
+        $range = $this->dashboardRange($request, 30);
 
         $filename = "report_{$type}_" . now()->format('Y-m-d') . '.csv';
         $headers = [
@@ -346,34 +433,35 @@ class ReportsController extends Controller
             'Content-Disposition' => "attachment; filename=\"{$filename}\"",
         ];
 
-        $callback = function () use ($user, $type) {
+        $callback = function () use ($type, $range, $request) {
             $file = fopen('php://output', 'w');
+            $this->writeCsvRow($file, ['Period', $range['period_start'], $range['period_end'], 'Timezone', $range['timezone']]);
 
             if ($type === 'messages') {
-                fputcsv($file, ['Date', 'Direction', 'Is AI', 'Content', 'Channel Type']);
+                $this->writeCsvRow($file, ['Date', 'Direction', 'Is AI', 'Content', 'Channel Type']);
                 
-                $this->userMessages()
+                $this->messagesForRange($range)
                     ->with('conversation.channel')
                     ->orderBy('created_at', 'desc')
                     ->chunk(1000, function ($messages) use ($file) {
                         foreach ($messages as $msg) {
-                            fputcsv($file, [
+                            $this->writeCsvRow($file, [
                                 $msg->created_at,
                                 $msg->direction,
                                 $msg->is_ai ? 'Yes' : 'No',
-                                substr($msg->content, 0, 500),
+                                mb_substr((string) $msg->content, 0, 500, 'UTF-8'),
                                 $msg->conversation->channel->type ?? 'Unknown',
                             ]);
                         }
                     });
             } elseif ($type === 'channels') {
-                fputcsv($file, ['Channel Type', 'Channel Name', 'Message Count', 'Status']);
+                $this->writeCsvRow($file, ['Channel Type', 'Channel Name', 'Message Count', 'Status']);
                 
-                Channel::where('user_id', $user->id)
-                    ->withCount('messages')
+                Channel::where('business_id', $this->businessId())
+                    ->withCount(['messages as messages_count' => fn ($query) => $query->whereBetween('messages.created_at', [$range['start_utc'], $range['end_utc']])])
                     ->get()
                     ->each(function ($channel) use ($file) {
-                        fputcsv($file, [
+                        $this->writeCsvRow($file, [
                             $channel->type,
                             $channel->page_name ?? 'N/A',
                             $channel->messages_count,
@@ -381,22 +469,12 @@ class ReportsController extends Controller
                         ]);
                     });
             } elseif ($type === 'ai_performance') {
-                fputcsv($file, ['Metric', 'Value']);
-                
-                $totalMessages = $this->userMessages()->count();
-                $autoReplies = $this->userMessages()->where('is_ai', true)->count();
-                $manualInterventions = $this->userMessages()
-                    ->where('is_ai', false)
-                    ->where('direction', 'outbound')
-                    ->count();
-                $avgResponseTime = $this->averageResponseTimeSeconds();
-                $responseRate = $totalMessages > 0 ? ($autoReplies / $totalMessages) * 100 : 0;
-
-                fputcsv($file, ['Total Messages', $totalMessages]);
-                fputcsv($file, ['AI Auto Replies', $autoReplies]);
-                fputcsv($file, ['Manual Interventions', $manualInterventions]);
-                fputcsv($file, ['Auto Reply Rate (%)', round($responseRate, 1)]);
-                fputcsv($file, ['Avg Response Time (seconds)', round($avgResponseTime, 1)]);
+                $this->writeCsvRow($file, ['Metric', 'Value']);
+                $metrics = $this->aiPerformance($request)->getData(true);
+                $this->writeCsvRow($file, ['AI Share of Replies (%)', $metrics['ai_share_of_replies']]);
+                $this->writeCsvRow($file, ['Manual Interventions', $metrics['manual_interventions']]);
+                $this->writeCsvRow($file, ['AI Conversations', $metrics['ai_conversations']]);
+                $this->writeCsvRow($file, ['Median Response Time (seconds)', $metrics['median_response_time_seconds']]);
             }
 
             fclose($file);
@@ -405,124 +483,102 @@ class ReportsController extends Controller
         return response()->stream($callback, 200, $headers);
     }
 
-    /**
-     * Export reports as PDF using FPDF library
-     */
+    private function writeCsvRow($file, array $values): void
+    {
+        $safe = array_map(function ($value): string {
+            $cell = (string) ($value ?? '');
+            return preg_match('/^[=+\-@\t\r]/', $cell) ? "'" . $cell : $cell;
+        }, $values);
+        fputcsv($file, $safe);
+    }
+
+    /** Export a business-scoped, Unicode PDF report for the selected local date range. */
     public function exportPdf(Request $request)
     {
-        $user = Auth::user();
-        $type = $request->get('type', 'messages');
-
-        // Create new PDF document
-        $pdf = new \FPDF();
-        $pdf->AddPage();
-        
-        // Set font
-        $pdf->SetFont('Arial', '', 12);
-        
-        // Add header
-        $pdf->SetFont('Arial', 'B', 16);
-        $pdf->Cell(0, 10, ucfirst($type) . ' Report', 0, 1, 'C');
-        $pdf->SetFont('Arial', '', 10);
-        $pdf->Cell(0, 6, 'Generated: ' . now()->toDateTimeString(), 0, 1, 'C');
-        $pdf->Cell(0, 6, 'User: ' . $user->name . ' (' . $user->email . ')', 0, 1, 'C');
-        $pdf->Ln(10);
-        
-        // Add separator line
-        $pdf->Line(10, $pdf->GetY(), 200, $pdf->GetY());
-        $pdf->Ln(10);
+        $validated = $request->validate([
+            'type' => ['sometimes', 'in:messages,channels,ai_performance'],
+            'days' => ['sometimes', 'integer', 'min:1', 'max:365'],
+        ]);
+        $type = $validated['type'] ?? 'messages';
+        $range = $this->dashboardRange($request, 30);
+        $periodLabel = $range['period_start'] . ' – ' . $range['period_end'] . ' (' . $range['timezone'] . ')';
+        $headers = [];
+        $rows = [];
+        $rowLimit = 100;
+        $totalRows = 0;
 
         if ($type === 'messages') {
-            $pdf->SetFont('Arial', 'B', 14);
-            $pdf->Cell(0, 10, 'Message Report', 0, 1);
-            $pdf->SetFont('Arial', '', 10);
-            
-            $messages = $this->userMessages()
-                ->with('conversation.channel')
-                ->orderBy('created_at', 'desc')
-                ->limit(100)
-                ->get();
-            
-            // Table header
-            $pdf->SetFont('Arial', 'B', 10);
-            $pdf->Cell(30, 7, 'Date', 1);
-            $pdf->Cell(20, 7, 'Direction', 1);
-            $pdf->Cell(15, 7, 'AI', 1);
-            $pdf->Cell(25, 7, 'Channel', 1);
-            $pdf->Cell(100, 7, 'Content', 1);
-            $pdf->Ln();
-            
-            // Table data
-            $pdf->SetFont('Arial', '', 9);
-            foreach ($messages as $msg) {
-                $pdf->Cell(30, 7, $msg->created_at->format('Y-m-d H:i'), 1);
-                $pdf->Cell(20, 7, $msg->direction, 1);
-                $pdf->Cell(15, 7, $msg->is_ai ? 'Yes' : 'No', 1);
-                $pdf->Cell(25, 7, $msg->conversation->channel->type ?? 'Unknown', 1);
-                $pdf->Cell(100, 7, substr($msg->content, 0, 50) . '...', 1);
-                $pdf->Ln();
-            }
-            
+            $headers = ['Date', 'Direction', 'AI', 'Channel', 'Content'];
+            $query = $this->messagesForRange($range)->with('conversation.channel')->orderByDesc('created_at');
+            $totalRows = (clone $query)->count();
+            $rows = $query->limit($rowLimit)->get()->map(fn (Message $message) => [
+                $message->created_at->setTimezone($range['timezone'])->format('Y-m-d H:i'),
+                $message->direction,
+                $message->is_ai ? 'Yes' : 'No',
+                $message->conversation?->channel?->type ?? 'Unknown',
+                mb_substr((string) $message->content, 0, 300, 'UTF-8'),
+            ])->all();
         } elseif ($type === 'channels') {
-            $pdf->SetFont('Arial', 'B', 14);
-            $pdf->Cell(0, 10, 'Channel Report', 0, 1);
-            $pdf->SetFont('Arial', '', 10);
-            
-            $channels = Channel::where('user_id', $user->id)
-                ->withCount('messages')
+            $headers = ['Channel', 'Name', 'Messages in range', 'Status'];
+            $channels = Channel::where('business_id', $this->businessId())
+                ->withCount(['messages as messages_count' => fn ($query) => $query->whereBetween('messages.created_at', [$range['start_utc'], $range['end_utc']])])
+                ->orderBy('type')
+                ->limit($rowLimit)
                 ->get();
-            
-            // Table header
-            $pdf->SetFont('Arial', 'B', 10);
-            $pdf->Cell(30, 7, 'Type', 1);
-            $pdf->Cell(50, 7, 'Name', 1);
-            $pdf->Cell(30, 7, 'Messages', 1);
-            $pdf->Cell(30, 7, 'Status', 1);
-            $pdf->Ln();
-            
-            // Table data
-            $pdf->SetFont('Arial', '', 10);
-            foreach ($channels as $channel) {
-                $pdf->Cell(30, 7, $channel->type, 1);
-                $pdf->Cell(50, 7, $channel->page_name ?? 'N/A', 1);
-                $pdf->Cell(30, 7, $channel->messages_count, 1);
-                $pdf->Cell(30, 7, $channel->status, 1);
-                $pdf->Ln();
-            }
-            
-        } elseif ($type === 'ai_performance') {
-            $pdf->SetFont('Arial', 'B', 14);
-            $pdf->Cell(0, 10, 'AI Performance Report', 0, 1);
-            $pdf->SetFont('Arial', '', 10);
-            
-            $totalMessages = $this->userMessages()->count();
-            $autoReplies = $this->userMessages()->where('is_ai', true)->count();
-            $manualInterventions = $this->userMessages()
-                ->where('is_ai', false)
-                ->where('direction', 'outbound')
-                ->count();
-            $avgResponseTime = $this->averageResponseTimeSeconds();
-            $responseRate = $totalMessages > 0 ? ($autoReplies / $totalMessages) * 100 : 0;
-
-            $pdf->Cell(60, 10, 'Total Messages:', 0);
-            $pdf->Cell(40, 10, $totalMessages, 0, 1);
-            $pdf->Cell(60, 10, 'AI Auto Replies:', 0);
-            $pdf->Cell(40, 10, $autoReplies, 0, 1);
-            $pdf->Cell(60, 10, 'Manual Interventions:', 0);
-            $pdf->Cell(40, 10, $manualInterventions, 0, 1);
-            $pdf->Cell(60, 10, 'Auto Reply Rate:', 0);
-            $pdf->Cell(40, 10, round($responseRate, 1) . '%', 0, 1);
-            $pdf->Cell(60, 10, 'Avg Response Time:', 0);
-            $pdf->Cell(40, 10, round($avgResponseTime, 1) . ' seconds', 0, 1);
+            $totalRows = Channel::where('business_id', $this->businessId())->count();
+            $rows = $channels->map(fn (Channel $channel) => [
+                $channel->type,
+                $channel->page_name ?: $channel->store_name ?: $channel->page_id ?: 'N/A',
+                (string) $channel->messages_count,
+                $channel->status,
+            ])->all();
+        } else {
+            $headers = ['Metric', 'Value'];
+            $metrics = $this->aiPerformance($request)->getData(true);
+            $rows = [
+                ['AI share of replies (%)', (string) round((float) ($metrics['ai_share_of_replies'] ?? 0), 1)],
+                ['Manual interventions', (string) ($metrics['manual_interventions'] ?? 0)],
+                ['AI conversations', (string) ($metrics['ai_conversations'] ?? 0)],
+                ['Median response time (seconds)', (string) round((float) ($metrics['median_response_time_seconds'] ?? 0), 1)],
+            ];
+            $totalRows = count($rows);
         }
 
-        // Generate PDF content using proper FPDF output
-        $filename = "report_{$type}_" . now()->format('Y-m-d') . '.pdf';
-        
-        return response()->streamDownload(function() use ($pdf) {
-            $pdf->Output('D', $filename);
-        }, $filename, [
-            'Content-Type' => 'application/pdf',
+        $escape = static fn ($value): string => htmlspecialchars((string) ($value ?? ''), ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8');
+        $cell = static function ($value) use ($escape): string {
+            $text = (string) ($value ?? '');
+            $rtl = preg_match('/[\x{0600}-\x{06FF}]/u', $text) === 1;
+            return '<td dir="' . ($rtl ? 'rtl' : 'ltr') . '"' . ($rtl ? ' lang="ar"' : '') . '>' . $escape($text) . '</td>';
+        };
+        $tableHead = '<tr>' . implode('', array_map(fn ($header) => '<th>' . $escape($header) . '</th>', $headers)) . '</tr>';
+        $tableRows = '';
+        foreach ($rows as $row) {
+            $tableRows .= '<tr>' . implode('', array_map($cell, $row)) . '</tr>';
+        }
+        $notice = $totalRows > $rowLimit
+            ? '<p class="notice">Showing the first ' . $rowLimit . ' of ' . $totalRows . ' rows.</p>'
+            : '<p class="notice">Showing ' . count($rows) . ' rows.</p>';
+        $html = '<!doctype html><html lang="en"><head><meta charset="utf-8"><style>
+            body{font-family:dejavusans,sans-serif;font-size:9pt;color:#18212f}h1{font-size:18pt;margin:0 0 5mm}p.meta{color:#526071;font-size:8pt}table{border-collapse:collapse;width:100%;margin-top:6mm}th,td{border:1px solid #cbd5e1;padding:5px;vertical-align:top}th{background:#eef2f7;font-weight:bold}.notice{margin-top:4mm;font-size:8pt;color:#526071}td[dir="rtl"]{text-align:right}
+            </style></head><body dir="ltr"><h1>' . $escape(ucfirst(str_replace('_', ' ', $type))) . ' Report</h1><p class="meta">' . $escape($periodLabel) . ' · Generated ' . $escape(now()->toDateTimeString()) . '</p><table><thead>' . $tableHead . '</thead><tbody>' . $tableRows . '</tbody></table>' . $notice . '</body></html>';
+
+        $tempDir = storage_path('app/mpdf-temp');
+        if (!is_dir($tempDir)) {
+            mkdir($tempDir, 0770, true);
+        }
+        $pdf = new \Mpdf\Mpdf([
+            'mode' => 'utf-8',
+            'default_font' => 'dejavusans',
+            'tempDir' => $tempDir,
         ]);
+        $pdf->WriteHTML($html);
+        $filename = "report_{$type}_" . now()->format('Y-m-d') . '.pdf';
+
+        return response()->streamDownload(
+            fn () => print($pdf->Output('', 'S')),
+            $filename,
+            ['Content-Type' => 'application/pdf']
+        );
     }
+
 }

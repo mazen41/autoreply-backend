@@ -3,9 +3,10 @@
 namespace App\Http\Middleware;
 
 use App\Models\Bot;
-use App\Models\Channel;
 use App\Models\Package;
 use App\Models\TeamMember;
+use App\Services\ActiveBusiness;
+use App\Services\UsageMeter;
 use Closure;
 use Illuminate\Http\Request;
 use Symfony\Component\HttpFoundation\Response;
@@ -19,40 +20,27 @@ class PlanEnforcement
      */
     public function handle(Request $request, Closure $next, string $limitType): Response
     {
-        $user = $request->user();
-        $businessId = $user?->business_id;
-
-        if (!$businessId) {
-            return response()->json([
-                'error' => 'No business profile found',
-                'error_code' => 'NO_BUSINESS_PROFILE',
-            ], 400);
-        }
-
-        // Get the user's active subscription and package
-        $subscription = $user->activeSubscription;
+        $business = app(ActiveBusiness::class)->resolve($request, permission: 'write');
+        $request->attributes->set('authorized_business', $business);
+        $businessId = (int) $business->id;
+        $usageMeter = app(UsageMeter::class);
+        $subscription = $usageMeter->subscriptionFor($business);
         $package = $subscription?->package ?? Package::where('name', 'Free')->first();
 
-        if (!$package) {
-            return response()->json([
-                'error' => 'No package found',
-                'error_code' => 'NO_PACKAGE',
-            ], 400);
-        }
-
-        $maxAllowed = match ($limitType) {
+        $configuredLimit = match ($limitType) {
             'max_bots' => $package->max_bots ?? PHP_INT_MAX,
-            'max_channels' => $package->max_channels ?? PHP_INT_MAX,
+            'max_channels' => $package->channels_limit ?? PHP_INT_MAX,
             'max_team_members' => $package->max_team_members ?? PHP_INT_MAX,
-            'max_monthly_messages' => $package->max_monthly_messages ?? PHP_INT_MAX,
+            'max_monthly_messages' => $package->outbound_messages_limit ?? PHP_INT_MAX,
             default => PHP_INT_MAX,
         };
+        $maxAllowed = (int) $configuredLimit < 0 ? PHP_INT_MAX : (int) $configuredLimit;
 
         $currentUsage = match ($limitType) {
             'max_bots' => Bot::where('business_profile_id', $businessId)->count(),
-            'max_channels' => Channel::where('business_id', $businessId)->count(),
+            'max_channels' => $usageMeter->canUse($business, UsageMeter::CHANNELS)['used'],
             'max_team_members' => TeamMember::where('business_id', $businessId)->count(),
-            'max_monthly_messages' => $this->getMonthlyMessageCount($businessId),
+            'max_monthly_messages' => $usageMeter->canUse($business, UsageMeter::OUTBOUND_MESSAGES)['used'],
             default => 0,
         };
 
@@ -68,18 +56,6 @@ class PlanEnforcement
         }
 
         return $next($request);
-    }
-
-    /**
-     * Get the monthly message count for a business.
-     */
-    private function getMonthlyMessageCount(int $businessId): int
-    {
-        return \App\Models\Message::whereHas('conversation', function ($q) use ($businessId) {
-                $q->where('business_id', $businessId);
-            })
-            ->where('created_at', '>=', now()->startOfMonth())
-            ->count();
     }
 
     /**

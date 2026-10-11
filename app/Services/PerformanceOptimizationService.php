@@ -44,7 +44,7 @@ class PerformanceOptimizationService
 
             Log::info('Performance indexes added successfully');
         } catch (\Exception $e) {
-            Log::error('Failed to add performance indexes', ['error' => $e->getMessage()]);
+            Log::error('Failed to add performance indexes', ['exception_type' => get_class($e)]);
         }
     }
 
@@ -122,7 +122,7 @@ class PerformanceOptimizationService
 
             Log::info('Database tables optimized');
         } catch (\Exception $e) {
-            Log::error('Failed to optimize tables', ['error' => $e->getMessage()]);
+            Log::error('Failed to optimize tables', ['exception_type' => get_class($e)]);
         }
     }
 
@@ -144,7 +144,7 @@ class PerformanceOptimizationService
                 'total_queries' => count($slowQueries),
             ];
         } catch (\Exception $e) {
-            Log::error('Failed to get query performance metrics', ['error' => $e->getMessage()]);
+            Log::error('Failed to get query performance metrics', ['exception_type' => get_class($e)]);
             return ['error' => $e->getMessage()];
         }
     }

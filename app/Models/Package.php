@@ -15,6 +15,7 @@ class Package extends Model
         'price_yearly',
         'ai_replies_limit',
         'channels_limit',
+        'outbound_messages_limit',
         'tools_limit',
         'blog_posts_limit',
         'features',

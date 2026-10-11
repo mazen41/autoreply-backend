@@ -5,6 +5,8 @@ namespace App\Console\Commands;
 use Illuminate\Console\Command;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Log;
+use Illuminate\Support\Facades\Cache;
+use App\Services\ScheduledFailureNotifier;
 
 class MonitorFailedJobs extends Command
 {
@@ -25,36 +27,40 @@ class MonitorFailedJobs extends Command
     /**
      * Execute the console command.
      */
-    public function handle()
+    public function handle(ScheduledFailureNotifier $notifier)
     {
+        $failedCount = DB::table('failed_jobs')->count();
         $failedJobs = DB::table('failed_jobs')
             ->orderBy('failed_at', 'desc')
             ->limit(10)
             ->get();
 
-        if ($failedJobs->isEmpty()) {
+        if ($failedCount === 0) {
             Log::info('No failed jobs to monitor');
             return Command::SUCCESS;
         }
 
         Log::warning('Failed jobs detected', [
-            'count' => $failedJobs->count(),
+            'count' => $failedCount,
             'jobs' => $failedJobs->map(function ($job) {
                 return [
                     'id' => $job->id,
                     'queue' => $job->queue,
-                    'exception' => substr($job->exception, 0, 200),
                     'failed_at' => $job->failed_at,
                 ];
             })->toArray(),
         ]);
 
-        // In production, you would send alerts here (Slack, email, PagerDuty, etc.)
-        // For now, we just log the alert
         Log::alert('ALERT: Failed jobs require attention', [
-            'count' => $failedJobs->count(),
+            'count' => $failedCount,
             'latest_failure' => $failedJobs->first()->failed_at,
         ]);
+
+        $threshold = max(1, (int) config('services.operations.failed_job_alert_threshold', 1));
+        if ($failedCount >= $threshold
+            && Cache::add('ops:alert:failed_jobs', true, now()->addMinutes(max(1, (int) config('services.operations.alert_dedup_minutes', 60))))) {
+            $notifier->notify("Failed queue jobs: {$failedCount} (alert threshold {$threshold}).");
+        }
 
         return Command::SUCCESS;
     }

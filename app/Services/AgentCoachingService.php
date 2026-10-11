@@ -147,7 +147,7 @@ PROMPT;
             ];
 
         } catch (\Exception $e) {
-            Log::error('Agent coaching LLM analysis error', ['error' => $e->getMessage()]);
+            Log::error('Agent coaching LLM analysis error', ['exception_type' => get_class($e)]);
             return self::getDefaultScores($e->getMessage());
         }
     }

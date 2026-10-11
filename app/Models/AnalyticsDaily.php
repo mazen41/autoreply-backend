@@ -6,6 +6,8 @@ use Illuminate\Database\Eloquent\Model;
 
 class AnalyticsDaily extends Model
 {
+    protected $table = 'analytics_daily';
+
     protected $fillable = [
         'business_id',
         'date',

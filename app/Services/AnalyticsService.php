@@ -9,6 +9,7 @@ use App\Models\Conversation;
 use App\Models\Message;
 use App\Models\Subscription;
 use Carbon\Carbon;
+use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Log;
 
 class AnalyticsService
@@ -16,32 +17,17 @@ class AnalyticsService
     /**
      * Calculate daily analytics for a business
      */
-    public function calculateDailyAnalytics(int $businessId, string $date = null): void
+    public function calculateDailyAnalytics(int $businessId, ?string $date = null): void
     {
-        $date = $date ?? Carbon::yesterday()->toDateString();
-        
-        $startDate = Carbon::parse($date)->startOfDay();
-        $endDate = Carbon::parse($date)->endOfDay();
+        [$date, $startDate, $endDate] = $this->businessDayRange($businessId, $date);
 
         // Get conversations for the day
-        $conversations = Conversation::whereHas('channel', function ($q) use ($businessId) {
-                $q->where('user_id', function ($query) use ($businessId) {
-                    $query->whereHas('business', function ($q) use ($businessId) {
-                        $q->where('id', $businessId);
-                    });
-                });
-            })
+        $conversations = Conversation::where('business_id', $businessId)
             ->whereBetween('created_at', [$startDate, $endDate])
             ->get();
 
         // Get messages for the day
-        $messages = Message::whereHas('conversation.channel', function ($q) use ($businessId) {
-                $q->where('user_id', function ($query) use ($businessId) {
-                    $query->whereHas('business', function ($q) use ($businessId) {
-                        $q->where('id', $businessId);
-                    });
-                });
-            })
+        $messages = Message::whereHas('conversation', fn ($query) => $query->where('business_id', $businessId))
             ->whereBetween('created_at', [$startDate, $endDate])
             ->get();
 
@@ -52,34 +38,20 @@ class AnalyticsService
         $humanMessages = $messages->where('is_ai', false)->count();
         
         // Calculate average response time
-        $responseTimes = [];
-        foreach ($conversations as $conversation) {
-            $firstMessage = $conversation->messages()->orderBy('created_at')->first();
-            $firstReply = $conversation->messages()
-                ->where('direction', 'outbound')
-                ->where('is_ai', true)
-                ->orderBy('created_at')
-                ->first();
-            
-            if ($firstMessage && $firstReply) {
-                $responseTime = $firstReply->created_at->diffInSeconds($firstMessage->created_at);
-                $responseTimes[] = $responseTime;
-            }
-        }
-        
-        $avgResponseTime = count($responseTimes) > 0 
-            ? array_sum($responseTimes) / count($responseTimes) 
-            : 0;
+        $avgResponseTime = $this->medianResponseTimeSeconds($businessId, $startDate, $endDate) ?? 0.0;
 
         // Count new vs returning users
-        $newUsers = $conversations->where('created_at', '>=', $startDate)
+        $newUsers = Conversation::where('business_id', $businessId)
+            ->whereBetween('created_at', [$startDate, $endDate])
             ->distinct('sender_id')
-            ->count();
+            ->count('sender_id');
         
-        $returningUsers = $conversations->where('created_at', '<', $startDate)
+        $returningUsers = Conversation::where('business_id', $businessId)
+            ->where('created_at', '<', $startDate)
             ->where('last_message_at', '>=', $startDate)
+            ->where('last_message_at', '<=', $endDate)
             ->distinct('sender_id')
-            ->count();
+            ->count('sender_id');
 
         // Calculate resolved conversations (conversations with no activity in last 24h)
         $resolvedConversations = $conversations
@@ -87,22 +59,20 @@ class AnalyticsService
             ->count();
 
         // Update or create daily analytics
-        AnalyticsDaily::updateOrCreate(
-            [
-                'business_id' => $businessId,
-                'date' => $date,
-            ],
-            [
-                'total_conversations' => $totalConversations,
-                'total_messages' => $totalMessages,
-                'ai_messages' => $aiMessages,
-                'human_messages' => $humanMessages,
-                'avg_response_time_seconds' => round($avgResponseTime, 2),
-                'new_users' => $newUsers,
-                'returning_users' => $returningUsers,
-                'resolved_conversations' => $resolvedConversations,
-            ]
-        );
+        $daily = AnalyticsDaily::query()
+            ->where('business_id', $businessId)
+            ->whereDate('date', $date)
+            ->first() ?? new AnalyticsDaily(['business_id' => $businessId, 'date' => $date]);
+        $daily->fill([
+            'total_conversations' => $totalConversations,
+            'total_messages' => $totalMessages,
+            'ai_messages' => $aiMessages,
+            'human_messages' => $humanMessages,
+            'avg_response_time_seconds' => round($avgResponseTime, 2),
+            'new_users' => $newUsers,
+            'returning_users' => $returningUsers,
+            'resolved_conversations' => $resolvedConversations,
+        ])->save();
 
         Log::info('Daily analytics calculated', [
             'business_id' => $businessId,
@@ -209,79 +179,25 @@ class AnalyticsService
     /**
      * Calculate AI metrics for a business
      */
-    public function calculateAiMetrics(int $businessId, string $date = null): void
+    public function calculateAiMetrics(int $businessId, ?string $date = null): void
     {
-        $date = $date ?? Carbon::yesterday()->toDateString();
-        
-        $startDate = Carbon::parse($date)->startOfDay();
-        $endDate = Carbon::parse($date)->endOfDay();
+        [$date, $startDate, $endDate] = $this->businessDayRange($businessId, $date);
 
-        // Get AI messages for the day
-        $aiMessages = Message::whereHas('conversation.channel', function ($q) use ($businessId) {
-                $q->where('user_id', function ($query) use ($businessId) {
-                    $query->whereHas('business', function ($q) use ($businessId) {
-                        $q->where('id', $businessId);
-                    });
-                });
-            })
-            ->where('is_ai', true)
+        // AiMetric is a per-request token/cost ledger (not a daily rollup
+        // table). Calls are recorded when the AI request runs, so the daily
+        // task validates/aggregates that ledger without writing incompatible
+        // legacy columns back into it.
+        $summary = AiMetric::where('business_profile_id', $businessId)
             ->whereBetween('created_at', [$startDate, $endDate])
-            ->get();
+            ->selectRaw('COUNT(*) as requests, COALESCE(SUM(total_tokens), 0) as total_tokens, COALESCE(SUM(estimated_cost), 0) as estimated_cost')
+            ->first();
 
-        $totalAiMessages = $aiMessages->count();
-        $successfulAiMessages = $aiMessages->where('send_status', 'sent')->count();
-        $escalatedMessages = $aiMessages->whereHas('conversation', function ($q) {
-            $q->where('requires_human', true);
-        })->count();
-
-        // Calculate average confidence score
-        $confidenceScores = $aiMessages->whereNotNull('confidence_score')
-            ->pluck('confidence_score')
-            ->toArray();
-        
-        $avgConfidence = count($confidenceScores) > 0 
-            ? array_sum($confidenceScores) / count($confidenceScores) 
-            : 0;
-
-        // Get feedback from MessageFeedback
-        $feedback = \App\Models\MessageFeedback::whereHas('message.conversation.channel', function ($q) use ($businessId) {
-                $q->where('user_id', function ($query) use ($businessId) {
-                    $query->whereHas('business', function ($q) use ($businessId) {
-                        $q->where('id', $businessId);
-                    });
-                });
-            })
-            ->whereBetween('created_at', [$startDate, $endDate])
-            ->get();
-
-        $positiveFeedback = $feedback->where('feedback', 'positive')->count();
-        $negativeFeedback = $feedback->where('feedback', 'negative')->count();
-
-        // Calculate success rate
-        $successRate = $totalAiMessages > 0 
-            ? round(($successfulAiMessages / $totalAiMessages) * 100, 2) 
-            : 0;
-
-        // Update or create AI metrics
-        AiMetric::updateOrCreate(
-            [
-                'business_id' => $businessId,
-                'date' => $date,
-            ],
-            [
-                'total_ai_messages' => $totalAiMessages,
-                'successful_ai_messages' => $successfulAiMessages,
-                'escalated_messages' => $escalatedMessages,
-                'avg_confidence_score' => round($avgConfidence, 2),
-                'positive_feedback' => $positiveFeedback,
-                'negative_feedback' => $negativeFeedback,
-                'success_rate' => $successRate,
-            ]
-        );
-
-        Log::info('AI metrics calculated', [
+        Log::info('AI usage metrics summarized', [
             'business_id' => $businessId,
             'date' => $date,
+            'requests' => (int) ($summary->requests ?? 0),
+            'total_tokens' => (int) ($summary->total_tokens ?? 0),
+            'estimated_cost' => (float) ($summary->estimated_cost ?? 0),
         ]);
     }
 
@@ -290,7 +206,11 @@ class AnalyticsService
      */
     public function getCsatScore(int $businessId, int $days = 30): array
     {
-        $startDate = Carbon::now()->subDays($days)->startOfDay();
+        $business = \App\Models\BusinessProfile::query()->findOrFail($businessId);
+        $timezone = in_array($business->timezone, timezone_identifiers_list(), true)
+            ? $business->timezone
+            : config('app.timezone', 'UTC');
+        $startDate = Carbon::now($timezone)->startOfDay()->subDays(max(1, min(365, $days)) - 1)->utc();
         
         $ratings = CsatRating::where('business_id', $businessId)
             ->where('rated_at', '>=', $startDate)
@@ -315,9 +235,9 @@ class AnalyticsService
     /**
      * Generate daily report for a business
      */
-    public function generateDailyReport(int $businessId, string $date = null): array
+    public function generateDailyReport(int $businessId, ?string $date = null): array
     {
-        $date = $date ?? Carbon::yesterday()->toDateString();
+        [$date] = $this->businessDayRange($businessId, $date);
         
         // Calculate both daily analytics and AI metrics
         $this->calculateDailyAnalytics($businessId, $date);
@@ -333,5 +253,69 @@ class AnalyticsService
             'total_ratings' => $csatData['total_ratings'],
             'generated_at' => Carbon::now()->toIso8601String(),
         ];
+    }
+
+    /** Business dates are local calendar dates; stored timestamps are queried in UTC. */
+    private function businessDayRange(int $businessId, ?string $date = null): array
+    {
+        $business = \App\Models\BusinessProfile::query()->findOrFail($businessId);
+        $timezone = in_array($business->timezone, timezone_identifiers_list(), true)
+            ? $business->timezone
+            : config('app.timezone', 'UTC');
+        $date ??= Carbon::now($timezone)->subDay()->toDateString();
+        $localStart = Carbon::parse($date, $timezone)->startOfDay();
+
+        return [
+            $localStart->toDateString(),
+            $localStart->copy()->utc(),
+            $localStart->copy()->endOfDay()->utc(),
+        ];
+    }
+
+    /** The median first human-or-AI reply latency for inbound customer messages in the range. */
+    public function medianResponseTimeSeconds(int $businessId, \DateTimeInterface $start, \DateTimeInterface $end): ?float
+    {
+        $firstInbound = DB::table('messages as inbound')
+            ->join('conversations', 'conversations.id', '=', 'inbound.conversation_id')
+            ->where('conversations.business_id', $businessId)
+            ->where('inbound.direction', 'inbound')
+            ->whereBetween('inbound.created_at', [$start, $end])
+            ->select('inbound.id as inbound_id', 'inbound.conversation_id', 'inbound.created_at as inbound_at');
+
+        $firstReply = DB::table('messages as outbound')
+            ->joinSub($firstInbound, 'inbound', 'inbound.conversation_id', '=', 'outbound.conversation_id')
+            ->where('outbound.direction', 'outbound')
+            ->whereColumn('outbound.created_at', '>', 'inbound.inbound_at')
+            ->whereNotExists(function ($query): void {
+                $query->selectRaw('1')->from('messages as next_inbound')
+                    ->whereColumn('next_inbound.conversation_id', 'inbound.conversation_id')
+                    ->where('next_inbound.direction', 'inbound')
+                    ->whereColumn('next_inbound.created_at', '>', 'inbound.inbound_at')
+                    ->whereColumn('next_inbound.created_at', '<', 'outbound.created_at');
+            })
+            ->select('inbound.inbound_id')
+            ->selectRaw('MIN(outbound.created_at) AS first_reply_at')
+            ->groupBy('inbound.inbound_id');
+
+        $driver = DB::connection()->getDriverName();
+        $durationSql = $driver === 'sqlite'
+            ? '((julianday(replies.first_reply_at) - julianday(eligible_inbound.inbound_at)) * 86400)'
+            : 'TIMESTAMPDIFF(SECOND, eligible_inbound.inbound_at, replies.first_reply_at)';
+
+        $latencies = DB::table('messages as inbound')
+            ->joinSub($firstInbound, 'eligible_inbound', 'eligible_inbound.inbound_id', '=', 'inbound.id')
+            ->joinSub($firstReply, 'replies', 'replies.inbound_id', '=', 'inbound.id')
+            ->selectRaw("{$durationSql} AS latency_seconds")
+            ->orderBy('latency_seconds');
+        $count = (clone $latencies)->count();
+        if ($count === 0) {
+            return null;
+        }
+
+        $middle = intdiv($count - 1, 2);
+        $take = $count % 2 === 0 ? 2 : 1;
+        $median = $latencies->offset($middle)->limit($take)->pluck('latency_seconds');
+
+        return (float) $median->avg();
     }
 }

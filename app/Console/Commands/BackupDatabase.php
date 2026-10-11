@@ -3,108 +3,114 @@
 namespace App\Console\Commands;
 
 use Illuminate\Console\Command;
+use Illuminate\Support\Facades\Crypt;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Storage;
+use RuntimeException;
 
 class BackupDatabase extends Command
 {
-    /**
-     * The name and signature of the console command.
-     *
-     * @var string
-     */
     protected $signature = 'backup:database';
 
-    /**
-     * The console command description.
-     *
-     * @var string
-     */
-    protected $description = 'Backup the database to storage';
+    protected $description = 'Create an encrypted database backup and remove expired backups';
 
-    /**
-     * Execute the console command.
-     */
-    public function handle()
+    public function handle(): int
     {
-        $this->info('Starting database backup...');
+        $database = (string) config('database.connections.mysql.database', 'database');
+        $diskName = (string) config('filesystems.backup_disk', config('filesystems.default', 'local'));
+        $directory = trim((string) config('filesystems.backup_path', 'backups'), '/');
+        $retentionDays = max(1, (int) config('filesystems.backup_retention_days', 7));
+        $disk = Storage::disk($diskName);
+
+        $this->info('Starting encrypted database backup...');
 
         try {
-            $database = config('database.connections.mysql.database');
-            $filename = "backup_{$database}_" . date('Y-m-d_H-i-s') . '.sql';
-            $path = storage_path('app/backups/' . $filename);
+            $sql = $this->dumpDatabase();
+            $filename = sprintf('backup_%s_%s.sql.enc', preg_replace('/[^A-Za-z0-9_-]/', '_', $database), now()->format('Y-m-d_H-i-s'));
+            $relativePath = ($directory !== '' ? $directory . '/' : '') . $filename;
+            $encrypted = Crypt::encryptString($sql);
 
-            // Ensure backup directory exists
-            if (!is_dir(dirname($path))) {
-                mkdir(dirname($path), 0755, true);
+            if (!$disk->put($relativePath, $encrypted, ['visibility' => 'private'])) {
+                throw new RuntimeException('Configured backup storage did not accept the encrypted backup.');
             }
 
-            // Use Laravel's built-in database backup
-            $tables = DB::select('SHOW TABLES');
-            $sql = '';
+            $this->restrictLocalPermissions($disk, $relativePath, $directory);
+            $this->cleanupExpiredBackups($disk, $directory, $retentionDays);
 
-            foreach ($tables as $table) {
-                $tableName = array_values((array)$table)[0];
-                $this->info("Backing up table: {$tableName}");
-                
-                $sql .= "-- Backup of table {$tableName}\n";
-                $sql .= "-- Date: " . date('Y-m-d H:i:s') . "\n\n";
-                
-                // Get table structure
-                $createTable = DB::select("SHOW CREATE TABLE `{$tableName}`");
-                $sql .= $createTable[0]->{'Create Table'} . ";\n\n";
-                
-                // Get table data
-                $rows = DB::table($tableName)->get();
-                foreach ($rows as $row) {
-                    $columns = array_keys((array)$row);
-                    $values = array_map(function($value) {
-                        if ($value === null) return 'NULL';
-                        if (is_numeric($value)) return $value;
-                        return "'" . addslashes($value) . "'";
-                    }, (array)$row);
-                    
-                    $sql .= "INSERT INTO `{$tableName}` (`" . implode('`, `', $columns) . "`) VALUES (" . implode(', ', $values) . ");\n";
-                }
-                
-                $sql .= "\n-- End of table {$tableName}\n\n";
-            }
-
-            file_put_contents($path, $sql);
-            $this->info("Database backup completed: {$filename}");
-            
-            // Clean up old backups (keep last 7 days)
-            $this->cleanupOldBackups();
-            
+            $this->info("Encrypted database backup completed: {$relativePath}");
             return Command::SUCCESS;
-
-        } catch (\Exception $e) {
-            $this->error('Database backup error: ' . $e->getMessage());
+        } catch (\Throwable $e) {
+            $this->error('Database backup failed (' . get_class($e) . '). Check backup storage and APP_KEY configuration.');
+            report($e);
             return Command::FAILURE;
         }
     }
 
-    private function cleanupOldBackups()
+    private function dumpDatabase(): string
     {
-        $backupDir = storage_path('app/backups/');
-        $files = glob($backupDir . 'backup_*.sql');
-        
-        if (empty($files)) {
+        $sql = '';
+        foreach (DB::select('SHOW TABLES') as $table) {
+            $tableName = (string) array_values((array) $table)[0];
+            if (!preg_match('/^[A-Za-z0-9_]+$/', $tableName)) {
+                throw new RuntimeException('Database returned an invalid table name.');
+            }
+
+            $this->line("Backing up table: {$tableName}");
+            $createTable = DB::select("SHOW CREATE TABLE `{$tableName}`");
+            $schema = (string) ($createTable[0]->{'Create Table'} ?? '');
+            if ($schema === '') {
+                throw new RuntimeException("Database did not return schema for table {$tableName}.");
+            }
+            $sql .= "-- Backup of table {$tableName}\n{$schema};\n\n";
+
+            foreach (DB::table($tableName)->get() as $row) {
+                $record = (array) $row;
+                $columns = array_keys($record);
+                $values = array_map(static function ($value): string {
+                    if ($value === null) {
+                        return 'NULL';
+                    }
+                    if (is_numeric($value)) {
+                        return (string) $value;
+                    }
+                    return "'" . addslashes((string) $value) . "'";
+                }, array_values($record));
+
+                $quotedColumns = array_map(static fn ($column) => '`' . str_replace('`', '``', (string) $column) . '`', $columns);
+                $sql .= 'INSERT INTO `' . $tableName . '` (' . implode(', ', $quotedColumns) . ') VALUES (' . implode(', ', $values) . ");\n";
+            }
+            $sql .= "\n";
+        }
+
+        return $sql;
+    }
+
+    private function restrictLocalPermissions($disk, string $relativePath, string $directory): void
+    {
+        if (($disk->getConfig()['driver'] ?? null) !== 'local') {
             return;
         }
-        
-        // Sort by modification time, oldest first
-        usort($files, function($a, $b) {
-            return filemtime($a) - filemtime($b);
-        });
 
-        // Keep only the last 7 backups
-        $filesToDelete = array_slice($files, 0, -7);
-        
-        foreach ($filesToDelete as $file) {
-            if (file_exists($file)) {
-                unlink($file);
-                $this->info("Deleted old backup: " . basename($file));
+        $fullPath = $disk->path($relativePath);
+        $dirPath = dirname($fullPath);
+        if (is_dir($dirPath)) {
+            @chmod($dirPath, 0700);
+        }
+        if (is_file($fullPath)) {
+            @chmod($fullPath, 0600);
+        }
+    }
+
+    private function cleanupExpiredBackups($disk, string $directory, int $retentionDays): void
+    {
+        $cutoff = now()->subDays($retentionDays)->timestamp;
+        foreach ($disk->files($directory) as $path) {
+            if (!preg_match('/^backup_.*\.sql\.enc$/', basename($path))) {
+                continue;
+            }
+            if ($disk->lastModified($path) < $cutoff) {
+                $disk->delete($path);
+                $this->line('Deleted expired encrypted backup: ' . basename($path));
             }
         }
     }

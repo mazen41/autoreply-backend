@@ -87,7 +87,6 @@ class BlogAIService
             if (!$response->successful()) {
                 Log::error('BlogAIService: Claude API request failed', [
                     'status' => $response->status(),
-                    'body' => $response->json(),
                 ]);
                 return null;
             }
@@ -96,7 +95,7 @@ class BlogAIService
             return $data['content'][0]['text'] ?? null;
 
         } catch (\Exception $e) {
-            Log::error('BlogAIService: Claude API exception', ['error' => $e->getMessage()]);
+            Log::error('BlogAIService: Claude API exception', ['exception_type' => get_class($e)]);
             return null;
         }
     }
@@ -182,7 +181,7 @@ class BlogAIService
             } catch (\Exception $e) {
                 Log::warning('BlogAIService: Gemini model exception', [
                     'model' => $model,
-                    'error' => $e->getMessage(),
+                    'exception_type' => get_class($e),
                 ]);
                 continue;
             }

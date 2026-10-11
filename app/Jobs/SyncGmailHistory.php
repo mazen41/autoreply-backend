@@ -107,7 +107,7 @@ class SyncGmailHistory implements ShouldQueue
                 } catch (\Throwable $e) {
                     Log::warning('Gmail history sync: customer resolution failed', [
                         'conversation_id' => $conversation->id,
-                        'error'           => $e->getMessage(),
+                        'exception_type' => get_class($e),
                     ]);
                 }
 
@@ -134,7 +134,7 @@ class SyncGmailHistory implements ShouldQueue
 
         } catch (\Exception $e) {
             Log::error('SyncGmailHistory exception', [
-                'error' => $e->getMessage(),
+                'exception_type' => get_class($e),
                 'channel_id' => $this->channelId,
             ]);
         }

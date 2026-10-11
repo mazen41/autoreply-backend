@@ -6,8 +6,9 @@ use App\Http\Controllers\Controller;
 use App\Models\ApiKey;
 use App\Models\Conversation;
 use App\Models\Message;
+use App\Services\ChannelMessageService;
+use App\Services\ConsentGate;
 use Illuminate\Http\Request;
-use Illuminate\Support\Facades\Validator;
 
 class PublicApiController extends Controller
 {
@@ -17,16 +18,11 @@ class PublicApiController extends Controller
     public function sendMessage(Request $request)
     {
         $request->validate([
-            'api_key' => 'required|string',
             'conversation_id' => 'required|integer',
             'message' => 'required|string',
         ]);
 
-        // Validate API key
-        $apiKey = ApiKey::where('key', $request->api_key)
-            ->active()
-            ->notExpired()
-            ->first();
+        $apiKey = $this->authenticateApiKey($request);
 
         if (!$apiKey) {
             return response()->json(['error' => 'Invalid or expired API key'], 401);
@@ -36,13 +32,14 @@ class PublicApiController extends Controller
         $apiKey->update(['last_used_at' => now()]);
 
         // Check permissions
-        if (!in_array('send_message', $apiKey->permissions ?? ['*'])) {
+        if (!$this->hasPermission($apiKey, 'send_message', 'messages:write')) {
             return response()->json(['error' => 'Permission denied'], 403);
         }
 
         // Verify conversation belongs to user
-        $conversation = Conversation::whereHas('channel', function ($q) use ($apiKey) {
-                $q->where('user_id', $apiKey->user_id);
+        $conversation = Conversation::with('channel')->whereHas('channel', function ($q) use ($apiKey) {
+                $q->where('user_id', $apiKey->user_id)
+                    ->whereColumn('channels.business_id', 'conversations.business_id');
             })
             ->find($request->conversation_id);
 
@@ -50,22 +47,56 @@ class PublicApiController extends Controller
             return response()->json(['error' => 'Conversation not found'], 404);
         }
 
-        // Create message
+        $channel = $conversation->channel;
+        if (!$channel || $channel->status !== 'connected') {
+            return response()->json([
+                'error' => 'The conversation channel is not connected.',
+                'error_code' => 'CHANNEL_UNAVAILABLE',
+            ], 422);
+        }
+
+        $consent = app(ConsentGate::class)->checkConversation($conversation, 'service');
+        if (!$consent->allowed) {
+            return response()->json([
+                'error' => 'The contact is not eligible for a service message.',
+                'error_code' => 'CONSENT_REQUIRED',
+            ], 403);
+        }
+
+        $requiresMessagingWindow = in_array($channel->type, ['facebook', 'instagram'], true)
+            || ($channel->type === 'whatsapp' && ($channel->metadata['whatsapp_provider'] ?? null) === 'cloud');
+        if ($requiresMessagingWindow) {
+            $lastInbound = $conversation->messages()
+                ->where('direction', 'inbound')
+                ->latest('created_at')
+                ->first();
+            if (!$lastInbound || !$lastInbound->created_at || $lastInbound->created_at->lte(now()->subHours(24))) {
+                return response()->json([
+                    'error' => 'The customer messaging window has expired.',
+                    'error_code' => 'OUTSIDE_WINDOW',
+                ], 403);
+            }
+        }
+
         $message = Message::create([
             'conversation_id' => $conversation->id,
             'content' => $request->message,
             'direction' => 'outbound',
-            'status' => 'api',
+            'status' => 'queued',
             'is_ai' => false,
             'source' => 'public_api',
             'send_status' => 'pending',
         ]);
 
+        $sent = app(ChannelMessageService::class)->sendMessage($channel, $conversation, $message);
+        $message->refresh();
+
         return response()->json([
-            'success' => true,
+            'success' => $sent,
             'message_id' => $message->id,
-            'status' => 'queued',
-        ]);
+            'status' => $message->send_status,
+            'provider_message_id' => data_get($message->metadata, 'platform_message_id'),
+        ], $sent ? 200 : 502);
     }
 
     /**
@@ -74,13 +105,9 @@ class PublicApiController extends Controller
     public function getConversations(Request $request)
     {
         $request->validate([
-            'api_key' => 'required|string',
         ]);
 
-        $apiKey = ApiKey::where('key', $request->api_key)
-            ->active()
-            ->notExpired()
-            ->first();
+        $apiKey = $this->authenticateApiKey($request);
 
         if (!$apiKey) {
             return response()->json(['error' => 'Invalid or expired API key'], 401);
@@ -88,7 +115,7 @@ class PublicApiController extends Controller
 
         $apiKey->update(['last_used_at' => now()]);
 
-        if (!in_array('read_conversations', $apiKey->permissions ?? ['*'])) {
+        if (!$this->hasPermission($apiKey, 'read_conversations', 'conversations:read')) {
             return response()->json(['error' => 'Permission denied'], 403);
         }
 
@@ -108,13 +135,9 @@ class PublicApiController extends Controller
     public function getMessages(Request $request, $conversationId)
     {
         $request->validate([
-            'api_key' => 'required|string',
         ]);
 
-        $apiKey = ApiKey::where('key', $request->api_key)
-            ->active()
-            ->notExpired()
-            ->first();
+        $apiKey = $this->authenticateApiKey($request);
 
         if (!$apiKey) {
             return response()->json(['error' => 'Invalid or expired API key'], 401);
@@ -122,7 +145,7 @@ class PublicApiController extends Controller
 
         $apiKey->update(['last_used_at' => now()]);
 
-        if (!in_array('read_messages', $apiKey->permissions ?? ['*'])) {
+        if (!$this->hasPermission($apiKey, 'read_messages', 'messages:read')) {
             return response()->json(['error' => 'Permission denied'], 403);
         }
 
@@ -140,5 +163,27 @@ class PublicApiController extends Controller
             ->paginate(100);
 
         return response()->json($messages);
+    }
+
+    private function hasPermission(ApiKey $apiKey, string ...$acceptedPermissions): bool
+    {
+        $permissions = $apiKey->permissions ?? ['*'];
+        return in_array('*', $permissions, true)
+            || count(array_intersect($acceptedPermissions, $permissions)) > 0;
+    }
+
+    private function authenticateApiKey(Request $request): ?ApiKey
+    {
+        // Credentials in query strings can leak through access logs, browser
+        // history, and referrer headers. Accept only request headers.
+        $secret = $request->bearerToken() ?: $request->header('X-API-Key');
+        if (!is_string($secret) || $secret === '') {
+            return null;
+        }
+
+        return ApiKey::where('secret_hash', hash('sha256', $secret))
+            ->active()
+            ->notExpired()
+            ->first();
     }
 }

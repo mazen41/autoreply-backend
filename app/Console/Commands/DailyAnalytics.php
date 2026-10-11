@@ -22,14 +22,21 @@ class DailyAnalytics extends Command
 
         $businesses = BusinessProfile::all();
         $analyticsService = new AnalyticsService();
+        $failedBusinessIds = [];
 
         foreach ($businesses as $business) {
             try {
                 $analyticsService->generateDailyReport($business->id);
                 $this->info("Generated daily report for business ID: {$business->id}");
-            } catch (\Exception $e) {
+            } catch (\Throwable $e) {
                 $this->error("Failed to generate report for business ID {$business->id}: {$e->getMessage()}");
+                $failedBusinessIds[] = $business->id;
             }
+        }
+
+        if ($failedBusinessIds !== []) {
+            $this->error('Daily analytics failed for business ID(s): ' . implode(', ', $failedBusinessIds));
+            return Command::FAILURE;
         }
 
         $this->info('Daily analytics generation completed.');

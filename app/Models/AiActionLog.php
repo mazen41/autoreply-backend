@@ -6,6 +6,8 @@ use Illuminate\Database\Eloquent\Model;
 
 class AiActionLog extends Model
 {
+    protected $table = 'ai_actions_logs';
+
     protected $fillable = [
         'conversation_id',
         'message_id',

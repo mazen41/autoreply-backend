@@ -9,12 +9,11 @@ use App\Models\CsatRating;
 use App\Models\AnalyticsDaily;
 use App\Models\AiMetric;
 use App\Models\Subscription;
-use App\Models\BusinessProfile;
 use App\Models\Conversation;
 use App\Models\Message;
 use App\Models\Channel;
+use App\Services\BusinessAccessService;
 use Illuminate\Http\Request;
-use Illuminate\Support\Facades\Auth;
 use Carbon\Carbon;
 
 class AnalyticsController extends Controller
@@ -37,18 +36,20 @@ class AnalyticsController extends Controller
      */
     public function getDashboard(Request $request, $businessId)
     {
-        // Enforce business_id ownership — same pattern used elsewhere in the codebase.
-        BusinessProfile::where('user_id', Auth::id())->findOrFail($businessId);
-
-        [$startDate, $endDate] = $this->resolveDateRangeFromPreset($request->query('preset', 'last_30_days'));
+        $business = app(BusinessAccessService::class)->authorize($request->user(), $businessId, 'read');
+        $timezone = in_array($business->timezone, timezone_identifiers_list(), true) ? $business->timezone : 'UTC';
+        [$startDate, $endDate, $rangeStartLocal, $rangeEndLocal] = $this->resolveDateRangeFromPreset(
+            $request->query('preset', 'last_30_days'),
+            $timezone
+        );
 
         $conversationsInRange = Conversation::where('business_id', $businessId)
             ->whereBetween('created_at', [$startDate, $endDate]);
 
-        $totalConversations = Conversation::where('business_id', $businessId)->count();
         $newConversations = (clone $conversationsInRange)->count();
-        $openConversations = Conversation::where('business_id', $businessId)->where('status', 'open')->count();
-        $closedConversations = Conversation::where('business_id', $businessId)->where('status', 'closed')->count();
+        $totalConversations = $newConversations;
+        $openConversations = (clone $conversationsInRange)->where('status', 'open')->count();
+        $closedConversations = (clone $conversationsInRange)->where('status', 'closed')->count();
         $escalatedConversations = Conversation::where('business_id', $businessId)
             ->whereNotNull('escalated_at')
             ->whereBetween('escalated_at', [$startDate, $endDate])
@@ -59,84 +60,66 @@ class AnalyticsController extends Controller
             })
             ->whereBetween('created_at', [$startDate, $endDate]);
 
-        $aiResponses = (clone $messagesInRange)->where('is_ai', true)->count();
-        $totalOutbound = (clone $messagesInRange)->where('direction', 'outbound')->count();
+        $automatedSources = ['campaign', 'email_campaign', 'sequence', 'automation', 'proactive'];
+        $aiResponses = (clone $messagesInRange)->where('direction', 'outbound')->where('is_ai', true)
+            ->where(fn ($query) => $query->whereNull('source')->orWhereNotIn('source', $automatedSources))->count();
+        $totalOutbound = (clone $messagesInRange)->where('direction', 'outbound')
+            ->where(fn ($query) => $query->whereNull('source')->orWhereNotIn('source', $automatedSources))->count();
         $aiConversationsCount = Conversation::where('business_id', $businessId)
-            ->where('ai_enabled', true)
             ->whereBetween('created_at', [$startDate, $endDate])
+            ->whereHas('messages', fn ($query) => $query->where('direction', 'outbound')->where('is_ai', true)
+                ->where(fn ($source) => $source->whereNull('source')->orWhereNotIn('source', $automatedSources))
+                ->whereBetween('created_at', [$startDate, $endDate]))
             ->count();
 
-        $aiSuccessRate = $totalOutbound > 0 ? ($aiResponses / $totalOutbound) * 100 : 0;
+        $aiShareOfReplies = $totalOutbound > 0 ? ($aiResponses / $totalOutbound) * 100 : 0;
 
         // Average response time: first outbound reply after each conversation's first inbound message.
-        $avgResponseMinutes = $this->averageResponseTimeMinutes($businessId, $startDate, $endDate);
+        $medianResponseMinutes = $this->medianResponseTimeMinutes($businessId, $startDate, $endDate);
 
         return response()->json([
-            'range' => ['start' => $startDate->toDateString(), 'end' => $endDate->toDateString()],
+            'range' => ['start' => $rangeStartLocal, 'end' => $rangeEndLocal, 'timezone' => $timezone],
             'conversations' => [
                 'total' => $totalConversations,
                 'new' => $newConversations,
                 'open' => $openConversations,
                 'closed' => $closedConversations,
-                'avg_response_time_minutes' => $avgResponseMinutes,
+                'median_response_time_minutes' => $medianResponseMinutes,
+                'avg_response_time_minutes' => $medianResponseMinutes, // deprecated compatibility alias
                 'avg_resolution_time_minutes' => null, // no resolution timestamp tracked yet — omitted rather than faked
             ],
             'ai' => [
                 'ai_conversations' => $aiConversationsCount,
                 'ai_responses' => $aiResponses,
                 'escalated_conversations' => $escalatedConversations,
-                'ai_success_rate' => round($aiSuccessRate, 1),
+                'ai_share_of_replies' => round($aiShareOfReplies, 1),
+                'ai_success_rate' => round($aiShareOfReplies, 1), // deprecated compatibility alias
             ],
         ]);
     }
 
-    private function resolveDateRangeFromPreset(string $preset): array
+    private function resolveDateRangeFromPreset(string $preset, string $timezone = 'UTC'): array
     {
-        $end = Carbon::now()->endOfDay();
-        $start = match ($preset) {
-            'today' => Carbon::now()->startOfDay(),
-            'yesterday' => Carbon::yesterday()->startOfDay(),
-            'last_7_days' => Carbon::now()->subDays(7)->startOfDay(),
-            'this_month' => Carbon::now()->startOfMonth(),
-            'last_30_days' => Carbon::now()->subDays(30)->startOfDay(),
-            default => Carbon::now()->subDays(30)->startOfDay(),
+        $now = Carbon::now($timezone);
+        $endLocal = $now->copy()->endOfDay();
+        $startLocal = match ($preset) {
+            'today' => $now->copy()->startOfDay(),
+            'yesterday' => $now->copy()->subDay()->startOfDay(),
+            'last_7_days' => $now->copy()->startOfDay()->subDays(6),
+            'this_month' => $now->copy()->startOfMonth(),
+            'last_30_days' => $now->copy()->startOfDay()->subDays(29),
+            default => $now->copy()->startOfDay()->subDays(29),
         };
         if ($preset === 'yesterday') {
-            $end = Carbon::yesterday()->endOfDay();
+            $endLocal = $now->copy()->subDay()->endOfDay();
         }
-        return [$start, $end];
+        return [$startLocal->copy()->utc(), $endLocal->copy()->utc(), $startLocal->toDateString(), $endLocal->toDateString()];
     }
 
-    private function averageResponseTimeMinutes(int $businessId, Carbon $start, Carbon $end): ?float
+    private function medianResponseTimeMinutes(int $businessId, Carbon $start, Carbon $end): ?float
     {
-        $conversations = Conversation::where('business_id', $businessId)
-            ->whereBetween('created_at', [$start, $end])
-            ->with(['messages' => function ($q) {
-                $q->orderBy('created_at', 'asc')->select('id', 'conversation_id', 'direction', 'created_at');
-            }])
-            ->get();
-
-        $diffs = [];
-        foreach ($conversations as $conversation) {
-            $firstInbound = $conversation->messages->firstWhere('direction', 'inbound');
-            if (!$firstInbound) {
-                continue;
-            }
-            $firstReply = $conversation->messages
-                ->where('direction', 'outbound')
-                ->where('created_at', '>', $firstInbound->created_at)
-                ->sortBy('created_at')
-                ->first();
-            if ($firstReply) {
-                $diffs[] = $firstInbound->created_at->diffInMinutes($firstReply->created_at);
-            }
-        }
-
-        if (empty($diffs)) {
-            return null;
-        }
-
-        return round(array_sum($diffs) / count($diffs), 1);
+        $seconds = $this->analyticsService->medianResponseTimeSeconds($businessId, $start, $end);
+        return $seconds === null ? null : round($seconds / 60, 1);
     }
 
     /**
@@ -144,7 +127,8 @@ class AnalyticsController extends Controller
      */
     public function getCsatScore(Request $request, $businessId)
     {
-        $days = $request->query('days', 30);
+        app(BusinessAccessService::class)->authorize($request->user(), $businessId, 'read');
+        $days = $request->validate(['days' => 'sometimes|integer|min:1|max:365'])['days'] ?? 30;
         
         $csatData = $this->analyticsService->getCsatScore($businessId, $days);
 
@@ -156,8 +140,13 @@ class AnalyticsController extends Controller
      */
     public function getDailyAnalytics(Request $request, $businessId)
     {
-        $startDate = $request->query('start_date');
-        $endDate = $request->query('end_date');
+        app(BusinessAccessService::class)->authorize($request->user(), $businessId, 'read');
+        $validated = $request->validate([
+            'start_date' => 'sometimes|date_format:Y-m-d',
+            'end_date' => 'sometimes|date_format:Y-m-d|after_or_equal:start_date',
+        ]);
+        $startDate = $validated['start_date'] ?? null;
+        $endDate = $validated['end_date'] ?? null;
 
         $query = AnalyticsDaily::where('business_id', $businessId);
 
@@ -175,16 +164,25 @@ class AnalyticsController extends Controller
      */
     public function getAiMetrics(Request $request, $businessId)
     {
-        $startDate = $request->query('start_date');
-        $endDate = $request->query('end_date');
+        $business = app(BusinessAccessService::class)->authorize($request->user(), $businessId, 'read');
+        $validated = $request->validate([
+            'start_date' => 'sometimes|date_format:Y-m-d',
+            'end_date' => 'sometimes|date_format:Y-m-d|after_or_equal:start_date',
+        ]);
+        $startDate = $validated['start_date'] ?? null;
+        $endDate = $validated['end_date'] ?? null;
 
-        $query = AiMetric::where('business_id', $businessId);
+        $query = AiMetric::where('business_profile_id', $businessId);
 
         if ($startDate && $endDate) {
-            $query->forDateRange($startDate, $endDate);
+            $timezone = in_array($business->timezone, timezone_identifiers_list(), true) ? $business->timezone : 'UTC';
+            $query->whereBetween('created_at', [
+                Carbon::parse($startDate, $timezone)->startOfDay()->utc(),
+                Carbon::parse($endDate, $timezone)->endOfDay()->utc(),
+            ]);
         }
 
-        $metrics = $query->orderBy('date', 'desc')->get();
+        $metrics = $query->orderBy('created_at', 'desc')->get();
 
         return response()->json($metrics);
     }
@@ -194,7 +192,8 @@ class AnalyticsController extends Controller
      */
     public function getRecentRatings(Request $request, $businessId)
     {
-        $limit = $request->query('limit', 20);
+        app(BusinessAccessService::class)->authorize($request->user(), $businessId, 'read');
+        $limit = $request->validate(['limit' => 'sometimes|integer|min:1|max:100'])['limit'] ?? 20;
 
         $ratings = CsatRating::where('business_id', $businessId)
             ->with(['conversation', 'user'])
@@ -210,6 +209,7 @@ class AnalyticsController extends Controller
      */
     public function calculateAnalytics(Request $request, $businessId)
     {
+        app(BusinessAccessService::class)->authorize($request->user(), $businessId, 'write');
         $request->validate([
             'date' => 'nullable|date',
         ]);

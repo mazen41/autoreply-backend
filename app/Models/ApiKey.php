@@ -9,11 +9,20 @@ class ApiKey extends Model
     protected $fillable = [
         'user_id',
         'key',
+        'secret_hash',
+        'key_last_four',
+        'secret_ciphertext',
         'name',
         'permissions',
         'expires_at',
         'last_used_at',
         'is_active',
+    ];
+
+    protected $hidden = [
+        'key',
+        'secret_hash',
+        'secret_ciphertext',
     ];
 
     protected $casts = [

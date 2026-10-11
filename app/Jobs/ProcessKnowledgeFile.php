@@ -8,17 +8,22 @@ use App\Services\KnowledgeChunker;
 use App\Services\EmbeddingsService;
 use Illuminate\Bus\Queueable;
 use Illuminate\Contracts\Queue\ShouldQueue;
+use Illuminate\Contracts\Queue\ShouldBeUnique;
 use Illuminate\Foundation\Bus\Dispatchable;
 use Illuminate\Queue\InteractsWithQueue;
 use Illuminate\Queue\SerializesModels;
 use Illuminate\Support\Facades\Log;
 use Illuminate\Support\Facades\DB;
+use Throwable;
 
-class ProcessKnowledgeFile implements ShouldQueue
+class ProcessKnowledgeFile implements ShouldQueue, ShouldBeUnique
 {
     use Dispatchable, InteractsWithQueue, Queueable, SerializesModels;
 
-    public $timeout = 300; // 5 minutes max
+    public int $timeout = 300;
+    public int $tries = 3;
+    public array $backoff = [30, 120];
+    public int $uniqueFor = 1800;
     
     protected $fileId;
 
@@ -28,6 +33,11 @@ class ProcessKnowledgeFile implements ShouldQueue
     public function __construct(int $fileId)
     {
         $this->fileId = $fileId;
+    }
+
+    public function uniqueId(): string
+    {
+        return 'knowledge-file:' . $this->fileId;
     }
 
     /**
@@ -44,9 +54,6 @@ class ProcessKnowledgeFile implements ShouldQueue
 
         try {
             $file->update(['status' => 'processing']);
-
-            // Delete any existing chunks for this file to make this job idempotent
-            BusinessKnowledgeChunk::where('business_knowledge_file_id', $file->id)->delete();
 
             $fullText = $file->extracted_text;
             
@@ -69,6 +76,11 @@ class ProcessKnowledgeFile implements ShouldQueue
                 return;
             }
 
+            $chunkLimit = max(1, (int) config('knowledge.max_chunks_per_file', 500));
+            if (count($chunks) > $chunkLimit) {
+                throw new \RuntimeException("Knowledge file exceeds the {$chunkLimit} chunk limit.");
+            }
+
             // 2. Generate embeddings for chunks
             $embeddings = $embeddingsService->embedBatch($chunks);
             
@@ -77,8 +89,6 @@ class ProcessKnowledgeFile implements ShouldQueue
             }
 
             // 3. Save chunks to DB
-            DB::beginTransaction();
-            
             $chunksData = [];
             foreach ($chunks as $index => $chunkText) {
                 $chunksData[] = [
@@ -92,12 +102,16 @@ class ProcessKnowledgeFile implements ShouldQueue
                 ];
             }
             
-            // Insert in batches if large
-            foreach (array_chunk($chunksData, 100) as $batch) {
-                BusinessKnowledgeChunk::insert($batch);
-            }
-            
-            DB::commit();
+            // Build the complete replacement before touching live chunks, then
+            // atomically swap the indexed version.
+            DB::transaction(function () use ($file, $chunksData): void {
+                BusinessKnowledgeFile::query()->whereKey($file->id)->lockForUpdate()->firstOrFail();
+                BusinessKnowledgeChunk::where('business_knowledge_file_id', $file->id)->delete();
+
+                foreach (array_chunk($chunksData, 100) as $batch) {
+                    BusinessKnowledgeChunk::insert($batch);
+                }
+            });
 
             $file->update(['status' => 'active', 'error_message' => null]);
             
@@ -106,20 +120,35 @@ class ProcessKnowledgeFile implements ShouldQueue
                 'chunks_count' => count($chunks)
             ]);
 
-        } catch (\Exception $e) {
-            if (DB::transactionLevel() > 0) {
-                DB::rollBack();
-            }
-            
+        } catch (Throwable $e) {
             Log::error('ProcessKnowledgeFile: Failed to process file', [
                 'file_id' => $this->fileId,
-                'error' => $e->getMessage()
+                'error_class' => get_class($e),
             ]);
-            
+
             $file->update([
                 'status' => 'failed',
-                'error_message' => $e->getMessage()
+                'error_message' => 'Knowledge indexing failed; the last successfully indexed content is still available.',
             ]);
+            throw $e;
         }
+    }
+
+    public function failed(Throwable $exception): void
+    {
+        $file = BusinessKnowledgeFile::find($this->fileId);
+        if (!$file) {
+            return;
+        }
+
+        $file->update([
+            'status' => 'failed',
+            'error_message' => 'Knowledge indexing failed after all retries; the last successfully indexed content is still available.',
+        ]);
+
+        Log::error('ProcessKnowledgeFile: retries exhausted', [
+            'file_id' => $this->fileId,
+            'error_class' => get_class($exception),
+        ]);
     }
 }

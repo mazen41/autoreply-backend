@@ -32,6 +32,7 @@ return Application::configure(basePath: dirname(__DIR__))
             'validate.input' => \App\Http\Middleware\ValidateInput::class,
             'plan.enforce' => \App\Http\Middleware\PlanEnforcement::class,
             'feature.flag' => \App\Http\Middleware\CheckFeatureFlag::class,
+            'business.access' => \App\Http\Middleware\EnsureBusinessAccess::class,
         ]);
     })
     ->withExceptions(function (Exceptions $exceptions): void {
@@ -40,48 +41,39 @@ return Application::configure(basePath: dirname(__DIR__))
         );
     })
     ->withSchedule(function (\Illuminate\Console\Scheduling\Schedule $schedule): void {
-        // Every minute: process due campaign messages
-        $schedule->command('campaigns:send-due')->everyMinute()->withoutOverlapping();
+        $command = static function (string $signature, string $name, int $lockMinutes, callable $frequency) use ($schedule): void {
+            $event = $schedule->command($signature);
+            $frequency($event);
+            $event->name($name)
+                ->withoutOverlapping($lockMinutes)
+                ->onFailure(static fn () => app(\App\Services\ScheduledFailureNotifier::class)->notify($name));
+        };
 
-        // Every minute: send due email campaigns
-        $schedule->command('email-campaigns:send-due')->everyMinute()->withoutOverlapping();
-
-        // Every 5 minutes: monitor sequence queue health
-        $schedule->command('sequence:monitor-queue')->everyFiveMinutes()->withoutOverlapping();
-
-        // Every 5 minutes: reset stuck sequence executions (worker crash recovery)
-        $schedule->command('sequences:reset-stuck-executions')->everyFiveMinutes()->withoutOverlapping();
-
-        // Every 5 minutes: reset stuck workflow executions (worker crash recovery)
-        $schedule->command('workflows:reset-stuck-executions')->everyFiveMinutes()->withoutOverlapping();
-
-        // Every 10 minutes: check for stuck no-reply sequences
-        $schedule->command('sequences:check-no-reply')->everyTenMinutes()->withoutOverlapping();
-
-        // Every 15 minutes: sync Salla orders
-        $schedule->command('salla:sync-orders')->everyFifteenMinutes()->withoutOverlapping();
-
-        // Every 30 minutes: sync Salla customers
-        $schedule->command('salla:sync-customers')->everyThirtyMinutes()->withoutOverlapping();
-
-        // Every hour: check system health
-        $schedule->command('system:health-check')->hourly()->withoutOverlapping();
-
-        // Every hour: check usage limits
-        $schedule->command('billing:check-usage-limits')->hourly()->withoutOverlapping();
-
-        // Daily at midnight: generate analytics
-        $schedule->command('analytics:daily')->dailyAt('00:00')->withoutOverlapping();
-
-        // Daily at 2 AM: backup database
-        $schedule->command('backup:database')->dailyAt('02:00')->withoutOverlapping();
-
-        // Daily at 3 AM: create performance indexes
-        $schedule->command('db:create-performance-indexes')->dailyAt('03:00')->withoutOverlapping();
-
-        // Every 6 hours: renew Gmail watch
-        $schedule->command('gmail:renew-watch')->everySixHours()->withoutOverlapping();
-
-        // Every 12 hours: resync Telegram webhooks (00:00 + 12:00)
-        $schedule->command('telegram:resync-webhooks')->twiceDaily(0, 12)->withoutOverlapping();
+        // All scheduler declarations live here so every task has one bounded
+        // mutex and command failures share the same operational alert path.
+        $schedule->job(new \App\Jobs\PollGmailInbox())
+            ->everyTwoMinutes()
+            ->name('poll-gmail')
+            ->withoutOverlapping(5)
+            ->onFailure(static fn () => app(\App\Services\ScheduledFailureNotifier::class)->notify('poll-gmail'));
+        $command('gmail:renew-watch', 'renew-gmail-watch', 180, static fn ($event) => $event->daily());
+        $command('monitor:failed-jobs', 'monitor-failed-jobs', 15, static fn ($event) => $event->everyFiveMinutes());
+        $command('monitor:operations', 'monitor-operational-health', 15, static fn ($event) => $event->everyFiveMinutes());
+        $command('backup:database', 'database-backup', 300, static fn ($event) => $event->dailyAt('02:00'));
+        $command('analytics:daily', 'daily-analytics', 240, static fn ($event) => $event->dailyAt('01:00'));
+        $command('email-campaigns:send-due', 'send-due-email-campaigns', 5, static fn ($event) => $event->everyMinute());
+        $command('campaigns:send-due', 'send-due-campaigns', 5, static fn ($event) => $event->everyMinute());
+        $command('usage:check', 'check-usage-limits', 120, static fn ($event) => $event->dailyAt('01:30'));
+        $command('system:health-check', 'system-health-check', 90, static fn ($event) => $event->hourly());
+        $command('workflows:run-time-triggers', 'run-time-workflows', 5, static fn ($event) => $event->everyMinute());
+        $command('media:expire-inbound', 'expire-inbound-media', 180, static fn ($event) => $event->dailyAt('03:30'));
+        $command('data:apply-retention', 'apply-business-data-retention', 180, static fn ($event) => $event->dailyAt('03:45'));
+        $command('sequence:monitor-queue', 'monitor-sequence-queue', 15, static fn ($event) => $event->everyFiveMinutes());
+        $command('sequences:reset-stuck-executions', 'reset-stuck-sequence-executions', 15, static fn ($event) => $event->everyFiveMinutes());
+        $command('workflows:reset-stuck-executions', 'reset-stuck-workflow-executions', 15, static fn ($event) => $event->everyFiveMinutes());
+        $command('sequences:check-no-reply', 'check-no-reply-sequences', 20, static fn ($event) => $event->everyTenMinutes());
+        $command('salla:sync-orders', 'sync-salla-orders', 30, static fn ($event) => $event->everyFifteenMinutes());
+        $command('salla:sync-customers', 'sync-salla-customers', 45, static fn ($event) => $event->everyThirtyMinutes());
+        $command('db:create-performance-indexes', 'create-performance-indexes', 180, static fn ($event) => $event->dailyAt('03:00'));
+        $command('telegram:resync-webhooks', 'resync-telegram-webhooks', 60, static fn ($event) => $event->twiceDaily(0, 12));
     })->create();

@@ -65,7 +65,7 @@ class WebChatController extends Controller
                     'access_token' => '',
                     'status' => 'connected',
                     'connected_at' => now(),
-                    'ai_enabled' => true,
+                    'ai_enabled' => false,
                 ]
             );
 
@@ -90,7 +90,7 @@ class WebChatController extends Controller
                     'access_token' => '',
                     'status' => 'connected',
                     'connected_at' => now(),
-                    'ai_enabled' => true,
+                    'ai_enabled' => false,
                 ]
             );
             $conversation->update(['channel_id' => $channel->id]);
@@ -102,7 +102,7 @@ class WebChatController extends Controller
         } catch (\Throwable $e) {
             \Illuminate\Support\Facades\Log::warning('Web chat: customer resolution failed', [
                 'conversation_id' => $conversation->id,
-                'error'           => $e->getMessage(),
+                'exception_type' => get_class($e),
             ]);
         }
 

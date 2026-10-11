@@ -1,6 +1,8 @@
 <?php
 
 use App\Http\Controllers\Api\AuthController;
+use App\Http\Controllers\Api\BusinessController;
+use App\Http\Controllers\Api\OrdersController;
 use App\Http\Controllers\Api\OnboardingController;
 use App\Http\Controllers\Api\SocialAuthController;
 use App\Http\Controllers\Api\PackageController;
@@ -21,7 +23,11 @@ use App\Http\Controllers\Api\CsatController;
 use App\Http\Controllers\Api\NotificationController;
 use App\Http\Controllers\Api\WebChatController;
 use App\Http\Controllers\Api\AiActionsController;
+use App\Http\Controllers\Api\AiReplyAuditController;
 use App\Http\Controllers\Api\WhatsAppController;
+use App\Http\Controllers\Api\WhatsAppCloudController;
+use App\Http\Controllers\Api\MediaProcessingDisclosureController;
+use App\Http\Controllers\Api\DataRightsController;
 use App\Http\Controllers\Api\ReportsController;
 use App\Http\Controllers\N8nIntegrationController;
 use App\Http\Controllers\Api\KnowledgeController;
@@ -38,36 +44,21 @@ use App\Http\Controllers\GmailController;
 use App\Http\Controllers\InboxController;
 use App\Http\Controllers\PostController;
 use App\Http\Controllers\TelegramController;
+use App\Http\Controllers\PrivateMediaController;
 use App\Http\Controllers\TikTokController;
 use App\Http\Controllers\ShopifyController;
 use App\Http\Controllers\WooCommerceController;
 use Illuminate\Support\Facades\Route;
-use Illuminate\Support\Facades\RateLimiter;
-
-// Rate limiting middleware
-$rateLimitMiddleware = function ($request, $next) {
-    $key = 'api:' . $request->ip() . ':' . $request->path();
-    $limit = 60; // 60 requests per minute
-    $decay = 60; // per minute
-    
-    if (RateLimiter::tooManyAttempts($key, $limit, $decay)) {
-        return response()->json([
-            'error' => 'Too many requests. Please slow down.',
-            'retry_after' => $decay
-        ], 429);
-    }
-    
-    return $next($request);
-};
 
 // ── Public auth routes ────────────────────────────────────────────────────────
-Route::prefix('auth')->group(function () {
+Route::middleware('throttle:auth')->prefix('auth')->group(function () {
     Route::post('/register', [AuthController::class, 'register']);
     Route::post('/login',    [AuthController::class, 'login']);
     Route::post('/forgot-password', [AuthController::class, 'forgotPassword']);
     Route::post('/reset-password',  [AuthController::class, 'resetPassword']);
     Route::post('/verify-email',       [AuthController::class, 'verifyEmail']);
     Route::post('/resend-verification',[AuthController::class, 'resendVerification']);
+    Route::post('/exchange', [\App\Http\Controllers\Api\SocialAuthController::class, 'exchangeLoginCode']);
     
     // Social login routes
     Route::get('/google/redirect',  [SocialAuthController::class, 'redirectToGoogle']);
@@ -91,15 +82,33 @@ Route::middleware('auth:sanctum')->prefix('broadcasting')->group(function () {
 Route::get('/webhook/meta',  [MetaWebhookController::class, 'verify']);
 Route::post('/webhook/meta', [MetaWebhookController::class, 'handle']);
 
+// Short-lived signed URLs are used for private generated voice responses.
+Route::get('/media/tts/{mediaPath}', [PrivateMediaController::class, 'showTts'])
+    ->where('mediaPath', '.*')
+    ->middleware('signed')
+    ->name('media.tts.show');
+
 // ── Public OAuth channels callbacks ──────────────────────────────────────────
-Route::get('/channels/connect/facebook',  [ChannelController::class, 'connectFacebook']);
+Route::post('/channels/connect/facebook', [ChannelController::class, 'connectFacebook'])->middleware(['auth:sanctum', 'plan.enforce:max_channels']);
 Route::get('/channels/callback/facebook', [ChannelController::class, 'callbackFacebook']);
 Route::get('/channels/callback/gmail',    [GmailController::class, 'callback']);
-Route::get('/channels/connect/salla',     [ChannelController::class, 'connectSalla']);
+Route::post('/channels/connect/salla',    [ChannelController::class, 'connectSalla'])->middleware(['auth:sanctum', 'plan.enforce:max_channels']);
 Route::get('/channels/callback/salla',    [ChannelController::class, 'callbackSalla']);
 
+// Invitation links are bearer-token capabilities. Throttle checks and account
+// setup, and persist only the invitation token hash.
+Route::get('/team-invitations/check/{token}', [TeamController::class, 'checkPublicInvitation'])
+    ->where('token', '[A-Za-z0-9]{64}')
+    ->middleware('throttle:30,1');
+Route::post('/team-invitations/{token}/accept', [TeamController::class, 'acceptPublicInvitation'])
+    ->where('token', '[A-Za-z0-9]{64}')
+    ->middleware('throttle:10,1');
+Route::post('/team-invitations/{token}/reject', [TeamController::class, 'rejectPublicInvitation'])
+    ->where('token', '[A-Za-z0-9]{64}')
+    ->middleware('throttle:10,1');
+
 // New channel OAuth endpoints
-Route::get('/channels/connect/tiktok',     [TikTokController::class, 'connect']);
+Route::post('/channels/connect/tiktok',   [TikTokController::class, 'connect'])->middleware(['auth:sanctum', 'plan.enforce:max_channels']);
 Route::get('/channels/callback/tiktok',    [TikTokController::class, 'callback']);
 Route::get('/channels/callback/shopify',   [ShopifyController::class, 'callback']);
 
@@ -125,15 +134,31 @@ Route::post('/webhooks/myfatoorah', [MyFatoorahWebhookController::class, 'handle
 
 // Email campaign open-tracking pixel — public, hit by recipients' mail clients
 Route::get('/email-campaigns/track/open/{recipientId}', [EmailCampaignController::class, 'trackOpen']);
-Route::get('/email-campaigns/track/click/{recipientId}', [EmailCampaignController::class, 'trackClick']);
-Route::get('/messages/{messageId}/media', [InboxController::class, 'media']);
+Route::get('/email-campaigns/track/click/{recipientId}/{linkToken}', [EmailCampaignController::class, 'trackClick']);
+Route::match(['get', 'post'], '/email-campaigns/unsubscribe/{trackingToken}', [EmailCampaignController::class, 'unsubscribe'])
+    ->where('trackingToken', '[A-Za-z0-9]{48}');
 
 // ── Protected routes ──────────────────────────────────────────────────────────
 Route::middleware('auth:sanctum')->group(function () {
+    Route::get('/businesses', [BusinessController::class, 'index']);
+    Route::get('/business', [BusinessController::class, 'showProfile']);
+    Route::post('/business', [BusinessController::class, 'updateProfile']);
+    Route::get('/orders', [OrdersController::class, 'index']);
     Route::post('/auth/logout', [AuthController::class, 'logout']);
     Route::get('/auth/user',    [AuthController::class, 'user']);
     Route::patch('/auth/profile', [AuthController::class, 'updateProfile']);
     Route::post('/auth/password', [AuthController::class, 'changePassword']);
+    Route::get('/businesses/{businessId}/go-live-settings', [BusinessController::class, 'showGoLiveSettings']);
+    Route::put('/businesses/{businessId}/go-live-settings', [BusinessController::class, 'updateGoLiveSettings']);
+
+    // Business-scoped privacy, data export, and retention controls.
+    Route::get('/businesses/{businessId}/data-retention', [DataRightsController::class, 'retention']);
+    Route::put('/businesses/{businessId}/data-retention', [DataRightsController::class, 'updateRetention']);
+    Route::get('/businesses/{businessId}/data-rights-requests', [DataRightsController::class, 'requests']);
+    Route::get('/businesses/{businessId}/data-rights/customers', [DataRightsController::class, 'customers']);
+    Route::post('/businesses/{businessId}/data-exports', [DataRightsController::class, 'requestExport']);
+    Route::get('/businesses/{businessId}/data-exports/{requestId}/download', [DataRightsController::class, 'downloadExport']);
+    Route::delete('/businesses/{businessId}/customers/{customerId}/data', [DataRightsController::class, 'eraseCustomer']);
 
     // Onboarding
     Route::prefix('onboarding')->group(function () {
@@ -146,6 +171,11 @@ Route::middleware('auth:sanctum')->group(function () {
     });
 
     // AI Knowledge & Instructions
+    Route::get('/ai/setup-verification', [\App\Http\Controllers\Api\AiSetupVerificationController::class, 'show']);
+    Route::get('/media-processing/disclosure', [MediaProcessingDisclosureController::class, 'show']);
+    Route::put('/media-processing/disclosure', [MediaProcessingDisclosureController::class, 'update']);
+    Route::post('/multimodal/test-image', [\App\Http\Controllers\Api\MultimodalController::class, 'testImage'])
+        ->middleware('throttle:10,1');
     Route::prefix('knowledge')->group(function () {
         Route::get('/', [KnowledgeController::class, 'index']);
         Route::post('/upload', [KnowledgeController::class, 'upload']);
@@ -158,7 +188,8 @@ Route::middleware('auth:sanctum')->group(function () {
     });
 
     // Bot Management
-    Route::apiResource('bots', \App\Http\Controllers\Api\BotController::class)->middleware('plan.enforce:max_bots');
+    Route::apiResource('bots', \App\Http\Controllers\Api\BotController::class)->except(['store']);
+    Route::post('/bots', [\App\Http\Controllers\Api\BotController::class, 'store'])->middleware('plan.enforce:max_bots');
     // Bot-Channel management
     Route::get('/bots/{id}/channels', [\App\Http\Controllers\Api\BotController::class, 'channels']);
     Route::post('/bots/{id}/channels', [\App\Http\Controllers\Api\BotController::class, 'attachChannels']);
@@ -175,13 +206,29 @@ Route::middleware('auth:sanctum')->group(function () {
     Route::patch('/customers/{customerId}/tags', [\App\Http\Controllers\Api\CustomerController::class, 'updateTags']);
 
     // Channels – listing and disconnect
-    Route::get('/channels/connect/gmail',     [GmailController::class, 'connect']);
+    Route::get('/channels/connect/gmail',     [GmailController::class, 'connect'])->middleware('plan.enforce:max_channels');
     Route::get('/channels/gmail/fetch',         [GmailController::class, 'fetchEmails']);
     Route::get('/channels',                   [ChannelController::class, 'index']);
     Route::patch('/channels/{id}',            [ChannelController::class, 'update']);
     Route::delete('/channels/{id}',           [ChannelController::class, 'disconnect']);
+
+    // Public API key management (secret value is shown once at creation).
+    Route::get('/api-keys', [\App\Http\Controllers\Api\ApiKeyController::class, 'index']);
+    Route::post('/api-keys', [\App\Http\Controllers\Api\ApiKeyController::class, 'store']);
+    Route::delete('/api-keys/{id}', [\App\Http\Controllers\Api\ApiKeyController::class, 'destroy']);
+    Route::post('/api-keys/{id}/toggle', [\App\Http\Controllers\Api\ApiKeyController::class, 'toggle']);
+
+    // Business-scoped campaign audiences and reusable message templates.
+    Route::get('/segments', [\App\Http\Controllers\Api\CampaignAudienceController::class, 'segments']);
+    Route::post('/segments', [\App\Http\Controllers\Api\CampaignAudienceController::class, 'storeSegment']);
+    Route::put('/segments/{id}', [\App\Http\Controllers\Api\CampaignAudienceController::class, 'updateSegment']);
+    Route::delete('/segments/{id}', [\App\Http\Controllers\Api\CampaignAudienceController::class, 'destroySegment']);
+    Route::get('/campaign-templates', [\App\Http\Controllers\Api\CampaignAudienceController::class, 'templates']);
+    Route::post('/campaign-templates', [\App\Http\Controllers\Api\CampaignAudienceController::class, 'storeTemplate']);
+    Route::put('/campaign-templates/{id}', [\App\Http\Controllers\Api\CampaignAudienceController::class, 'updateTemplate']);
+    Route::delete('/campaign-templates/{id}', [\App\Http\Controllers\Api\CampaignAudienceController::class, 'destroyTemplate']);
     
-    Route::post('/channels/salla/claim', [ChannelController::class, 'claimSalla']);
+    Route::post('/channels/salla/claim', [ChannelController::class, 'claimSalla'])->middleware('plan.enforce:max_channels');
     // New channel endpoints (protected)
     Route::post('/channels/telegram/connect', [TelegramController::class, 'connect'])->middleware('plan.enforce:max_channels');
     Route::post('/channels/telegram/set-webhook', [TelegramController::class, 'setWebhook']);
@@ -191,6 +238,10 @@ Route::middleware('auth:sanctum')->group(function () {
     Route::post('/channels/woocommerce/connect', [WooCommerceController::class, 'connect'])->middleware('plan.enforce:max_channels');
     Route::get('/channels/woocommerce/connection-status', [WooCommerceController::class, 'connectionStatus']);
     Route::post('/channels/woocommerce/{channelId}/sync', [WooCommerceController::class, 'sync']);
+    Route::post('/channels/whatsapp/cloud', [WhatsAppCloudController::class, 'connect'])->middleware('plan.enforce:max_channels');
+    Route::get('/channels/whatsapp/{channelId}/templates', [WhatsAppCloudController::class, 'templates']);
+    Route::post('/channels/whatsapp/{channelId}/templates', [WhatsAppCloudController::class, 'createTemplate']);
+    Route::post('/channels/whatsapp/{channelId}/accept-unofficial-risk', [WhatsAppCloudController::class, 'acceptUnofficialRisk']);
     Route::get('/channels/shopify/orders',    [ShopifyController::class, 'getOrders']);
     Route::get('/channels/woocommerce/orders', [WooCommerceController::class, 'getOrders']);
     
@@ -205,8 +256,17 @@ Route::middleware('auth:sanctum')->group(function () {
     });
 
     // Inbox — conversations + messages + manual reply
+    Route::get('/handoff-tasks', [\App\Http\Controllers\Api\HandoffTaskController::class, 'index']);
+    Route::get('/handoff-tasks/assignees', [\App\Http\Controllers\Api\HandoffTaskController::class, 'assignees']);
+    Route::patch('/handoff-tasks/{taskId}', [\App\Http\Controllers\Api\HandoffTaskController::class, 'update']);
+    Route::patch('/handoff-tasks/{taskId}/resolve', [\App\Http\Controllers\Api\HandoffTaskController::class, 'resolve']);
+    Route::patch('/handoff-tasks/{taskId}/assign', [\App\Http\Controllers\Api\HandoffTaskController::class, 'assign']);
     Route::get('/inbox',                                [InboxController::class, 'index']);
     Route::get('/inbox/{conversationId}/messages',      [InboxController::class, 'messages']);
+    Route::post('/businesses/{businessId}/conversations/{conversationId}/read', [InboxController::class, 'markRead'])
+        ->middleware('business.access:conversation_read');
+    Route::get('/messages/{messageId}/ai-audit', [AiReplyAuditController::class, 'show']);
+    Route::get('/messages/{messageId}/media',           [InboxController::class, 'media']);
     Route::post('/inbox/{conversationId}/reply',        [InboxController::class, 'reply']);
     Route::post('/inbox/{conversationId}/media',        [InboxController::class, 'mediaReply']);
     Route::patch('/inbox/{conversationId}/toggle-ai',   [InboxController::class, 'toggleAi']);
@@ -226,30 +286,57 @@ Route::middleware('auth:sanctum')->group(function () {
     Route::get('/feedback/recent',                     [FeedbackController::class, 'recent']);
 
     // Team Management
-    Route::get('/businesses/{businessId}/team',       [TeamController::class, 'index']);
-    Route::post('/businesses/{businessId}/team/invite', [TeamController::class, 'invite'])->middleware('plan.enforce:max_team_members');
-    Route::patch('/businesses/{businessId}/team/{memberId}/role', [TeamController::class, 'updateRole']);
-    Route::delete('/businesses/{businessId}/team/{memberId}', [TeamController::class, 'remove']);
+    Route::middleware('business.access:manage_team')->group(function () {
+          Route::get('/businesses/{businessId}/team', [TeamController::class, 'index']);
+          Route::get('/businesses/{businessId}/team/invitations', [TeamController::class, 'pendingInvitations']);
+        Route::post('/businesses/{businessId}/team/invite', [TeamController::class, 'invite'])->middleware('plan.enforce:max_team_members');
+        Route::post('/businesses/{businessId}/team/invitations/{invitationId}/resend', [TeamController::class, 'resendInvitation']);
+        Route::delete('/businesses/{businessId}/team/invitations/{invitationId}', [TeamController::class, 'revokeInvitation']);
+        Route::patch('/businesses/{businessId}/team/{memberId}/role', [TeamController::class, 'updateRole']);
+        Route::delete('/businesses/{businessId}/team/{memberId}', [TeamController::class, 'remove']);
+    });
     Route::post('/conversations/{conversationId}/assign', [TeamController::class, 'assignConversation']);
     Route::get('/team/assignments',                    [TeamController::class, 'myAssignments']);
+      Route::post('/team/invitations/accept', [TeamController::class, 'acceptInvitation']);
+      Route::get('/team/invitations', [TeamController::class, 'myPendingInvitations']);
+      Route::post('/team/invitations/{invitationId}/accept', [TeamController::class, 'acceptInvitationById']);
 
     // Automation
-    Route::get('/businesses/{businessId}/hours',      [AutomationController::class, 'getBusinessHours']);
-    Route::put('/businesses/{businessId}/hours',      [AutomationController::class, 'updateBusinessHours']);
-    Route::get('/businesses/{businessId}/auto-messages', [AutomationController::class, 'getAutoMessages']);
-    Route::put('/businesses/{businessId}/auto-messages', [AutomationController::class, 'updateAutoMessage']);
-    Route::put('/businesses/{businessId}/timezone',    [AutomationController::class, 'updateTimezone']);
-    Route::get('/automation/comment-settings/{businessId}',  [AutomationController::class, 'getCommentSettings']);
-    Route::post('/automation/comment-settings/{businessId}', [AutomationController::class, 'updateCommentSettings']);
+    Route::get('/businesses/{businessId}/automation-run-control', [\App\Http\Controllers\Api\AutomationRunControlController::class, 'show'])
+        ->middleware('business.access:automation_read');
+    Route::put('/businesses/{businessId}/automation-run-control', [\App\Http\Controllers\Api\AutomationRunControlController::class, 'update'])
+        ->middleware('business.access:automation_write');
+    Route::get('/businesses/{businessId}/rollout-flags', [\App\Http\Controllers\Api\BusinessFeatureFlagController::class, 'index'])
+        ->middleware('business.access:automation_read');
+    Route::put('/businesses/{businessId}/rollout-flags/{key}', [\App\Http\Controllers\Api\BusinessFeatureFlagController::class, 'update'])
+        ->middleware('business.access:automation_write');
+    Route::middleware('business.access:automation_read')->group(function () {
+        Route::get('/businesses/{businessId}/hours', [AutomationController::class, 'getBusinessHours']);
+        Route::get('/businesses/{businessId}/auto-messages', [AutomationController::class, 'getAutoMessages']);
+        Route::get('/automation/comment-settings/{businessId}', [AutomationController::class, 'getCommentSettings']);
+    });
+    Route::middleware('business.access:automation_write')->group(function () {
+        Route::put('/businesses/{businessId}/hours', [AutomationController::class, 'updateBusinessHours']);
+        Route::put('/businesses/{businessId}/auto-messages', [AutomationController::class, 'updateAutoMessage']);
+        Route::put('/businesses/{businessId}/timezone', [AutomationController::class, 'updateTimezone']);
+        Route::post('/automation/comment-settings/{businessId}', [AutomationController::class, 'updateCommentSettings']);
+    });
 
     // Campaigns
-    Route::get('/businesses/{businessId}/campaigns',   [CampaignController::class, 'index']);
-    Route::post('/businesses/{businessId}/campaigns',  [CampaignController::class, 'store']);
-    Route::put('/businesses/{businessId}/campaigns/{campaignId}', [CampaignController::class, 'update']);
-    Route::delete('/businesses/{businessId}/campaigns/{campaignId}', [CampaignController::class, 'destroy']);
-    Route::post('/businesses/{businessId}/campaigns/{campaignId}/launch', [CampaignController::class, 'launch']);
-    Route::post('/businesses/{businessId}/campaigns/{campaignId}/cancel-schedule', [CampaignController::class, 'cancelSchedule']);
-    Route::get('/businesses/{businessId}/campaigns/{campaignId}/logs', [CampaignController::class, 'logs']);
+    Route::middleware('business.access:read')->group(function () {
+        Route::get('/businesses/{businessId}/campaigns', [CampaignController::class, 'index']);
+        Route::get('/businesses/{businessId}/campaigns/{campaignId}/logs', [CampaignController::class, 'logs']);
+        Route::post('/businesses/{businessId}/campaigns/audience/preview', [CampaignController::class, 'audiencePreview']);
+    });
+    Route::middleware('business.access:write')->group(function () {
+        Route::post('/businesses/{businessId}/campaigns', [CampaignController::class, 'store']);
+        Route::put('/businesses/{businessId}/campaigns/{campaignId}', [CampaignController::class, 'update']);
+        Route::delete('/businesses/{businessId}/campaigns/{campaignId}', [CampaignController::class, 'destroy']);
+        Route::post('/businesses/{businessId}/campaigns/{campaignId}/launch', [CampaignController::class, 'launch']);
+        Route::post('/businesses/{businessId}/campaigns/{campaignId}/cancel-schedule', [CampaignController::class, 'cancelSchedule']);
+        Route::post('/businesses/{businessId}/campaigns/{campaignId}/pause', [CampaignController::class, 'pause']);
+        Route::post('/businesses/{businessId}/campaigns/{campaignId}/resume', [CampaignController::class, 'resume']);
+    });
 
     // Email Campaigns
     Route::get('/email-campaigns',              [EmailCampaignController::class, 'index']);
@@ -257,6 +344,8 @@ Route::middleware('auth:sanctum')->group(function () {
     Route::put('/email-campaigns/{id}',         [EmailCampaignController::class, 'update']);
     Route::patch('/email-campaigns/{id}',       [EmailCampaignController::class, 'update']);
     Route::post('/email-campaigns/{id}/send',   [EmailCampaignController::class, 'send']);
+    Route::post('/email-campaigns/{id}/pause', [EmailCampaignController::class, 'pause'])->middleware('business.access:automation_write');
+    Route::post('/email-campaigns/{id}/resume', [EmailCampaignController::class, 'resume'])->middleware('business.access:automation_write');
     Route::post('/email-campaigns/{id}/schedule', [EmailCampaignController::class, 'schedule']);
     Route::post('/email-campaigns/{id}/cancel-schedule', [EmailCampaignController::class, 'cancelSchedule']);
     Route::get('/email-campaigns/{id}/stats',   [EmailCampaignController::class, 'stats']);
@@ -281,30 +370,49 @@ Route::middleware('auth:sanctum')->group(function () {
     Route::post('/sequences/queue/reset-stuck', [SequenceController::class, 'resetStuckExecutions']);
 
     // Webhooks
-    Route::get('/businesses/{businessId}/webhooks',     [ApiWebhookController::class, 'index']);
-    Route::post('/businesses/{businessId}/webhooks',    [ApiWebhookController::class, 'store']);
-    Route::put('/businesses/{businessId}/webhooks/{webhookId}', [ApiWebhookController::class, 'update']);
-    Route::delete('/businesses/{businessId}/webhooks/{webhookId}', [ApiWebhookController::class, 'destroy']);
-    Route::post('/businesses/{businessId}/webhooks/{webhookId}/test', [ApiWebhookController::class, 'test']);
+    Route::middleware('business.access:read')->group(function () {
+        Route::get('/businesses/{businessId}/webhooks', [ApiWebhookController::class, 'index']);
+    });
+    Route::middleware('business.access:write')->group(function () {
+        Route::post('/businesses/{businessId}/webhooks', [ApiWebhookController::class, 'store']);
+        Route::put('/businesses/{businessId}/webhooks/{webhookId}', [ApiWebhookController::class, 'update']);
+        Route::delete('/businesses/{businessId}/webhooks/{webhookId}', [ApiWebhookController::class, 'destroy']);
+        Route::post('/businesses/{businessId}/webhooks/{webhookId}/test', [ApiWebhookController::class, 'test']);
+        Route::post('/businesses/{businessId}/webhooks/{webhookId}/rotate-secret', [ApiWebhookController::class, 'rotateSecret']);
+    });
 
     // Analytics
-    Route::get('/businesses/{businessId}/analytics/dashboard', [AnalyticsController::class, 'getDashboard']);
-    Route::get('/businesses/{businessId}/analytics/csat', [AnalyticsController::class, 'getCsatScore']);
-    Route::get('/businesses/{businessId}/analytics/daily', [AnalyticsController::class, 'getDailyAnalytics']);
-    Route::get('/businesses/{businessId}/analytics/ai-metrics', [AnalyticsController::class, 'getAiMetrics']);
-    Route::get('/businesses/{businessId}/analytics/ratings', [AnalyticsController::class, 'getRecentRatings']);
-    Route::post('/businesses/{businessId}/analytics/calculate', [AnalyticsController::class, 'calculateAnalytics']);
+    Route::middleware('business.access:read')->group(function () {
+        Route::get('/businesses/{businessId}/analytics/dashboard', [AnalyticsController::class, 'getDashboard']);
+        Route::get('/businesses/{businessId}/analytics/csat', [AnalyticsController::class, 'getCsatScore']);
+        Route::get('/businesses/{businessId}/analytics/daily', [AnalyticsController::class, 'getDailyAnalytics']);
+        Route::get('/businesses/{businessId}/analytics/ai-metrics', [AnalyticsController::class, 'getAiMetrics']);
+        Route::get('/businesses/{businessId}/analytics/ratings', [AnalyticsController::class, 'getRecentRatings']);
+        Route::get('/businesses/{businessId}/usage', [BillingController::class, 'usageForBusiness']);
+    });
+    Route::post('/businesses/{businessId}/analytics/calculate', [AnalyticsController::class, 'calculateAnalytics'])->middleware('business.access:write');
 
     // CSAT Ratings
     Route::post('/conversations/{conversationId}/csat', [CsatController::class, 'submitRating']);
     Route::get('/conversations/{conversationId}/csat', [CsatController::class, 'getRating']);
 
     // Billing
-    Route::get('/billing/subscription', [BillingController::class, 'getCurrentSubscription']);
-    Route::get('/billing/usage', [BillingController::class, 'getUsageStats']);
-    Route::get('/billing/service-status', [BillingController::class, 'checkServiceStatus']);
-    Route::post('/billing/upgrade', [BillingController::class, 'upgradePlan']);
-    Route::get('/billing/history', [BillingController::class, 'getBillingHistory']);
+    Route::middleware('business.access:read')->group(function () {
+        Route::get('/billing/subscription', [BillingController::class, 'getCurrentSubscription']);
+        Route::get('/billing/usage', [BillingController::class, 'getUsageStats']);
+        Route::get('/billing/service-status', [BillingController::class, 'checkServiceStatus']);
+        Route::get('/billing/history', [BillingController::class, 'getBillingHistory']);
+        Route::get('/subscriptions/current', [SubscriptionController::class, 'current']);
+    });
+    Route::middleware('business.access:manage_billing')->group(function () {
+        Route::post('/billing/upgrade', [BillingController::class, 'upgradePlan']);
+        Route::post('/subscriptions/create-free', [SubscriptionController::class, 'createFree']);
+        Route::delete('/subscriptions', [SubscriptionController::class, 'cancel']);
+        Route::post('/subscriptions/auto-renew/disable', [SubscriptionController::class, 'disableAutoRenew']);
+        Route::post('/payments/create', [PaymentController::class, 'createPayment']);
+        Route::post('/payment/myfatoorah/initiate', [MyFatoorahController::class, 'initiate'])
+            ->name('payment.myfatoorah.initiate');
+    });
 
     // Notifications
     Route::get('/notifications', [NotificationController::class, 'index']);
@@ -329,11 +437,15 @@ Route::middleware('auth:sanctum')->group(function () {
     });
 
     // AI Actions
-    Route::get('/businesses/{businessId}/ai-actions', [AiActionsController::class, 'index']);
-    Route::get('/businesses/{businessId}/ai-actions/pending', [AiActionsController::class, 'pending']);
-    Route::post('/businesses/{businessId}/ai-actions/{actionId}/approve', [AiActionsController::class, 'approve']);
-    Route::post('/businesses/{businessId}/ai-actions/{actionId}/reject', [AiActionsController::class, 'reject']);
-    Route::get('/businesses/{businessId}/ai-actions/statistics', [AiActionsController::class, 'statistics']);
+    Route::middleware('business.access:read')->group(function () {
+        Route::get('/businesses/{businessId}/ai-actions', [AiActionsController::class, 'index']);
+        Route::get('/businesses/{businessId}/ai-actions/pending', [AiActionsController::class, 'pending']);
+        Route::get('/businesses/{businessId}/ai-actions/statistics', [AiActionsController::class, 'statistics']);
+    });
+    Route::middleware('business.access:write')->group(function () {
+        Route::post('/businesses/{businessId}/ai-actions/{actionId}/approve', [AiActionsController::class, 'approve']);
+        Route::post('/businesses/{businessId}/ai-actions/{actionId}/reject', [AiActionsController::class, 'reject']);
+    });
 
     // Reports
     Route::prefix('reports')->group(function () {
@@ -342,6 +454,7 @@ Route::middleware('auth:sanctum')->group(function () {
         Route::get('/ai-performance', [ReportsController::class, 'aiPerformance']);
         Route::get('/top-questions', [ReportsController::class, 'topQuestions']);
         Route::get('/time-saved', [ReportsController::class, 'timeSaved']);
+        Route::put('/time-saved/settings', [ReportsController::class, 'updateTimeSavedSettings']);
         Route::get('/summary', [ReportsController::class, 'summary']);
         Route::get('/export/csv', [ReportsController::class, 'exportCsv']);
         Route::get('/export/pdf', [ReportsController::class, 'exportPdf']);
@@ -387,6 +500,7 @@ Route::middleware('auth:sanctum')->group(function () {
         Route::post('/{id}/duplicate', [AutomationController::class, 'duplicate']);
         Route::post('/{id}/test', [AutomationController::class, 'test']);
         Route::get('/{id}/executions', [AutomationController::class, 'executions']);
+        Route::post('/{id}/executions/{executionId}/replay', [AutomationController::class, 'replayExecution'])->middleware('feature.flag:advanced_automation');
         Route::get('/{id}/stats', [AutomationController::class, 'getStats']);
     });
 
@@ -394,8 +508,6 @@ Route::middleware('auth:sanctum')->group(function () {
     Route::get('/stats', [ReportsController::class, 'dashboardStats']);
 
     // ── MyFatoorah Payment (authenticated) ───────────────────────────────────
-    Route::post('/payment/myfatoorah/initiate', [MyFatoorahController::class, 'initiate'])
-        ->name('payment.myfatoorah.initiate');
     Route::get('/payment/callback', [MyFatoorahController::class, 'callback'])
         ->name('payment.callback');
     Route::get('/payment/error', [MyFatoorahController::class, 'error'])
@@ -404,15 +516,6 @@ Route::middleware('auth:sanctum')->group(function () {
 
 // Gmail Webhook - public, Google Pub/Sub calls this
 Route::post('/webhook/gmail', [MetaWebhookController::class, 'handleGmail']);
-
-// n8n Integration Routes (public — kept for legacy/future use)
-Route::prefix('n8n')->group(function () {
-    Route::post('/rate-limit/check', [N8nIntegrationController::class, 'checkRateLimit']);
-    Route::post('/language/detect', [N8nIntegrationController::class, 'detectLanguage']);
-    Route::post('/conversation/memory', [N8nIntegrationController::class, 'getConversationMemory']);
-    Route::post('/ai/ultimate-process', [N8nIntegrationController::class, 'ultimateAIProcess']);
-    Route::post('/escalate', [N8nIntegrationController::class, 'triggerEscalation']);
-});
 
 // Public blog routes
 Route::get('/posts', [PostController::class, 'index']);
@@ -452,19 +555,15 @@ Route::post('/payments/webhook', [PaymentController::class, 'webhook'])->without
 
 // Protected subscription and payment routes
 Route::middleware('auth:sanctum')->group(function () {
-    Route::get('/subscriptions/current', [SubscriptionController::class, 'current']);
-    Route::post('/subscriptions/create-free', [SubscriptionController::class, 'createFree']);
-    Route::delete('/subscriptions', [SubscriptionController::class, 'cancel']);
-    Route::post('/payments/create', [PaymentController::class, 'createPayment']);
-
     // WhatsApp routes
     Route::prefix('whatsapp')->group(function () {
         Route::get('/status', [WhatsAppController::class, 'status']);
-        Route::post('/connect', [WhatsAppController::class, 'connect']);
+        Route::post('/connect', [WhatsAppController::class, 'connect'])->middleware('plan.enforce:max_channels');
         Route::get('/qrcode', [WhatsAppController::class, 'getQrCode']);
         Route::post('/disconnect', [WhatsAppController::class, 'disconnect']);
-        Route::post('/reconnect', [WhatsAppController::class, 'reconnect']);
-        Route::post('/send', [WhatsAppController::class, 'sendMessage']);
+        Route::post('/reconnect', [WhatsAppController::class, 'reconnect'])->middleware('plan.enforce:max_channels');
+        Route::post('/send', [WhatsAppController::class, 'sendMessage'])
+            ->middleware(['business.access:write', 'plan.enforce:max_monthly_messages']);
         Route::get('/messages', [WhatsAppController::class, 'getMessages']);
         Route::get('/instance', [WhatsAppController::class, 'getInstance']);
     });

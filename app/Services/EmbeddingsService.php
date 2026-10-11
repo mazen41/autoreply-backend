@@ -75,14 +75,13 @@ class EmbeddingsService
 
             Log::error('EmbeddingsService: API request failed', [
                 'status' => $response->status(),
-                'body' => $response->body()
             ]);
 
             return null;
 
         } catch (\Exception $e) {
             Log::error('EmbeddingsService: Exception during embedding', [
-                'error' => $e->getMessage()
+                'exception_type' => get_class($e),
             ]);
             return null;
         }
@@ -135,14 +134,13 @@ class EmbeddingsService
 
             Log::error('EmbeddingsService: Batch API request failed', [
                 'status' => $response->status(),
-                'body' => $response->body()
             ]);
 
             return [];
 
         } catch (\Exception $e) {
             Log::error('EmbeddingsService: Exception during batch embedding', [
-                'error' => $e->getMessage()
+                'exception_type' => get_class($e),
             ]);
             return [];
         }

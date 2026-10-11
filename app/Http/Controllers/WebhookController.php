@@ -42,6 +42,11 @@ class WebhookController extends Controller
             $payload = $request->getContent();
             $appSecret = config('services.meta.app_secret');
 
+            if (!$appSecret) {
+                Log::critical('Meta webhook rejected: app secret is not configured');
+                return response('Webhook signature verification is unavailable', 503);
+            }
+
             if ($appSecret) {
                 if ($signature === '') {
                     // Meta always signs webhook deliveries; a payload without
@@ -53,28 +58,27 @@ class WebhookController extends Controller
                 $expectedSignature = 'sha256=' . hash_hmac('sha256', $payload, $appSecret);
 
                 if (!hash_equals($expectedSignature, $signature)) {
+                    app(\App\Support\OperationalMetricCounter::class)->increment('webhook_signature_failures');
                     Log::warning('Invalid Meta webhook signature', [
-                        'received' => $signature,
                         'payload_length' => strlen($payload),
                     ]);
                     return response('Invalid signature', 403);
                 }
 
                 Log::info('Meta webhook signature verified successfully');
-            } else {
-                // Secret not configured — verification is impossible. Allow
-                // (misconfiguration must not silently drop all intake) but
-                // make it loud.
-                Log::warning('Meta webhook received without app secret configured — signature NOT verified');
             }
 
             $body = $request->all();
-            Log::info('Meta Webhook received', $body);
-
             $object = $body['object'] ?? '';
+            Log::info('Meta Webhook received', [
+                'object' => $object,
+                'entry_count' => count($body['entry'] ?? []),
+            ]);
 
             if ($object === 'instagram') {
                 $this->handleInstagram($body);
+            } elseif ($object === 'whatsapp_business_account') {
+                $this->handleWhatsAppCloud($body);
             } elseif ($object === 'page') {
                 // Meta sends Instagram DMs as object=page when using Messenger API for Instagram.
                 // Check if any entry ID matches a connected Instagram account — if so, route to Instagram handler.
@@ -101,9 +105,130 @@ class WebhookController extends Controller
 
             return response('EVENT_RECEIVED', 200);
         } catch (\Exception $e) {
-            Log::error('Webhook handler error', ['error' => $e->getMessage(), 'trace' => $e->getTraceAsString()]);
+            Log::error('Webhook handler error', ['exception' => get_class($e)]);
             return response('EVENT_RECEIVED', 200);
         }
+    }
+
+    /** Route Cloud API messages by their exact Meta phone-number asset ID. */
+    private function handleWhatsAppCloud(array $body): void
+    {
+        foreach ($body['entry'] ?? [] as $entry) {
+            foreach ($entry['changes'] ?? [] as $change) {
+                if (($change['field'] ?? null) !== 'messages') {
+                    continue; // Delivery/read status notifications are not inbound messages.
+                }
+
+                $value = $change['value'] ?? [];
+                $phoneNumberId = (string) ($value['metadata']['phone_number_id'] ?? '');
+                if ($phoneNumberId === '') {
+                    Log::warning('WhatsApp Cloud webhook missing phone number ID');
+                    continue;
+                }
+
+                $channel = Channel::query()
+                    ->where('type', 'whatsapp')
+                    ->where('page_id', $phoneNumberId)
+                    ->where('status', 'connected')
+                    ->whereJsonContains('metadata->whatsapp_provider', 'cloud')
+                    ->first();
+
+                if (!$channel) {
+                    Log::warning('WhatsApp Cloud webhook has no matching connected channel', [
+                        'phone_number_id' => $phoneNumberId,
+                    ]);
+                    continue;
+                }
+
+                foreach ($value['statuses'] ?? [] as $statusEvent) {
+                    $providerMessageId = $statusEvent['id'] ?? null;
+                    $providerStatus = strtolower((string) ($statusEvent['status'] ?? ''));
+                    if (!$providerMessageId || !in_array($providerStatus, ['sent', 'delivered', 'read', 'failed'], true)) {
+                        continue;
+                    }
+
+                    $message = \App\Models\Message::where('whatsapp_message_id', $providerMessageId)
+                        ->whereHas('conversation', fn ($query) => $query->where('channel_id', $channel->id))
+                        ->first();
+                    if (!$message) {
+                        continue;
+                    }
+
+                    // Meta may retry or reorder delivery callbacks. Preserve a
+                    // terminal/read state when an older event arrives later.
+                    $rank = ['pending' => 0, 'queued' => 0, 'sent' => 1, 'delivered' => 2, 'read' => 3, 'failed' => 4, 'blocked' => 4];
+                    $currentStatus = (string) ($message->send_status ?: 'queued');
+                    if (in_array($currentStatus, ['failed', 'blocked'], true)
+                        || ($currentStatus === 'read' && $providerStatus !== 'read')
+                        || ($rank[$providerStatus] ?? -1) < ($rank[$currentStatus] ?? -1)) {
+                        continue;
+                    }
+
+                    $message->update([
+                        'status' => $providerStatus,
+                        'send_status' => $providerStatus,
+                        // The legacy enum predates `read`; keep it at delivered
+                        // while send_status retains Meta's exact terminal state.
+                        'delivery_status' => $providerStatus === 'read' ? 'delivered' : $providerStatus,
+                        'error_details' => $providerStatus === 'failed'
+                            ? $this->whatsAppStatusFailureReason($statusEvent)
+                            : null,
+                    ]);
+                }
+
+                foreach ($value['messages'] ?? [] as $incoming) {
+                    $senderId = (string) ($incoming['from'] ?? '');
+                    $messageId = $incoming['id'] ?? null;
+                    $text = $this->whatsAppCloudMessageText($incoming);
+                    if ($senderId === '') {
+                        continue;
+                    }
+
+                    $media = null;
+                    $incomingType = (string) ($incoming['type'] ?? '');
+                    if (in_array($incomingType, ['image', 'audio', 'video', 'document'], true)) {
+                        $mediaId = (string) ($incoming[$incomingType]['id'] ?? '');
+                        $media = $mediaId !== ''
+                            ? app(\App\Services\WhatsAppCloudApiService::class)->downloadInboundMedia($channel, $mediaId, $incomingType)
+                            : ['type' => $incomingType, 'storage_status' => 'failed'];
+                    }
+                    if ($text === '' && $media === null) {
+                        continue;
+                    }
+
+                    $senderName = collect($value['contacts'] ?? [])->firstWhere('wa_id', $senderId)['profile']['name'] ?? null;
+                    $this->processMessage($channel, $senderId, $text, $messageId, null, $senderName, $media);
+                }
+            }
+        }
+    }
+
+    private function whatsAppStatusFailureReason(array $statusEvent): string
+    {
+        $error = $statusEvent['errors'][0] ?? [];
+        $reason = $error['title'] ?? $error['message'] ?? $error['details'] ?? $error['code'] ?? 'WhatsApp delivery failed';
+        return mb_substr(trim((string) $reason), 0, 2000) ?: 'WhatsApp delivery failed';
+    }
+
+    private function whatsAppCloudMessageText(array $message): string
+    {
+        return match ($message['type'] ?? '') {
+            'text' => trim((string) ($message['text']['body'] ?? '')),
+            'button' => trim((string) ($message['button']['text'] ?? '')),
+            'interactive' => trim((string) (
+                $message['interactive']['button_reply']['title']
+                ?? $message['interactive']['list_reply']['title']
+                ?? ''
+            )),
+            'location' => 'Customer shared a WhatsApp location. Location coordinates: '
+                . (string) ($message['location']['latitude'] ?? '') . ', '
+                . (string) ($message['location']['longitude'] ?? ''),
+            'image' => trim((string) ($message['image']['caption'] ?? 'Customer sent an image.')),
+            'document' => trim((string) ($message['document']['caption'] ?? 'Customer sent a document.')),
+            'audio' => 'Customer sent an audio message.',
+            'video' => trim((string) ($message['video']['caption'] ?? 'Customer sent a video.')),
+            default => '',
+        };
     }
 
     private function handleFacebook(array $body): void
@@ -115,12 +240,18 @@ class WebhookController extends Controller
 
             // Handle messages (existing functionality)
             foreach ($entry['messaging'] ?? [] as $event) {
+                if (isset($event['read'])) {
+                    $this->applyMetaReadReceipt($event, 'facebook', (string) $pageId);
+                    continue;
+                }
                 if (isset($event['message']['is_echo'])) continue;
-                if (!isset($event['message']['text'])) continue;
+                $incoming = $event['message'] ?? [];
+                $attachments = $incoming['attachments'] ?? [];
+                if (!isset($incoming['text']) && empty($attachments)) continue;
 
                 $senderId    = $event['sender']['id'];
                 $recipientId = $event['recipient']['id'] ?? $pageId;
-                $messageText = $event['message']['text'];
+                $messageText = trim((string) ($incoming['text'] ?? ''));
 
                 if (str_starts_with($senderId, 'TEST_')) continue;
 
@@ -135,7 +266,12 @@ class WebhookController extends Controller
                     continue;
                 }
 
-                $this->processMessage($channel, $senderId, $messageText);
+                $media = $this->downloadMetaAttachment($this->metaAttachmentDescriptor($attachments));
+                if ($messageText === '' && $media !== null) {
+                    $messageText = $this->metaMediaFallbackText($media['type'] ?? null);
+                }
+                if ($messageText === '' && $media === null) continue;
+                $this->processMessage($channel, $senderId, $messageText, $incoming['mid'] ?? null, null, null, $media);
             }
 
             // Handle comments
@@ -185,6 +321,10 @@ class WebhookController extends Controller
             Log::info('Instagram entry', ['id' => $entryId, 'keys' => array_keys($entry)]);
 
             foreach ($entry['messaging'] ?? [] as $event) {
+                if (isset($event['read'])) {
+                    $this->applyMetaReadReceipt($event, 'instagram', (string) $entryId);
+                    continue;
+                }
                 $incomingMessage = $event['message'] ?? [];
                 if (isset($incomingMessage['is_echo'])) continue;
                 if (isset($event['message_edit'])) continue;
@@ -192,25 +332,14 @@ class WebhookController extends Controller
                 $location = $this->extractMetaLocation($incomingMessage);
                 $messageText = trim((string) ($incomingMessage['text'] ?? ''));
                 $attachments = $incomingMessage['attachments'] ?? [];
+                $attachmentDescriptor = $this->metaAttachmentDescriptor($attachments);
                 if ($location) {
                     $locationText = 'Shared delivery location coordinates: '
                         . $location['lat'] . ', ' . $location['lng'];
                     $messageText = trim($messageText . ($messageText !== '' ? "\n" : '') . $locationText);
-                } elseif ($messageText === '' && !empty($attachments)) {
-                    // Meta may send shared locations as a structured template, not
-                    // an attachment whose type is literally "location".
-                    $attachmentTypes = array_values(array_filter(array_map(
-                        fn ($attachment) => is_array($attachment) ? ($attachment['type'] ?? null) : null,
-                        $attachments
-                    )));
-                    Log::info('Instagram attachment had no extractable location coordinates', [
-                        'attachment_types' => $attachmentTypes,
-                        'payload_key_paths' => $this->summarizeMetaAttachmentStructure($attachments),
-                    ]);
-                    $typeLabel = $attachmentTypes ? implode(', ', $attachmentTypes) : 'unknown';
-                    $messageText = "Customer shared an Instagram attachment (type: {$typeLabel}) without readable text or coordinates. If delivery details are still needed, ask for the complete written street address, district, building number, and postal code; do not ask for a map link or coordinates.";
+                } elseif ($messageText === '' && empty($attachments)) {
+                    continue;
                 }
-                if ($messageText === '') continue;
 
                 $senderId    = $event['sender']['id'];
                 $platformMessageId = $incomingMessage['mid'] ?? null;
@@ -220,10 +349,8 @@ class WebhookController extends Controller
 
                 Log::info('Instagram DM received', [
                     'entry_id' => $entryId,
-                    'sender'   => $senderId,
-                    'message'  => $messageText,
-                    'platform_message_id' => $platformMessageId,
-                    'reply_to_mid' => $replyToMid,
+                    'has_platform_message_id' => $platformMessageId !== null,
+                    'message_length' => mb_strlen($messageText),
                 ]);
 
                 // Strategy 1: entry ID is the Instagram account ID (object=instagram)
@@ -279,15 +406,27 @@ class WebhookController extends Controller
                 if (!$channel) {
                     Log::error('No Instagram channel found', [
                         'entry_id'  => $entryId,
-                        'available' => Channel::where('type', 'instagram')
-                            ->where('status', 'connected')
-                            ->get(['id', 'instagram_account_id', 'page_id', 'page_name'])
-                            ->toArray(),
+                        'available_channel_count' => Channel::where('type', 'instagram')
+                            ->where('status', 'connected')->count(),
                     ]);
                     continue;
                 }
 
-                $this->processMessage($channel, $senderId, $messageText, $platformMessageId, $replyToMid);
+                $media = $location ? null : $this->downloadMetaAttachment($attachmentDescriptor);
+                if ($messageText === '' && $media !== null) {
+                    $messageText = $this->metaMediaFallbackText($media['type'] ?? null);
+                } elseif ($messageText === '' && !empty($attachments) && $media === null) {
+                    // Preserve useful context for structured attachments such as locations
+                    // when no downloadable media URL is present.
+                    $attachmentTypes = array_values(array_filter(array_map(
+                        fn ($attachment) => is_array($attachment) ? ($attachment['type'] ?? null) : null,
+                        $attachments
+                    )));
+                    $typeLabel = $attachmentTypes ? implode(', ', $attachmentTypes) : 'unknown';
+                    $messageText = "Customer shared an Instagram attachment (type: {$typeLabel}) without readable text or coordinates. If delivery details are still needed, ask for the complete written street address, district, building number, and postal code; do not ask for a map link or coordinates.";
+                }
+                if ($messageText === '') continue;
+                $this->processMessage($channel, $senderId, $messageText, $platformMessageId, $replyToMid, null, $media);
             }
 
             // Handle Instagram comments
@@ -334,16 +473,61 @@ class WebhookController extends Controller
         }
     }
 
-    private function processMessage(Channel $channel, string $senderId, string $messageText, ?string $platformMessageId = null, ?string $replyToMid = null): void
+    /** Apply a Meta read watermark to outbound messages on the matching asset. */
+    private function applyMetaReadReceipt(array $event, string $platform, string $entryId): void
+    {
+        $assetIds = array_unique(array_filter([
+            $entryId,
+            (string) ($event['recipient']['id'] ?? ''),
+        ]));
+        $channelQuery = Channel::query()->where('status', 'connected');
+        if ($platform === 'instagram') {
+            $channelQuery->where('type', 'instagram')->where(function ($query) use ($assetIds) {
+                $query->whereIn('instagram_account_id', $assetIds)->orWhereIn('page_id', $assetIds);
+            });
+        } else {
+            $channelQuery->where('type', 'facebook')->whereIn('page_id', $assetIds);
+        }
+        $channel = $channelQuery->first();
+        if (!$channel) {
+            return;
+        }
+
+        $watermark = $event['read']['watermark'] ?? null;
+        if (!is_numeric($watermark)) {
+            return;
+        }
+
+        $readThrough = \Illuminate\Support\Carbon::createFromTimestampMs((int) $watermark);
+        $conversationIds = \App\Models\Conversation::where('channel_id', $channel->id)->select('id');
+        $messages = \App\Models\Message::whereIn('conversation_id', $conversationIds)
+            ->where('direction', 'outbound')
+            ->where('created_at', '<=', $readThrough)
+            ->whereIn('send_status', ['queued', 'pending', 'sent', 'delivered', 'read'])
+            ->get();
+
+        foreach ($messages as $message) {
+            // A read watermark must never downgrade a delivery state.
+            if (in_array($message->send_status, ['queued', 'pending', 'sent', 'delivered'], true)) {
+                $message->update([
+                    'status' => 'read',
+                    'send_status' => 'read',
+                    // `delivery_status` predates Meta's read state and its
+                    // database enum ends at delivered; send_status is canonical.
+                    'delivery_status' => 'delivered',
+                ]);
+            }
+        }
+    }
+
+    private function processMessage(Channel $channel, string $senderId, string $messageText, ?string $platformMessageId = null, ?string $replyToMid = null, ?string $senderName = null, ?array $media = null): void
     {
         Log::info('Processing message', [
             'channel_type' => $channel->type,
             'channel_id'   => $channel->id,
-            'sender'       => $senderId,
-            'message'      => $messageText,
             'business_id'  => $channel->business_id,
-            'platform_message_id' => $platformMessageId,
-            'reply_to_mid' => $replyToMid,
+            'has_platform_message_id' => $platformMessageId !== null,
+            'message_length' => mb_strlen($messageText),
         ]);
 
         // ── WEBHOOK IDEMPOTENCY ────────────────────────────────────────────
@@ -355,7 +539,7 @@ class WebhookController extends Controller
             if ($this->safeCacheHas($idempotencyKey)) {
                 Log::info('Duplicate webhook delivery — skipping', [
                     'channel_type' => $channel->type,
-                    'platform_message_id' => $platformMessageId,
+                    'has_platform_message_id' => true,
                 ]);
                 return;
             }
@@ -364,8 +548,11 @@ class WebhookController extends Controller
 
         $conversation = \App\Models\Conversation::firstOrCreate(
             ['channel_id' => $channel->id, 'sender_id' => $senderId],
-            ['business_id' => $channel->business_id, 'status' => 'open', 'last_message_at' => now()]
+            ['business_id' => $channel->business_id, 'status' => 'open', 'last_message_at' => now(), 'sender_name' => $senderName]
         );
+        if ($senderName && empty($conversation->sender_name)) {
+            $conversation->update(['sender_name' => $senderName]);
+        }
 
         // Resolve/link the business-scoped Customer for this sender (Instagram/
         // Facebook sender ids have no phone/email — platform-identity matching).
@@ -374,12 +561,12 @@ class WebhookController extends Controller
         } catch (\Throwable $e) {
             Log::warning('Customer resolution failed for Meta sender', [
                 'conversation_id' => $conversation->id,
-                'error'           => $e->getMessage(),
+                'exception'       => get_class($e),
             ]);
         }
 
         // If we don't have a name for this sender yet, queue a job to fetch it from the Graph API
-        if ($conversation->wasRecentlyCreated || empty($conversation->sender_name)) {
+        if ($channel->type !== 'whatsapp' && ($conversation->wasRecentlyCreated || empty($conversation->sender_name))) {
             \App\Jobs\FetchSenderName::dispatch($conversation->id, $channel->id, $senderId);
         }
 
@@ -395,14 +582,31 @@ class WebhookController extends Controller
             $metadata['quoted_message_id'] = $replyToMid;
             $metadata['reply_to_platform'] = $channel->type;
         }
+        if ($media !== null) {
+            $metadata['media'] = $media;
+        }
 
         $message = \App\Models\Message::create([
             'conversation_id' => $conversation->id,
             'content'         => $messageText,
+            'type'            => $media['type'] ?? 'text',
             'direction'       => 'inbound',
             'is_ai'           => false,
             'status'          => 'received',
+            'media_url'       => $media['url'] ?? null,
+            'media_type'      => $media['type'] ?? null,
+            'mime_type'       => $media['mime_type'] ?? null,
+            'file_size'       => $media['file_size'] ?? null,
+            'media_processing_status' => $media === null
+                ? null
+                : (($media['storage_status'] ?? null) === 'stored' ? 'pending' : 'failed'),
+            'media_processing_reason' => $media !== null && ($media['storage_status'] ?? null) !== 'stored'
+                ? 'Media download or private storage failed.'
+                : null,
             'metadata'         => !empty($metadata) ? $metadata : null,
+            'whatsapp_message_id' => $channel->type === 'whatsapp' ? $platformMessageId : null,
+            'whatsapp_remote_jid' => $channel->type === 'whatsapp' ? $senderId : null,
+            'whatsapp_from_me' => false,
         ]);
 
         if ($channel->user_id) {
@@ -437,6 +641,90 @@ class WebhookController extends Controller
         }
 
         return null;
+    }
+
+    private function metaAttachmentDescriptor(array $attachments): ?array
+    {
+        foreach ($attachments as $attachment) {
+            if (!is_array($attachment)) continue;
+            $type = strtolower((string) ($attachment['type'] ?? ''));
+            $payload = $attachment['payload'] ?? [];
+            $url = $payload['url'] ?? $attachment['url'] ?? null;
+            if (!is_string($url) || $url === '') continue;
+            $normalizedType = match ($type) {
+                'image' => 'image', 'audio' => 'audio', 'video' => 'video',
+                'file' => 'document', default => null,
+            };
+            if ($normalizedType === null) continue;
+            return [
+                'type' => $normalizedType,
+                'url' => $url,
+                'mime_type' => is_string($payload['mime_type'] ?? null) ? $payload['mime_type'] : null,
+                'file_name' => is_string($payload['name'] ?? null) ? $payload['name'] : null,
+            ];
+        }
+        return null;
+    }
+
+    /** Fetch only HTTPS media from Meta CDN hosts, then store it privately. */
+    private function downloadMetaAttachment(?array $attachment): ?array
+    {
+        if ($attachment === null) return null;
+        $failed = [
+            'type' => $attachment['type'],
+            'storage_status' => 'failed',
+            'mime_type' => $attachment['mime_type'] ?? null,
+            'file_name' => $attachment['file_name'] ?? null,
+        ];
+        try {
+            $url = $attachment['url'];
+            $host = strtolower((string) parse_url($url, PHP_URL_HOST));
+            $trustedHost = $host === 'lookaside.fbsbx.com'
+                || str_ends_with($host, '.fbcdn.net')
+                || str_ends_with($host, '.fbsbx.com');
+            if (strtolower((string) parse_url($url, PHP_URL_SCHEME)) !== 'https' || !$trustedHost) {
+                return $failed;
+            }
+
+            $download = Http::timeout(30)->withoutRedirecting()->get($url);
+            if (!$download->successful() || strlen($download->body()) > 50 * 1024 * 1024) {
+                return $failed;
+            }
+            $mime = strtolower(trim(explode(';', (string) ($attachment['mime_type'] ?? $download->header('Content-Type', 'application/octet-stream')))[0]));
+            $extension = match ($mime) {
+                'image/jpeg' => 'jpg', 'image/png' => 'png', 'image/webp' => 'webp',
+                'audio/ogg' => 'ogg', 'audio/mpeg' => 'mp3', 'audio/mp4' => 'm4a',
+                'video/mp4' => 'mp4', 'application/pdf' => 'pdf',
+                default => strtolower(pathinfo($attachment['file_name'] ?? parse_url($url, PHP_URL_PATH), PATHINFO_EXTENSION)) ?: 'bin',
+            };
+            $storage = app(\App\Services\IncomingMediaStorage::class);
+            $contents = $download->body();
+            $path = $storage->store($contents, $extension);
+
+            return [
+                'type' => $attachment['type'], 'url' => $path,
+                'storage_disk' => $storage->diskName(), 'storage_status' => 'stored',
+                'mime_type' => $mime, 'file_name' => $attachment['file_name'] ?? null,
+                'file_size' => strlen($contents),
+            ];
+        } catch (\Throwable $exception) {
+            Log::warning('Meta inbound media could not be stored', [
+                'media_type' => $attachment['type'],
+                'error_class' => get_class($exception),
+            ]);
+            return $failed;
+        }
+    }
+
+    private function metaMediaFallbackText(?string $type): string
+    {
+        return match ($type) {
+            'image' => 'Customer sent an image.',
+            'audio' => 'Customer sent an audio message.',
+            'video' => 'Customer sent a video.',
+            'document' => 'Customer sent a document.',
+            default => 'Customer sent media.',
+        };
     }
 
     /** Search nested template/location payloads without logging customer coordinates. */
@@ -503,7 +791,7 @@ class WebhookController extends Controller
         } catch (\Throwable $e) {
             Log::warning('Webhook cache read failed; continuing without cache', [
                 'key' => $key,
-                'error' => $e->getMessage(),
+                'exception_type' => get_class($e),
             ]);
             return false;
         }
@@ -516,7 +804,7 @@ class WebhookController extends Controller
         } catch (\Throwable $e) {
             Log::warning('Webhook cache write failed; continuing with message processing', [
                 'key' => $key,
-                'error' => $e->getMessage(),
+                'exception_type' => get_class($e),
             ]);
         }
     }
@@ -538,16 +826,16 @@ class WebhookController extends Controller
                 ]);
 
             if ($response->successful()) {
-                Log::info('Reply sent successfully via ' . $channel->type, ['recipient' => $recipientId]);
+                Log::info('Reply sent successfully via ' . $channel->type, ['recipient_present' => $recipientId !== '']);
             } else {
                 Log::error('Failed to send reply', [
                     'channel_type' => $channel->type,
                     'status'       => $response->status(),
-                    'response'     => $response->json(),
+                    'status' => $response->status(),
                 ]);
             }
         } catch (\Exception $e) {
-            Log::error('Send reply exception', ['error' => $e->getMessage()]);
+            Log::error('Send reply exception', ['exception_type' => get_class($e)]);
         }
     }
 
@@ -613,7 +901,7 @@ Reply:";
                 );
 
             if (!$response->successful()) {
-                Log::error('Gemini API error', $response->json());
+                Log::error('Gemini API error', ['http_status' => $response->status()]);
                 return null;
             }
 
@@ -621,7 +909,7 @@ Reply:";
             return $reply ? trim($reply) : null;
 
         } catch (\Exception $e) {
-            Log::error('Gemini exception', ['error' => $e->getMessage()]);
+            Log::error('Gemini exception', ['exception_type' => get_class($e)]);
             return null;
         }
     }
@@ -666,7 +954,7 @@ Reply:";
         } catch (\Throwable $e) {
             Log::warning('Customer resolution failed for Meta sender', [
                 'conversation_id' => $conversation->id,
-                'error'           => $e->getMessage(),
+                'exception'       => get_class($e),
             ]);
         }
 
@@ -715,7 +1003,10 @@ Reply:";
     {
         try {
             $body = $request->all();
-            Log::info('Gmail Pub/Sub webhook received', $body);
+            Log::info('Gmail Pub/Sub webhook received', [
+                'has_message' => isset($body['message']),
+                'message_id' => is_string($body['message']['messageId'] ?? null) ? $body['message']['messageId'] : null,
+            ]);
 
             // Google Pub/Sub sends the message in a specific format
             $messageData = $body['message'] ?? null;
@@ -738,12 +1029,15 @@ Reply:";
             $historyId = $payload['historyId'] ?? null;
 
             if (!$emailAddress || !$historyId) {
-                Log::warning('Gmail webhook: missing emailAddress or historyId', ['payload' => $payload]);
+                Log::warning('Gmail webhook: missing emailAddress or historyId', [
+                    'has_email_address' => (bool) $emailAddress,
+                    'has_history_id' => (bool) $historyId,
+                ]);
                 return response('OK', 200);
             }
 
             Log::info('Gmail push notification', [
-                'email' => $emailAddress,
+                'has_email_address' => true,
                 'history_id' => $historyId,
             ]);
 
@@ -754,7 +1048,7 @@ Reply:";
                 ->first();
 
             if (!$channel) {
-                Log::warning('Gmail webhook: no channel found for email', ['email' => $emailAddress]);
+                Log::warning('Gmail webhook: no channel found for email');
                 return response('OK', 200);
             }
 
@@ -809,8 +1103,7 @@ Reply:";
 
         } catch (\Exception $e) {
             Log::error('Gmail webhook error', [
-                'error' => $e->getMessage(),
-                'trace' => $e->getTraceAsString(),
+                'exception' => get_class($e),
             ]);
             return response('OK', 200); // Always return 200 to avoid retries
         }
@@ -883,16 +1176,16 @@ Reply:";
             try {
                 app(\App\Services\CustomerService::class)->attachToConversation($conversation);
             } catch (\Throwable $e) {
-                Log::warning('Customer resolution failed for Gmail message', [
-                    'conversation_id' => $conversation->id,
-                    'error'           => $e->getMessage(),
+            Log::warning('Customer resolution failed for Gmail message', [
+                'conversation_id' => $conversation->id,
+                'exception'       => get_class($e),
                 ]);
             }
 
             // Check if message already exists (deduplication)
             $existingMessage = \App\Models\Message::where('gmail_message_id', $messageId)->first();
             if ($existingMessage) {
-                Log::info('Gmail message already processed', ['message_id' => $messageId]);
+                Log::info('Gmail message already processed');
                 return;
             }
 
@@ -932,8 +1225,7 @@ Reply:";
 
         } catch (\Exception $e) {
             Log::error('Error processing Gmail message', [
-                'error' => $e->getMessage(),
-                'message_id' => $messageId,
+                'exception' => get_class($e),
             ]);
         }
     }

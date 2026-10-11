@@ -48,10 +48,10 @@ class RenewGmailWatch extends Command
                 $this->line("  - Watch renewed successfully");
                 $renewed++;
             } catch (\Exception $e) {
-                $this->error("  - Failed to renew watch: {$e->getMessage()}");
+                $this->error('  - Failed to renew watch.');
                 Log::error('Gmail watch renewal failed', [
                     'channel_id' => $channel->id,
-                    'error' => $e->getMessage(),
+                    'exception_type' => get_class($e),
                 ]);
                 $failed++;
             }

@@ -39,7 +39,10 @@ class WooCommerceService
             $lineItem['variation_id'] = (int) $variationId;
         }
 
+                $currency = $this->storeCurrency($storeUrl, $consumerKey, $consumerSecret);
+
         $payload = [
+            'currency' => $currency,
             'payment_method' => '',
             'payment_method_title' => '',
             'set_paid' => false,
@@ -151,5 +154,25 @@ class WooCommerceService
                "• Items         : " . implode(', ', $items) . "\n" .
                "• Date Created  : {$dateCreated}\n\n" .
                "Present these details in a clear, friendly format. intent = order_status\n\n";
+    }
+    /**
+     * Current store currency from the WooCommerce store itself. Never guessed:
+     * WooCommerce defaults to USD when currency is omitted, so a failed lookup
+     * stops the order instead of recording it in the wrong currency.
+     */
+    private function storeCurrency(string $storeUrl, string $consumerKey, string $consumerSecret): string
+    {
+        $response = Http::withBasicAuth($consumerKey, $consumerSecret)
+            ->acceptJson()
+            ->connectTimeout(5)
+            ->timeout(15)
+            ->get("{$storeUrl}/wp-json/wc/v3/data/currencies/current");
+
+        $code = $response->successful() ? strtoupper((string) ($response->json('code') ?? '')) : '';
+        if (!preg_match('/^[A-Z]{3}$/', $code)) {
+            throw new \RuntimeException('WooCommerce store currency could not be read (HTTP ' . $response->status() . ').');
+        }
+
+        return $code;
     }
 }

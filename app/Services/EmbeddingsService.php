@@ -53,6 +53,11 @@ class EmbeddingsService
      */
     public function embedChunk(string $text): ?array
     {
+        // An empty input (for example an attachment with no text) is rejected by the API with 400.
+        if (trim($text) === '') {
+            return null;
+        }
+
         try {
             // FIX (2026-08-31): same missing-timeout issue as AICapabilitiesService's
             // Gemini chat call — a hang here blocks ProcessAutoReply's knowledge-base

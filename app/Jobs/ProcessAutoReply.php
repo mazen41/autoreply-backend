@@ -937,7 +937,7 @@ class ProcessAutoReply implements ShouldQueue
         // Shopify and WooCommerce order lookups are scoped to the same
         // connection as the product catalog for this conversation.
         if ($isOrderStatus && $commerceChannel && in_array($commerceChannel->type, ['shopify', 'woocommerce'], true)) {
-            $phone = preg_replace('/[^0-9]/', '', $conversation->sender_id ?? '');
+            $phone = $this->senderPhoneDigits($conversation);
             try {
                 if ($commerceChannel->type === 'shopify' && $phone !== '') {
                     $response = Http::withToken($commerceChannel->access_token)
@@ -1007,7 +1007,7 @@ class ProcessAutoReply implements ShouldQueue
 
             // ── ORDER STATUS FLOW ────────────────────────────────────────────
             if ($isOrderStatus) {
-                $rawPhone = preg_replace('/[^0-9]/', '', $conversation->sender_id ?? '');
+                $rawPhone = $this->senderPhoneDigits($conversation);
 
                 // WhatsApp: try direct order-number lookup first (if message is a bare order number),
                 // then fall back to phone-based lookup.
@@ -2631,6 +2631,9 @@ class ProcessAutoReply implements ShouldQueue
             is_array($conversation->fresh()->checkout_state) ? $conversation->fresh()->checkout_state : [],
             is_array($updatedCheckoutState) ? $updatedCheckoutState : []
         );
+        $greetingGuard = app(\App\Services\GreetingRepeatGuard::class)->apply($message, (string) $aiResponse);
+        $aiResponse = $greetingGuard['reply'];
+
         $claimGuard = app(\App\Services\OrderClaimGuard::class)->inspect(
             $conversation,
             (string) $aiResponse,
@@ -3792,7 +3795,7 @@ class ProcessAutoReply implements ShouldQueue
                 'product_name' => $checkoutState['product_name'] ?? 'Product',
                 'customer'     => [
                     'name'    => $checkoutState['full_name'] ?? $conversation->sender_name,
-                    'phone'   => $checkoutState['phone'] ?? $conversation->sender_id,
+                    'phone'   => $checkoutState['phone'] ?? $checkoutState['customer_phone'] ?? null,
                     'address' => $checkoutState['address'] ?? null,
                 ],
                 'completed_at' => now()->toISOString(),
@@ -3973,5 +3976,13 @@ class ProcessAutoReply implements ShouldQueue
         );
     }
 
+    /** Digits of the sender ID, only when the channel's sender ID is itself a phone number (WhatsApp). */
+    private function senderPhoneDigits(\App\Models\Conversation $conversation): string
+    {
+        if (($conversation->channel?->type ?? null) !== 'whatsapp') {
+            return '';
+        }
 
+        return preg_replace('/[^0-9]/', '', (string) ($conversation->sender_id ?? '')) ?? '';
+    }
 }

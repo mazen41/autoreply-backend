@@ -366,6 +366,7 @@ class CommerceContextResolverTest extends TestCase
             'consumer_secret' => encrypt('cs_test'),
         ]]);
         Http::fake([
+            'wholesale.example/wp-json/wc/v3/data/currencies/current' => Http::response(['code' => 'USD'], 200),
             'wholesale.example/wp-json/wc/v3/orders' => Http::response([
                 'id' => 901,
                 'number' => '901',

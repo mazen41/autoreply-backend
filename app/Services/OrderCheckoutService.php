@@ -305,6 +305,10 @@ class OrderCheckoutService
             $existingState['email'] = $existingState['customer_email'];
         }
 
+        // Drop stored phone values that are not real numbers (for example a placeholder
+        // or a platform ID saved by an earlier turn).
+        $existingState = self::sanitizeStoredPhone($existingState);
+
         // 1. Extract phone number
         $extractedPhone = null;
         $phoneSearchText = preg_replace('/(?:postal|zip)\s*(?:code)?\s*[:#-]?\s*[A-Z0-9-]{3,12}/i', '', $incomingText);
@@ -720,6 +724,39 @@ class OrderCheckoutService
             $state['confirmation_state'] = 'confirmed';
         } elseif (!in_array($currentState, ['confirmation_pending', 'confirmed'], true)) {
             $state['confirmation_state'] = 'confirmation_pending';
+        }
+
+        return $state;
+    }
+
+    /** A phone must be a real number: 8-15 digits with only phone formatting around them. */
+    public static function isValidPhone(mixed $value): bool
+    {
+        if (!is_string($value)) {
+            return false;
+        }
+        if (preg_match('/[^\d+\s().\-]/', $value)) {
+            return false; // letters or brackets, for example the placeholder "[phone]"
+        }
+        $digits = preg_replace('/\D+/', '', $value) ?? '';
+        if (strlen($digits) < 8 || strlen($digits) > 15) {
+            return false;
+        }
+
+        return str_starts_with(trim($value), '+')
+            || str_starts_with($digits, '00')
+            || preg_match('/^01[0125]\d{8}$/', $digits) === 1
+            || preg_match('/^05\d{8}$/', $digits) === 1
+            || preg_match('/^(?:966|971|965|974|973|968|967|962|961|964|20)\d{7,12}$/', $digits) === 1;
+    }
+
+    /** Removes stored phone values that are not real phone numbers (placeholders, platform IDs). */
+    public static function sanitizeStoredPhone(array $state): array
+    {
+        foreach (['phone', 'customer_phone'] as $key) {
+            if (array_key_exists($key, $state) && !self::isValidPhone($state[$key])) {
+                unset($state[$key]);
+            }
         }
 
         return $state;

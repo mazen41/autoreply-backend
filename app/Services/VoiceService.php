@@ -4,7 +4,7 @@ namespace App\Services;
 
 use Illuminate\Support\Facades\Http;
 use Illuminate\Support\Facades\Log;
-use Illuminate\Support\Facades\Storage;
+use Illuminate\Support\Facades\URL;
 
 class VoiceService
 {
@@ -17,7 +17,7 @@ class VoiceService
      */
     public static function transcribeAudio(string $audioFilePath): string
     {
-        $apiKey = env('OPENAI_API_KEY');
+        $apiKey = config('services.openai.api_key');
 
         if (!$apiKey) {
             throw new \Exception('OpenAI API key not configured for voice transcription');
@@ -35,16 +35,14 @@ class VoiceService
                 ->attach('file', file_get_contents($audioFilePath), basename($audioFilePath))
                 ->post('https://api.openai.com/v1/audio/transcriptions', [
                     'model' => 'whisper-1',
-                    'language' => 'ar',
                     'response_format' => 'text',
                 ]);
 
             if (!$response->successful()) {
                 Log::error('Whisper transcription failed', [
                     'status' => $response->status(),
-                    'body' => $response->body(),
                 ]);
-                throw new \Exception('Transcription failed: ' . $response->body());
+                throw new \Exception('Transcription failed with HTTP status ' . $response->status());
             }
 
             $transcription = $response->body();
@@ -58,7 +56,7 @@ class VoiceService
 
         } catch (\Exception $e) {
             Log::error('Voice transcription error', [
-                'error' => $e->getMessage(),
+                'exception_type' => get_class($e),
                 'file' => basename($audioFilePath),
             ]);
             throw $e;
@@ -70,12 +68,12 @@ class VoiceService
      *
      * @param string $text The text to convert to speech
      * @param string $voice The voice to use (alloy, echo, fable, onyx, nova, shimmer)
-     * @return string Public URL of the generated audio file
+     * @return string Expiring signed URL for private playback of the generated audio
      * @throws \Exception
      */
     public static function textToSpeech(string $text, string $voice = 'alloy'): string
     {
-        $apiKey = env('OPENAI_API_KEY');
+        $apiKey = config('services.openai.api_key');
 
         if (!$apiKey) {
             throw new \Exception('OpenAI API key not configured for text-to-speech');
@@ -102,17 +100,17 @@ class VoiceService
             if (!$response->successful()) {
                 Log::error('TTS generation failed', [
                     'status' => $response->status(),
-                    'body' => $response->body(),
                 ]);
-                throw new \Exception('TTS generation failed: ' . $response->body());
+                throw new \Exception('TTS generation failed with HTTP status ' . $response->status());
             }
 
-            // Save audio file to storage
+            // Keep generated speech private and expose only an expiring signed URL.
             $audioContent = $response->body();
-            $fileName = 'tts/' . uniqid() . '.mp3';
-            Storage::disk('public')->put($fileName, $audioContent);
-
-            $publicUrl = Storage::disk('public')->url($fileName);
+            $storage = app(IncomingMediaStorage::class);
+            $fileName = $storage->store($audioContent, 'mp3');
+            $signedUrl = URL::temporarySignedRoute('media.tts.show', now()->addDays(7), [
+                'mediaPath' => $fileName,
+            ]);
 
             Log::info('TTS audio generated', [
                 'voice' => $voice,
@@ -120,11 +118,11 @@ class VoiceService
                 'file' => $fileName,
             ]);
 
-            return $publicUrl;
+            return $signedUrl;
 
         } catch (\Exception $e) {
             Log::error('TTS generation error', [
-                'error' => $e->getMessage(),
+                'exception_type' => get_class($e),
             ]);
             throw $e;
         }
@@ -135,6 +133,6 @@ class VoiceService
      */
     public static function isAvailable(): bool
     {
-        return !empty(env('OPENAI_API_KEY'));
+        return !empty(config('services.openai.api_key'));
     }
 }

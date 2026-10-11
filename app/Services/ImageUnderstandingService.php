@@ -4,175 +4,175 @@ namespace App\Services;
 
 use Illuminate\Support\Facades\Http;
 use Illuminate\Support\Facades\Log;
+use Illuminate\Support\Facades\Storage;
 
 class ImageUnderstandingService
 {
-    /**
-     * Analyze an image using Vision API (GPT-4o or Gemini).
-     *
-     * @param string $imageUrl Public URL or base64-encoded image
-     * @param string $prompt Custom analysis prompt
-     * @return array Structured analysis result
-     */
-    public static function analyzeImage(string $imageUrl, string $prompt = 'Describe this image and identify any products or receipts'): array
-    {
-        $provider = env('VISION_PROVIDER', 'openai');
+    public static function analyzeImage(
+        string $imagePath,
+        string $prompt = 'Describe this image and identify any products or receipts',
+        ?string $diskName = null,
+    ): array {
+        $provider = (string) config('services.vision.provider', 'openai');
+        $apiKey = match ($provider) {
+            'gemini' => (string) config('services.vision.gemini_api_key', ''),
+            default => (string) config('services.vision.openai_api_key', ''),
+        };
 
-        return match ($provider) {
-            'gemini' => self::analyzeWithGemini($imageUrl, $prompt),
-            default => self::analyzeWithOpenAI($imageUrl, $prompt),
+        if ($apiKey === '') {
+            return self::unavailable(ucfirst($provider) . ' Vision API key is not configured.');
+        }
+
+        $resolvedPath = self::resolveStoredImagePath($imagePath, $diskName);
+        if (!$resolvedPath) {
+            return self::unavailable('Image path is unavailable or outside the allowed storage root.');
+        }
+
+        $imageData = @file_get_contents($resolvedPath);
+        if ($imageData === false) {
+            return self::unavailable('Stored image could not be read.');
+        }
+
+        $mimeType = self::detectImageMimeType($resolvedPath);
+
+        return $provider === 'gemini'
+            ? self::analyzeWithGemini($imageData, $mimeType, $prompt, $apiKey)
+            : self::analyzeWithOpenAI($imageData, $mimeType, $prompt, $apiKey);
+    }
+
+    public static function isAvailable(): bool
+    {
+        return match ((string) config('services.vision.provider', 'openai')) {
+            'gemini' => (string) config('services.vision.gemini_api_key', '') !== '',
+            default => (string) config('services.vision.openai_api_key', '') !== '',
         };
     }
 
-    /**
-     * Analyze image using OpenAI GPT-4o Vision.
-     */
-    private static function analyzeWithOpenAI(string $imageUrl, string $prompt): array
+    private static function resolveStoredImagePath(string $imagePath, ?string $diskName): ?string
     {
-        $apiKey = env('OPENAI_API_KEY');
+        $storage = app(IncomingMediaStorage::class);
+        $diskName ??= $storage->diskName();
+        $decoded = rawurldecode($imagePath);
 
-        if (!$apiKey) {
-            return self::getEmptyResult('OpenAI API key not configured');
+        if ($decoded === '' || str_contains($decoded, "\0") || preg_match('#^https?://#i', $decoded)) {
+            return null;
         }
 
-        try {
-            $imageData = str_starts_with($imageUrl, 'http')
-                ? $imageUrl
-                : 'data:image/jpeg;base64,' . base64_encode(file_get_contents($imageUrl));
+        if (!self::isAbsolutePath($decoded)) {
+            return $storage->absolutePath($decoded, $diskName);
+        }
 
+        $resolved = realpath($decoded);
+        $root = realpath(Storage::disk($diskName)->path(''));
+        if (!$resolved || !$root || !is_file($resolved)) {
+            return null;
+        }
+
+        return str_starts_with($resolved, rtrim($root, DIRECTORY_SEPARATOR) . DIRECTORY_SEPARATOR)
+            ? $resolved
+            : null;
+    }
+
+    private static function isAbsolutePath(string $path): bool
+    {
+        return str_starts_with($path, DIRECTORY_SEPARATOR)
+            || (bool) preg_match('/^[A-Za-z]:[\\\\\/]/', $path);
+    }
+
+    private static function analyzeWithOpenAI(string $imageData, string $mimeType, string $prompt, string $apiKey): array
+    {
+        try {
             $response = Http::timeout(60)
-                ->withHeaders([
-                    'Authorization' => 'Bearer ' . $apiKey,
-                    'Content-Type' => 'application/json',
-                ])
+                ->withToken($apiKey)
                 ->post('https://api.openai.com/v1/chat/completions', [
-                    'model' => 'gpt-4o',
-                    'messages' => [
-                        [
-                            'role' => 'user',
-                            'content' => [
-                                ['type' => 'text', 'text' => $prompt],
-                                ['type' => 'image_url', 'image_url' => ['url' => $imageData]],
-                            ],
+                    'model' => config('services.vision.openai_model', 'gpt-4o'),
+                    'messages' => [[
+                        'role' => 'user',
+                        'content' => [
+                            ['type' => 'text', 'text' => $prompt],
+                            ['type' => 'image_url', 'image_url' => [
+                                'url' => 'data:' . $mimeType . ';base64,' . base64_encode($imageData),
+                            ]],
                         ],
-                    ],
+                    ]],
                     'response_format' => ['type' => 'json_object'],
                     'max_tokens' => 500,
                 ]);
 
             if (!$response->successful()) {
-                Log::error('OpenAI Vision analysis failed', [
-                    'status' => $response->status(),
-                    'body' => $response->body(),
-                ]);
-                return self::getEmptyResult('Vision API call failed');
+                Log::warning('OpenAI Vision analysis failed', ['status' => $response->status()]);
+                return self::unavailable('OpenAI Vision API request failed.');
             }
 
-            $result = $response->json();
-            $content = $result['choices'][0]['message']['content'] ?? '{}';
-            $parsed = json_decode($content, true) ?? [];
-
-            return [
-                'detected_intent' => $parsed['detected_intent'] ?? 'unknown',
-                'extracted_text' => $parsed['extracted_text'] ?? '',
-                'product_matches' => $parsed['product_matches'] ?? [],
-                'confidence' => $parsed['confidence'] ?? 0.5,
-                'raw_analysis' => $parsed['description'] ?? '',
-            ];
-
-        } catch (\Exception $e) {
-            Log::error('Image analysis error', ['error' => $e->getMessage()]);
-            return self::getEmptyResult($e->getMessage());
+            $content = $response->json('choices.0.message.content', '{}');
+            return self::normalizeResponse(json_decode((string) $content, true) ?: []);
+        } catch (\Throwable $exception) {
+            Log::warning('OpenAI Vision analysis failed', ['exception_type' => get_class($exception)]);
+            return self::unavailable('OpenAI Vision analysis failed.');
         }
     }
 
-    /**
-     * Analyze image using Gemini 1.5 Flash.
-     */
-    private static function analyzeWithGemini(string $imageUrl, string $prompt): array
+    private static function analyzeWithGemini(string $imageData, string $mimeType, string $prompt, string $apiKey): array
     {
-        $apiKey = env('GEMINI_API_KEY');
-
-        if (!$apiKey) {
-            return self::getEmptyResult('Gemini API key not configured');
-        }
-
         try {
-            $imageData = str_starts_with($imageUrl, 'http')
-                ? file_get_contents($imageUrl)
-                : file_get_contents($imageUrl);
-
-            $base64Image = base64_encode($imageData);
-
+            $model = (string) config('services.vision.gemini_model', 'gemini-3.8-flash');
             $response = Http::timeout(60)
-                ->withHeaders([
-                    'Content-Type' => 'application/json',
-                ])
-                ->post("https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key={$apiKey}", [
-                    'contents' => [
-                        [
-                            'parts' => [
-                                ['text' => $prompt],
-                                [
-                                    'inline_data' => [
-                                        'mime_type' => 'image/jpeg',
-                                        'data' => $base64Image,
-                                    ],
-                                ],
-                            ],
+                ->post("https://generativelanguage.googleapis.com/v1beta/models/{$model}:generateContent?key=" . urlencode($apiKey), [
+                    'contents' => [[
+                        'parts' => [
+                            ['text' => $prompt],
+                            ['inline_data' => [
+                                'mime_type' => $mimeType,
+                                'data' => base64_encode($imageData),
+                            ]],
                         ],
-                    ],
-                    'generationConfig' => [
-                        'responseMimeType' => 'application/json',
-                    ],
+                    ]],
+                    'generationConfig' => ['responseMimeType' => 'application/json'],
                 ]);
 
             if (!$response->successful()) {
-                Log::error('Gemini Vision analysis failed', [
-                    'status' => $response->status(),
-                    'body' => $response->body(),
-                ]);
-                return self::getEmptyResult('Gemini Vision API call failed');
+                Log::warning('Gemini Vision analysis failed', ['status' => $response->status()]);
+                return self::unavailable('Gemini Vision API request failed.');
             }
 
-            $result = $response->json();
-            $content = $result['candidates'][0]['content']['parts'][0]['text'] ?? '{}';
-            $parsed = json_decode($content, true) ?? [];
-
-            return [
-                'detected_intent' => $parsed['detected_intent'] ?? 'unknown',
-                'extracted_text' => $parsed['extracted_text'] ?? '',
-                'product_matches' => $parsed['product_matches'] ?? [],
-                'confidence' => $parsed['confidence'] ?? 0.5,
-                'raw_analysis' => $parsed['description'] ?? '',
-            ];
-
-        } catch (\Exception $e) {
-            Log::error('Gemini image analysis error', ['error' => $e->getMessage()]);
-            return self::getEmptyResult($e->getMessage());
+            $content = $response->json('candidates.0.content.parts.0.text', '{}');
+            return self::normalizeResponse(json_decode((string) $content, true) ?: []);
+        } catch (\Throwable $exception) {
+            Log::warning('Gemini Vision analysis failed', ['exception_type' => get_class($exception)]);
+            return self::unavailable('Gemini Vision analysis failed.');
         }
     }
 
-    /**
-     * Get empty result structure.
-     */
-    private static function getEmptyResult(string $error): array
+    private static function normalizeResponse(array $parsed): array
     {
         return [
+            'detected_intent' => $parsed['detected_intent'] ?? 'unknown',
+            'extracted_text' => $parsed['extracted_text'] ?? '',
+            'product_matches' => $parsed['product_matches'] ?? [],
+            'confidence' => $parsed['confidence'] ?? 0.5,
+            'raw_analysis' => $parsed['description'] ?? '',
+        ];
+    }
+
+    private static function unavailable(string $reason): array
+    {
+        return [
+            'status' => 'unavailable',
             'detected_intent' => 'unknown',
             'extracted_text' => '',
             'product_matches' => [],
             'confidence' => 0,
             'raw_analysis' => '',
-            'error' => $error,
+            'error' => 'Image analysis unavailable: ' . $reason,
         ];
     }
 
-    /**
-     * Check if image understanding is available.
-     */
-    public static function isAvailable(): bool
+    private static function detectImageMimeType(string $path): string
     {
-        return !empty(env('OPENAI_API_KEY')) || !empty(env('GEMINI_API_KEY'));
+        $mimeType = function_exists('mime_content_type') ? mime_content_type($path) : false;
+
+        return in_array($mimeType, ['image/jpeg', 'image/png', 'image/webp'], true)
+            ? $mimeType
+            : 'image/jpeg';
     }
 }

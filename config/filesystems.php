@@ -15,6 +15,12 @@ return [
 
     'default' => env('FILESYSTEM_DISK', 'local'),
 
+    // Database backup artifacts are encrypted with the application's APP_KEY
+    // before they are written to this private storage disk.
+    'backup_disk' => env('BACKUP_DISK', 'local'),
+    'backup_path' => env('BACKUP_PATH', 'backups'),
+    'backup_retention_days' => env('BACKUP_RETENTION_DAYS', 7),
+
     /*
     |--------------------------------------------------------------------------
     | Filesystem Disks
@@ -35,6 +41,14 @@ return [
             'root' => storage_path('app/private'),
             'serve' => true,
             'throw' => false,
+            'report' => false,
+        ],
+
+        'private_media' => [
+            'driver' => 'local',
+            'root' => storage_path('app/private-media'),
+            'serve' => false,
+            'throw' => true,
             'report' => false,
         ],
 

@@ -4,6 +4,7 @@ namespace Tests\Feature;
 
 use App\Jobs\ProcessAutoReply;
 use App\Models\BusinessProfile;
+use App\Models\Bot;
 use App\Models\Channel;
 use App\Models\Conversation;
 use App\Models\Message;
@@ -11,6 +12,8 @@ use App\Models\Package;
 use App\Models\User;
 use Illuminate\Foundation\Testing\RefreshDatabase;
 use Illuminate\Support\Facades\Http;
+use Illuminate\Support\Facades\Cache;
+use Illuminate\Support\Facades\Redis;
 use Tests\TestCase;
 
 /**
@@ -48,6 +51,11 @@ class SallaImageSendTest extends TestCase
 
     private function makeFixture(string $inboundContent, string $priorAiMessage): array
     {
+        config(['services.evolution.base_url' => 'http://localhost:8080']);
+        // Each fixture reuses the same database IDs after RefreshDatabase;
+        // clear cached catalog results so image-failure cases cannot reuse a
+        // previous test's product response.
+        Cache::flush();
         $this->makeFreePackage();
 
         $user = User::forceCreate([
@@ -61,6 +69,11 @@ class SallaImageSendTest extends TestCase
             'business_name' => 'Demo Store',
         ]);
 
+        // Rate limiting uses Redis (outside RefreshDatabase's transaction),
+        // and test databases reuse primary keys. Reset this fixture's key so
+        // unrelated ProcessAutoReply tests cannot make it hit the limit.
+        Redis::del("rate_limit:{$business->id}:{$user->id}");
+
         $whatsappChannel = Channel::create([
             'user_id' => $user->id,
             'business_id' => $business->id,
@@ -69,6 +82,7 @@ class SallaImageSendTest extends TestCase
             'status' => 'connected',
             'access_token' => 'test_token_' . \Illuminate\Support\Str::random(10),
             'ai_enabled' => true,
+            'metadata' => ['whatsapp_provider' => 'evolution', 'unofficial_risk_accepted' => true],
         ]);
 
         $sallaChannel = Channel::create([
@@ -80,9 +94,18 @@ class SallaImageSendTest extends TestCase
             'refresh_token' => 'fake-salla-refresh-token',
         ]);
 
+        $bot = Bot::create([
+            'business_profile_id' => $business->id,
+            'name' => 'Salla Image Test Agent',
+            'status' => 'active',
+            'ecommerce_channel_id' => $sallaChannel->id,
+        ]);
+        $bot->channels()->attach($whatsappChannel->id, ['is_primary' => true]);
+
         $conversation = Conversation::create([
             'channel_id' => $whatsappChannel->id,
             'business_id' => $business->id,
+            'bot_id' => $bot->id,
             'sender_id' => '966500000000',
             'status' => 'open',
         ]);
@@ -159,7 +182,6 @@ class SallaImageSendTest extends TestCase
         ]);
 
         (new ProcessAutoReply($fixture['message']->id))->handle();
-
         // A real media-send call must have happened, with a real image URL.
         Http::assertSent(function ($request) {
             return str_contains($request->url(), '/message/sendMedia/')
@@ -172,6 +194,12 @@ class SallaImageSendTest extends TestCase
 
         // Claim is true here, so it's allowed to stand.
         $this->assertStringContainsString('photos', strtolower($reply->content));
+        $imageMessages = Message::where('conversation_id', $fixture['conversation']->id)
+            ->where('source', 'ai_product_image')
+            ->where('send_status', 'sent')
+            ->get();
+        $this->assertCount(2, $imageMessages, 'Each provider-accepted product image must count as an outbound message.');
+        $this->assertSame(['image', 'image'], $imageMessages->pluck('media_type')->all());
     }
 
     /**
@@ -264,5 +292,38 @@ class SallaImageSendTest extends TestCase
             ->where('direction', 'outbound')->where('is_ai', true)->latest('id')->first();
 
         $this->assertStringNotContainsString('here are the photos', strtolower($reply->content));
+    }
+
+    public function test_product_images_leave_one_plan_unit_for_the_customer_facing_text_reply(): void
+    {
+        $fixture = $this->makeFixture(
+            'can I see photos of the dress and pants',
+            'Here are some of our products: 1. Dress (174 SAR), 2. Pants (94 SAR).'
+        );
+        Package::where('name', 'Free')->update(['outbound_messages_limit' => 2]);
+
+        Http::fake([
+            'generativelanguage.googleapis.com/*embedContent*' => Http::response(['embedding' => ['values' => []]], 200),
+            'generativelanguage.googleapis.com/*generateContent*' => Http::response(
+                $this->fakeGeminiReply('Here are the photos of the dress and pants!'),
+                200
+            ),
+            'api.salla.dev/admin/v2/products*' => Http::response([
+                'data' => [
+                    ['id' => 1, 'name' => 'Dress', 'price' => ['amount' => 174, 'currency_code' => 'SAR'], 'quantity' => 5, 'thumbnail' => 'https://cdn.salla.sa/dress.jpg'],
+                    ['id' => 2, 'name' => 'Pants', 'price' => ['amount' => 94, 'currency_code' => 'SAR'], 'quantity' => 3, 'thumbnail' => 'https://cdn.salla.sa/pants.jpg'],
+                ],
+                'pagination' => ['total' => 2, 'per_page' => 10, 'current_page' => 1],
+            ], 200),
+            'localhost:8080/message/sendMedia/*' => Http::response(['key' => ['id' => 'MEDIA_MSG_1']], 200),
+            'localhost:8080/message/sendText/*' => Http::response(['key' => ['id' => 'TEXT_MSG_1']], 200),
+        ]);
+
+        (new ProcessAutoReply($fixture['message']->id))->handle();
+
+        Http::assertNotSent(fn ($request) => str_contains($request->url(), '/message/sendMedia/'));
+        Http::assertSent(fn ($request) => str_contains($request->url(), '/message/sendText/'));
+        $this->assertDatabaseCount('product_message_maps', 0);
+        $this->assertSame(2, app(\App\Services\UsageMeter::class)->snapshot($fixture['business'])['usage']['outbound_messages']['used']);
     }
 }

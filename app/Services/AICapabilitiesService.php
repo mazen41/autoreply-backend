@@ -1157,8 +1157,11 @@ JSON;
                 return self::callGroqChat($messages, $context);
             } catch (\Exception $e) {
                 // If Groq fails (e.g. invalid API key), try Gemini as a fallback if configured
-            Log::warning('Groq API failed. Falling back to Gemini.', ['exception_type' => get_class($e)]);
-                return self::callGeminiChat($messages, $context);
+                Log::warning('Groq API failed. Falling back to Gemini.', ['exception_type' => get_class($e)]);
+                $fallbackContext = $context;
+                $fallbackContext['ai_provider'] = 'gemini';
+                unset($fallbackContext['ai_model']);
+                return self::callGeminiChat($messages, $fallbackContext);
             }
         }
 

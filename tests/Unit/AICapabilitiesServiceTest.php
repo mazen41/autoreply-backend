@@ -4,9 +4,43 @@ namespace Tests\Unit;
 
 use Tests\TestCase;
 use App\Services\AICapabilitiesService;
+use Illuminate\Support\Facades\Http;
 
 class AICapabilitiesServiceTest extends TestCase
 {
+    public function test_groq_rate_limit_fallback_uses_gemini_credentials_and_model(): void
+    {
+        config([
+            'services.groq.api_key' => 'groq-test-key',
+            'services.groq.model' => 'llama-3.3-70b-versatile',
+            'services.gemini.api_key' => 'gemini-test-key',
+            'services.gemini.model' => 'gemini-2.5-flash',
+        ]);
+
+        Http::fake([
+            'api.groq.com/openai/v1/chat/completions' => Http::response(['error' => 'rate limited'], 429),
+            'generativelanguage.googleapis.com/*' => Http::response([
+                'candidates' => [[
+                    'content' => ['parts' => [['text' => json_encode([
+                        'success' => true,
+                        'reply' => 'Please send your phone number.',
+                        'intent' => 'place_order',
+                        'confidence' => 0.9,
+                    ])]]],
+                ]],
+            ], 200),
+        ]);
+
+        $result = AICapabilitiesService::callAIWithJSON('I want to order this', [
+            'ai_provider' => 'groq',
+            'ai_model' => 'llama-3.3-70b-versatile',
+        ]);
+
+        $this->assertSame('Please send your phone number.', $result['reply']);
+        Http::assertSent(fn ($request) => str_contains($request->url(), 'generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent')
+            && str_contains($request->url(), 'key=gemini-test-key'));
+    }
+
     public function test_detect_intent_greeting_arabic()
     {
         // Use simple fallback detection now

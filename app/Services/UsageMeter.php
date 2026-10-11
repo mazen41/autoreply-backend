@@ -161,7 +161,13 @@ class UsageMeter
     ): int
     {
         if ($metric === self::CHANNELS) {
-            return Channel::query()->where('business_id', $business->id)->count();
+            // Commerce stores are connections, not messaging channels: they do not use the channel allowance.
+            // Disconnected channels do not count either.
+            return Channel::query()
+                ->where('business_id', $business->id)
+                ->where('status', 'connected')
+                ->whereNotIn('type', ['salla', 'shopify', 'woocommerce'])
+                ->count();
         }
 
         $messageCount = $this->billableOutboundMessages($business, $periodStart, $excludeMessageId)

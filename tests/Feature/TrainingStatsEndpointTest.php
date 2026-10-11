@@ -24,6 +24,7 @@ class TrainingStatsEndpointTest extends TestCase
 
     private function makeChannel(User $user, array $attrs = []): Channel
     {
+        $business = BusinessProfile::firstOrCreate(['user_id' => $user->id], ['name' => 'Training test business']);
         $attrs = array_merge([
             'type' => 'whatsapp',
             'page_id' => 'wa-1',
@@ -34,13 +35,22 @@ class TrainingStatsEndpointTest extends TestCase
             'ai_enabled' => true,
         ], $attrs);
         $attrs['user_id'] = $user->id;
+        $attrs['business_id'] ??= $business->id;
         return Channel::create($attrs);
+    }
+
+    private function getStats(User $user, string $query = '')
+    {
+        $business = BusinessProfile::firstOrCreate(['user_id' => $user->id], ['name' => 'Training test business']);
+        Sanctum::actingAs($user);
+        return $this->getJson('/api/training/stats' . $query, ['X-Business-Id' => (string) $business->id]);
     }
 
     private function makeConversation(Channel $channel, array $attrs = []): Conversation
     {
         $attrs = array_merge([
             'channel_id' => $channel->id,
+            'business_id' => $channel->business_id,
             'sender_id' => 'buyer-' . uniqid(),
             'sender_name' => 'Buyer',
             'status' => 'open',
@@ -68,7 +78,7 @@ class TrainingStatsEndpointTest extends TestCase
         $user = $this->makeUser();
         Sanctum::actingAs($user);
 
-        $this->getJson('/api/training/stats')
+        $this->getStats($user)
             ->assertOk()
             ->assertJsonPath('total_ai_messages', 0)
             ->assertJsonPath('total_conversations', 0)
@@ -78,6 +88,15 @@ class TrainingStatsEndpointTest extends TestCase
             ->assertJsonPath('auto_reply_rate', null)
             ->assertJsonPath('satisfaction_percentage', null)
             ->assertJson([]);
+    }
+
+    public function test_stats_require_an_explicit_business_selection(): void
+    {
+        $user = $this->makeUser();
+        BusinessProfile::create(['user_id' => $user->id, 'name' => 'Owned Business']);
+        Sanctum::actingAs($user);
+
+        $this->getJson('/api/training/stats')->assertStatus(422);
     }
 
     public function test_avg_confidence_excludes_null_and_normalizes_scale(): void
@@ -93,7 +112,7 @@ class TrainingStatsEndpointTest extends TestCase
 
         Sanctum::actingAs($user);
 
-        $this->getJson('/api/training/stats')
+        $this->getStats($user)
             ->assertOk()
             ->assertJsonPath('total_ai_messages', 4)
             ->assertJsonPath('confidence_count', 3)                 // NULL excluded
@@ -127,7 +146,7 @@ class TrainingStatsEndpointTest extends TestCase
 
         Sanctum::actingAs($user);
 
-        $this->getJson('/api/training/stats')
+        $this->getStats($user)
             ->assertOk()
             ->assertJsonPath('total_ai_messages', 1);
     }
@@ -145,7 +164,7 @@ class TrainingStatsEndpointTest extends TestCase
 
         Sanctum::actingAs($userA);
 
-        $this->getJson('/api/training/stats')
+        $this->getStats($userA)
             ->assertOk()
             ->assertJsonPath('total_ai_messages', 1)
             ->assertJsonPath('avg_confidence', 90.0) // only user A's channel
@@ -168,9 +187,9 @@ class TrainingStatsEndpointTest extends TestCase
 
         Sanctum::actingAs($intruder);
 
-        // Intruder passing someone else's business_id → 404 (not exposed).
-        $this->getJson('/api/training/stats?business_id=' . $business->id)
-            ->assertNotFound();
+        // Intruder selecting someone else's business is forbidden.
+        $this->getJson('/api/training/stats', ['X-Business-Id' => (string) $business->id])
+            ->assertForbidden();
     }
 
     public function test_escalation_statistics(): void
@@ -185,7 +204,7 @@ class TrainingStatsEndpointTest extends TestCase
 
         Sanctum::actingAs($user);
 
-        $this->getJson('/api/training/stats')
+        $this->getStats($user)
             ->assertOk()
             ->assertJsonPath('escalated_conversations', 1)
             ->assertJsonPath('escalations_today', 1)
@@ -213,7 +232,7 @@ class TrainingStatsEndpointTest extends TestCase
 
         Sanctum::actingAs($user);
 
-        $this->getJson('/api/training/stats')
+        $this->getStats($user)
             ->assertOk()
             ->assertJsonPath('feedback_total', 2)
             ->assertJsonPath('feedback_positive', 1)
@@ -237,12 +256,12 @@ class TrainingStatsEndpointTest extends TestCase
         Sanctum::actingAs($user);
 
         // Default (last_30_days) should exclude the 40-day-old message.
-        $this->getJson('/api/training/stats')
+        $this->getStats($user)
             ->assertOk()
             ->assertJsonPath('total_ai_messages', 1);
 
         // all_time includes it.
-        $this->getJson('/api/training/stats?preset=all_time')
+        $this->getStats($user, '?preset=all_time')
             ->assertOk()
             ->assertJsonPath('total_ai_messages', 2);
     }
@@ -252,7 +271,7 @@ class TrainingStatsEndpointTest extends TestCase
         $user = $this->makeUser();
         Sanctum::actingAs($user);
 
-        $this->getJson('/api/training/stats?preset=not-a-real-range')
+        $this->getStats($user, '?preset=not-a-real-range')
             ->assertStatus(422);
     }
 
@@ -269,7 +288,7 @@ class TrainingStatsEndpointTest extends TestCase
 
         Sanctum::actingAs($user);
 
-        $this->getJson('/api/training/stats')
+        $this->getStats($user)
             ->assertOk()
             ->assertJsonPath('dialect_breakdown.egyptian', 1)
             ->assertJsonPath('dialect_breakdown.english', 1)

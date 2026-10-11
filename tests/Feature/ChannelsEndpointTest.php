@@ -3,7 +3,11 @@
 namespace Tests\Feature;
 
 use App\Models\Channel;
+use App\Models\Bot;
+use App\Models\BusinessProfile;
 use App\Models\User;
+use App\Models\FeatureFlag;
+use App\Models\BusinessFeatureFlagAssignment;
 use Illuminate\Foundation\Testing\RefreshDatabase;
 use Laravel\Sanctum\Sanctum;
 use Tests\TestCase;
@@ -16,9 +20,12 @@ class ChannelsEndpointTest extends TestCase
     {
         $user = User::factory()->create();
         $otherUser = User::factory()->create();
+        $business = BusinessProfile::factory()->create(['user_id' => $user->id]);
+        $otherBusiness = BusinessProfile::factory()->create(['user_id' => $otherUser->id]);
 
         Channel::create([
             'user_id' => $user->id,
+            'business_id' => $business->id,
             'type' => 'facebook',
             'page_id' => 'page-1',
             'page_name' => 'Main Page',
@@ -30,6 +37,7 @@ class ChannelsEndpointTest extends TestCase
 
         Channel::create([
             'user_id' => $otherUser->id,
+            'business_id' => $otherBusiness->id,
             'type' => 'gmail',
             'page_id' => 'mailbox-1',
             'page_name' => 'Other Mailbox',
@@ -40,11 +48,51 @@ class ChannelsEndpointTest extends TestCase
 
         Sanctum::actingAs($user);
 
-        $this->getJson('/api/channels')
+        $this->getJson('/api/channels', ['X-Business-Id' => (string) $business->id])
             ->assertOk()
             ->assertJsonCount(1, 'data')
             ->assertJsonPath('data.0.type', 'facebook')
             ->assertJsonPath('data.0.page_name', 'Main Page')
             ->assertJsonMissing(['access_token' => 'secret-token']);
+    }
+
+    public function test_channel_and_bot_screens_report_paused_effective_ai_for_inactive_agent(): void
+    {
+        $user = User::factory()->create();
+        $business = BusinessProfile::factory()->create(['user_id' => $user->id]);
+        $channel = Channel::create([
+            'user_id' => $user->id,
+            'business_id' => $business->id,
+            'type' => 'instagram',
+            'page_id' => 'paused-agent-page',
+            'access_token' => 'test-token',
+            'status' => 'connected',
+            'ai_enabled' => true,
+        ]);
+        $bot = Bot::create([
+            'business_profile_id' => $business->id,
+            'name' => 'Paused agent',
+            'status' => 'inactive',
+        ]);
+        $bot->channels()->attach($channel->id, ['is_primary' => true]);
+        $flag = FeatureFlag::where('key', 'phase3_no_agent_fail_closed')->firstOrFail();
+        BusinessFeatureFlagAssignment::create([
+            'business_id' => $business->id,
+            'feature_flag_id' => $flag->id,
+            'enabled' => true,
+        ]);
+        Sanctum::actingAs($user);
+
+        $this->getJson('/api/channels', ['X-Business-Id' => (string) $business->id])
+            ->assertOk()
+            ->assertJsonPath('data.0.effective_ai_enabled', false)
+            ->assertJsonPath('data.0.ai_pause_reason', 'no_active_agent');
+
+        $this->withoutMiddleware(\App\Http\Middleware\PlanEnforcement::class);
+        $this->getJson('/api/bots', ['X-Business-Id' => (string) $business->id])
+            ->assertOk()
+            ->assertJsonPath('bots.0.effective_ai_enabled', false)
+            ->assertJsonPath('bots.0.ai_pause_reason', 'agent_inactive')
+            ->assertJsonPath('bots.0.channels.0.agent_ai_enabled', false);
     }
 }

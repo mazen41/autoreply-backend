@@ -241,6 +241,32 @@ class ConditionEvaluationServiceTest extends TestCase
         $this->assertTrue($isNotEscalated);
     }
 
+    public function test_empty_and_unknown_conditions_fail_closed(): void
+    {
+        $this->assertFalse($this->service->evaluate($this->enrollment, $this->step, []));
+        $this->assertFalse($this->service->evaluate($this->enrollment, $this->step, [
+            'match' => 'any',
+            'conditions' => [],
+        ]));
+        $this->assertFalse($this->service->evaluate($this->enrollment, $this->step, [
+            'type' => 'customer_replid',
+        ]));
+    }
+
+    public function test_channel_conditions_use_stored_channel_types(): void
+    {
+        $channel = $this->conversation->channel;
+        $channel->update(['type' => 'facebook']);
+        $this->assertTrue($this->service->evaluate($this->enrollment->fresh(), $this->step, [
+            'type' => 'channel_equals_facebook',
+        ]));
+
+        $channel->update(['type' => 'gmail']);
+        $this->assertTrue($this->service->evaluate($this->enrollment->fresh(), $this->step, [
+            'type' => 'channel_equals_gmail',
+        ]));
+    }
+
     /** @test */
     public function it_supports_and_or_group_conditions()
     {

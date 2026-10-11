@@ -12,7 +12,7 @@ class OrderClaimGuard
     public function inspect(Conversation $conversation, string $reply, array $checkoutState, array $missingFields, string $language = 'english'): array
     {
         $claimsCompletion = (bool) preg_match(
-            '/\b(?:order\s+(?:has\s+been\s+)?(?:placed|submitted|confirmed|processed)|placed\s+(?:your|the)\s+order|successfully\s+placed|order\s+is\s+confirmed)\b|(?:تم\s+(?:تسجيل|إنشاء|انشاء|تأكيد|تاكيد|طلب)|طلبك\s+(?:اتسجل|تسجل|تم))\s*(?:طلبك|الطلب)?/ui',
+            '/\b(?:your\s+|the\s+)?order(?:\s+for\b[^\r\n.!?]{0,120})?\s+(?:(?:has|was)\s+been\s+|(?:is|was)\s+)?(?:now\s+)?(?:being\s+)?(?:placed|submitted|confirmed|processed|processing|created)\b|\bplaced\s+(?:your|the)\s+order\b|\bsuccessfully\s+placed\b|\border\s+(?:is\s+)?complete\b|(?:تم\s+(?:تسجيل|إنشاء|انشاء|تأكيد|تاكيد|طلب)|طلبك\s+(?:اتسجل|تسجل|تم))\s*(?:طلبك|الطلب)?/ui',
             $reply
         );
 

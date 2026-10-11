@@ -393,7 +393,7 @@ class CheckoutOrderFlowTest extends TestCase
         Http::fake([
             'api.groq.com/*' => Http::response(['choices' => [['message' => ['content' => json_encode([
                 'success' => true,
-                'reply' => "Thank you, Alex Rivera Stone! I've placed your order.",
+                'reply' => 'Great, Alex Rivera Stone, we have your full name, phone, and address. Your order for Sample Product (600 SAR) is now being processed and you will receive a confirmation shortly.',
                 'intent' => 'place_order',
                 'needs_escalation' => false,
                 'confidence' => 0.99,
@@ -444,7 +444,8 @@ class CheckoutOrderFlowTest extends TestCase
         $this->assertArrayNotHasKey('phone', $state);
         $reply = Message::query()->where('conversation_id', $conversation->id)->where('direction', 'outbound')->latest('id')->firstOrFail();
         $this->assertStringContainsString('phone number', strtolower($reply->content));
-        $this->assertStringNotContainsString('placed your order', strtolower($reply->content));
+        $this->assertStringNotContainsString('being processed', strtolower($reply->content));
+        $this->assertStringNotContainsString('we have your full name', strtolower($reply->content));
         $this->assertDatabaseHas('handoff_tasks', [
             'conversation_id' => $conversation->id,
             'reason' => 'ai_claim_blocked',

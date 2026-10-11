@@ -38,6 +38,24 @@ class OrderClaimGuardTest extends TestCase
         $this->assertStringContainsString('phone number', strtolower($result['replacement']));
     }
 
+    public function test_order_being_processed_claim_is_blocked_without_a_completed_order(): void
+    {
+        [$conversation] = $this->makeConversation();
+
+        $result = app(OrderClaimGuard::class)->inspect(
+            $conversation,
+            'We have your full name, phone, and address. Your order for Sample Product (600 SAR) is now being processed and you will receive a confirmation shortly.',
+            ['full_name' => 'Alex Customer'],
+            ['phone', 'address']
+        );
+
+        $this->assertFalse($result['allowed']);
+        $this->assertTrue($result['claims_completion']);
+        $this->assertSame('missing_phone', $result['reason']);
+        $this->assertStringContainsString('phone number', strtolower($result['replacement']));
+        $this->assertStringContainsString('delivery address', strtolower($result['replacement']));
+    }
+
     public function test_matching_completed_attempt_allows_claim_but_wrong_fingerprint_does_not(): void
     {
         [$conversation, $connection] = $this->makeConversation();

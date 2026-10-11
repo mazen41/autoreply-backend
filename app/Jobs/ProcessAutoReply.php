@@ -2230,7 +2230,12 @@ class ProcessAutoReply implements ShouldQueue
                 . 'Reply “confirm order” to place it, or “cancel” to stop.';
         }
 
-        if ($shopifyVariantSelectionRequired && $intent === 'place_order' && !$isProductBrowseMessage) {
+        // Ask for the product option first when the customer wants to order, so the option is
+        // settled before name, phone and address are requested (not after them).
+        $variantOrderIntent = $intent === 'place_order'
+            || \App\Services\ShopifyOrderIntent::wantsToOrder((string) $message->content)
+            || ($checkoutState['confirmation_state'] ?? null) === 'selecting_variant';
+        if ($shopifyVariantSelectionRequired && $variantOrderIntent && !$isProductBrowseMessage) {
             $options = [];
             foreach ($shopifyVariants as $index => $variant) {
                 $label = trim((string) ($variant['title'] ?? 'Variant'));
@@ -2253,7 +2258,11 @@ class ProcessAutoReply implements ShouldQueue
                     'high'
                 );
             } else {
-                $aiResponse = "Which product option would you like? Please reply with its number or exact name:\n"
+                // When details are already saved, say so: the option is the only thing left before the summary.
+$intro = !empty($fieldStatus['is_complete'])
+    ? "Your details are saved. To show your order summary, which product option would you like? Reply with its number or exact name:\n"
+    : "Which product option would you like? Reply with its number or exact name, then I'll ask for your name, phone and address:\n";
+$aiResponse = $intro
                     . implode("\n", $options);
             }
         }

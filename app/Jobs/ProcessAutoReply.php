@@ -2600,8 +2600,9 @@ $aiResponse = $intro
                     ]);
                 } else {
                     // ❌ FAILURE — Salla API returned no order ID or threw an exception
-                    Log::error('ProcessAutoReply: Salla order creation returned no order ID — sending honest failure reply', [
+                    Log::error('ProcessAutoReply: commerce order creation returned no order ID — sending honest failure reply', [
                         'conversation_id' => $conversation->id,
+                        'provider' => $commerceChannel?->type,
                         'order_data'      => $orderData,
                     ]);
 
@@ -3794,6 +3795,7 @@ $aiResponse = $intro
                             Log::error('SHOPIFY_ORDER_CREATION_FAILED', [
                                 'conversation_id' => $conversation->id,
                                 'status'          => $response->status(),
+                                ...$this->sanitizedShopifyErrorDetails($response->json('errors'), $checkoutState),
                             ]);
                             if (in_array($response->status(), [401, 403], true)) {
                                 // The store token is invalid or revoked: no order can be created until it is reconnected.
@@ -3926,6 +3928,33 @@ $aiResponse = $intro
             preg_replace('/\D+/', '', (string) ($state['phone'] ?? $state['customer_phone'] ?? '')),
             mb_strtolower(trim((string) ($state['address'] ?? $state['customer_address'] ?? ''))),
         ]));
+    }
+
+    /** Keep Shopify's useful validation details in logs without exposing checkout PII. */
+    private function sanitizedShopifyErrorDetails(mixed $errors, array $checkoutState): array
+    {
+        if ($errors === null) {
+            return ['error_fields' => [], 'error_summary' => null];
+        }
+
+        $fields = is_array($errors) ? array_map('strval', array_keys($errors)) : [];
+        $summary = json_encode($errors, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE);
+        $summary = is_string($summary) ? $summary : '';
+
+        foreach (['full_name', 'customer_name', 'phone', 'customer_phone', 'address', 'email', 'customer_email', 'postal_code'] as $key) {
+            $sensitiveValue = trim((string) ($checkoutState[$key] ?? ''));
+            if ($sensitiveValue !== '') {
+                $summary = str_ireplace($sensitiveValue, '[redacted]', $summary);
+            }
+        }
+
+        $summary = preg_replace('/[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/i', '[redacted-email]', $summary) ?? '';
+        $summary = preg_replace('/(?<!\w)\+?[0-9][0-9().\s-]{6,}[0-9](?!\w)/', '[redacted-number]', $summary) ?? '';
+
+        return [
+            'error_fields' => array_slice($fields, 0, 20),
+            'error_summary' => substr($summary, 0, 800),
+        ];
     }
 
     private function hasValidOrderSummaryForConfirmation(Conversation $conversation, Message $incoming, array $state): bool

@@ -108,6 +108,26 @@ class CheckoutOrderFlowTest extends TestCase
         $this->assertSame('confirmed', $secondConfirmation['confirmation_state']);
     }
 
+    public function test_shopify_order_failure_details_are_useful_without_logging_checkout_pii(): void
+    {
+        $job = new ProcessAutoReply(1);
+        $method = new \ReflectionMethod($job, 'sanitizedShopifyErrorDetails');
+        $details = $method->invoke($job, [
+            'phone' => ['Invalid phone 01152879755 for Mazen Hossny Ahmed at 36 Example Road'],
+            'line_items' => ['Variant is unavailable'],
+        ], [
+            'full_name' => 'Mazen Hossny Ahmed',
+            'phone' => '01152879755',
+            'address' => '36 Example Road',
+        ]);
+
+        $this->assertSame(['phone', 'line_items'], $details['error_fields']);
+        $this->assertStringContainsString('Variant is unavailable', $details['error_summary']);
+        $this->assertStringNotContainsString('01152879755', $details['error_summary']);
+        $this->assertStringNotContainsString('Mazen Hossny Ahmed', $details['error_summary']);
+        $this->assertStringNotContainsString('36 Example Road', $details['error_summary']);
+    }
+
     public function test_explicit_cancel_stops_pending_checkout_before_any_provider_order_request(): void
     {
         \Illuminate\Support\Facades\Event::fake();

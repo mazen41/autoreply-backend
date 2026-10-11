@@ -229,6 +229,8 @@ class CustomerResolutionTest extends TestCase
 
     public function test_instagram_attachment_is_downloaded_and_saved_privately(): void
     {
+        config(['attachments.read_enabled' => true]);
+
         config(['services.meta.app_secret' => 'test-meta-secret']);
         config(['services.evolution.incoming_media_disk' => 'private_media']);
         Storage::fake('private_media');

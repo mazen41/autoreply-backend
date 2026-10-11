@@ -246,7 +246,7 @@ class ProcessAutoReply implements ShouldQueue
 
         // ── VOICE MESSAGE TRANSCRIPTION ────────────────────────────────────
         $voiceTranscription = null;
-        if (in_array($message->type ?? '', ['voice', 'audio']) && $message->media_url) {
+        if (config('attachments.read_enabled', false) && in_array($message->type ?? '', ['voice', 'audio']) && $message->media_url) {
             try {
                 $voiceService = new \App\Services\VoiceService();
                 $audioPath = app(\App\Services\IncomingMediaStorage::class)->absolutePath(
@@ -282,7 +282,7 @@ class ProcessAutoReply implements ShouldQueue
 
         // ── IMAGE UNDERSTANDING ─────────────────────────────────────────────
         $imageAnalysis = null;
-        if (($message->type ?? '') === 'image' && $message->media_url) {
+        if (config('attachments.read_enabled', false) && ($message->type ?? '') === 'image' && $message->media_url) {
             try {
                 $imageService = new \App\Services\ImageUnderstandingService();
                 $imagePath = app(\App\Services\IncomingMediaStorage::class)->absolutePath(
@@ -2650,7 +2650,7 @@ $aiResponse = $intro
             $checkoutState['confirmation_state'] ?? null,
             (bool) $containsConfirmPhrase
         );
-        if (($message->media_processing_status ?? null) === 'attachment_without_text' && trim((string) $message->content) === '') {
+        if (trim((string) $message->content) === '') {
             $aiResponse = \App\Services\ConfirmationGuard::attachmentWithoutTextReply($detectedLanguage === 'arabic');
         }
         if (($placeholderReply = \App\Services\ConfirmationGuard::placeholderPhoneReply((string) $message->content)) !== null) {

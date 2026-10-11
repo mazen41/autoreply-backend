@@ -2650,6 +2650,9 @@ $aiResponse = $intro
             $checkoutState['confirmation_state'] ?? null,
             (bool) $containsConfirmPhrase
         );
+        if (($message->media_processing_status ?? null) === 'attachment_without_text' && trim((string) $message->content) === '') {
+            $aiResponse = \App\Services\ConfirmationGuard::attachmentWithoutTextReply($detectedLanguage === 'arabic');
+        }
         if (($placeholderReply = \App\Services\ConfirmationGuard::placeholderPhoneReply((string) $message->content)) !== null) {
             $aiResponse = $placeholderReply;
         }

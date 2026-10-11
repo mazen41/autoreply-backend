@@ -37,4 +37,12 @@ class ConfirmationGuard
 
         return null;
     }
+
+    /** Reply for an attachment the bot cannot read (no text, no media stored). */
+    public static function attachmentWithoutTextReply(bool $arabic): string
+    {
+        return $arabic
+            ? 'وصلتني الصورة أو المرفق لكن مش قادر أقرأه. اكتبلي طلبك أو التفاصيل اللي محتاجها من فضلك.'
+            : "I received your attachment, but I can't read it. Please type your request or the details you need.";
+    }
 }

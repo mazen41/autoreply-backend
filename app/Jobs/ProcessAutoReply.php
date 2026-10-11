@@ -1971,7 +1971,7 @@ class ProcessAutoReply implements ShouldQueue
             $containsConfirmPhrase
             && in_array($checkoutState['confirmation_state'] ?? null, ['confirmed', 'order_placed'], true)
             && !empty($fieldStatus['is_complete'])
-            && !$sallaChannel
+            && !$commerceChannel
             && !empty($checkoutState['salla_product_id'])
         ) {
             $orderCreationFailedReason = 'salla_store_not_connected';

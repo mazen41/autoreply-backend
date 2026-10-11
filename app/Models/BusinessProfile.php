@@ -9,6 +9,11 @@ use Illuminate\Database\Eloquent\Relations\BelongsTo;
 class BusinessProfile extends Model
 {
     use HasFactory;
+
+    protected $attributes = [
+        'auto_order_confirmation_enabled' => true,
+    ];
+
     protected $fillable = [
         'user_id',
         'name',
@@ -51,6 +56,7 @@ class BusinessProfile extends Model
         'handoff_notification_email',
         'ai_setup_tested_config_hash',
         'automation_paused_at',
+        'auto_order_confirmation_enabled',
     ];
 
     protected $casts = [
@@ -66,6 +72,7 @@ class BusinessProfile extends Model
         'consent_retention_days' => 'integer',
         'consent_policy_acknowledged_at' => 'datetime',
         'automation_paused_at' => 'datetime',
+        'auto_order_confirmation_enabled' => 'boolean',
     ];
 
     public function user(): BelongsTo

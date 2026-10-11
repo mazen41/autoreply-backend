@@ -272,7 +272,6 @@ class ProcessAutoReply implements ShouldQueue
             } catch (\Throwable $e) {
                 $message->media_processing_status = 'failed';
                 $message->media_processing_reason = 'Voice note could not be transcribed.';
-                $message->content = trim((string) $message->content . ' [Customer voice note could not be processed.]');
                 $message->save();
                 Log::warning('ProcessAutoReply: voice transcription failed', [
                     'conversation_id' => $conversation->id,
@@ -305,24 +304,24 @@ class ProcessAutoReply implements ShouldQueue
                         'detected_intent' => $imageAnalysis['detected_intent'],
                     ]);
 
-                    // Append image analysis to message content for AI context
-                    $imageContext = "\n\n[Image Analysis: {$imageAnalysis['raw_analysis']}]";
-                    if (!empty($imageAnalysis['extracted_text'])) {
-                        $imageContext .= "\n[Extracted Text: {$imageAnalysis['extracted_text']}]";
-                    }
-                    $message->content .= $imageContext;
+                    // Keep interpreted media data out of customer-authored
+                    // content. It is passed to the model as labeled metadata.
+                    $metadata = is_array($message->metadata) ? $message->metadata : [];
+                    $metadata['attachment_analysis'] = [
+                        'description' => (string) $imageAnalysis['raw_analysis'],
+                        'extracted_text' => (string) ($imageAnalysis['extracted_text'] ?? ''),
+                    ];
+                    $message->metadata = $metadata;
                     $message->media_processing_status = 'done';
                     $message->media_processing_reason = null;
                 } else {
                     $message->media_processing_status = 'failed';
                     $message->media_processing_reason = 'Image could not be analyzed.';
-                    $message->content = trim((string) $message->content . ' [Customer image could not be processed.]');
                 }
                 $message->save();
             } catch (\Throwable $e) {
                 $message->media_processing_status = 'failed';
                 $message->media_processing_reason = 'Image could not be analyzed.';
-                $message->content = trim((string) $message->content . ' [Customer image could not be processed.]');
                 $message->save();
                 Log::warning('ProcessAutoReply: image analysis failed', [
                     'conversation_id' => $conversation->id,
@@ -333,16 +332,6 @@ class ProcessAutoReply implements ShouldQueue
             $message->media_processing_status = 'unsupported';
             $message->media_processing_reason = 'This media type is not analyzed by the assistant.';
             $message->save();
-        } elseif (in_array($message->type ?? '', ['audio', 'voice', 'image'], true)
-            && !$message->media_url
-            && $message->media_processing_status === 'failed') {
-            $notice = in_array($message->type, ['audio', 'voice'], true)
-                ? '[Customer voice note could not be processed.]'
-                : '[Customer image could not be processed.]';
-            if (!str_contains((string) $message->content, $notice)) {
-                $message->content = trim((string) $message->content . ' ' . $notice);
-                $message->save();
-            }
         }
 
         // Get last 10 messages for context
@@ -1422,6 +1411,16 @@ class ProcessAutoReply implements ShouldQueue
             ? []
             : $checkoutService->extractAndMergeState($conversation, $message->content, $referencedProduct);
         if (!empty($updatedCheckoutState)) {
+            $attachmentCoordinates = data_get($message->metadata, 'attachment.coordinates');
+            if (is_array($attachmentCoordinates)
+                && is_numeric($attachmentCoordinates['lat'] ?? null)
+                && is_numeric($attachmentCoordinates['lng'] ?? null)
+                && (!empty($updatedCheckoutState['salla_product_id']) || !empty($updatedCheckoutState['commerce_external_id']))) {
+                $updatedCheckoutState['geo_coordinates'] = [
+                    'lat' => (float) $attachmentCoordinates['lat'],
+                    'lng' => (float) $attachmentCoordinates['lng'],
+                ];
+            }
             // Merge new extraction into existing checkout_state so fields
             // (full_name, phone, address) accumulate across messages rather than
             // being overwritten.  Use array_merge so previously stored values
@@ -1548,6 +1547,9 @@ class ProcessAutoReply implements ShouldQueue
         }
 
         $orderCreationFailedReason = null;
+        $autoOrderConfirmationEnabled = $channel->auto_order_confirmation_enabled !== null
+            ? (bool) $channel->auto_order_confirmation_enabled
+            : (bool) ($business?->auto_order_confirmation_enabled ?? true);
 
         // ── CUSTOMER RESOLUTION & CONTEXT (Phase 2) ──────────────────────────
         // Link the conversation to its business-scoped Customer, using the
@@ -1711,6 +1713,18 @@ class ProcessAutoReply implements ShouldQueue
             // Active partial order state (persisted across turns so the AI
             // knows which fields have already been collected and won't re-ask).
             'cart'                     => !empty($updatedCheckoutState) ? $updatedCheckoutState : null,
+            'incoming_attachment'      => ($attachment = data_get($message->metadata, 'attachment'))
+                ? [
+                    'type' => $attachment['type'] ?? 'unknown',
+                    'status' => $attachment['status'] ?? 'received',
+                    'has_readable_customer_text' => trim((string) $message->content) !== '',
+                    'has_location_coordinates' => is_array($attachment['coordinates'] ?? null),
+                    'analysis' => [
+                        'description' => mb_substr((string) data_get($message->metadata, 'attachment_analysis.description', ''), 0, 5000),
+                        'extracted_text' => mb_substr((string) data_get($message->metadata, 'attachment_analysis.extracted_text', ''), 0, 5000),
+                    ],
+                ]
+                : null,
             'known_fields'             => $fieldStatus['known_fields'],
             'missing_fields'           => $fieldStatus['missing_fields'],
             'is_checkout_complete'     => $fieldStatus['is_complete'],
@@ -2197,7 +2211,6 @@ class ProcessAutoReply implements ShouldQueue
             Log::warning('ProcessAutoReply: AI intended to claim images were sent but zero actually sent -- overriding reply text to stay honest', [
                 'conversation_id'  => $conversation->id,
                 'candidate_images' => count($productImageItems),
-                'original_reply'   => substr($aiResponse, 0, 200),
             ]);
             $aiResponse = $detectedLanguage === 'arabic'
                 ? "عذرًا، لا أستطيع إرسال صور المنتج الآن. سأقوم بتوصيلك بأحد أفراد الفريق ليرسلها لك مباشرة 🙏"
@@ -2209,6 +2222,39 @@ class ProcessAutoReply implements ShouldQueue
                 'conversation_id' => $conversation->id,
             ]);
             $aiResponse = "I'm sorry, your order was not submitted because the store connection needs attention. A team member will help you complete it.";
+        }
+
+        $checkoutConfirmedForSubmission = $containsConfirmPhrase
+            && in_array($checkoutState['confirmation_state'] ?? null, ['confirmed', 'order_placed'], true)
+            && !$isProductBrowseMessage
+            && $commerceChannel
+            && !empty($fieldStatus['is_complete'])
+            && !empty($checkoutState['salla_product_id'])
+            && !empty($checkoutState['customer_phone'] ?? $checkoutState['phone'] ?? '')
+            && !empty($checkoutState['address'] ?? $checkoutState['customer_address'] ?? '')
+            && !empty($checkoutState['full_name'] ?? $checkoutState['customer_name'] ?? '');
+
+        if ($checkoutConfirmedForSubmission && !$autoOrderConfirmationEnabled) {
+            $orderCreationFailedReason = 'order_confirmation_disabled';
+            $aiResponse = $detectedLanguage === 'arabic'
+                ? 'تم حفظ تفاصيل الطلب، لكن تأكيد الطلب التلقائي متوقف. سيتابع معك أحد أعضاء الفريق لإتمامه.'
+                : 'I’ve saved your order details, but automatic order submission is turned off. A team member will follow up to complete it.';
+            app(\App\Services\HandoffTaskService::class)->openForConversation(
+                $conversation,
+                'order_confirmation_disabled',
+                'normal'
+            );
+            $conversation->update([
+                'requires_human' => true,
+                'status' => 'pending_human',
+                'escalated_at' => now(),
+                'escalation_reason' => 'order_confirmation_disabled',
+            ]);
+            Log::info('Order confirmation disabled', [
+                'conversation_id' => $conversation->id,
+                'channel_id' => $channel->id,
+                'business_id' => $conversation->business_id,
+            ]);
         }
 
         // STRICT GUARDRAIL: Prevent AI from hallucinating order confirmation if order creation failed
@@ -2226,7 +2272,6 @@ class ProcessAutoReply implements ShouldQueue
             if ($hallucinated) {
                 Log::warning('ProcessAutoReply: AI hallucinated order confirmation despite order creation failure -- overriding reply text to stay honest', [
                     'conversation_id' => $conversation->id,
-                    'original_reply'  => substr($aiResponse, 0, 200),
                 ]);
                 
                 $aiResponse = $detectedLanguage === 'arabic'
@@ -2318,6 +2363,7 @@ class ProcessAutoReply implements ShouldQueue
             && !empty($checkoutState['customer_phone'] ?? $checkoutState['phone'] ?? '')
             && !empty($checkoutState['address'] ?? $checkoutState['customer_address'] ?? '')
             && !empty($checkoutState['full_name'] ?? $checkoutState['customer_name'] ?? '')
+            && $autoOrderConfirmationEnabled
         ) {
             Log::info('ProcessAutoReply: triggering real commerce order creation after validated confirmation', [
                 'conversation_id' => $conversation->id,
@@ -2485,6 +2531,62 @@ class ProcessAutoReply implements ShouldQueue
             Log::info('ProcessAutoReply: blocked Salla order confirmation while required details are missing', [
                 'conversation_id' => $conversation->id,
                 'missing_fields' => $fieldStatus['missing_fields'],
+            ]);
+        }
+
+        // The model may claim completion or ask again for a field the customer
+        // already supplied. Verify both against durable checkout/order state
+        // immediately before the reply can be sent.
+        $guardCheckoutState = array_merge(
+            is_array($conversation->fresh()->checkout_state) ? $conversation->fresh()->checkout_state : [],
+            is_array($updatedCheckoutState) ? $updatedCheckoutState : []
+        );
+        $claimGuard = app(\App\Services\OrderClaimGuard::class)->inspect(
+            $conversation,
+            (string) $aiResponse,
+            $guardCheckoutState,
+            $fieldStatus['missing_fields'] ?? [],
+            $detectedLanguage
+        );
+        if (!$claimGuard['allowed']) {
+            $aiResponse = $claimGuard['replacement'];
+            $messageMetadata = is_array($replyMessage->metadata) ? $replyMessage->metadata : [];
+            $messageMetadata['order_claim_guard'] = [
+                'decision' => $claimGuard['decision'],
+                'reason' => $claimGuard['reason'],
+            ];
+            $replyMessage->metadata = $messageMetadata;
+            if ($claimGuard['requires_handoff']) {
+                app(\App\Services\HandoffTaskService::class)->openForConversation(
+                    $conversation,
+                    'ai_claim_blocked',
+                    'high'
+                );
+                $conversation->update([
+                    'requires_human' => true,
+                    'status' => 'pending_human',
+                    'escalated_at' => now(),
+                    'escalation_reason' => 'ai_claim_blocked',
+                ]);
+            }
+            Log::info('Order claim guard', [
+                'message_id' => $replyMessage->id,
+                'conversation_id' => $conversation->id,
+                'intent' => $intent,
+                'decision' => $claimGuard['decision'],
+                'reason' => $claimGuard['reason'],
+                'missing_fields' => $fieldStatus['missing_fields'] ?? [],
+                'order_record_present' => $claimGuard['order_record_present'],
+            ]);
+        } else {
+            Log::info('Order claim guard', [
+                'message_id' => $replyMessage->id,
+                'conversation_id' => $conversation->id,
+                'intent' => $intent,
+                'decision' => 'allowed',
+                'reason' => $claimGuard['reason'],
+                'missing_fields' => $fieldStatus['missing_fields'] ?? [],
+                'order_record_present' => $claimGuard['order_record_present'],
             ]);
         }
 
@@ -3377,6 +3479,7 @@ class ProcessAutoReply implements ShouldQueue
                 ->resolveConversation($conversation, $conversation->bot);
             $commerceChannel = $commerceContext['connection'] ?? null;
             $externalOrderId = null;
+            $externalOrderNumber = null;
             $externalSource  = null;
 
             if (!$commerceChannel || (int) $commerceChannel->business_id !== (int) $conversation->business_id) {
@@ -3511,7 +3614,8 @@ class ProcessAutoReply implements ShouldQueue
 
                         if ($response->successful()) {
                             $resJson = $response->json();
-                            $externalOrderId = (string)($resJson['order']['id'] ?? $resJson['order']['order_number'] ?? null);
+                            $externalOrderId = (string)($resJson['order']['id'] ?? '');
+                            $externalOrderNumber = (string)($resJson['order']['name'] ?? $resJson['order']['order_number'] ?? '');
                             if ($externalOrderId) {
                                 $externalSource = 'shopify';
                                 Log::info('ProcessAutoReply: Shopify order created successfully via API', [
@@ -3575,14 +3679,14 @@ class ProcessAutoReply implements ShouldQueue
             $attempt->update([
                 'status' => 'completed',
                 'external_order_id' => $externalOrderId,
-                'order_number' => $externalOrderId,
+                'order_number' => $externalOrderNumber ?: $externalOrderId,
             ]);
 
             $orderTotal = (float)($checkoutState['product_price'] ?? 0);
             $orderData  = [
                 'id'              => $externalOrderId,
                 'order_id'        => $externalOrderId,
-                'order_number'    => $externalOrderId,
+                'order_number'    => $externalOrderNumber ?: $externalOrderId,
                 'external_source' => $externalSource,
                 'total'           => $orderTotal,
                 'status'          => 'completed',

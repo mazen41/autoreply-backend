@@ -538,6 +538,7 @@ class ChannelController extends Controller
         $validated = $request->validate([
             'ai_enabled' => 'boolean',
             'default_ecommerce_connection_id' => 'nullable|integer',
+            'auto_order_confirmation_enabled' => 'nullable|boolean',
         ]);
 
         if ($channel->type === 'tiktok' && ($validated['ai_enabled'] ?? false)) {

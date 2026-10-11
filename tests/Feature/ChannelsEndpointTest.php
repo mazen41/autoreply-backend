@@ -95,4 +95,32 @@ class ChannelsEndpointTest extends TestCase
             ->assertJsonPath('bots.0.ai_pause_reason', 'agent_inactive')
             ->assertJsonPath('bots.0.channels.0.agent_ai_enabled', false);
     }
+
+    public function test_owner_can_set_channel_order_confirmation_override_or_inherit_business_default(): void
+    {
+        $user = User::factory()->create();
+        $business = BusinessProfile::factory()->create([
+            'user_id' => $user->id,
+            'auto_order_confirmation_enabled' => true,
+        ]);
+        $channel = Channel::create([
+            'user_id' => $user->id,
+            'business_id' => $business->id,
+            'type' => 'instagram',
+            'page_id' => 'order-toggle-channel',
+            'access_token' => 'test-token',
+            'status' => 'connected',
+        ]);
+        Sanctum::actingAs($user);
+
+        $this->patchJson('/api/channels/' . $channel->id, ['auto_order_confirmation_enabled' => false], [
+            'X-Business-Id' => (string) $business->id,
+        ])->assertOk();
+        $this->assertFalse((bool) $channel->fresh()->auto_order_confirmation_enabled);
+
+        $this->patchJson('/api/channels/' . $channel->id, ['auto_order_confirmation_enabled' => null], [
+            'X-Business-Id' => (string) $business->id,
+        ])->assertOk();
+        $this->assertNull($channel->fresh()->auto_order_confirmation_enabled);
+    }
 }

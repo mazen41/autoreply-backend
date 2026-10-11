@@ -425,4 +425,39 @@ class WhatsAppCloudApiTest extends TestCase
         Http::assertSent(fn ($request) => $request->url() === 'https://lookaside.fbsbx.com/media/image-1'
             && $request->hasHeader('Authorization', 'Bearer cloud-token'));
     }
+
+    public function test_cloud_location_is_stored_structurally_without_generated_customer_text(): void
+    {
+        Queue::fake();
+        config(['services.meta.app_secret' => 'test-meta-secret']);
+        $business = BusinessProfile::factory()->create();
+        Channel::create([
+            'user_id' => $business->user_id, 'business_id' => $business->id,
+            'type' => 'whatsapp', 'page_id' => 'phone-location', 'access_token' => 'cloud-token',
+            'status' => 'connected', 'metadata' => ['whatsapp_provider' => 'cloud', 'whatsapp_business_account_id' => 'waba-location'],
+        ]);
+        $body = json_encode(['object' => 'whatsapp_business_account', 'entry' => [[
+            'id' => 'waba-location', 'changes' => [[
+                'field' => 'messages', 'value' => [
+                    'metadata' => ['phone_number_id' => 'phone-location'],
+                    'messages' => [[
+                        'from' => '201155555555', 'id' => 'wamid.location-inbound',
+                        'type' => 'location', 'location' => ['latitude' => 30.0444, 'longitude' => 31.2357],
+                    ]],
+                ],
+            ]],
+        ]]]);
+        $signature = 'sha256=' . hash_hmac('sha256', $body, 'test-meta-secret');
+
+        $this->call('POST', '/api/webhook/meta', [], [], [], [
+            'CONTENT_TYPE' => 'application/json', 'HTTP_X_HUB_SIGNATURE_256' => $signature,
+        ], $body)->assertOk();
+
+        $message = Message::where('whatsapp_message_id', 'wamid.location-inbound')->firstOrFail();
+        $this->assertSame('', $message->content);
+        $this->assertSame('attachment_without_text', $message->media_processing_status);
+        $this->assertSame('location', data_get($message->metadata, 'attachment.type'));
+        $this->assertSame(30.0444, data_get($message->metadata, 'attachment.coordinates.lat'));
+        $this->assertSame(31.2357, data_get($message->metadata, 'attachment.coordinates.lng'));
+    }
 }

@@ -39,7 +39,10 @@ class OnboardingController extends Controller
 
         $profile = BusinessProfile::firstOrCreate(
             ['user_id' => $request->user()->id],
-            ['name' => $request->user()->name . "'s Business"]
+            [
+                'name' => $request->user()->name . "'s Business",
+                'auto_order_confirmation_enabled' => false,
+            ]
         );
 
         // business_id is the user's selected/primary tenant. A team member's

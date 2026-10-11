@@ -403,6 +403,25 @@ class OrderCheckoutService
             }
         }
 
+        // Customers often provide all checkout details in one sentence without
+        // labels around the name (for example, "Alex Rivera Stone and the
+        // phone number is [phone] and the address is ..."). Extract only the
+        // leading name segment; never let later address/phone words become part
+        // of the name or fall through as customer-provided text.
+        if (!$extractedName && empty($existingState['full_name'])
+            && preg_match('/\b(?:phone|mobile|telephone|tel|address|delivery\s+address|email)\b/i', $incomingText)) {
+            $leadingSegment = preg_split(
+                '/\s+(?:and\s+)?(?:the\s+)?(?:phone|mobile|telephone|tel|address|delivery\s+address|email)\b/i',
+                trim($incomingText),
+                2
+            )[0] ?? '';
+            $candidate = trim(preg_replace('/^(?:my name is|name is)\s+/i', '', $leadingSegment), " \t\n\r\0\x0B,;:-");
+            if (preg_match('/^(?:[\p{L}][\p{L}\x{2019}\x{27}-]*\s+){1,3}[\p{L}][\p{L}\x{2019}\x{27}-]*$/u', $candidate)
+                && !preg_match('/(?:order|buy|help|phone|address|price|product|dress|the|this|that|طلب|شراء|عنوان|هاتف|جوال|الفستان)/ui', $candidate)) {
+                $extractedName = $candidate;
+            }
+        }
+
         // Fallback: If customer is answering a direct name query and message is short (1-4 words, no numbers/keywords)
         if (!$extractedName && empty($existingState['full_name'])) {
             $words = array_filter(explode(' ', trim($incomingText)));

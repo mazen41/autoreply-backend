@@ -169,15 +169,7 @@ class TelegramController extends Controller
             $senderName = trim($firstName . ' ' . $lastName) ?: $username ?: 'Unknown';
 
             $media = $this->downloadInboundMedia($channel, $message);
-            if ($text === '') {
-                $text = match ($media['type'] ?? null) {
-                    'image' => 'Customer sent an image.',
-                    'audio' => 'Customer sent an audio message.',
-                    'video' => 'Customer sent a video.',
-                    'document' => 'Customer sent a document.',
-                    default => '[Unsupported Telegram media message]',
-                };
-            }
+            $telegramAttachment = $this->telegramAttachmentContext($message, (string) $messageId, $text === '');
 
             // Create or get conversation
             $conversation = Conversation::firstOrCreate(
@@ -223,17 +215,26 @@ class TelegramController extends Controller
                 'file_size' => $media['file_size'] ?? null,
                 'duration' => $media['duration'] ?? null,
                 'media_processing_status' => $media === null
-                    ? null
+                    ? (($telegramAttachment['status'] ?? null) === 'attachment_without_text' ? 'attachment_without_text' : null)
                     : (($media['storage_status'] ?? null) === 'stored' ? 'pending' : 'failed'),
                 'media_processing_reason' => $media !== null && ($media['storage_status'] ?? null) !== 'stored'
                     ? 'Media download or private storage failed.'
                     : null,
                 'metadata' => array_filter([
                     'media' => $media,
+                    'attachment' => $telegramAttachment,
                     'referenced_platform_message_id' => $referencedPlatformMessageId,
                     'quoted_message_id' => $referencedPlatformMessageId,
                 ], fn ($value) => $value !== null),
             ]);
+
+            if ($telegramAttachment !== null) {
+                Log::info('Attachment handled', [
+                    'message_id' => $messageModel->id,
+                    'attachment_type' => $telegramAttachment['type'],
+                    'status' => $telegramAttachment['status'],
+                ]);
+            }
 
             // Broadcast real-time event
             if ($channel->user_id) {
@@ -251,6 +252,29 @@ class TelegramController extends Controller
             ]);
             return response('OK', 200); // Always return 200 to avoid retries
         }
+    }
+
+    /** Keep Telegram file identity separate from the customer's text body. */
+    private function telegramAttachmentContext(array $message, string $messageId, bool $withoutText): ?array
+    {
+        foreach (['photo' => 'image', 'voice' => 'audio', 'audio' => 'audio', 'video' => 'video', 'document' => 'document', 'sticker' => 'sticker'] as $key => $type) {
+            $payload = $message[$key] ?? null;
+            if (!is_array($payload)) {
+                continue;
+            }
+            if ($key === 'photo' && array_is_list($payload)) {
+                $payload = end($payload) ?: [];
+            }
+
+            return [
+                'type' => $type,
+                'provider_message_id' => $messageId,
+                'provider_attachment_id' => $payload['file_id'] ?? null,
+                'status' => $withoutText ? 'attachment_without_text' : 'received_with_text',
+            ];
+        }
+
+        return null;
     }
 
     /** Download Telegram media to private storage; never persist provider URLs or tokens. */

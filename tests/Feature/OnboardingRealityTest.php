@@ -62,4 +62,16 @@ class OnboardingRealityTest extends TestCase
         $this->actingAs($user)->postJson('/api/onboarding/progress', ['step' => 'complete'])->assertUnprocessable();
         $this->actingAs($user)->postJson('/api/onboarding/progress', ['step' => 'invented'])->assertUnprocessable();
     }
+
+    public function test_newly_created_business_defaults_order_submission_to_off_but_legacy_profiles_default_on(): void
+    {
+        $legacyUser = User::factory()->create();
+        $legacyBusiness = BusinessProfile::factory()->create(['user_id' => $legacyUser->id]);
+        $this->assertTrue((bool) $legacyBusiness->auto_order_confirmation_enabled);
+
+        $newUser = User::factory()->create();
+        $this->actingAs($newUser)->postJson('/api/onboarding/skip')->assertOk();
+        $newBusiness = BusinessProfile::where('user_id', $newUser->id)->firstOrFail();
+        $this->assertFalse((bool) $newBusiness->auto_order_confirmation_enabled);
+    }
 }

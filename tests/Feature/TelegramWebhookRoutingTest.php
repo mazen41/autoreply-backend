@@ -154,6 +154,8 @@ class TelegramWebhookRoutingTest extends TestCase
         $this->assertSame('document', $message->media_type);
         $this->assertSame('failed', $message->media_processing_status);
         $this->assertNotEmpty($message->media_processing_reason);
-        $this->assertSame('Customer sent a document.', $message->content);
+        $this->assertSame('', $message->content);
+        $this->assertSame('document', $message->metadata['attachment']['type'] ?? null);
+        $this->assertSame('attachment_without_text', $message->metadata['attachment']['status'] ?? null);
     }
 }

@@ -432,9 +432,10 @@ class CommerceContextResolverTest extends TestCase
             'checkout_state' => ['status' => 'collecting_info'],
         ])->save();
         Http::fake([
-            'shop-a.myshopify.com/admin/api/2026-07/orders.json' => Http::response([
-                'order' => ['id' => 7001, 'order_number' => 7001],
-            ], 201),
+            'shop-a.myshopify.com/admin/api/2026-07/orders.json' => Http::sequence()
+                ->push(['order' => ['id' => 7001, 'order_number' => 1001, 'name' => '#1001']], 201)
+                ->push(['errors' => ['phone' => ['is invalid']]], 422)
+                ->push(['errors' => ['base' => ['internal error']]], 500),
             'shop-b.myshopify.com/*' => Http::response([], 500),
         ]);
 
@@ -454,8 +455,37 @@ class CommerceContextResolverTest extends TestCase
         ], $chat);
 
         $this->assertSame('7001', $result['order_id']);
+        $this->assertDatabaseHas('commerce_order_attempts', [
+            'conversation_id' => $conversation->id,
+            'connection_id' => $shopA->id,
+            'status' => 'completed',
+            'external_order_id' => '7001',
+            'order_number' => '#1001',
+        ]);
         Http::assertSent(fn ($request) => str_contains($request->url(), 'shop-a.myshopify.com')
             && ($request['order']['line_items'][0]['variant_id'] ?? null) === 1001);
         Http::assertNotSent(fn ($request) => str_contains($request->url(), 'shop-b.myshopify.com'));
+
+        $failedInput = [
+            'salla_product_id' => 'gid://shopify/Product/101',
+            'commerce_external_id' => 'gid://shopify/Product/101',
+            'commerce_channel_id' => $shopA->id,
+            'full_name' => 'Alex Customer',
+            'phone' => '+201000000001',
+            'address' => 'Alexandria',
+            'product_name' => 'Egypt dress',
+            'product_price' => 100,
+            'product_currency' => 'EGP',
+        ];
+        $this->assertNull($method->invoke($job, $conversation, $failedInput, $chat));
+        $failedInput['phone'] = '+201000000002';
+        $failedInput['address'] = 'Giza';
+        $this->assertNull($method->invoke($job, $conversation, $failedInput, $chat));
+        $this->assertSame(2, \App\Models\CommerceOrderAttempt::query()
+            ->where('conversation_id', $conversation->id)
+            ->where('provider', 'shopify')
+            ->where('status', 'failed')
+            ->whereNull('external_order_id')
+            ->count());
     }
 }

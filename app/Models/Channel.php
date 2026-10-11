@@ -32,12 +32,14 @@ class Channel extends Model
         'token_expires_at',
         'metadata',
         'ai_enabled',
+        'auto_order_confirmation_enabled',
     ];
 
     protected $casts = [
         'connected_at' => 'datetime',
         'token_expires_at' => 'datetime',
         'metadata' => 'array',
+        'auto_order_confirmation_enabled' => 'boolean',
     ];
 
     public function setAccessTokenAttribute($value)

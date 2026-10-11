@@ -192,12 +192,25 @@ class WebhookController extends Controller
                             ? app(\App\Services\WhatsAppCloudApiService::class)->downloadInboundMedia($channel, $mediaId, $incomingType)
                             : ['type' => $incomingType, 'storage_status' => 'failed'];
                     }
-                    if ($text === '' && $media === null) {
+                    $attachmentContext = in_array($incomingType, ['image', 'audio', 'video', 'document', 'location'], true)
+                        ? [
+                            'type' => $incomingType,
+                            'provider_message_id' => $messageId,
+                            'provider_attachment_id' => $incoming[$incomingType]['id'] ?? null,
+                            'status' => $text === '' ? 'attachment_without_text' : 'received_with_text',
+                            'coordinates' => $incomingType === 'location'
+                                && is_numeric($incoming['location']['latitude'] ?? null)
+                                && is_numeric($incoming['location']['longitude'] ?? null)
+                                    ? ['lat' => (float) $incoming['location']['latitude'], 'lng' => (float) $incoming['location']['longitude']]
+                                    : null,
+                        ]
+                        : null;
+                    if ($text === '' && $media === null && $attachmentContext === null) {
                         continue;
                     }
 
                     $senderName = collect($value['contacts'] ?? [])->firstWhere('wa_id', $senderId)['profile']['name'] ?? null;
-                    $this->processMessage($channel, $senderId, $text, $messageId, app(\App\Services\ReferencedMessageNormalizer::class)->whatsappCloud($incoming), $senderName, $media);
+                    $this->processMessage($channel, $senderId, $text, $messageId, app(\App\Services\ReferencedMessageNormalizer::class)->whatsappCloud($incoming), $senderName, $media, $attachmentContext);
                 }
             }
         }
@@ -220,13 +233,11 @@ class WebhookController extends Controller
                 ?? $message['interactive']['list_reply']['title']
                 ?? ''
             )),
-            'location' => 'Customer shared a WhatsApp location. Location coordinates: '
-                . (string) ($message['location']['latitude'] ?? '') . ', '
-                . (string) ($message['location']['longitude'] ?? ''),
-            'image' => trim((string) ($message['image']['caption'] ?? 'Customer sent an image.')),
-            'document' => trim((string) ($message['document']['caption'] ?? 'Customer sent a document.')),
-            'audio' => 'Customer sent an audio message.',
-            'video' => trim((string) ($message['video']['caption'] ?? 'Customer sent a video.')),
+            'location' => '',
+            'image' => trim((string) ($message['image']['caption'] ?? '')),
+            'document' => trim((string) ($message['document']['caption'] ?? '')),
+            'audio' => '',
+            'video' => trim((string) ($message['video']['caption'] ?? '')),
             default => '',
         };
     }
@@ -267,11 +278,9 @@ class WebhookController extends Controller
                 }
 
                 $media = $this->downloadMetaAttachment($this->metaAttachmentDescriptor($attachments));
-                if ($messageText === '' && $media !== null) {
-                    $messageText = $this->metaMediaFallbackText($media['type'] ?? null);
-                }
-                if ($messageText === '' && $media === null) continue;
-                $this->processMessage($channel, $senderId, $messageText, $incoming['mid'] ?? null, app(\App\Services\ReferencedMessageNormalizer::class)->meta($incoming), null, $media);
+                $attachmentContext = $this->metaAttachmentContext($attachments, $incoming['mid'] ?? null, $messageText === '');
+                if ($messageText === '' && $media === null && $attachmentContext === null) continue;
+                $this->processMessage($channel, $senderId, $messageText, $incoming['mid'] ?? null, app(\App\Services\ReferencedMessageNormalizer::class)->meta($incoming), null, $media, $attachmentContext);
             }
 
             // Handle comments
@@ -333,11 +342,7 @@ class WebhookController extends Controller
                 $messageText = trim((string) ($incomingMessage['text'] ?? ''));
                 $attachments = $incomingMessage['attachments'] ?? [];
                 $attachmentDescriptor = $this->metaAttachmentDescriptor($attachments);
-                if ($location) {
-                    $locationText = 'Shared delivery location coordinates: '
-                        . $location['lat'] . ', ' . $location['lng'];
-                    $messageText = trim($messageText . ($messageText !== '' ? "\n" : '') . $locationText);
-                } elseif ($messageText === '' && empty($attachments)) {
+                if (!$location && $messageText === '' && empty($attachments)) {
                     continue;
                 }
 
@@ -372,20 +377,9 @@ class WebhookController extends Controller
                 }
 
                 $media = $location ? null : $this->downloadMetaAttachment($attachmentDescriptor);
-                if ($messageText === '' && $media !== null) {
-                    $messageText = $this->metaMediaFallbackText($media['type'] ?? null);
-                } elseif ($messageText === '' && !empty($attachments) && $media === null) {
-                    // Preserve useful context for structured attachments such as locations
-                    // when no downloadable media URL is present.
-                    $attachmentTypes = array_values(array_filter(array_map(
-                        fn ($attachment) => is_array($attachment) ? ($attachment['type'] ?? null) : null,
-                        $attachments
-                    )));
-                    $typeLabel = $attachmentTypes ? implode(', ', $attachmentTypes) : 'unknown';
-                    $messageText = "Customer shared an Instagram attachment (type: {$typeLabel}) without readable text or coordinates. If delivery details are still needed, ask for the complete written street address, district, building number, and postal code; do not ask for a map link or coordinates.";
-                }
-                if ($messageText === '') continue;
-                $this->processMessage($channel, $senderId, $messageText, $platformMessageId, $replyToMid, null, $media);
+                $attachmentContext = $this->metaAttachmentContext($attachments, $platformMessageId, $messageText === '', $location);
+                if ($messageText === '' && $media === null && $attachmentContext === null) continue;
+                $this->processMessage($channel, $senderId, $messageText, $platformMessageId, $replyToMid, null, $media, $attachmentContext);
             }
 
             // Handle Instagram comments
@@ -463,7 +457,7 @@ class WebhookController extends Controller
         }
     }
 
-    private function processMessage(Channel $channel, string $senderId, string $messageText, ?string $platformMessageId = null, ?string $replyToMid = null, ?string $senderName = null, ?array $media = null): void
+    private function processMessage(Channel $channel, string $senderId, string $messageText, ?string $platformMessageId = null, ?string $replyToMid = null, ?string $senderName = null, ?array $media = null, ?array $attachmentContext = null): void
     {
         Log::info('Processing message', [
             'channel_type' => $channel->type,
@@ -529,6 +523,9 @@ class WebhookController extends Controller
         if ($media !== null) {
             $metadata['media'] = $media;
         }
+        if ($attachmentContext !== null) {
+            $metadata['attachment'] = $attachmentContext;
+        }
 
         $message = \App\Models\Message::create([
             'conversation_id' => $conversation->id,
@@ -542,7 +539,7 @@ class WebhookController extends Controller
             'mime_type'       => $media['mime_type'] ?? null,
             'file_size'       => $media['file_size'] ?? null,
             'media_processing_status' => $media === null
-                ? null
+                ? (($attachmentContext['status'] ?? null) === 'attachment_without_text' ? 'attachment_without_text' : null)
                 : (($media['storage_status'] ?? null) === 'stored' ? 'pending' : 'failed'),
             'media_processing_reason' => $media !== null && ($media['storage_status'] ?? null) !== 'stored'
                 ? 'Media download or private storage failed.'
@@ -552,6 +549,14 @@ class WebhookController extends Controller
             'whatsapp_remote_jid' => $channel->type === 'whatsapp' ? $senderId : null,
             'whatsapp_from_me' => false,
         ]);
+
+        if ($attachmentContext !== null) {
+            Log::info('Attachment handled', [
+                'message_id' => $message->id,
+                'attachment_type' => $attachmentContext['type'] ?? 'unknown',
+                'status' => $attachmentContext['status'] ?? 'received',
+            ]);
+        }
 
         if ($channel->user_id) {
             broadcast(new \App\Events\MessageReceived($message, $conversation, $channel->user_id));
@@ -610,6 +615,29 @@ class WebhookController extends Controller
         return null;
     }
 
+    /** Keep provider attachment facts separate from customer-authored text. */
+    private function metaAttachmentContext(array $attachments, ?string $messageId, bool $withoutText, ?array $coordinates = null): ?array
+    {
+        if ($attachments === []) {
+            return null;
+        }
+
+        $attachment = $attachments[0] ?? [];
+        if (!is_array($attachment)) {
+            $attachment = [];
+        }
+        $payload = is_array($attachment['payload'] ?? null) ? $attachment['payload'] : [];
+        $type = strtolower((string) ($attachment['type'] ?? 'unknown'));
+
+        return [
+            'type' => $type !== '' ? $type : 'unknown',
+            'provider_message_id' => $messageId,
+            'provider_attachment_id' => $payload['attachment_id'] ?? $attachment['attachment_id'] ?? null,
+            'status' => $withoutText ? 'attachment_without_text' : 'received_with_text',
+            'coordinates' => $coordinates,
+        ];
+    }
+
     /** Fetch only HTTPS media from Meta CDN hosts, then store it privately. */
     private function downloadMetaAttachment(?array $attachment): ?array
     {
@@ -658,17 +686,6 @@ class WebhookController extends Controller
             ]);
             return $failed;
         }
-    }
-
-    private function metaMediaFallbackText(?string $type): string
-    {
-        return match ($type) {
-            'image' => 'Customer sent an image.',
-            'audio' => 'Customer sent an audio message.',
-            'video' => 'Customer sent a video.',
-            'document' => 'Customer sent a document.',
-            default => 'Customer sent media.',
-        };
     }
 
     /** Search nested template/location payloads without logging customer coordinates. */

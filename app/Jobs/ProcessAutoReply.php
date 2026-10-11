@@ -1629,6 +1629,10 @@ class ProcessAutoReply implements ShouldQueue
             'is_complete'     => $fieldStatus['is_complete'],
         ]);
 
+        $autoOrderConfirmationEnabled = $channel->auto_order_confirmation_enabled !== null
+            ? (bool) $channel->auto_order_confirmation_enabled
+            : (bool) ($business?->auto_order_confirmation_enabled ?? true);
+
         // Explicit confirmation is necessary; complete checkout fields alone never authorize an order.
         $incomingLower = mb_strtolower(trim($message->content));
         $containsConfirmPhrase = (bool) preg_match(
@@ -1673,9 +1677,6 @@ class ProcessAutoReply implements ShouldQueue
         }
 
         $orderCreationFailedReason = null;
-        $autoOrderConfirmationEnabled = $channel->auto_order_confirmation_enabled !== null
-            ? (bool) $channel->auto_order_confirmation_enabled
-            : (bool) ($business?->auto_order_confirmation_enabled ?? true);
 
         // ── CUSTOMER RESOLUTION & CONTEXT (Phase 2) ──────────────────────────
         // Link the conversation to its business-scoped Customer, using the

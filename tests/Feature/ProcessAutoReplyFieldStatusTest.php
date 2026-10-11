@@ -41,6 +41,33 @@ class ProcessAutoReplyFieldStatusTest extends TestCase
 {
     use RefreshDatabase;
 
+    public function test_attachment_without_text_gets_one_deterministic_reply_without_calling_ai(): void
+    {
+        $fixture = $this->makeFixture(null, '');
+        $fixture['message']->update([
+            'metadata' => ['attachment' => ['type' => 'image', 'status' => 'attachment_without_text']],
+            'media_processing_status' => 'attachment_without_text',
+        ]);
+
+        Http::fake(['*' => Http::response(['message_id' => 'mid_attachment_ack'], 200)]);
+
+        (new ProcessAutoReply($fixture['message']->id))->handle();
+        (new ProcessAutoReply($fixture['message']->id))->handle();
+
+        Http::assertNotSent(fn ($request) => str_contains($request->url(), 'api.groq.com')
+            || str_contains($request->url(), 'generativelanguage.googleapis.com'));
+        Http::assertSent(fn ($request) => str_contains($request->url(), 'graph.facebook.com/v19.0/me/messages'));
+
+        $replies = Message::query()
+            ->where('conversation_id', $fixture['conversation']->id)
+            ->where('direction', 'outbound')
+            ->get();
+        $this->assertCount(1, $replies);
+        $this->assertSame('attachment_without_text', $replies->first()->source);
+        $this->assertSame('sent', $replies->first()->send_status);
+        $this->assertStringContainsString("can't read", $replies->first()->content);
+    }
+
     /**
      * Exact production scenario: Instagram DM, bot resolved from the
      * conversation snapshot (groq provider), no checkout state at all.

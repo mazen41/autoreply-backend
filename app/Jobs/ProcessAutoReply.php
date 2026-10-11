@@ -104,6 +104,54 @@ class ProcessAutoReply implements ShouldQueue
             return;
         }
 
+        // An attachment without accompanying text has a deterministic reply.
+        // Handle it before business-hours, sequences, commerce resolution, or
+        // provider calls so it cannot trigger an AI turn or duplicate checkout
+        // summary while an order is in progress.
+        if (trim((string) $message->content) === ''
+            && data_get($message->metadata, 'attachment.status') === 'attachment_without_text') {
+            $lock = Cache::lock('attachment_without_text_reply:' . $message->id, 60);
+            if (!$lock->get()) {
+                Log::info('ProcessAutoReply: attachment acknowledgement already in progress', [
+                    'message_id' => $message->id,
+                ]);
+                return;
+            }
+
+            try {
+                $reply = Message::query()
+                    ->where('conversation_id', $conversation->id)
+                    ->where('direction', 'outbound')
+                    ->where('source', 'attachment_without_text')
+                    ->get()
+                    ->first(fn (Message $candidate) => (int) data_get($candidate->metadata, 'attachment_ack_for_message_id') === $message->id);
+
+                if ($reply?->send_status === 'sent') {
+                    return;
+                }
+
+                $reply ??= Message::create([
+                    'conversation_id' => $conversation->id,
+                    'content' => \App\Services\ConfirmationGuard::attachmentWithoutTextReply(false),
+                    'direction' => 'outbound',
+                    'status' => 'auto',
+                    'is_ai' => false,
+                    'source' => 'attachment_without_text',
+                    'send_status' => 'pending',
+                    'metadata' => ['attachment_ack_for_message_id' => $message->id],
+                ]);
+
+                if ($channel->user_id) {
+                    broadcast(new \App\Events\MessageReceived($reply, $conversation, $channel->user_id));
+                }
+                $this->sendReply($channel, $conversation, $reply);
+            } finally {
+                $lock->release();
+            }
+
+            return;
+        }
+
         // Resolve business profile — Conversation has no direct business_id FK,
         // so we load it exclusively from the channel. If it's null the channel
         // was never linked to a business profile (data-integrity gap) — bail

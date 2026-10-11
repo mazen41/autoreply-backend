@@ -76,7 +76,7 @@ class BillingService
         } catch (\Exception $e) {
             Log::error('Failed to send usage alert', [
                 'user_id' => $user->id,
-                'error' => $e->getMessage(),
+                'exception_type' => get_class($e),
             ]);
         }
     }
@@ -142,7 +142,7 @@ class BillingService
         } catch (\Exception $e) {
             Log::error('Failed to send grace period notification', [
                 'subscription_id' => $subscription->id,
-                'error' => $e->getMessage(),
+                'exception_type' => get_class($e),
             ]);
         }
     }
@@ -203,7 +203,7 @@ class BillingService
 
                 Log::error('Overage billing exception', [
                     'overage_id' => $overage->id,
-                    'error'      => $e->getMessage(),
+                    'exception_type' => get_class($e),
                 ]);
             }
         }

@@ -33,9 +33,8 @@ class MyFatoorahService
         ];
 
         Log::info('[MyFatoorah] InitiatePayment request', [
-            'url'     => "{$this->baseUrl}/v2/InitiatePayment",
-            'payload' => $payload,
-            'key_prefix' => substr($this->apiKey, 0, 10) . '...',
+            'amount' => $invoiceAmount,
+            'currency' => $currencyIso,
         ]);
 
         $response = Http::withHeaders($this->defaultHeaders)
@@ -43,11 +42,10 @@ class MyFatoorahService
 
         Log::info('[MyFatoorah] InitiatePayment response', [
             'status' => $response->status(),
-            'body'   => $response->body(),
         ]);
 
         if ($response->failed()) {
-            throw new Exception('MyFatoorah InitiatePayment failed: ' . $response->body());
+            throw new Exception('MyFatoorah InitiatePayment failed with HTTP status ' . $response->status());
         }
 
         $data = $response->json();
@@ -65,18 +63,17 @@ class MyFatoorahService
         $payload['CallBackUrl'] = $payload['CallBackUrl'] ?? 'https://nazbiz.io/payment/callback';
         $payload['ErrorUrl']    = $payload['ErrorUrl']    ?? 'https://nazbiz.io/payment/error';
 
-        Log::info('[MyFatoorah] ExecutePayment request', ['payload' => $payload]);
+        Log::info('[MyFatoorah] ExecutePayment request', ['field_count' => count($payload)]);
 
         $response = Http::withHeaders($this->defaultHeaders)
             ->post("{$this->baseUrl}/v2/ExecutePayment", $payload);
 
         Log::info('[MyFatoorah] ExecutePayment response', [
             'status' => $response->status(),
-            'body'   => $response->body(),
         ]);
 
         if ($response->failed()) {
-            throw new Exception('MyFatoorah ExecutePayment failed: ' . $response->body());
+            throw new Exception('MyFatoorah ExecutePayment failed with HTTP status ' . $response->status());
         }
 
         $data = $response->json();
@@ -100,9 +97,8 @@ class MyFatoorahService
         if ($response->failed()) {
             Log::error('[MyFatoorah] GetPaymentStatus failed', [
                 'status' => $response->status(),
-                'body'   => $response->body(),
             ]);
-            throw new Exception('MyFatoorah GetPaymentStatus failed: ' . $response->body());
+            throw new Exception('MyFatoorah GetPaymentStatus failed with HTTP status ' . $response->status());
         }
 
         $data = $response->json();
@@ -112,6 +108,31 @@ class MyFatoorahService
         }
 
         return $data['Data'];
+    }
+
+    public function cancelRecurringPayment(string $recurringId): void
+    {
+        $response = Http::withHeaders($this->defaultHeaders)
+            ->post("{$this->baseUrl}/v2/CancelRecurringPayment?recurringId=" . urlencode($recurringId));
+
+        if ($response->failed() || !($response->json('IsSuccess') ?? false) || !($response->json('Data') ?? false)) {
+            throw new Exception('MyFatoorah recurring cancellation failed with HTTP status ' . $response->status());
+        }
+    }
+
+    public function verifyRecurringWebhookSignature(array $payload, string $signature): bool
+    {
+        $secret = config('services.myfatoorah.webhook_secret');
+        $recurring = $payload['Data']['Recurring'] ?? [];
+        if (empty($secret) || empty($signature) || !isset($recurring['Id'], $recurring['Status'], $recurring['InitialInvoiceId'])) {
+            return false;
+        }
+
+        $signedData = 'Recurring.Id=' . $recurring['Id']
+            . ',Recurring.Status=' . $recurring['Status']
+            . ',Recurring.InitialInvoiceId=' . $recurring['InitialInvoiceId'];
+
+        return hash_equals(hash_hmac('sha256', $signedData, $secret), $signature);
     }
 
     // ─── Webhook Signature Verification ───────────────────────────────────────

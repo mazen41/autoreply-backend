@@ -12,9 +12,16 @@ class PaymentIntent extends Model
 
     protected $fillable = [
         'user_id',
+        'business_id',
         'package_id',
         'billing_cycle',
         'status',
+        'expected_amount_minor',
+        'expected_currency',
+        'auto_renew_requested',
+        'auto_renew_consented_at',
+        'myfatoorah_recurring_id',
+        'failure_reason',
         'paymob_order_id',
         'paymob_transaction_id',
         'myfatoorah_invoice_id',
@@ -25,6 +32,9 @@ class PaymentIntent extends Model
 
     protected $casts = [
         'gateway_response' => 'array',
+        'expected_amount_minor' => 'integer',
+        'auto_renew_requested' => 'boolean',
+        'auto_renew_consented_at' => 'datetime',
     ];
 
     public function user(): BelongsTo

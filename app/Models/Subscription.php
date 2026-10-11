@@ -6,8 +6,11 @@ use Illuminate\Database\Eloquent\Model;
 
 class Subscription extends Model
 {
+    protected $hidden = ['myfatoorah_recurring_id'];
+
     protected $fillable = [
         'user_id',
+        'business_id',
         'package_id',
         'status',
         'billing_cycle',
@@ -16,6 +19,9 @@ class Subscription extends Model
         'paymob_transaction_id',
         'myfatoorah_invoice_id',
         'myfatoorah_payment_id',
+        'myfatoorah_recurring_id',
+        'auto_renew_enabled',
+        'auto_renew_consented_at',
         'payment_gateway',
         'starts_at',
         'ends_at',
@@ -34,11 +40,18 @@ class Subscription extends Model
         'trial_ends_at' => 'datetime',
         'grace_period_ends_at' => 'datetime',
         'last_usage_alert_at' => 'datetime',
+        'auto_renew_enabled' => 'boolean',
+        'auto_renew_consented_at' => 'datetime',
     ];
 
     public function user()
     {
         return $this->belongsTo(User::class);
+    }
+
+    public function business()
+    {
+        return $this->belongsTo(BusinessProfile::class, 'business_id');
     }
 
     public function package()

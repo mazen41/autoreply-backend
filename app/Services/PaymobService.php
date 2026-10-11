@@ -99,10 +99,9 @@ class PaymobService
         if (!$response->successful()) {
             Log::error('Paymob: Intention creation failed', [
                 'status'   => $response->status(),
-                'response' => $response->body(),
             ]);
 
-            throw new \RuntimeException('Paymob intention creation failed: ' . $response->body());
+            throw new \RuntimeException('Paymob intention creation failed.');
         }
 
         $data = $response->json();
@@ -111,13 +110,13 @@ class PaymobService
         $orderId      = $data['id'] ?? null;
 
         if (!$clientSecret) {
-            Log::error('Paymob: No client_secret in response', ['data' => $data]);
+            Log::error('Paymob: No client_secret in response', ['has_response_data' => $data !== []]);
             throw new \RuntimeException('Paymob did not return a client_secret');
         }
 
         $checkoutUrl = "{$this->apiBase}/unifiedcheckout/?publicKey={$this->publicKey}&clientSecret={$clientSecret}";
 
-        Log::info('Paymob: Intention created', ['order_id' => $orderId, 'checkout_url' => $checkoutUrl]);
+        Log::info('Paymob: Intention created', ['order_id' => $orderId]);
 
         return [
             'client_secret' => $clientSecret,

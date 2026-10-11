@@ -6,6 +6,7 @@ use App\Http\Controllers\Controller;
 use App\Models\Package;
 use App\Models\PaymentIntent;
 use App\Models\Subscription;
+use App\Services\ActiveBusiness;
 use App\Services\MyFatoorahService;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\Auth;
@@ -19,19 +20,51 @@ class MyFatoorahController extends Controller
     // ─── POST /api/payment/myfatoorah/initiate ─────────────────────────────────
     public function initiate(Request $request)
     {
+        $business = app(ActiveBusiness::class)->resolve($request, permission: 'manage_billing');
         $request->validate([
             'package_id'    => 'required|exists:packages,id',
             'billing_cycle' => 'required|in:monthly,yearly',
+            'auto_renew'    => 'sometimes|boolean',
         ]);
+
+        $autoRenew = $request->boolean('auto_renew');
+        if ($autoRenew && $request->billing_cycle !== 'monthly') {
+            return response()->json(['message' => 'Automatic renewal is currently available for monthly plans only. Annual plans can be renewed manually.'], 422);
+        }
+        if ($autoRenew && !config('services.myfatoorah.recurring_enabled')) {
+            return response()->json(['message' => 'Automatic renewal is not enabled for this payment account yet. Please choose manual renewal or contact support.'], 422);
+        }
 
         $user    = Auth::user();
         $package = Package::findOrFail($request->package_id);
+        abort_unless($package->is_active, 422, 'This plan is not available for purchase.');
 
         $amount = $request->billing_cycle === 'yearly'
             ? (float) ($package->price_yearly ?? $package->price_monthly * 12 * 0.8)
             : (float) $package->price_monthly;
+        if ($amount <= 0) {
+            return response()->json(['message' => 'Free plans must be activated without checkout.'], 422);
+        }
+
+        $activeSubscription = app(\App\Services\UsageMeter::class)->subscriptionFor($business);
+        if ($activeSubscription?->auto_renew_enabled) {
+            return response()->json(['message' => 'Turn off automatic renewal on your current plan before starting another subscription checkout.'], 409);
+        }
 
         $currency = 'SAR';
+
+        $intent = PaymentIntent::create([
+            'user_id'               => $user->id,
+            'business_id'           => $business->id,
+            'package_id'            => $package->id,
+            'billing_cycle'         => $request->billing_cycle,
+            'status'                => 'pending',
+            'payment_gateway'       => 'myfatoorah',
+            'expected_amount_minor' => (int) round($amount * 100),
+            'expected_currency'    => $currency,
+            'auto_renew_requested' => $autoRenew,
+            'auto_renew_consented_at' => $autoRenew ? now() : null,
+        ]);
 
         try {
             // Step 1 – discover payment methods
@@ -49,17 +82,17 @@ class MyFatoorahController extends Controller
                 'Language'           => 'EN',
                 'CallBackUrl'        => 'https://nazbiz.io/payment/callback',
                 'ErrorUrl'           => 'https://nazbiz.io/payment/error',
-                'UserDefinedField'   => (string) $user->id,
+                'UserDefinedField'   => (string) $intent->id,
+                ...($autoRenew ? ['RecurringModel' => [
+                    'RecurringType' => 'Monthly',
+                    'Iteration' => 0,
+                    'RetryCount' => 3,
+                ]] : []),
             ]);
 
-            // Persist pending intent
-            $intent = PaymentIntent::create([
-                'user_id'               => $user->id,
-                'package_id'            => $package->id,
-                'billing_cycle'         => $request->billing_cycle,
-                'status'                => 'pending',
-                'payment_gateway'       => 'myfatoorah',
+            $intent->update([
                 'myfatoorah_invoice_id' => (string) $executeData['InvoiceId'],
+                'myfatoorah_recurring_id' => $executeData['RecurringId'] ?? null,
                 'gateway_response'      => $executeData,
             ]);
 
@@ -72,7 +105,8 @@ class MyFatoorahController extends Controller
             ]);
 
         } catch (\Exception $e) {
-            Log::error('[MyFatoorah] initiate error', ['error' => $e->getMessage(), 'user' => $user->id]);
+            $intent->update(['status' => 'failed']);
+            Log::error('[MyFatoorah] initiate error', ['exception_type' => get_class($e), 'user_id' => $user->id]);
             return response()->json(['message' => 'Payment initiation failed. Please try again.'], 502);
         }
     }
@@ -91,7 +125,7 @@ class MyFatoorahController extends Controller
             $data = $this->mf->getPaymentStatus($paymentId, 'PaymentId');
             return $this->handlePaymentData($data);
         } catch (\Exception $e) {
-            Log::error('[MyFatoorah] Callback error', ['error' => $e->getMessage()]);
+            Log::error('[MyFatoorah] Callback error', ['exception_type' => get_class($e)]);
             return response()->json(['message' => 'Could not verify payment. Please contact support.'], 502);
         }
     }
@@ -112,7 +146,7 @@ class MyFatoorahController extends Controller
                         ->update(['status' => 'failed']);
                 }
             } catch (\Exception $e) {
-                Log::warning('[MyFatoorah] Could not fetch status on error URL', ['error' => $e->getMessage()]);
+                Log::warning('[MyFatoorah] Could not fetch status on error URL', ['exception_type' => get_class($e)]);
             }
         }
 
@@ -120,7 +154,7 @@ class MyFatoorahController extends Controller
     }
 
     // ─── Shared: activate subscription after confirmed payment ─────────────────
-    private function handlePaymentData(array $data): \Illuminate\Http\JsonResponse
+    protected function handlePaymentData(array $data): \Illuminate\Http\JsonResponse
     {
         $invoiceId     = (string) ($data['InvoiceId'] ?? '');
         $invoiceStatus = $data['InvoiceStatus'] ?? '';
@@ -134,32 +168,68 @@ class MyFatoorahController extends Controller
             return response()->json(['message' => 'Invoice not recognised.'], 404);
         }
 
-        if ($invoiceStatus === 'Paid' && $intent->status !== 'completed') {
+        if ($invoiceStatus === 'Paid' && $intent->status === 'pending') {
+            $transaction = collect($data['InvoiceTransactions'] ?? [])->first();
+            $actualCurrency = $data['CurrencyIso']
+                ?? $data['DisplayCurrencyIso']
+                ?? $data['DisplayCurrencyIsoAlpha']
+                ?? (is_array($transaction) ? ($transaction['Currency'] ?? $transaction['PaidCurrency'] ?? null) : null);
+            $actualMinor = isset($data['InvoiceValue']) && is_numeric($data['InvoiceValue'])
+                ? (int) round((float) $data['InvoiceValue'] * 100)
+                : null;
+            if (!app(\App\Services\PaymentIntentAmountVerifier::class)->verify(
+                $intent, $actualMinor, $actualCurrency !== null ? (string) $actualCurrency : null, 'myfatoorah'
+            )) {
+                return response()->json(['message' => 'Payment amount or currency did not match the invoice.'], 422);
+            }
+
             DB::transaction(function () use ($intent, $data) {
+                $lockedIntent = PaymentIntent::query()->lockForUpdate()->find($intent->id);
+                if (!$lockedIntent || $lockedIntent->status === 'completed') {
+                    return;
+                }
+
+                $businessId = $lockedIntent->business_id ?: $lockedIntent->user?->business_id;
+                if (!$businessId || !\App\Models\BusinessProfile::whereKey($businessId)->exists()) {
+                    Log::error('[MyFatoorah] PaymentIntent has no valid business scope', [
+                        'payment_intent_id' => $lockedIntent->id,
+                        'user_id' => $lockedIntent->user_id,
+                        'business_id' => $lockedIntent->business_id,
+                    ]);
+                    return;
+                }
+
                 $txn = collect($data['InvoiceTransactions'] ?? [])->first();
 
-                $intent->update([
+                $lockedIntent->update([
                     'status'                => 'completed',
                     'myfatoorah_payment_id' => $txn['TransactionId'] ?? null,
                     'gateway_response'      => $data,
                 ]);
 
-                Subscription::updateOrCreate(
-                    ['user_id' => $intent->user_id],
-                    [
-                        'package_id'            => $intent->package_id,
+                Subscription::query()
+                    ->where('business_id', $businessId)
+                    ->whereIn('status', ['active', 'trial'])
+                    ->update(['status' => 'cancelled', 'cancelled_at' => now()]);
+
+                Subscription::create([
+                        'business_id'           => $businessId,
+                        'user_id'               => $lockedIntent->user_id,
+                        'package_id'            => $lockedIntent->package_id,
                         'status'                => 'active',
-                        'billing_cycle'         => $intent->billing_cycle,
+                        'billing_cycle'         => $lockedIntent->billing_cycle,
                         'amount_paid'           => $data['InvoiceValue'] ?? 0,
                         'payment_gateway'       => 'myfatoorah',
                         'myfatoorah_invoice_id' => (string) ($data['InvoiceId'] ?? ''),
                         'myfatoorah_payment_id' => $txn['TransactionId'] ?? null,
+                        'myfatoorah_recurring_id' => $lockedIntent->myfatoorah_recurring_id,
+                        'auto_renew_enabled' => $lockedIntent->auto_renew_requested && !empty($lockedIntent->myfatoorah_recurring_id),
+                        'auto_renew_consented_at' => $lockedIntent->auto_renew_consented_at,
                         'starts_at'             => now(),
-                        'ends_at'               => $intent->billing_cycle === 'yearly'
+                        'ends_at'               => $lockedIntent->billing_cycle === 'yearly'
                             ? now()->addYear()
                             : now()->addMonth(),
-                    ]
-                );
+                    ]);
             });
 
             return response()->json(['message' => 'Subscription activated successfully.']);

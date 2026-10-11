@@ -7,6 +7,7 @@ use App\Models\Package;
 use App\Models\PaymentIntent;
 use App\Models\Subscription;
 use App\Models\User;
+use App\Services\ActiveBusiness;
 use App\Services\PaymobService;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\Log;
@@ -26,12 +27,14 @@ class PaymentController extends Controller
     // ──────────────────────────────────────────────────────────────────────────
     public function createPayment(Request $request)
     {
+        $business = app(ActiveBusiness::class)->resolve($request, permission: 'manage_billing');
         $request->validate([
             'package_id'    => 'required|exists:packages,id',
             'billing_cycle' => 'required|in:monthly,yearly',
         ]);
 
         $package = Package::findOrFail($request->package_id);
+        abort_unless($package->is_active, 422, 'This plan is not available for purchase.');
         $user    = auth()->user();
 
         // Paymob rejects blank billing_data fields (e.g. "last_name": [""] fails
@@ -45,6 +48,9 @@ class PaymentController extends Controller
             ? $package->price_yearly
             : $package->price_monthly;
         $amountCents = (int) round($amount * 100);
+        if ($amountCents <= 0) {
+            return response()->json(['message' => 'Free plans must be activated without checkout.'], 422);
+        }
 
         // Redirect back to our callback after payment
         $redirectUrl = config('app.url') . '/api/payments/callback';
@@ -72,9 +78,12 @@ class PaymentController extends Controller
         // metadata/extras echo, which is undocumented and was unreliable.
         $intent = PaymentIntent::create([
             'user_id'       => $user->id,
+            'business_id'   => $business->id,
             'package_id'    => $package->id,
             'billing_cycle' => $request->billing_cycle,
             'status'        => 'pending',
+            'expected_amount_minor' => $amountCents,
+            'expected_currency' => strtoupper((string) config('services.paymob.currency', 'EGP')),
         ]);
 
         $displayInfo = [
@@ -103,12 +112,12 @@ class PaymentController extends Controller
 
             Log::error('PaymentController: createPayment failed', [
                 'user_id' => $user->id,
-                'error'   => $e->getMessage(),
+                'exception_type' => get_class($e),
             ]);
 
             return response()->json([
                 'message' => 'Payment initiation failed',
-                'error'   => $e->getMessage(),
+                'error'   => 'Please try again or contact support if the problem continues.',
             ], 500);
         }
     }
@@ -120,7 +129,11 @@ class PaymentController extends Controller
     public function callback(Request $request)
     {
         $query = $request->query();
-        Log::info('Paymob: Callback hit', ['query' => $query]);
+        Log::info('Paymob: Callback hit', [
+            'has_transaction_id' => !empty($query['id']),
+            'has_hmac' => !empty($query['hmac']),
+            'has_success_value' => array_key_exists('success', $query),
+        ]);
 
         $transactionId = $query['id']   ?? null;
         $hmac          = $query['hmac'] ?? null;
@@ -130,12 +143,12 @@ class PaymentController extends Controller
         // (This endpoint is public — previously it trusted raw query params,
         // meaning anyone could hit it manually with success=true.)
         if (!$transactionId || !$hmac || !$this->paymob->verifyRedirectHmac($query, $hmac)) {
-            Log::error('Paymob callback: HMAC verification failed', ['transaction_id' => $transactionId]);
+            Log::error('Paymob callback: HMAC verification failed');
             return redirect(config('services.frontend_url') . '/pricing?payment=failed');
         }
 
         if ($success !== 'true') {
-            Log::warning('Paymob callback: payment not successful', ['transaction_id' => $transactionId]);
+            Log::warning('Paymob callback: payment not successful');
             return redirect(config('services.frontend_url') . '/pricing?payment=failed');
         }
 
@@ -157,9 +170,7 @@ class PaymentController extends Controller
             return redirect(config('services.frontend_url') . '/dashboard?payment=success');
         }
 
-        Log::warning('Paymob callback: payment verified but webhook has not fulfilled yet', [
-            'transaction_id' => $transactionId,
-        ]);
+        Log::warning('Paymob callback: payment verified but webhook has not fulfilled yet');
         // Payment is genuinely successful (HMAC-verified) — send the user to
         // the dashboard rather than "failed"; the webhook will finish
         // shortly. Adjust the frontend to show a "confirming payment" state
@@ -182,14 +193,19 @@ class PaymentController extends Controller
         $type = $payload['type'] ?? $request->query('type');
         $hmac = $request->query('hmac');
 
-        Log::info('Paymob: Webhook received', ['type' => $type, 'payload' => $payload]);
+        Log::info('Paymob: Webhook received', [
+            'type' => $type,
+            'payload_key_count' => count($payload),
+            'has_transaction_object' => is_array($payload['obj'] ?? null),
+        ]);
 
         if ($type !== 'TRANSACTION') {
             return response()->json(['message' => 'Ignored non-transaction webhook']);
         }
 
         if (!$this->paymob->verifyHmac($payload, (string) $hmac)) {
-            Log::error('Paymob: Invalid webhook HMAC', ['received_hmac' => $hmac]);
+            app(\App\Support\OperationalMetricCounter::class)->increment('webhook_signature_failures');
+            Log::error('Paymob: Invalid webhook HMAC');
             return response()->json(['message' => 'Invalid signature'], 401);
         }
 
@@ -227,25 +243,38 @@ class PaymentController extends Controller
 
         if (!$transactionId || !$merchantOrderId) {
             Log::error('Paymob: cannot fulfill — missing transaction id or merchant_order_id', [
-                'transaction_id'    => $transactionId,
-                'merchant_order_id' => $merchantOrderId,
+                'has_transaction_id' => $transactionId !== '',
+                'has_merchant_order_id' => !empty($merchantOrderId),
             ]);
             return false;
         }
 
         // Idempotency: already fulfilled by the other path (callback vs webhook)?
         if (Subscription::where('paymob_transaction_id', $transactionId)->exists()) {
-            Log::info('Paymob: transaction already fulfilled, skipping', ['transaction_id' => $transactionId]);
+            Log::info('Paymob: transaction already fulfilled, skipping');
             return true;
         }
 
         $intent = PaymentIntent::find($merchantOrderId);
 
         if (!$intent) {
-            Log::error('Paymob: no matching PaymentIntent for merchant_order_id', [
-                'merchant_order_id' => $merchantOrderId,
-                'transaction_id'    => $transactionId,
-            ]);
+            Log::error('Paymob: no matching PaymentIntent for merchant_order_id');
+            return false;
+        }
+
+        if ($intent->status !== 'pending') {
+            return false;
+        }
+
+        $actualAmountMinor = isset($transaction['amount_cents']) && is_numeric($transaction['amount_cents'])
+            ? (int) $transaction['amount_cents']
+            : null;
+        if (!app(\App\Services\PaymentIntentAmountVerifier::class)->verify(
+            $intent,
+            $actualAmountMinor,
+            isset($transaction['currency']) ? (string) $transaction['currency'] : null,
+            'paymob'
+        )) {
             return false;
         }
 
@@ -254,14 +283,25 @@ class PaymentController extends Controller
 
         if (!$user || !$package) {
             Log::error('Paymob: package or user not found for PaymentIntent', [
-                'payment_intent_id' => $intent->id,
-                'user_id'           => $intent->user_id,
-                'package_id'        => $intent->package_id,
+                'has_user' => (bool) $user,
+                'has_package' => (bool) $package,
             ]);
             return false;
         }
 
-        $activeSubscription = $user->activeSubscription;
+        $businessId = $intent->business_id ?: $user->business_id;
+        if (!$businessId || !\App\Models\BusinessProfile::whereKey($businessId)->exists()) {
+            Log::error('Paymob: PaymentIntent has no valid business scope');
+            return false;
+        }
+
+        $activeSubscription = Subscription::query()
+            ->where('business_id', $businessId)
+            ->whereIn('status', ['active', 'trial'])
+            ->where(fn ($query) => $query->whereNull('starts_at')->orWhere('starts_at', '<=', now()))
+            ->where(fn ($query) => $query->whereNull('ends_at')->orWhere('ends_at', '>', now()))
+            ->latest('id')
+            ->first();
         if ($activeSubscription) {
             $activeSubscription->update([
                 'status'       => 'cancelled',
@@ -276,6 +316,7 @@ class PaymentController extends Controller
 
         $subscription = Subscription::create([
             'user_id'               => $user->id,
+            'business_id'           => $businessId,
             'package_id'            => $package->id,
             'status'                => 'active',
             'billing_cycle'         => $intent->billing_cycle,
@@ -309,6 +350,6 @@ class PaymentController extends Controller
             PaymentIntent::where('id', $merchantOrderId)->update(['status' => 'failed']);
         }
 
-        Log::info('Paymob webhook: payment failed', ['merchant_order_id' => $merchantOrderId]);
+        Log::info('Paymob webhook: payment failed', ['has_merchant_order_id' => !empty($merchantOrderId)]);
     }
 }

@@ -1489,6 +1489,51 @@ class ProcessAutoReply implements ShouldQueue
             }
         }
 
+        // Shopify products can have multiple sellable variants. Resolve a
+        // customer's explicit title/SKU/number selection before generating a
+        // checkout summary; never let the order request guess a variant.
+        $shopifyVariants = [];
+        $shopifyVariantSelectionRequired = false;
+        $shopifyVariantChosenThisMessage = false;
+        $shopifyVariantDataUnavailable = false;
+        if ($commerceChannel?->type === 'shopify' && !empty($updatedCheckoutState['commerce_external_id'])) {
+            $commerceProduct = \App\Models\Product::query()
+                ->where('business_id', $conversation->business_id)
+                ->where('commerce_channel_id', $commerceChannel->id)
+                ->where('commerce_external_id', (string) $updatedCheckoutState['commerce_external_id'])
+                ->first();
+            $shopifyVariants = \App\Services\ShopifyVariantSelection::available(
+                $commerceProduct?->metadata['variants'] ?? []
+            );
+
+            if (count($shopifyVariants) === 1) {
+                $selectedVariant = $shopifyVariants[0];
+            } elseif (count($shopifyVariants) > 1) {
+                $selectedVariantId = (string) ($updatedCheckoutState['commerce_variant_id'] ?? '');
+                $selectedVariant = collect($shopifyVariants)->firstWhere('id', $selectedVariantId);
+                if (!$selectedVariant) {
+                    $selectedVariant = \App\Services\ShopifyVariantSelection::match(
+                        $shopifyVariants,
+                        (string) $message->content
+                    );
+                    $shopifyVariantChosenThisMessage = $selectedVariant !== null;
+                }
+                $shopifyVariantSelectionRequired = $selectedVariant === null;
+            } else {
+                $selectedVariant = null;
+                $shopifyVariantSelectionRequired = true;
+                $shopifyVariantDataUnavailable = true;
+            }
+
+            if ($selectedVariant) {
+                $updatedCheckoutState['commerce_variant_id'] = (string) $selectedVariant['id'];
+                $updatedCheckoutState['commerce_variant_title'] = (string) ($selectedVariant['title'] ?? '');
+                if (isset($selectedVariant['price'])) {
+                    $updatedCheckoutState['product_price'] = (string) $selectedVariant['price'];
+                }
+            }
+        }
+
         $checkoutState = $updatedCheckoutState;
         $fieldStatus = $checkoutService->computeFieldStatus($updatedCheckoutState, $sallaCheckoutActive);
         $hasValidOrderSummary = $this->hasValidOrderSummaryForConfirmation(
@@ -1502,6 +1547,14 @@ class ProcessAutoReply implements ShouldQueue
             (bool) ($fieldStatus['is_complete'] ?? false),
             $hasValidOrderSummary
         );
+        if ($shopifyVariantSelectionRequired) {
+            $updatedCheckoutState['confirmation_state'] = 'selecting_variant';
+            unset(
+                $updatedCheckoutState['confirmation_summary_message_id'],
+                $updatedCheckoutState['confirmation_summary_fingerprint'],
+                $updatedCheckoutState['confirmation_summary_sent_at']
+            );
+        }
         $checkoutState = $updatedCheckoutState;
         if (!empty($updatedCheckoutState)) {
             $conversation->update(['checkout_state' => $updatedCheckoutState]);
@@ -2133,6 +2186,11 @@ class ProcessAutoReply implements ShouldQueue
 
         // Step 6: Send AI Response
         $aiResponse = $aiResult['reply'];
+        if ($shopifyVariantChosenThisMessage) {
+            // A variant choice is a checkout answer even if the model calls it
+            // a generic question. Send a fresh deterministic summary below.
+            $intent = 'place_order';
+        }
 
         // A complete order summary must be shown for one turn before a
         // customer's confirmation can authorize an external order. Do not let
@@ -2150,6 +2208,7 @@ class ProcessAutoReply implements ShouldQueue
 
         $isOrderSummaryMessage = $intent === 'place_order'
             && !empty($fieldStatus['is_complete'])
+            && !$shopifyVariantSelectionRequired
             && ($checkoutState['confirmation_state'] ?? null) === 'confirmation_pending';
         if ($isOrderSummaryMessage) {
             $productName = trim((string) ($checkoutState['product_name'] ?? 'Selected product'));
@@ -2159,12 +2218,41 @@ class ProcessAutoReply implements ShouldQueue
             $storeName = trim((string) ($commerceChannel?->page_name ?? '')) ?: 'our store';
             $aiResponse = "Please review your order summary:\n"
                 . "Product: {$productName}\n"
+                . (!empty($checkoutState['commerce_variant_title']) ? 'Variant: ' . trim((string) $checkoutState['commerce_variant_title']) . "\n" : '')
                 . "Price: {$priceText}\n"
                 . "Store: {$storeName}\n"
                 . 'Name: ' . trim((string) ($checkoutState['full_name'] ?? '')) . "\n"
                 . 'Phone: ' . trim((string) ($checkoutState['phone'] ?? $checkoutState['customer_phone'] ?? '')) . "\n"
                 . 'Delivery address: ' . trim((string) ($checkoutState['address'] ?? $checkoutState['customer_address'] ?? '')) . "\n\n"
                 . 'Reply “confirm order” to place it, or “cancel” to stop.';
+        }
+
+        if ($shopifyVariantSelectionRequired && $intent === 'place_order' && !$isProductBrowseMessage) {
+            $options = [];
+            foreach ($shopifyVariants as $index => $variant) {
+                $label = trim((string) ($variant['title'] ?? 'Variant'));
+                if (isset($variant['price']) && $variant['price'] !== '') {
+                    $label .= ' — ' . $variant['price'] . ' ' . ($checkoutState['product_currency'] ?? '');
+                }
+                $options[] = ($index + 1) . '. ' . $label;
+            }
+            if ($shopifyVariantDataUnavailable) {
+                $aiResponse = "I can't verify this product's available options right now. A team member will help complete your order.";
+                $conversation->update([
+                    'requires_human' => true,
+                    'status' => 'pending_human',
+                    'escalated_at' => now(),
+                    'escalation_reason' => 'shopify_variant_data_unavailable',
+                ]);
+                app(\App\Services\HandoffTaskService::class)->openForConversation(
+                    $conversation,
+                    'shopify_variant_data_unavailable',
+                    'high'
+                );
+            } else {
+                $aiResponse = "Which product option would you like? Please reply with its number or exact name:\n"
+                    . implode("\n", $options);
+            }
         }
 
         if ($sallaCheckoutActive && $addressGeocodingStatus === 'country_unknown') {
@@ -2378,6 +2466,8 @@ class ProcessAutoReply implements ShouldQueue
                     'commerce_channel_id' => $commerceChannel->id,
                     'product_name'     => $checkoutState['product_name']     ?? null,
                     'product_price'    => $checkoutState['product_price']    ?? 0,
+                    'commerce_variant_id' => $checkoutState['commerce_variant_id'] ?? null,
+                    'commerce_variant_title' => $checkoutState['commerce_variant_title'] ?? null,
                     'full_name'        => $checkoutState['full_name']         ?? $checkoutState['customer_name']    ?? null,
                     'phone'            => $checkoutState['customer_phone']    ?? $checkoutState['phone']             ?? '',
                     'address'          => $checkoutState['address']           ?? $checkoutState['customer_address'] ?? '',
@@ -3747,6 +3837,7 @@ class ProcessAutoReply implements ShouldQueue
         return hash('sha256', implode('|', [
             (string) ($state['commerce_channel_id'] ?? ''),
             (string) ($state['commerce_external_id'] ?? $state['salla_product_id'] ?? ''),
+            (string) ($state['commerce_variant_id'] ?? ''),
             preg_replace('/\D+/', '', (string) ($state['phone'] ?? $state['customer_phone'] ?? '')),
             mb_strtolower(trim((string) ($state['address'] ?? $state['customer_address'] ?? ''))),
         ]));

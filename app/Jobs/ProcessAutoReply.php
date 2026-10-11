@@ -1899,6 +1899,38 @@ class ProcessAutoReply implements ShouldQueue
                     : 'message was not classified as an explicit order confirmation',
             ]);
 
+            $confirmedCheckoutReady = $containsConfirmPhrase
+                && in_array($checkoutState['confirmation_state'] ?? null, ['confirmed', 'order_placed'], true)
+                && !$isProductBrowseMessage
+                && $commerceChannel
+                && !empty($fieldStatus['is_complete'])
+                && !empty($checkoutState['salla_product_id'])
+                && !empty($checkoutState['customer_phone'] ?? $checkoutState['phone'] ?? '')
+                && !empty($checkoutState['address'] ?? $checkoutState['customer_address'] ?? '')
+                && !empty($checkoutState['full_name'] ?? $checkoutState['customer_name'] ?? '')
+                && $autoOrderConfirmationEnabled;
+
+            if ($confirmedCheckoutReady) {
+                Log::warning('ProcessAutoReply: AI failed after valid confirmation; continuing deterministic order submission', [
+                    'conversation_id' => $conversation->id,
+                    'message_id' => $message->id,
+                    'connection_id' => $commerceChannel->id,
+                    'provider' => $commerceChannel->type,
+                    'failure_code' => $aiResult['failure_code'] ?? data_get($aiResult, 'validation.reasons.0'),
+                ]);
+
+                if ($this->submitConfirmedCheckoutWithoutAi($conversation, $channel, $commerceChannel, $checkoutState, $detectedLanguage)) {
+                    return;
+                }
+
+                Log::error('ProcessAutoReply: deterministic order submission after AI failure returned no order ID', [
+                    'conversation_id' => $conversation->id,
+                    'message_id' => $message->id,
+                    'connection_id' => $commerceChannel->id,
+                    'provider' => $commerceChannel->type,
+                ]);
+            }
+
             // A failed AI call must not turn a successful product lookup into
             // silence. Give browse requests a useful, data-backed reply from
             // the Salla results already fetched for this turn.
@@ -3665,6 +3697,107 @@ $aiResponse = $intro
                 'user_id' => $user->id
             ]);
         }
+    }
+
+    /**
+     * A confirmed checkout is deterministic and must still submit if the AI
+     * provider is unavailable or returns malformed JSON.
+     */
+    private function submitConfirmedCheckoutWithoutAi(
+        Conversation $conversation,
+        Channel $channel,
+        Channel $commerceChannel,
+        array $checkoutState,
+        string $detectedLanguage
+    ): bool {
+        $orderInput = [
+            'salla_product_id' => $checkoutState['salla_product_id'],
+            'commerce_external_id' => $checkoutState['commerce_external_id'] ?? $checkoutState['salla_product_id'],
+            'commerce_channel_id' => $commerceChannel->id,
+            'product_name' => $checkoutState['product_name'] ?? null,
+            'product_price' => $checkoutState['product_price'] ?? 0,
+            'commerce_variant_id' => $checkoutState['commerce_variant_id'] ?? null,
+            'commerce_variant_title' => $checkoutState['commerce_variant_title'] ?? null,
+            'full_name' => $checkoutState['full_name'] ?? $checkoutState['customer_name'] ?? null,
+            'phone' => $checkoutState['customer_phone'] ?? $checkoutState['phone'] ?? '',
+            'address' => $checkoutState['address'] ?? $checkoutState['customer_address'] ?? '',
+            'email' => $checkoutState['email'] ?? $checkoutState['customer_email'] ?? null,
+            'postal_code' => $checkoutState['postal_code'] ?? null,
+            'geo_coordinates' => $checkoutState['geo_coordinates'] ?? null,
+            'building_number' => $checkoutState['building_number'] ?? null,
+            'short_address' => $checkoutState['short_address'] ?? null,
+            'additional_number' => $checkoutState['additional_number'] ?? null,
+        ];
+
+        $orderData = $this->createRealExternalOrder($conversation, $orderInput, $channel);
+        $orderId = (string) ($orderData['order_id'] ?? '');
+        if ($orderId === '') {
+            return false;
+        }
+
+        $productName = trim((string) ($orderInput['product_name'] ?? ''));
+        $customerName = trim((string) ($orderInput['full_name'] ?? ''));
+        $reply = $detectedLanguage === 'arabic'
+            ? "✅ تم تأكيد طلبك بنجاح!" . ($customerName !== '' ? " شكرًا {$customerName}" : '') . "\n"
+                . ($productName !== '' ? "المنتج: {$productName}\n" : '') . "رقم الطلب: #{$orderId}\nسيتم التواصل معك قريبًا لتأكيد التفاصيل 🚀"
+            : "✅ Your order has been placed successfully!" . ($customerName !== '' ? " Thank you, {$customerName}" : '') . "\n"
+                . ($productName !== '' ? "Product: {$productName}\n" : '') . "Order #: {$orderId}\nWe'll contact you shortly to confirm the details 🚀";
+
+        $completedState = array_merge(
+            is_array($conversation->fresh()->checkout_state) ? $conversation->fresh()->checkout_state : [],
+            [
+                'status' => 'completed',
+                'order_id' => $orderId,
+                'confirmation_state' => 'order_placed',
+                'order_fingerprint' => $this->orderFingerprint($orderInput),
+                'order_product_id' => (string) ($orderInput['commerce_external_id'] ?? $orderInput['salla_product_id'] ?? ''),
+                'order_connection_id' => (string) $commerceChannel->id,
+            ]
+        );
+        $conversation->update(['checkout_state' => $completedState, 'requires_human' => false]);
+        HandoffTask::where('conversation_id', $conversation->id)
+            ->where('status', 'open')
+            ->update(['status' => 'resolved', 'resolved_at' => now()]);
+
+        $replyMessage = Message::create([
+            'conversation_id' => $conversation->id,
+            'content' => $reply,
+            'direction' => 'outbound',
+            'status' => 'auto',
+            'is_ai' => false,
+            'source' => 'commerce_order_confirmation',
+            'send_status' => 'pending',
+            'intent' => 'place_order',
+            'detected_language' => $detectedLanguage,
+        ]);
+
+        if ($channel->user_id) {
+            broadcast(new \App\Events\MessageReceived($replyMessage, $conversation, $channel->user_id));
+        }
+        $sent = $this->sendReply($channel, $conversation, $replyMessage);
+        Log::info('ProcessAutoReply: deterministic order confirmation sent after AI failure', [
+            'conversation_id' => $conversation->id,
+            'message_id' => $replyMessage->id,
+            'connection_id' => $commerceChannel->id,
+            'provider' => $commerceChannel->type,
+            'order_id' => $orderId,
+            'reply_sent' => $sent,
+        ]);
+
+        try {
+            app(\App\Services\AutomationEngine::class)->executeWorkflowsForEvent(
+                \App\Services\AutomationEngine::EVENT_ORDER_STATUS_CHANGED,
+                $conversation,
+                ['order_id' => $orderId, 'status' => 'completed', 'event_id' => 'order-status:' . $orderId . ':completed']
+            );
+        } catch (\Throwable $e) {
+            Log::error('ProcessAutoReply: failed to fire order_status_changed event after deterministic order submission', [
+                'conversation_id' => $conversation->id,
+                'exception_type' => get_class($e),
+            ]);
+        }
+
+        return true;
     }
 
     /**

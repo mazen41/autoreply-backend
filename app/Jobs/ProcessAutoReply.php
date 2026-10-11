@@ -2643,6 +2643,16 @@ $aiResponse = $intro
             is_array($conversation->fresh()->checkout_state) ? $conversation->fresh()->checkout_state : [],
             is_array($updatedCheckoutState) ? $updatedCheckoutState : []
         );
+        // The model may not ask for its own YES while a summary is pending, and a placeholder
+        // phone in the customer's message is never accepted silently.
+        $aiResponse = \App\Services\ConfirmationGuard::replaceModelConfirmation(
+            (string) $aiResponse,
+            $checkoutState['confirmation_state'] ?? null,
+            (bool) $containsConfirmPhrase
+        );
+        if (($placeholderReply = \App\Services\ConfirmationGuard::placeholderPhoneReply((string) $message->content)) !== null) {
+            $aiResponse = $placeholderReply;
+        }
         $greetingGuard = app(\App\Services\GreetingRepeatGuard::class)->apply($message, (string) $aiResponse);
         $aiResponse = $greetingGuard['reply'];
 
@@ -3900,10 +3910,17 @@ $aiResponse = $intro
 
         // If no explicit quote exists, the summary must be the immediately
         // preceding conversation message, with no intervening turns.
+        // Only customer messages and merchant-typed replies count as intervening turns.
+        // The bot's own follow-up text must not invalidate a confirmation of its summary.
         return !Message::query()
             ->where('conversation_id', $conversation->id)
             ->where('id', '>', $summary->id)
             ->where('id', '<', $incoming->id)
+            ->where(function ($q) {
+                $q->where('direction', 'inbound')
+                    ->orWhere(fn ($r) => $r->where('direction', 'outbound')
+                        ->where(fn ($s) => $s->whereNull('source')->orWhere('source', '!=', 'ai')));
+            })
             ->exists();
     }
 

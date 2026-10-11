@@ -61,9 +61,10 @@ class TeamMember extends Model
     public function hasPermission($permission): bool
     {
         $permissions = [
-            'owner' => ['read', 'write', 'delete', 'manage_team', 'manage_billing'],
-            'agent' => ['read', 'write'],
-            'viewer' => ['read'],
+            'owner' => ['read', 'write', 'delete', 'manage_team', 'manage_billing', 'conversation_read', 'conversation_write', 'assigned_work', 'automation_read', 'automation_write'],
+            'manager' => ['read', 'write', 'delete', 'conversation_read', 'conversation_write', 'assigned_work', 'automation_read', 'automation_write'],
+            'agent' => ['conversation_read', 'conversation_write', 'assigned_work', 'automation_read'],
+            'viewer' => ['read', 'conversation_read', 'automation_read'],
         ];
 
         return in_array($permission, $permissions[$this->role] ?? []);

@@ -50,7 +50,9 @@ return [
     |
     */
 
-    'expiration' => null,
+    // This is a maximum token age. Login tokens expire earlier per token
+    // (3 days by default, 7 days with Remember me).
+    'expiration' => env('SANCTUM_TOKEN_EXPIRATION', 60 * 24 * 30),
 
     /*
     |--------------------------------------------------------------------------

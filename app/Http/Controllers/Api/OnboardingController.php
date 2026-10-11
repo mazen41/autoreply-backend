@@ -6,6 +6,8 @@ use App\Http\Controllers\Controller;
 use App\Models\BusinessProfile;
 use App\Models\Channel;
 use App\Services\OnboardingService;
+use App\Services\ActiveBusiness;
+use App\Models\TeamMember;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\Auth;
 
@@ -22,12 +24,28 @@ class OnboardingController extends Controller
      *  users.business_id + any of this user's channels stay linked to it. */
     private function profile(Request $request): BusinessProfile
     {
+        $selectedBusinessId = $request->header('X-Business-Id') ?? $request->input('business_id');
+        if ($selectedBusinessId) {
+            return app(ActiveBusiness::class)->resolve(
+                $request,
+                permission: 'write',
+                routeBusinessId: $selectedBusinessId,
+            );
+        }
+
+        if (TeamMember::query()->where('user_id', $request->user()->id)->where('is_active', true)->exists()) {
+            abort(403, 'Select the business you are onboarding.');
+        }
+
         $profile = BusinessProfile::firstOrCreate(
             ['user_id' => $request->user()->id],
             ['name' => $request->user()->name . "'s Business"]
         );
 
-        if ($request->user()->business_id !== $profile->id) {
+        // business_id is the user's selected/primary tenant. A team member's
+        // onboarding profile lookup must not silently move them out of the
+        // business they already belong to.
+        if (empty($request->user()->business_id)) {
             $request->user()->update(['business_id' => $profile->id]);
         }
 
@@ -56,9 +74,11 @@ class OnboardingController extends Controller
     public function updateProgress(Request $request)
     {
         $request->validate([
-            'step' => 'required|string',
+            'step' => 'required|string|in:step1,step2,step3,step4',
         ]);
 
+        $profile = $this->profile($request);
+        abort_unless((int) $profile->user_id === (int) Auth::id(), 403, 'Only the business owner can update personal onboarding progress.');
         $progress = $this->onboardingService->updateProgress(Auth::id(), $request->step);
 
         return response()->json(['success' => true, 'progress' => $progress]);
@@ -77,25 +97,12 @@ class OnboardingController extends Controller
         $step = $request->step;
         $businessId = $request->business_id;
 
-        switch ($step) {
-            case 'connect_channel':
-                $this->onboardingService->completeConnectChannel(Auth::id());
-                break;
-            case 'business_info':
-                if ($businessId) {
-                    $this->onboardingService->completeBusinessInfo(Auth::id(), $businessId);
-                }
-                break;
-            case 'enable_ai':
-                $this->onboardingService->completeEnableAI(Auth::id());
-                break;
-            case 'test_message':
-                $this->onboardingService->completeTestMessage(Auth::id());
-                break;
-            case 'complete':
-                $this->onboardingService->completeSetup(Auth::id());
-                break;
+        $business = $this->profile($request);
+        abort_unless((int) $business->user_id === (int) Auth::id(), 403);
+        if ($businessId && (int) $businessId !== (int) $business->id) {
+            abort(403, 'The selected onboarding business does not match the authorized business.');
         }
+        $this->onboardingService->completeVerifiedStep(Auth::id(), $step, $business);
 
         $status = $this->onboardingService->getOnboardingStatus(Auth::id());
 
@@ -107,9 +114,11 @@ class OnboardingController extends Controller
      */
     public function skip(Request $request)
     {
-        $this->onboardingService->skipOnboarding(Auth::id());
+        $business = $this->profile($request);
+        abort_unless((int) $business->user_id === (int) Auth::id(), 403, 'Only the business owner can skip onboarding.');
+        $this->onboardingService->skipOnboarding(Auth::id(), $business);
 
-        return response()->json(['success' => true]);
+        return response()->json(['success' => true, 'completed' => false, 'skipped' => true]);
     }
 
     /**
@@ -134,7 +143,7 @@ class OnboardingController extends Controller
         $profile = $this->profile($request);
         $profile->update(['business_type' => $request->business_type]);
 
-        $this->onboardingService->updateProgress(Auth::id(), 'step1');
+        $this->onboardingService->updateProgress(Auth::id(), 'step1', $profile);
 
         return response()->json(['success' => true, 'business_id' => $profile->id]);
     }
@@ -149,20 +158,56 @@ class OnboardingController extends Controller
             'phone'         => 'nullable|string|max:50',
             'city'          => 'nullable|string|max:255',
             'country'       => 'nullable|string|max:255',
+            'currency'      => 'nullable|string|size:3',
+            'timezone'      => ['nullable', 'string', 'timezone'],
             'working_days'  => 'nullable|array',
             'working_from'  => 'nullable|string|max:10',
             'working_to'    => 'nullable|string|max:10',
         ]);
 
         $profile = $this->profile($request);
+        $regionalDefaults = $this->regionalDefaults((string) ($request->country ?? ''));
+        $currency = strtoupper((string) ($request->input('currency') ?: $regionalDefaults['currency']));
+        $timezone = $request->input('timezone') ?: $regionalDefaults['timezone'];
         $profile->update(array_merge(
             $request->only(['business_name', 'phone', 'city', 'country', 'working_days', 'working_from', 'working_to']),
-            ['name' => $request->business_name]
+            ['name' => $request->business_name, 'currency' => $currency, 'timezone' => $timezone]
         ));
 
-        $this->onboardingService->updateProgress(Auth::id(), 'step2');
+        $this->onboardingService->updateProgress(Auth::id(), 'step2', $profile);
 
         return response()->json(['success' => true]);
+    }
+
+    private function regionalDefaults(string $country): array
+    {
+        $value = mb_strtolower(trim($country));
+        $countries = [
+            'sa' => ['currency' => 'SAR', 'timezone' => 'Asia/Riyadh'],
+            'saudi arabia' => ['currency' => 'SAR', 'timezone' => 'Asia/Riyadh'],
+            'السعودية' => ['currency' => 'SAR', 'timezone' => 'Asia/Riyadh'],
+            'مصر' => ['currency' => 'EGP', 'timezone' => 'Africa/Cairo'],
+            'egypt' => ['currency' => 'EGP', 'timezone' => 'Africa/Cairo'],
+            'eg' => ['currency' => 'EGP', 'timezone' => 'Africa/Cairo'],
+            'الإمارات' => ['currency' => 'AED', 'timezone' => 'Asia/Dubai'],
+            'united arab emirates' => ['currency' => 'AED', 'timezone' => 'Asia/Dubai'],
+            'الكويت' => ['currency' => 'KWD', 'timezone' => 'Asia/Kuwait'],
+            'kuwait' => ['currency' => 'KWD', 'timezone' => 'Asia/Kuwait'],
+            'قطر' => ['currency' => 'QAR', 'timezone' => 'Asia/Qatar'],
+            'qatar' => ['currency' => 'QAR', 'timezone' => 'Asia/Qatar'],
+            'البحرين' => ['currency' => 'BHD', 'timezone' => 'Asia/Bahrain'],
+            'bahrain' => ['currency' => 'BHD', 'timezone' => 'Asia/Bahrain'],
+            'عمان' => ['currency' => 'OMR', 'timezone' => 'Asia/Muscat'],
+            'oman' => ['currency' => 'OMR', 'timezone' => 'Asia/Muscat'],
+            'الأردن' => ['currency' => 'JOD', 'timezone' => 'Asia/Amman'],
+            'jordan' => ['currency' => 'JOD', 'timezone' => 'Asia/Amman'],
+            'المغرب' => ['currency' => 'MAD', 'timezone' => 'Africa/Casablanca'],
+            'morocco' => ['currency' => 'MAD', 'timezone' => 'Africa/Casablanca'],
+            'تونس' => ['currency' => 'TND', 'timezone' => 'Africa/Tunis'],
+            'tunisia' => ['currency' => 'TND', 'timezone' => 'Africa/Tunis'],
+        ];
+
+        return $countries[$value] ?? ['currency' => 'USD', 'timezone' => 'UTC'];
     }
 
     /**
@@ -179,7 +224,7 @@ class OnboardingController extends Controller
         $profile = $this->profile($request);
         $profile->update($request->only(['services', 'faqs', 'reply_style']));
 
-        $this->onboardingService->updateProgress(Auth::id(), 'step3');
+        $this->onboardingService->updateProgress(Auth::id(), 'step3', $profile);
 
         return response()->json(['success' => true]);
     }
@@ -196,7 +241,7 @@ class OnboardingController extends Controller
         $profile = $this->profile($request);
         $profile->update($request->only(['connected_channel']));
 
-        $this->onboardingService->updateProgress(Auth::id(), 'step4');
+        $this->onboardingService->updateProgress(Auth::id(), 'step4', $profile);
 
         return response()->json(['success' => true]);
     }
@@ -206,12 +251,16 @@ class OnboardingController extends Controller
      */
     public function complete(Request $request)
     {
-        $this->profile($request);
-        $this->onboardingService->updateProgress(Auth::id(), 'complete');
-        $this->onboardingService->completeSetup(Auth::id());
-        $request->user()->update(['onboarding_completed' => true]);
+        $business = $this->profile($request);
+        abort_unless((int) $business->user_id === (int) Auth::id(), 403, 'Only the business owner can complete onboarding.');
+        $readiness = $this->onboardingService->completeSetup(Auth::id(), $business);
 
-        return response()->json(['success' => true]);
+        return response()->json([
+            'success' => true,
+            'completed' => (bool) $readiness['ready'],
+            'setup_ready' => (bool) $readiness['ready'],
+            'setup_missing' => $readiness['missing'],
+        ]);
     }
 
     /**

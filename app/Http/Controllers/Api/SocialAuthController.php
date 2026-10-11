@@ -18,6 +18,7 @@ class SocialAuthController extends Controller
             $redirectTo = $request->query('redirect');
             $packageId = $request->query('package');
             $billingCycle = $request->query('billing');
+            $rememberMe = $request->boolean('remember_me');
 
             $driver = Socialite::driver('google')
                 ->stateless()
@@ -29,6 +30,7 @@ class SocialAuthController extends Controller
                 'redirect' => $redirectTo,
                 'package' => $packageId,
                 'billing' => $billingCycle,
+                'remember_me' => $rememberMe,
             ];
             $driver = $driver->with(['state' => base64_encode(json_encode($stateData))]);
 
@@ -36,8 +38,8 @@ class SocialAuthController extends Controller
 
             return response()->json(['url' => $url]);
         } catch (\Exception $e) {
-            Log::error('Google redirect error: ' . $e->getMessage());
-            return response()->json(['message' => 'Authentication failed', 'error' => $e->getMessage()], 401);
+            Log::error('Google redirect error', ['exception' => get_class($e)]);
+            return response()->json(['message' => 'Authentication failed'], 401);
         }
     }
 
@@ -56,12 +58,14 @@ class SocialAuthController extends Controller
             $redirectTo = $stateData['redirect'] ?? null;
             $packageId = $stateData['package'] ?? null;
             $billingCycle = $stateData['billing'] ?? null;
+            $rememberMe = (bool) ($stateData['remember_me'] ?? false);
 
             // Build redirect params
             $params = [];
             if ($redirectTo) $params[] = 'redirect=' . urlencode($redirectTo);
             if ($packageId) $params[] = 'package=' . urlencode($packageId);
             if ($billingCycle) $params[] = 'billing=' . urlencode($billingCycle);
+            if ($rememberMe) $params[] = 'remember_me=1';
             $redirectParam = !empty($params) ? '&' . implode('&', $params) : '';
 
             if ($user) {
@@ -74,14 +78,7 @@ class SocialAuthController extends Controller
                 }
                 $user->save();
 
-                $token = $user->createToken('auth_token')->plainTextToken;
-                $frontendUrl = config('services.frontend_url', 'http://localhost:3000');
-                $query = http_build_query([
-                    'token' => $token,
-                    'provider' => 'google',
-                    'is_new_user' => 'false',
-                ]);
-                return redirect()->away("{$frontendUrl}/auth/callback?{$query}{$redirectParam}");
+                return $this->redirectWithLoginCode($user, 'google', false, $redirectParam);
             } else {
                 // Create new user
                 $user = User::create([
@@ -93,17 +90,10 @@ class SocialAuthController extends Controller
                     'email_verified_at' => now(),
                 ]);
 
-                $token = $user->createToken('auth_token')->plainTextToken;
-                $frontendUrl = config('services.frontend_url', 'http://localhost:3000');
-                $query = http_build_query([
-                    'token' => $token,
-                    'provider' => 'google',
-                    'is_new_user' => 'true',
-                ]);
-                return redirect()->away("{$frontendUrl}/auth/callback?{$query}{$redirectParam}");
+                return $this->redirectWithLoginCode($user, 'google', true, $redirectParam);
             }
         } catch (\Exception $e) {
-            Log::error('Google callback error: ' . $e->getMessage());
+            Log::error('Google callback error', ['exception' => get_class($e)]);
             $frontendUrl = config('services.frontend_url', 'http://localhost:3000');
             return redirect()->away("{$frontendUrl}/login?error=auth_failed");
         }
@@ -115,6 +105,7 @@ class SocialAuthController extends Controller
             $redirectTo = $request->query('redirect');
             $packageId = $request->query('package');
             $billingCycle = $request->query('billing');
+            $rememberMe = $request->boolean('remember_me');
 
             $driver = Socialite::driver('facebook')
                 ->stateless()
@@ -126,6 +117,7 @@ class SocialAuthController extends Controller
                 'redirect' => $redirectTo,
                 'package' => $packageId,
                 'billing' => $billingCycle,
+                'remember_me' => $rememberMe,
             ];
             $driver = $driver->with(['state' => base64_encode(json_encode($stateData))]);
 
@@ -133,8 +125,8 @@ class SocialAuthController extends Controller
 
             return response()->json(['url' => $url]);
         } catch (\Exception $e) {
-            Log::error('Facebook redirect error: ' . $e->getMessage());
-            return response()->json(['message' => 'Authentication failed', 'error' => $e->getMessage()], 401);
+            Log::error('Facebook redirect error', ['exception' => get_class($e)]);
+            return response()->json(['message' => 'Authentication failed'], 401);
         }
     }
 
@@ -153,12 +145,14 @@ class SocialAuthController extends Controller
             $redirectTo = $stateData['redirect'] ?? null;
             $packageId = $stateData['package'] ?? null;
             $billingCycle = $stateData['billing'] ?? null;
+            $rememberMe = (bool) ($stateData['remember_me'] ?? false);
 
             // Build redirect params
             $params = [];
             if ($redirectTo) $params[] = 'redirect=' . urlencode($redirectTo);
             if ($packageId) $params[] = 'package=' . urlencode($packageId);
             if ($billingCycle) $params[] = 'billing=' . urlencode($billingCycle);
+            if ($rememberMe) $params[] = 'remember_me=1';
             $redirectParam = !empty($params) ? '&' . implode('&', $params) : '';
 
             if ($user) {
@@ -171,14 +165,7 @@ class SocialAuthController extends Controller
                 }
                 $user->save();
 
-                $token = $user->createToken('auth_token')->plainTextToken;
-                $frontendUrl = config('services.frontend_url', 'http://localhost:3000');
-                $query = http_build_query([
-                    'token' => $token,
-                    'provider' => 'facebook',
-                    'is_new_user' => 'false',
-                ]);
-                return redirect()->away("{$frontendUrl}/auth/callback?{$query}{$redirectParam}");
+                return $this->redirectWithLoginCode($user, 'facebook', false, $redirectParam);
             } else {
                 // Create new user
                 $user = User::create([
@@ -190,19 +177,43 @@ class SocialAuthController extends Controller
                     'email_verified_at' => now(),
                 ]);
 
-                $token = $user->createToken('auth_token')->plainTextToken;
-                $frontendUrl = config('services.frontend_url', 'http://localhost:3000');
-                $query = http_build_query([
-                    'token' => $token,
-                    'provider' => 'facebook',
-                    'is_new_user' => 'true',
-                ]);
-                return redirect()->away("{$frontendUrl}/auth/callback?{$query}{$redirectParam}");
+                return $this->redirectWithLoginCode($user, 'facebook', true, $redirectParam);
             }
         } catch (\Exception $e) {
-            Log::error('Facebook callback error: ' . $e->getMessage());
+            Log::error('Facebook callback error', ['exception' => get_class($e)]);
             $frontendUrl = config('services.frontend_url', 'http://localhost:3000');
             return redirect()->away("{$frontendUrl}/login?error=auth_failed");
         }
+    }
+
+    public function exchangeLoginCode(Request $request)
+    {
+        $validated = $request->validate([
+            'code' => ['required', 'string', 'max:128'],
+            'remember_me' => ['sometimes', 'boolean'],
+        ]);
+        $exchange = app(\App\Services\OAuthLoginExchange::class)->consume($validated['code']);
+
+        if (!$exchange || !($user = User::find($exchange['user_id'] ?? null))) {
+            return response()->json(['message' => 'The sign-in code is invalid or expired.'], 422);
+        }
+
+        $expiresAt = now()->addDays((bool) ($validated['remember_me'] ?? false) ? 7 : 3);
+
+        return response()->json([
+            'token' => $user->createToken('auth_token', ['*'], $expiresAt)->plainTextToken,
+            'expires_at' => $expiresAt->toIso8601String(),
+            'provider' => $exchange['provider'],
+            'is_new_user' => (bool) $exchange['is_new_user'],
+        ]);
+    }
+
+    private function redirectWithLoginCode(User $user, string $provider, bool $isNewUser, string $redirectParam)
+    {
+        $code = app(\App\Services\OAuthLoginExchange::class)->issue($user, $provider, $isNewUser);
+        $frontendUrl = config('services.frontend_url', 'http://localhost:3000');
+        $query = http_build_query(['code' => $code]);
+
+        return redirect()->away("{$frontendUrl}/auth/callback?{$query}{$redirectParam}");
     }
 }

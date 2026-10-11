@@ -3,9 +3,12 @@
 namespace Tests\Feature;
 
 use App\Models\Channel;
+use App\Models\BusinessProfile;
 use App\Models\User;
+use App\Services\OAuthStateService;
 use Illuminate\Foundation\Testing\RefreshDatabase;
 use Tests\TestCase;
+use Laravel\Sanctum\Sanctum;
 
 class SallaOAuthTest extends TestCase
 {
@@ -18,19 +21,18 @@ class SallaOAuthTest extends TestCase
             'email' => 'test' . rand() . '@test.com',
             'password' => '123'
         ]);
-        $token = $user->createToken('test-token')->plainTextToken;
+        $business = BusinessProfile::create(['user_id' => $user->id, 'name' => 'Salla test business']);
+        Sanctum::actingAs($user);
 
-        $response = $this->get("/api/channels/connect/salla?token={$token}&redirect=dashboard");
-
-        $response->assertRedirect();
-        $this->assertStringContainsString('accounts.salla.sa', $response->getTargetUrl());
+        $response = $this->postJson('/api/channels/connect/salla', [], ['X-Business-Id' => (string) $business->id]);
+        $response->assertOk();
+        $this->assertStringContainsString('accounts.salla.sa', $response->json('url'));
     }
 
     public function test_salla_connect_without_token_fails(): void
     {
         $response = $this->get('/api/channels/connect/salla');
-
-        $response->assertRedirect(env('FRONTEND_URL') . '/dashboard/channels?error=unauthorized');
+        $response->assertStatus(405);
     }
 
     public function test_salla_callback_creates_channel(): void
@@ -40,11 +42,13 @@ class SallaOAuthTest extends TestCase
             'email' => 'test' . rand() . '@test.com',
             'password' => '123'
         ]);
+        $business = BusinessProfile::create(['user_id' => $user->id, 'name' => 'Salla test business']);
+        $state = app(OAuthStateService::class)->issue('salla', $user->id, ['business_id' => $business->id]);
         
         // Mock the Salla service responses
         $this->mockSallaServiceResponses();
 
-        $response = $this->get('/api/channels/callback/salla?code=test_code&state=' . $user->id . ':dashboard');
+        $response = $this->get('/api/channels/callback/salla?code=test_code&state=' . $state);
 
         $response->assertRedirect(env('FRONTEND_URL') . '/dashboard/channels?success=salla_connected');
 
@@ -62,8 +66,10 @@ class SallaOAuthTest extends TestCase
             'email' => 'test' . rand() . '@test.com',
             'password' => '123'
         ]);
+        $business = BusinessProfile::create(['user_id' => $user->id, 'name' => 'Salla test business']);
+        $state = app(OAuthStateService::class)->issue('salla', $user->id, ['business_id' => $business->id]);
 
-        $response = $this->get('/api/channels/callback/salla?error=access_denied&state=' . $user->id . ':dashboard');
+        $response = $this->get('/api/channels/callback/salla?error=access_denied&state=' . $state);
 
         $response->assertRedirect(env('FRONTEND_URL') . '/dashboard/channels?error=salla_denied');
     }

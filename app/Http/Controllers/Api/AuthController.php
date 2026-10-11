@@ -58,7 +58,7 @@ class AuthController extends Controller
                 $message->to($user->email)->subject('Naz Biz - Verify your email');
             });
         } catch (\Exception $e) {
-            \Illuminate\Support\Facades\Log::error('Verification Email Error: ' . $e->getMessage());
+            \Illuminate\Support\Facades\Log::error('Verification email delivery failed', ['exception_type' => get_class($e)]);
         }
     }
 
@@ -116,9 +116,10 @@ class AuthController extends Controller
 
     public function login(Request $request)
     {
-        $request->validate([
+        $validated = $request->validate([
             'email'    => 'required|email',
             'password' => 'required',
+            'remember_me' => 'sometimes|boolean',
         ]);
 
         $user = User::where('email', $request->email)->first();
@@ -129,7 +130,17 @@ class AuthController extends Controller
             ]);
         }
 
-        $token = $user->createToken('auth_token')->plainTextToken;
+        if (!$user->email_verified_at) {
+            return response()->json([
+                'message' => 'Please verify your email before signing in.',
+                'error_code' => 'EMAIL_NOT_VERIFIED',
+                'requires_verification' => true,
+                'email' => $user->email,
+            ], 403);
+        }
+
+        $expiresAt = now()->addDays((bool) ($validated['remember_me'] ?? false) ? 7 : 3);
+        $token = $user->createToken('auth_token', ['*'], $expiresAt)->plainTextToken;
 
         return response()->json([
             'user'  => $user,
@@ -182,9 +193,16 @@ class AuthController extends Controller
             return response()->json(['message' => 'Current password is incorrect'], 400);
         }
 
-        $user->update([
-            'password' => Hash::make($validated['new_password']),
-        ]);
+        \DB::transaction(function () use ($user, $validated) {
+            $user->update(['password' => Hash::make($validated['new_password'])]);
+
+            $currentToken = $user->currentAccessToken();
+            if ($currentToken instanceof \Laravel\Sanctum\PersonalAccessToken) {
+                $user->tokens()->where('id', '!=', $currentToken->getKey())->delete();
+            } else {
+                $user->tokens()->delete();
+            }
+        });
 
         return response()->json(['message' => 'Password changed successfully']);
     }
@@ -214,7 +232,7 @@ class AuthController extends Controller
                 $message->to($user->email)->subject('Naz Biz - Password Reset Code');
             });
         } catch (\Exception $e) {
-            \Illuminate\Support\Facades\Log::error('Forgot Password Email Error: ' . $e->getMessage());
+            \Illuminate\Support\Facades\Log::error('Password reset email delivery failed', ['exception_type' => get_class($e)]);
         }
 
         return response()->json(['message' => 'If your account exists, a 6-digit reset code has been sent to your email.']);
@@ -245,11 +263,11 @@ class AuthController extends Controller
             return response()->json(['message' => 'User not found.'], 404);
         }
 
-        $user->update([
-            'password' => Hash::make($request->password),
-        ]);
-
-        \DB::table('password_reset_tokens')->where('email', $request->email)->delete();
+        \DB::transaction(function () use ($user, $request) {
+            $user->update(['password' => Hash::make($request->password)]);
+            $user->tokens()->delete();
+            \DB::table('password_reset_tokens')->where('email', $request->email)->delete();
+        });
 
         return response()->json(['message' => 'Password reset successfully. You can now login.']);
     }

@@ -20,10 +20,12 @@ class Message extends Model
         });
 
         static::created(function (Message $message): void {
+            app(\App\Services\MessageAuditLogger::class)->created($message);
             app(\App\Services\InboundConsentKeywordHandler::class)->handle($message);
         });
 
         static::updated(function (Message $message): void {
+            app(\App\Services\MessageAuditLogger::class)->statusChanged($message);
             if ($message->direction !== 'outbound'
                 || !$message->wasChanged(['send_status', 'delivery_status', 'error_details'])) {
                 return;

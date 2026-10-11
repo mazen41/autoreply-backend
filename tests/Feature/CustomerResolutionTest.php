@@ -148,7 +148,7 @@ class CustomerResolutionTest extends TestCase
         Queue::fake();
 
         $fixture = $this->makeBusiness();
-        $this->makeChannel($fixture, 'instagram', ['page_id' => '17841400000000099']);
+        $this->makeChannel($fixture, 'instagram', ['instagram_account_id' => '17841400000000099']);
 
         $payload = [
             'object' => 'instagram',
@@ -194,7 +194,7 @@ class CustomerResolutionTest extends TestCase
         Queue::fake();
 
         $fixture = $this->makeBusiness();
-        $this->makeChannel($fixture, 'instagram', ['page_id' => '17841400000000100']);
+        $this->makeChannel($fixture, 'instagram', ['instagram_account_id' => '17841400000000100']);
 
         $mid = 'mid_dup_' . uniqid();
         $payload = [
@@ -236,7 +236,7 @@ class CustomerResolutionTest extends TestCase
         Queue::fake();
 
         $fixture = $this->makeBusiness();
-        $this->makeChannel($fixture, 'instagram', ['page_id' => '17841400000000999']);
+        $this->makeChannel($fixture, 'instagram', ['instagram_account_id' => '17841400000000999']);
         $payload = [
             'object' => 'instagram',
             'entry' => [[

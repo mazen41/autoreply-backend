@@ -943,7 +943,7 @@ class ProcessAutoReply implements ShouldQueue
             $phone = $this->senderPhoneDigits($conversation);
             try {
                 if ($commerceChannel->type === 'shopify' && $phone !== '') {
-                    $response = Http::withToken($commerceChannel->access_token)
+                    $response = \App\Services\ShopifyHttp::client($commerceChannel->access_token)
                         ->get("https://{$commerceChannel->page_id}/admin/api/" . config('services.shopify.api_version', '2026-07') . "/orders.json", [
                             'status' => 'any',
                             'limit' => 1,
@@ -1087,7 +1087,7 @@ class ProcessAutoReply implements ShouldQueue
                                 $shopifyChannel = $commerceChannel;
 
                                 if ($shopifyChannel && $phoneMatch) {
-                                    $shopifyResponse = Http::withToken($shopifyChannel->access_token)
+                                    $shopifyResponse = \App\Services\ShopifyHttp::client($shopifyChannel->access_token)
                                         ->get("https://{$shopifyChannel->page_id}/admin/api/" . config('services.shopify.api_version', '2026-07') . "/orders.json", [
                                             'customer_phone' => $phoneMatch,
                                             'status' => 'any',
@@ -3728,7 +3728,7 @@ $aiResponse = $intro
                         $nameParts = preg_split('/\s+/', trim((string) ($checkoutState['full_name'] ?? '')), 2) ?: [];
                         $shop  = $shopifyChannel->page_id;
                         $token = $shopifyChannel->access_token;
-                        $response = Http::withToken($token)->post("https://{$shop}/admin/api/" . config('services.shopify.api_version', '2026-07') . "/orders.json", \App\Services\ShopifyOrderPayload::build((int) $variantMatch[1], (int) ($checkoutState['quantity'] ?? 1), $checkoutState));
+                        $response = \App\Services\ShopifyHttp::client($token)->post("https://{$shop}/admin/api/" . config('services.shopify.api_version', '2026-07') . "/orders.json", \App\Services\ShopifyOrderPayload::build((int) $variantMatch[1], (int) ($checkoutState['quantity'] ?? 1), $checkoutState));
 
                         if ($response->successful()) {
                             $resJson = $response->json();

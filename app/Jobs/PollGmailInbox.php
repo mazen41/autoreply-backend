@@ -87,7 +87,7 @@ class PollGmailInbox implements ShouldQueue
             }
 
         } catch (\Exception $e) {
-            Log::error('Gmail poll exception', ['error' => $e->getMessage(), 'channel_id' => $channel->id]);
+            Log::error('Gmail poll exception', ['exception_type' => get_class($e), 'channel_id' => $channel->id]);
         }
     }
 
@@ -110,8 +110,10 @@ class PollGmailInbox implements ShouldQueue
         }
 
         Log::info('Gmail: new email received', [
-            'from'    => $senderEmail,
-            'subject' => $subject,
+            'channel_id' => $channel->id,
+            'has_sender' => $senderEmail !== '',
+            'has_subject' => $subject !== '',
+            'body_length' => mb_strlen($body),
         ]);
 
         $conversation = Conversation::firstOrCreate(
@@ -137,7 +139,7 @@ class PollGmailInbox implements ShouldQueue
         } catch (\Throwable $e) {
             Log::warning('Gmail: customer resolution failed', [
                 'conversation_id' => $conversation->id,
-                'error'           => $e->getMessage(),
+                'exception'       => get_class($e),
             ]);
         }
 
@@ -226,7 +228,7 @@ class PollGmailInbox implements ShouldQueue
 
             return $response->json()['candidates'][0]['content']['parts'][0]['text'] ?? null;
         } catch (\Exception $e) {
-            Log::error('Gemini Gmail exception', ['error' => $e->getMessage()]);
+            Log::error('Gemini Gmail exception', ['exception_type' => get_class($e)]);
             return null;
         }
     }

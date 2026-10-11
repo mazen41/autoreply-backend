@@ -51,11 +51,13 @@ class InboxRealtimeTest extends TestCase
         $this->business = BusinessProfile::factory()->create([
             'user_id' => $this->user->id,
         ]);
+        $this->withHeader('X-Business-Id', (string) $this->business->id);
         $this->channel = Channel::factory()->create([
             'user_id' => $this->user->id,
             'business_id' => $this->business->id,
             'type' => 'whatsapp',
             'status' => 'connected',
+            'metadata' => ['whatsapp_provider' => 'evolution', 'unofficial_risk_accepted' => true],
         ]);
 
         \App\Models\WhatsAppInstance::create([
@@ -84,6 +86,23 @@ class InboxRealtimeTest extends TestCase
             'status' => 'open',
             'ai_enabled' => true,
         ], $attrs));
+    }
+
+    public function test_active_team_member_can_read_selected_business_inbox(): void
+    {
+        $conversation = $this->makeConversation();
+        $agent = User::factory()->create();
+        TeamMember::factory()->create([
+            'business_id' => $this->business->id,
+            'user_id' => $agent->id,
+            'role' => 'agent',
+            'is_active' => true,
+        ]);
+
+        $response = $this->actingAs($agent, 'sanctum')->getJson('/api/inbox');
+        $response->assertOk()->assertJsonPath('data.0.id', $conversation->id);
+
+        $this->withoutHeader('X-Business-Id')->getJson('/api/inbox')->assertStatus(422);
     }
 
     // ── message.received contract ─────────────────────────────────────
@@ -366,6 +385,70 @@ class InboxRealtimeTest extends TestCase
         $row = collect($response->json('data'))->firstWhere('id', $conversation->id);
         $this->assertNotNull($row);
         $this->assertEquals(2, $row['unread_count']);
+    }
+
+    public function test_opening_a_conversation_clears_unread_for_that_agent(): void
+    {
+        $conversation = $this->makeConversation();
+        Message::factory()->create([
+            'conversation_id' => $conversation->id,
+            'direction' => 'inbound',
+            'created_at' => now(),
+        ]);
+
+        $this->actingAs($this->user, 'sanctum')
+            ->postJson("/api/businesses/{$this->business->id}/conversations/{$conversation->id}/read")
+            ->assertOk();
+
+        $response = $this->getJson('/api/inbox');
+        $row = collect($response->json('data'))->firstWhere('id', $conversation->id);
+        $this->assertSame(0, $row['unread_count']);
+    }
+
+    public function test_new_inbound_message_after_read_increments_unread_count(): void
+    {
+        $conversation = $this->makeConversation();
+        $this->actingAs($this->user, 'sanctum')
+            ->postJson("/api/businesses/{$this->business->id}/conversations/{$conversation->id}/read")
+            ->assertOk();
+
+        Message::factory()->create([
+            'conversation_id' => $conversation->id,
+            'direction' => 'inbound',
+            'created_at' => now()->addSecond(),
+        ]);
+
+        $response = $this->getJson('/api/inbox');
+        $row = collect($response->json('data'))->firstWhere('id', $conversation->id);
+        $this->assertSame(1, $row['unread_count']);
+    }
+
+    public function test_one_team_members_read_does_not_clear_another_members_unread_count(): void
+    {
+        $conversation = $this->makeConversation();
+        Message::factory()->create([
+            'conversation_id' => $conversation->id,
+            'direction' => 'inbound',
+            'created_at' => now(),
+        ]);
+        $agent = User::factory()->create();
+        TeamMember::factory()->create([
+            'business_id' => $this->business->id,
+            'user_id' => $agent->id,
+            'role' => 'agent',
+            'is_active' => true,
+        ]);
+
+        $this->actingAs($agent, 'sanctum')
+            ->withHeader('X-Business-Id', (string) $this->business->id)
+            ->postJson("/api/businesses/{$this->business->id}/conversations/{$conversation->id}/read")
+            ->assertOk();
+
+        $this->actingAs($this->user, 'sanctum')
+            ->withHeader('X-Business-Id', (string) $this->business->id);
+        $response = $this->getJson('/api/inbox');
+        $row = collect($response->json('data'))->firstWhere('id', $conversation->id);
+        $this->assertSame(1, $row['unread_count']);
     }
 
     // ── Payload size (Pusher 10 KB limit) ──────────────────────────────

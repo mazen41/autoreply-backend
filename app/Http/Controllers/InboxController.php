@@ -10,22 +10,28 @@ use Illuminate\Http\Request;
 use Illuminate\Support\Facades\Http;
 use Illuminate\Support\Facades\Log;
 use Illuminate\Support\Facades\Storage;
+use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Str;
-use Laravel\Sanctum\PersonalAccessToken;
 use Google\Client as GoogleClient;
 use Google\Service\Gmail;
 
 class InboxController extends Controller
 {
+    private function conversationQuery(Request $request, string $permission = 'conversation_read')
+    {
+        $business = app(\App\Services\ActiveBusiness::class)->resolve($request, permission: $permission);
+        return Conversation::where('business_id', $business->id);
+    }
+
     /**
      * List all conversations for the authenticated user, newest first.
      * Supports search and advanced filtering.
      */
     public function index(Request $request)
     {
-        $query = Conversation::whereHas('channel', function ($q) {
-                $q->where('user_id', auth()->id());
-            })
+        $business = app(\App\Services\ActiveBusiness::class)->resolve($request, permission: 'conversation_read');
+        $userId = (int) $request->user()->id;
+        $query = Conversation::where('business_id', $business->id)
             ->with([
                 'channel:id,type,page_name,page_id',
                 'bot:id,name',
@@ -35,9 +41,10 @@ class InboxController extends Controller
             // Unread count within the 24h unread window — matches the
             // `unread` filter below and the realtime contract's
             // unread_count (InboxBroadcastPayload::unreadCount).
-            ->withCount(['messages as unread_count' => function ($q) {
+            ->withCount(['messages as unread_count' => function ($q) use ($userId) {
                 $q->where('direction', 'inbound')
-                  ->where('created_at', '>=', now()->subHours(24));
+                  ->where('created_at', '>=', now()->subHours(24))
+                  ->whereRaw('messages.created_at > COALESCE((SELECT conversation_reads.read_at FROM conversation_reads WHERE conversation_reads.conversation_id = messages.conversation_id AND conversation_reads.user_id = ? LIMIT 1), ?)', [$userId, now()->subHours(24)]);
             }]);
 
         // Agent-specific filter
@@ -69,7 +76,7 @@ class InboxController extends Controller
         if ($request->has('channel_id') && !empty($request->channel_id)) {
             $channelId = (int) $request->channel_id;
             $channelOwned = \App\Models\Channel::where('id', $channelId)
-                ->where('user_id', auth()->id())
+                ->where('business_id', $business->id)
                 ->exists();
             if (!$channelOwned) {
                 // Channel not owned by this user — return empty results
@@ -83,9 +90,7 @@ class InboxController extends Controller
         if ($request->has('bot_id') && !empty($request->bot_id)) {
             $botId = (int) $request->bot_id;
             $botOwned = \App\Models\Bot::where('id', $botId)
-                ->whereHas('channels', function ($q) {
-                    $q->where('user_id', auth()->id());
-                })
+                ->where('business_profile_id', $business->id)
                 ->exists();
             if (!$botOwned) {
                 // Bot not owned by this user — return empty results
@@ -107,9 +112,10 @@ class InboxController extends Controller
 
         // Unread filter (conversations with recent inbound messages)
         if ($request->has('unread') && $request->boolean('unread')) {
-            $query->whereHas('messages', function ($q) {
+            $query->whereHas('messages', function ($q) use ($userId) {
                 $q->where('direction', 'inbound')
-                  ->where('created_at', '>=', now()->subHours(24));
+                  ->where('created_at', '>=', now()->subHours(24))
+                  ->whereRaw('messages.created_at > COALESCE((SELECT conversation_reads.read_at FROM conversation_reads WHERE conversation_reads.conversation_id = messages.conversation_id AND conversation_reads.user_id = ? LIMIT 1), ?)', [$userId, now()->subHours(24)]);
             });
         }
 
@@ -141,9 +147,7 @@ class InboxController extends Controller
      */
     public function messages(Request $request, $conversationId)
     {
-        $conversation = Conversation::whereHas('channel', function ($q) {
-                $q->where('user_id', auth()->id());
-            })
+        $conversation = $this->conversationQuery($request, 'conversation_read')
             ->with('channel:id,type,page_name')
             ->findOrFail($conversationId);
 
@@ -157,6 +161,28 @@ class InboxController extends Controller
         ]);
     }
 
+    /** Mark this user's inbox view as read without changing another agent's state. */
+    public function markRead(Request $request, int $businessId, int $conversationId)
+    {
+        $business = app(\App\Services\ActiveBusiness::class)->resolve(
+            $request,
+            permission: 'conversation_read',
+            routeBusinessId: $businessId,
+        );
+        $conversation = Conversation::where('business_id', $business->id)->findOrFail($conversationId);
+        $now = now();
+
+        DB::table('conversation_reads')->upsert([[
+            'conversation_id' => $conversation->id,
+            'user_id' => $request->user()->id,
+            'read_at' => $now,
+            'created_at' => $now,
+            'updated_at' => $now,
+        ]], ['conversation_id', 'user_id'], ['read_at', 'updated_at']);
+
+        return response()->json(['success' => true, 'read_at' => $now->toISOString()]);
+    }
+
     /**
      * Send a manual reply from the business owner.
      */
@@ -164,9 +190,7 @@ class InboxController extends Controller
     {
         $request->validate(['message' => 'required|string|max:2000']);
 
-        $conversation = Conversation::whereHas('channel', function ($q) {
-                $q->where('user_id', auth()->id());
-            })
+        $conversation = $this->conversationQuery($request, 'conversation_write')
             ->findOrFail($conversationId);
 
         $channel = $conversation->channel;
@@ -196,14 +220,32 @@ class InboxController extends Controller
             'voice_note' => 'nullable|boolean',
         ]);
 
-        $conversation = Conversation::whereHas('channel', function ($q) {
-                $q->where('user_id', auth()->id());
-            })
+        $conversation = $this->conversationQuery($request, 'conversation_write')
             ->findOrFail($conversationId);
 
         $channel = $conversation->channel;
         if ($channel->type !== 'whatsapp') {
             return response()->json(['error' => 'Media uploads are only supported for WhatsApp conversations right now'], 400);
+        }
+        if ($blocked = $this->planUsageBlock($channel, $conversation, (string) $request->caption, 'whatsapp_media')) {
+            return $blocked;
+        }
+
+        $isCloud = ($channel->metadata['whatsapp_provider'] ?? null) === 'cloud';
+        if ($isCloud && !$this->withinWhatsAppCustomerCareWindow($conversation)) {
+            $reason = 'A WhatsApp template is required because the 24-hour customer care window has expired.';
+            $blocked = $this->recordBlockedOutboundMessage($channel, $conversation, $caption, $reason, 'whatsapp_media');
+            return response()->json(['error' => $reason, 'message' => $blocked], 422);
+        }
+        if ($isCloud && ($request->media_type ?: $this->mediaTypeFromMime($request->file('file')->getMimeType() ?: '')) !== 'image') {
+            $reason = 'WhatsApp Cloud media replies currently support images only.';
+            $blocked = $this->recordBlockedOutboundMessage($channel, $conversation, (string) $request->caption, $reason, 'whatsapp_media');
+            return response()->json(['error' => $reason, 'message' => $blocked], 422);
+        }
+        if (!$isCloud && ($channel->metadata['unofficial_risk_accepted'] ?? false) !== true) {
+            $reason = 'Acknowledge the unofficial WhatsApp connection risk before sending messages.';
+            $blocked = $this->recordBlockedOutboundMessage($channel, $conversation, (string) $request->caption, $reason, 'whatsapp_media');
+            return response()->json(['error' => $reason, 'message' => $blocked], 403);
         }
 
         try {
@@ -224,27 +266,40 @@ class InboxController extends Controller
             $path = $file->storeAs('whatsapp/outgoing/' . now()->format('Y/m'), Str::uuid() . '-' . $safeFileName, $disk);
             $mediaUrl = Storage::disk($disk)->url($path);
 
-            $whatsappService = new EvolutionApiService();
             $instanceName = $channel->page_id;
             $caption = $request->caption ?? '';
 
-            if ($mediaType === 'audio' && $request->boolean('voice_note')) {
-                $response = $whatsappService->sendWhatsAppAudio($instanceName, $conversation->sender_id, $mediaUrl);
+            if ($isCloud) {
+                $cloudResult = app(\App\Services\WhatsAppCloudApiService::class)
+                    ->sendImage($channel, $conversation->sender_id, $mediaUrl, $caption);
+                if (empty($cloudResult['success'])) {
+                    $reason = (string) ($cloudResult['reason'] ?? 'WhatsApp Cloud provider rejected the image.');
+                    $failed = $this->recordFailedOutboundMessage($channel, $conversation, $caption, $reason, 'whatsapp_media');
+                    return response()->json(['error' => 'Failed to send WhatsApp Cloud image', 'message' => $failed], 502);
+                }
+                $response = ['key' => ['id' => $cloudResult['message_id'] ?? null, 'remoteJid' => $conversation->sender_id, 'fromMe' => true]];
             } else {
-                $response = $whatsappService->sendMediaMessage(
-                    $instanceName,
-                    $conversation->sender_id,
-                    $mediaUrl,
-                    $caption,
-                    $mediaType,
-                    $mimeType,
-                    $fileName
-                );
+                $whatsappService = new EvolutionApiService();
+                if ($mediaType === 'audio' && $request->boolean('voice_note')) {
+                    $response = $whatsappService->sendWhatsAppAudio($instanceName, $conversation->sender_id, $mediaUrl);
+                } else {
+                    $response = $whatsappService->sendMediaMessage(
+                        $instanceName,
+                        $conversation->sender_id,
+                        $mediaUrl,
+                        $caption,
+                        $mediaType,
+                        $mimeType,
+                        $fileName
+                    );
+                }
             }
 
             if (!isset($response['key']['id'])) {
-                Log::error('WhatsApp media reply failed', ['response' => $response]);
-                return response()->json(['error' => 'Failed to send WhatsApp media'], 500);
+                Log::error('WhatsApp media reply failed', ['response_keys' => array_keys($response)]);
+                $reason = 'WhatsApp provider did not return a media message ID.';
+                $failed = $this->recordFailedOutboundMessage($channel, $conversation, $caption, $reason, 'whatsapp_media');
+                return response()->json(['error' => $reason, 'message' => $failed], 502);
             }
 
             $message = Message::create([
@@ -256,6 +311,7 @@ class InboxController extends Controller
                 'status' => 'manual',
                 'source' => 'whatsapp',
                 'send_status' => 'sent',
+                'delivery_status' => 'sent',
                 'media_url' => $mediaUrl,
                 'media_type' => $mediaType,
                 'mime_type' => $mimeType,
@@ -299,7 +355,7 @@ class InboxController extends Controller
 
             return response()->json(['success' => true, 'message' => $message]);
         } catch (\Exception $e) {
-            Log::error('WhatsApp media reply failed', ['error' => $e->getMessage(), 'channel_id' => $channel->id]);
+            Log::error('WhatsApp media reply failed', ['exception_type' => get_class($e), 'channel_id' => $channel->id]);
             return response()->json(['error' => 'Failed to send WhatsApp media: ' . $e->getMessage()], 500);
         }
     }
@@ -311,26 +367,26 @@ class InboxController extends Controller
     {
         $user = auth('sanctum')->user();
 
-        if (!$user && $request->query('token')) {
-            $accessToken = PersonalAccessToken::findToken((string) $request->query('token'));
-            $user = $accessToken?->tokenable;
-        }
-
         if (!$user) {
             return response()->json(['error' => 'Unauthenticated'], 401);
         }
 
-        $message = Message::whereHas('conversation.channel', function ($q) use ($user) {
-                $q->where('user_id', $user->id);
-            })
+        $business = app(\App\Services\ActiveBusiness::class)->resolve($request, permission: 'conversation_read');
+        $message = Message::whereHas('conversation', fn ($q) => $q->where('business_id', $business->id))
             ->findOrFail($messageId);
 
         if (!$message->media_url) {
             return response()->json(['error' => 'Attachment not found'], 404);
         }
 
-        $disk = config('services.evolution.media_disk', 'public');
+        $disk = data_get($message->metadata, 'media.storage_disk')
+            ?: config('services.evolution.media_disk', 'public');
         $path = $this->storagePathFromMediaUrl($message->media_url);
+
+        if ($disk === config('services.evolution.incoming_media_disk', 'private_media')
+            && $path && !app(\App\Services\IncomingMediaStorage::class)->absolutePath($path, $disk)) {
+            return response()->json(['error' => 'File unavailable'], 404);
+        }
 
         if (!$path || !Storage::disk($disk)->exists($path)) {
             Log::warning('Message media missing from storage', [
@@ -359,6 +415,10 @@ class InboxController extends Controller
      */
     private function sendGmailReply(Request $request, Conversation $conversation, Channel $channel)
     {
+        if ($blocked = $this->planUsageBlock($channel, $conversation, $request->message, 'gmail')) {
+            return $blocked;
+        }
+
         try {
             $client = $this->getGmailClient($channel);
             if (!$client) {
@@ -388,6 +448,8 @@ class InboxController extends Controller
                 'direction'       => 'outbound',
                 'is_ai'           => false,
                 'status'          => 'manual',
+                'send_status'     => 'sent',
+                'delivery_status' => 'sent',
                 'gmail_message_id' => $sentMessage->getId(),
             ]);
 
@@ -400,8 +462,10 @@ class InboxController extends Controller
             return response()->json(['success' => true, 'message' => $message]);
 
         } catch (\Exception $e) {
-            Log::error('Gmail reply failed', ['error' => $e->getMessage(), 'channel_id' => $channel->id]);
-            return response()->json(['error' => 'Failed to send Gmail reply: ' . $e->getMessage()], 500);
+            Log::error('Gmail reply failed', ['exception_type' => get_class($e), 'channel_id' => $channel->id]);
+            $reason = 'Gmail provider rejected or could not confirm the reply.';
+            $failed = $this->recordFailedOutboundMessage($channel, $conversation, $request->message, $reason, 'gmail');
+            return response()->json(['error' => $reason, 'message' => $failed], 502);
         }
     }
 
@@ -410,6 +474,10 @@ class InboxController extends Controller
      */
     private function sendFacebookReply(Request $request, Conversation $conversation, Channel $channel)
     {
+        if ($blocked = $this->planUsageBlock($channel, $conversation, $request->message, 'facebook')) {
+            return $blocked;
+        }
+
         // The Channel model's accessor already decrypts access_token — do NOT
         // call decrypt() again or it will throw "The payload is invalid."
         $accessToken = $channel->access_token;
@@ -424,8 +492,10 @@ class InboxController extends Controller
             );
 
         if (!$fbResponse->successful()) {
-            Log::error('Manual reply failed', $fbResponse->json());
-            return response()->json(['error' => 'Failed to send message via Facebook', 'details' => $fbResponse->json()], 500);
+            Log::error('Manual reply failed', ['http_status' => $fbResponse->status()]);
+            $reason = (string) ($fbResponse->json('error.message') ?? $fbResponse->json('error.code') ?? 'Facebook provider rejected the reply.');
+            $failed = $this->recordFailedOutboundMessage($channel, $conversation, $request->message, $reason, 'facebook');
+            return response()->json(['error' => 'Failed to send message via Facebook', 'message' => $failed], 502);
         }
 
         // Save to DB
@@ -435,6 +505,9 @@ class InboxController extends Controller
             'direction'       => 'outbound',
             'is_ai'           => false,
             'status'          => 'manual',
+            'send_status'     => 'sent',
+            'delivery_status' => 'sent',
+            'metadata'        => ['platform_message_id' => $fbResponse->json('message_id')],
         ]);
 
         $conversation->update(['last_message_at' => now()]);
@@ -452,6 +525,50 @@ class InboxController extends Controller
     private function sendWhatsAppReply(Request $request, Conversation $conversation, Channel $channel)
     {
         try {
+            if ($blocked = $this->planUsageBlock($channel, $conversation, $request->message, 'whatsapp')) {
+                return $blocked;
+            }
+
+            if (($channel->metadata['whatsapp_provider'] ?? null) !== 'cloud'
+                && ($channel->metadata['unofficial_risk_accepted'] ?? false) !== true) {
+                $reason = 'Acknowledge the unofficial WhatsApp connection risk before sending messages.';
+                $blocked = $this->recordBlockedOutboundMessage($channel, $conversation, $request->message, $reason, 'whatsapp');
+                return response()->json(['error' => $reason, 'message' => $blocked], 403);
+            }
+
+            if (($channel->metadata['whatsapp_provider'] ?? null) === 'cloud') {
+                if (!$this->withinWhatsAppCustomerCareWindow($conversation)) {
+                    $reason = 'A WhatsApp template is required because the 24-hour customer care window has expired.';
+                    $blocked = $this->recordBlockedOutboundMessage($channel, $conversation, $request->message, $reason, 'whatsapp');
+                    return response()->json(['error' => $reason, 'message' => $blocked], 422);
+                }
+
+                $message = Message::create([
+                    'conversation_id' => $conversation->id,
+                    'content' => $request->message,
+                    'direction' => 'outbound',
+                    'is_ai' => false,
+                    'status' => 'manual',
+                    'source' => 'whatsapp',
+                    'send_status' => 'pending',
+                ]);
+                $sent = app(\App\Services\ChannelMessageService::class)
+                    ->sendMessage($channel, $conversation, $message);
+                if (!$sent) {
+                    $current = $message->fresh();
+                    $statusCode = $current?->send_status === 'blocked' ? 422 : 502;
+                    return response()->json([
+                        'error' => $current?->error_details ?: 'Failed to send WhatsApp Cloud message',
+                        'message' => $current,
+                    ], $statusCode);
+                }
+                $conversation->update(['last_message_at' => now()]);
+                if ($channel->user_id) {
+                    broadcast(new \App\Events\MessageReceived($message->fresh(), $conversation, $channel->user_id));
+                }
+                return response()->json(['success' => true, 'message' => $message->fresh()]);
+            }
+
             $whatsappService = new EvolutionApiService();
             $instanceName = $channel->page_id; // We store instance_name in page_id for WhatsApp
 
@@ -463,8 +580,10 @@ class InboxController extends Controller
             );
 
             if (!isset($response['key']['id'])) {
-                Log::error('WhatsApp reply failed', ['response' => $response]);
-                return response()->json(['error' => 'Failed to send WhatsApp message'], 500);
+                Log::error('WhatsApp reply failed', ['response_keys' => array_keys($response)]);
+                $reason = 'WhatsApp provider did not return a message ID.';
+                $failed = $this->recordFailedOutboundMessage($channel, $conversation, $request->message, $reason, 'whatsapp');
+                return response()->json(['error' => $reason, 'message' => $failed], 502);
             }
 
             // Save to DB
@@ -476,6 +595,7 @@ class InboxController extends Controller
                 'status'          => 'manual',
                 'source'          => 'whatsapp',
                 'send_status'     => 'sent',
+                'delivery_status' => 'sent',
                 'whatsapp_message_id' => $response['key']['id'] ?? null,
                 'whatsapp_remote_jid' => $response['key']['remoteJid'] ?? $conversation->sender_id,
                 'whatsapp_from_me' => $response['key']['fromMe'] ?? true,
@@ -513,9 +633,84 @@ class InboxController extends Controller
             return response()->json(['success' => true, 'message' => $message]);
 
         } catch (\Exception $e) {
-            Log::error('WhatsApp reply failed', ['error' => $e->getMessage(), 'channel_id' => $channel->id]);
-            return response()->json(['error' => 'Failed to send WhatsApp reply: ' . $e->getMessage()], 500);
+            Log::error('WhatsApp reply failed', ['exception_type' => get_class($e), 'channel_id' => $channel->id]);
+            $reason = 'WhatsApp provider rejected or could not confirm the reply.';
+            $failed = $this->recordFailedOutboundMessage($channel, $conversation, $request->message, $reason, 'whatsapp');
+            return response()->json(['error' => $reason, 'message' => $failed], 502);
         }
+    }
+
+    private function withinWhatsAppCustomerCareWindow(Conversation $conversation): bool
+    {
+        $lastInbound = $conversation->messages()->where('direction', 'inbound')->latest('created_at')->first();
+        return $lastInbound !== null && $lastInbound->created_at->gt(now()->subHours(24));
+    }
+
+    private function planUsageBlock(Channel $channel, Conversation $conversation, string $content, string $source)
+    {
+        $business = $conversation->business;
+        if (!$business) {
+            return response()->json(['error' => 'Business context is required to send this message.'], 422);
+        }
+
+        $decision = app(\App\Services\UsageMeter::class)->canUse(
+            $business,
+            \App\Services\UsageMeter::OUTBOUND_MESSAGES,
+        );
+        if ($decision['allowed']) {
+            return null;
+        }
+
+        $reason = 'The business plan limit for monthly outbound messages has been reached.';
+        $message = $this->recordBlockedOutboundMessage($channel, $conversation, $content, $reason, $source);
+        return response()->json(['error' => $reason, 'message' => $message], 403);
+    }
+
+    private function recordBlockedOutboundMessage(
+        Channel $channel,
+        Conversation $conversation,
+        string $content,
+        string $reason,
+        string $source,
+    ): Message {
+        $message = Message::create([
+            'conversation_id' => $conversation->id,
+            'content' => $content,
+            'direction' => 'outbound',
+            'is_ai' => false,
+            'status' => 'blocked',
+            'source' => $source,
+            'send_status' => 'blocked',
+            'error_details' => mb_substr($reason, 0, 2000),
+        ]);
+        if ($channel->user_id) {
+            broadcast(new \App\Events\MessageReceived($message, $conversation, $channel->user_id));
+        }
+        return $message;
+    }
+
+    private function recordFailedOutboundMessage(
+        Channel $channel,
+        Conversation $conversation,
+        string $content,
+        string $reason,
+        string $source,
+    ): Message {
+        $message = Message::create([
+            'conversation_id' => $conversation->id,
+            'content' => $content,
+            'direction' => 'outbound',
+            'is_ai' => false,
+            'status' => 'failed',
+            'source' => $source,
+            'send_status' => 'failed',
+            'delivery_status' => 'failed',
+            'error_details' => mb_substr($reason, 0, 2000),
+        ]);
+        if ($channel->user_id) {
+            broadcast(new \App\Events\MessageReceived($message, $conversation, $channel->user_id));
+        }
+        return $message;
     }
 
     /**
@@ -527,9 +722,8 @@ class InboxController extends Controller
             'emoji' => 'required|string|max:10',
         ]);
 
-        $message = Message::whereHas('conversation.channel', function ($q) {
-                $q->where('user_id', auth()->id());
-            })
+        $business = app(\App\Services\ActiveBusiness::class)->resolve($request, permission: 'conversation_write');
+        $message = Message::whereHas('conversation', fn ($q) => $q->where('business_id', $business->id))
             ->with(['conversation.channel'])
             ->findOrFail($messageId);
         $channel = $message->conversation->channel;
@@ -537,6 +731,13 @@ class InboxController extends Controller
         // Only allow reactions for WhatsApp channels
         if ($channel->type !== 'whatsapp') {
             return response()->json(['error' => 'Reactions are only supported for WhatsApp messages'], 400);
+        }
+
+        if (($channel->metadata['whatsapp_provider'] ?? null) === 'cloud') {
+            return response()->json(['error' => 'WhatsApp Cloud reactions are not supported yet.'], 422);
+        }
+        if (($channel->metadata['unofficial_risk_accepted'] ?? false) !== true) {
+            return response()->json(['error' => 'Acknowledge the unofficial WhatsApp connection risk before sending messages.'], 403);
         }
 
         try {
@@ -555,7 +756,9 @@ class InboxController extends Controller
             );
 
             if (!$response || (isset($response['error']) && $response['error'])) {
-                Log::error('WhatsApp reaction failed', ['response' => $response]);
+                Log::error('WhatsApp reaction failed', [
+                    'response_keys' => is_array($response) ? array_keys($response) : [],
+                ]);
                 return response()->json(['error' => 'Failed to send reaction'], 500);
             }
 
@@ -579,7 +782,7 @@ class InboxController extends Controller
             return response()->json(['success' => true, 'reactions' => $currentReactions]);
 
         } catch (\Exception $e) {
-            Log::error('WhatsApp reaction error', ['error' => $e->getMessage(), 'message_id' => $messageId]);
+            Log::error('WhatsApp reaction error', ['exception_type' => get_class($e), 'message_id' => $messageId]);
             return response()->json(['error' => 'Failed to send reaction: ' . $e->getMessage()], 500);
         }
     }
@@ -589,9 +792,7 @@ class InboxController extends Controller
      */
     public function getTags(Request $request, $conversationId)
     {
-        $conversation = Conversation::whereHas('channel', function ($q) {
-                $q->where('user_id', auth()->id());
-            })
+        $conversation = $this->conversationQuery($request, 'conversation_read')
             ->findOrFail($conversationId);
 
         $tags = \App\Models\ConversationTag::where('conversation_id', $conversationId)
@@ -609,9 +810,7 @@ class InboxController extends Controller
             'tag' => 'required|string|max:50',
         ]);
 
-        $conversation = Conversation::whereHas('channel', function ($q) {
-                $q->where('user_id', auth()->id());
-            })
+        $conversation = $this->conversationQuery($request, 'conversation_write')
             ->findOrFail($conversationId);
 
         $tag = \App\Models\ConversationTag::firstOrCreate(
@@ -652,7 +851,7 @@ class InboxController extends Controller
                     ->executeWorkflowsForEvent(
                         \App\Services\AutomationEngine::EVENT_TAG_ADDED,
                         $conversation,
-                        ['tag' => $request->tag]
+                        ['tag' => $request->tag, 'tag_event_id' => $tag->id]
                     );
             } catch (\Exception $e) {
                 \Log::error('Failed to evaluate tag_added workflows', [
@@ -675,9 +874,7 @@ class InboxController extends Controller
      */
     public function removeTag(Request $request, $conversationId, $tagId)
     {
-        $conversation = Conversation::whereHas('channel', function ($q) {
-                $q->where('user_id', auth()->id());
-            })
+        $conversation = $this->conversationQuery($request, 'conversation_write')
             ->findOrFail($conversationId);
 
         $tag = \App\Models\ConversationTag::where('id', $tagId)
@@ -697,9 +894,8 @@ class InboxController extends Controller
      */
     public function getAllTags(Request $request)
     {
-        $tags = \App\Models\ConversationTag::whereHas('conversation.channel', function ($q) {
-                $q->where('user_id', auth()->id());
-            })
+        $business = app(\App\Services\ActiveBusiness::class)->resolve($request, permission: 'conversation_read');
+        $tags = \App\Models\ConversationTag::whereHas('conversation', fn ($q) => $q->where('business_id', $business->id))
             ->select('tag')
             ->distinct()
             ->get()
@@ -725,8 +921,13 @@ class InboxController extends Controller
 
     private function storagePathFromMediaUrl(string $mediaUrl): ?string
     {
+        if (str_contains($mediaUrl, "\0") || str_contains($mediaUrl, '\\')) {
+            return null;
+        }
+
         if (!preg_match('#^https?://#i', $mediaUrl)) {
-            return ltrim($mediaUrl, '/');
+            $relative = ltrim(rawurldecode($mediaUrl), '/');
+            return in_array('..', explode('/', $relative), true) ? null : $relative;
         }
 
         $path = parse_url($mediaUrl, PHP_URL_PATH);
@@ -737,10 +938,12 @@ class InboxController extends Controller
         $storagePrefix = '/storage/';
         $position = strpos($path, $storagePrefix);
         if ($position !== false) {
-            return urldecode(substr($path, $position + strlen($storagePrefix)));
+            $relative = urldecode(substr($path, $position + strlen($storagePrefix)));
+            return in_array('..', explode('/', $relative), true) ? null : $relative;
         }
 
-        return ltrim(urldecode($path), '/');
+        $relative = ltrim(urldecode($path), '/');
+        return in_array('..', explode('/', $relative), true) ? null : $relative;
     }
 
     public function updateStatus(Request $request, $conversationId)
@@ -749,9 +952,7 @@ class InboxController extends Controller
             'status' => 'required|in:open,closed,pending',
         ]);
 
-        $conversation = Conversation::whereHas('channel', function ($q) {
-                $q->where('user_id', auth()->id());
-            })
+        $conversation = $this->conversationQuery($request, 'conversation_write')
             ->findOrFail($conversationId);
 
         $conversation->update(['status' => $request->status]);
@@ -814,7 +1015,7 @@ class InboxController extends Controller
 
             return $client;
         } catch (\Exception $e) {
-            Log::error('Gmail client error', ['error' => $e->getMessage(), 'channel_id' => $channel->id]);
+            Log::error('Gmail client error', ['exception_type' => get_class($e), 'channel_id' => $channel->id]);
             return null;
         }
     }
@@ -845,9 +1046,7 @@ class InboxController extends Controller
      */
     public function toggleAi(Request $request, $conversationId)
     {
-        $conversation = Conversation::whereHas('channel', function ($q) {
-                $q->where('user_id', auth()->id());
-            })
+        $conversation = $this->conversationQuery($request, 'conversation_write')
             ->findOrFail($conversationId);
 
         $newValue = !$conversation->ai_enabled;
@@ -878,9 +1077,7 @@ class InboxController extends Controller
             'content' => 'required|string|max:5000',
         ]);
 
-        $conversation = Conversation::whereHas('channel', function ($q) {
-                $q->where('user_id', auth()->id());
-            })
+        $conversation = $this->conversationQuery($request, 'conversation_write')
             ->findOrFail($conversationId);
 
         $note = \App\Models\CustomerNote::create([
@@ -913,9 +1110,7 @@ class InboxController extends Controller
             'bot_id' => 'nullable|integer',
         ]);
 
-        $conversation = Conversation::whereHas('channel', function ($q) {
-                $q->where('user_id', auth()->id());
-            })
+        $conversation = $this->conversationQuery($request, 'conversation_write')
             ->with('bot:id,name')
             ->findOrFail($id);
 

@@ -74,6 +74,9 @@ class InboxBroadcastPayload
             'type'              => $message->type ?? 'text',
             'direction'         => $message->direction,
             'status'            => $message->status,
+            'send_status'       => $message->send_status,
+            'delivery_status'   => $message->delivery_status,
+            'error_details'     => $message->error_details,
             'is_ai'             => (bool) $message->is_ai,
             'media_url'         => $message->media_url,
             'media_type'        => $message->media_type,
@@ -91,7 +94,7 @@ class InboxBroadcastPayload
      * state, agent assignment, channel identity, bot identity and the
      * unread count.
      */
-    public static function conversationPayload(Conversation $conversation): array
+    public static function conversationPayload(Conversation $conversation, ?int $userId = null): array
     {
         $channel = $conversation->channel;
         $bot = $conversation->bot;
@@ -112,7 +115,7 @@ class InboxBroadcastPayload
             'assigned_agent_id' => $conversation->assigned_agent_id,
             'assigned_at'       => $conversation->assigned_at?->toISOString(),
             'channel_id'        => $conversation->channel_id,
-            'unread_count'      => self::unreadCount($conversation),
+            'unread_count'      => self::unreadCount($conversation, $userId),
             'channel'           => [
                 'id'        => $channel?->id,
                 'type'      => $channel?->type,
@@ -125,13 +128,13 @@ class InboxBroadcastPayload
     /**
      * Full message.received payload.
      */
-    public static function messageReceived(Message $message, Conversation $conversation): array
+    public static function messageReceived(Message $message, Conversation $conversation, ?int $userId = null): array
     {
         $messagePayload = self::messagePayload($message);
 
         return [
             'message'      => $messagePayload,
-            'conversation' => self::conversationPayload($conversation),
+            'conversation' => self::conversationPayload($conversation, $userId),
             // Top-level identity mirrors for consumers that don't need
             // the whole conversation object.
             'channel'      => $conversation->channel
@@ -150,10 +153,10 @@ class InboxBroadcastPayload
      * Full conversation.updated payload — fired on agent assignment,
      * AI toggle, status change, bot switch and tag changes.
      */
-    public static function conversationUpdated(Conversation $conversation): array
+    public static function conversationUpdated(Conversation $conversation, ?int $userId = null): array
     {
         return [
-            'conversation' => self::conversationPayload($conversation),
+            'conversation' => self::conversationPayload($conversation, $userId),
             'tags'         => $conversation->tags()
                 ->orderBy('id')
                 ->get(['id', 'tag'])
@@ -170,11 +173,22 @@ class InboxBroadcastPayload
      * Unread messages for a conversation within the unread window.
      * Definition matches the `unread` filter in InboxController@index.
      */
-    public static function unreadCount(Conversation $conversation): int
+    public static function unreadCount(Conversation $conversation, ?int $userId = null): int
     {
-        return (int) $conversation->messages()
+        $query = $conversation->messages()
             ->where('direction', 'inbound')
-            ->where('created_at', '>=', now()->subHours(self::UNREAD_WINDOW_HOURS))
-            ->count();
+            ->where('created_at', '>=', now()->subHours(self::UNREAD_WINDOW_HOURS));
+
+        if ($userId !== null) {
+            $readAt = \Illuminate\Support\Facades\DB::table('conversation_reads')
+                ->where('conversation_id', $conversation->id)
+                ->where('user_id', $userId)
+                ->value('read_at');
+            if ($readAt !== null) {
+                $query->where('created_at', '>', $readAt);
+            }
+        }
+
+        return (int) $query->count();
     }
 }

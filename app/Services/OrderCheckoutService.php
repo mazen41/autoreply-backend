@@ -121,7 +121,7 @@ class OrderCheckoutService
             Cache::put($cacheKey, $result, now()->addDays(30));
             return $result;
         } catch (\Throwable $e) {
-            Log::warning('Nominatim address lookup unavailable', ['exception_type' => get_class($e)]);
+            Log::warning('Nominatim address lookup unavailable', ['exception_type' => get_class($e), 'message' => self::maskSensitive($e->getMessage()), 'file' => basename($e->getFile()), 'line' => $e->getLine()]);
             return ['status' => 'unavailable', 'coordinates' => null];
         }
     }
@@ -377,10 +377,7 @@ class OrderCheckoutService
             }
         }
 
-        $extractedBuildingNumber = null;
-        if (preg_match('/(?:building|house|villa)\s*(?:number|no\.?|#)?\s*(?:(?:is|equals?)\s+|[:#-]\s*)?([A-Z0-9-]+)/i', $incomingText, $buildingMatch)) {
-            $extractedBuildingNumber = trim($buildingMatch[1]);
-        }
+        $extractedBuildingNumber = self::extractBuildingNumber((string) $incomingText);
 
         $extractedShortAddress = null;
         if (preg_match('/(?:short address|national address|العنوان المختصر)\s*(?:(?:is|equals?)\s+|[:#-]\s*)?([A-Z0-9]{4,12})/iu', $incomingText, $shortAddressMatch)) {
@@ -630,7 +627,7 @@ class OrderCheckoutService
         $requiredFields = self::REQUIRED_FIELDS;
         if ($requireSallaShippingDetails) {
             $requiredFields = array_merge($requiredFields, [
-                'email', 'postal_code', 'geo_coordinates', 'building_number',
+                'email', 'postal_code', 'building_number',
             ]);
 
             // Saudi National Address codes are not applicable to international
@@ -741,7 +738,7 @@ class OrderCheckoutService
         $normalized = preg_replace('/[,.!]*\s+please[.!]*$/u', '', $normalized) ?? $normalized;
 
         return (bool) preg_match(
-            '/^(?:(?:yes|yeah|yep|sure|ok|okay)(?:[,.!\\s]+confirm(?:\\s+(?:the\\s+)?order|\\s+(?:it|this))?)?|confirm(?:\\s+(?:the\\s+)?order|\\s+(?:it|this))?|please\\s+confirm(?:\\s+(?:the\\s+)?order)?|submit\\s+(?:the\\s+)?order|نعم(?:\\s+(?:أكد|اكد|تأكيد|موافق))?|(?:أكد|اكد|تأكيد|موافق|اعتمد)\\s+(?:الطلب|الاوردر)|تأكيد الطلب|تم التأكيد)[.!\\s]*$/ui',
+            '/^(?:(?:yes|yeah|yep|sure|ok|okay)(?:[,.!\\s]+(?:please\\s+)?confirm(?:\\s+(?:the\\s+)?order|\\s+(?:it|this))?)?|confirm(?:\\s+(?:the\\s+)?order|\\s+(?:it|this))?|please\\s+confirm(?:\\s+(?:the\\s+)?order)?|submit\\s+(?:the\\s+)?order|نعم(?:\\s+(?:أكد|اكد|تأكيد|موافق))?|(?:أكد|اكد|تأكيد|موافق|اعتمد)\\s+(?:الطلب|الاوردر)|تأكيد الطلب|تم التأكيد)[.!\\s]*$/ui',
             $normalized
         );
     }
@@ -777,5 +774,48 @@ class OrderCheckoutService
         }
 
         return $state;
+    }
+
+    /**
+     * Building number from typed address text. Postal codes and phone numbers are never returned.
+     * Handles labelled forms (building/house/villa/apt/flat, Arabic عمارة/مبنى/بناية/شقة) and a
+     * number at the start of a street address ("36 sayed abdelrahman ...").
+     */
+    public static function extractBuildingNumber(string $text): ?string
+    {
+        $text = trim($text);
+        if ($text === '') {
+            return null;
+        }
+
+        if (preg_match('/\b(?:building|house|villa|apt|apartment|flat)\s*(?:number|no\.?|#)?\s*(?:(?:is|equals?)\s+|[:#-]\s*)?(\d{1,6}[A-Za-z]?)\b/i', $text, $m) === 1) {
+            return $m[1];
+        }
+
+        if (preg_match('/(?:عمارة|عماره|مبنى|بناية|رقم\s+العمارة|رقم\s+المبنى|شقة)\s*(?:رقم\s*)?(\d{1,6}[A-Za-z]?)/u', $text, $m) === 1) {
+            return $m[1];
+        }
+
+        if (preg_match('/(?:^|[\s,،])(\d{1,5}[A-Za-z]?)\s+(?=\p{L})/u', $text, $m, PREG_OFFSET_CAPTURE) === 1) {
+            $number = $m[1][0];
+            $offset = (int) $m[1][1];
+            $before = strtolower(substr($text, max(0, $offset - 25), min(25, $offset)));
+            // A five-digit number after "postal code"/"zip" is a postal code, not a building.
+            if (strlen(preg_replace('/\D/', '', $number)) === 5 || preg_match('/postal|zip|postcode|post code|بريد|رمز/', $before) === 1) {
+                return null;
+            }
+
+            return $number;
+        }
+
+        return null;
+    }
+
+    /** Masks emails and phone-like numbers before text is written to logs. */
+    public static function maskSensitive(string $text): string
+    {
+        $text = preg_replace('/[\w.+-]+@[\w-]+\.[\w.-]+/u', '[email]', $text) ?? $text;
+
+        return preg_replace('/\+?\d[\d\s\-]{6,}\d/u', '[number]', $text) ?? $text;
     }
 }

@@ -82,7 +82,19 @@ class ReferencedProductResolver
             }
         }
 
-        if ($referenceId !== null && $referenceId !== '') {
+        // Quoting our own pending order summary is a confirmation reference, not a product reference.
+$checkoutForRef = is_array($conversation->checkout_state) ? $conversation->checkout_state : [];
+$summaryRow = !empty($checkoutForRef['confirmation_summary_message_id'])
+    ? \App\Models\Message::query()->find((int) $checkoutForRef['confirmation_summary_message_id'])
+    : null;
+$summaryReferences = array_filter([
+    (string) ($checkoutForRef['confirmation_summary_message_id'] ?? ''),
+    (string) ($summaryRow?->metadata['platform_message_id'] ?? ''),
+]);
+if ($referenceId !== null && in_array((string) $referenceId, $summaryReferences, true)) {
+    $referenceId = null;
+}
+if ($referenceId !== null && $referenceId !== '') {
             $mapQuery = clone $query;
             if ($channelType === 'web_chat' && str_starts_with((string) $referenceId, 'internal:')) {
                 $mapQuery->where('internal_message_id', (int) substr((string) $referenceId, 9));

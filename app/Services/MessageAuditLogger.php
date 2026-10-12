@@ -31,6 +31,14 @@ class MessageAuditLogger
         }
 
         $changes = [];
+        if ($message->wasChanged('content')) {
+            $changes['content'] = [
+                'from_hash' => self::hash($message->getOriginal('content')),
+                'to_hash' => self::hash($message->content),
+                'to_length' => mb_strlen((string) $message->content),
+            ];
+        }
+
         foreach (['send_status', 'delivery_status', 'error_details'] as $field) {
             if ($message->wasChanged($field)) {
                 $changes[$field] = [
@@ -98,5 +106,10 @@ class MessageAuditLogger
         $userId = Auth::id();
 
         return $userId ? 'merchant:' . $userId : ($message->source ?: 'system');
+    }
+
+    private static function hash(?string $text): ?string
+    {
+        return $text === null ? null : substr(sha1($text), 0, 12);
     }
 }

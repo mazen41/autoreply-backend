@@ -2029,7 +2029,9 @@ class ProcessAutoReply implements ShouldQueue
             }
         }
 
-        if (!$isProductBrowseMessage && $commerceChannel) {
+        // A customer confirming a pending order summary is not asking about a product.
+$summaryConfirmTurn = ($checkoutState['confirmation_state'] ?? null) === 'confirmation_pending' && \App\Services\OrderCheckoutService::isExplicitOrderConfirmation((string) $message->content);
+if (!$isProductBrowseMessage && $commerceChannel && !$summaryConfirmTurn) {
             if ($referenceResolution['resolution'] === 'ambiguous') {
                 $options = [];
                 foreach (array_values($referenceResolution['candidates']) as $index => $candidate) {

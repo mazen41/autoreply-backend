@@ -494,7 +494,7 @@ ROLE;
                 'email' => 'Email Address',
                 'postal_code' => 'Postal / ZIP Code',
                 'geo_coordinates' => 'delivery coordinates resolved by the application; do not request a map pin or coordinates from the customer',
-                'building_number' => 'Building or house number',
+                'building_number' => 'Building or house number', 'block' => 'block number or name', 'district' => 'district or area name',
                 'short_address' => 'Short / national address code',
                 'additional_number' => 'Additional address number',
             ];

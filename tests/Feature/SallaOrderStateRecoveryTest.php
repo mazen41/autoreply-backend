@@ -202,7 +202,7 @@ class SallaOrderStateRecoveryTest extends TestCase
         // 3. TURN 2: Customer provides the required delivery details.
         $msg2 = Message::create([
             'conversation_id' => $conversation->id,
-            'content' => 'My name is Mazen Hossny. My address is Cairo. My phone is 01152879755. Email is mazen@example.com, postal code 11511, building number 123, coordinates 30.0444,31.2357.',
+            'content' => 'My name is Mazen Hossny. My address is Cairo. My phone is 01152879755. Email is mazen@example.com, postal code 11511, building number 123, block 5, district Nasr City, coordinates 30.0444,31.2357.',
             'direction' => 'inbound',
             'is_ai' => false,
         ]);

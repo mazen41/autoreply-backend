@@ -1070,7 +1070,7 @@ class SallaService
                 'country'       => $shippingAddress['country_id'] ?? null,
                 'city'          => $shippingAddress['city_id'] ?? null,
                 'street_number' => $shippingAddress['street_number'] ?? ($checkoutState['building_number'] ?? null),
-                'block'         => $shippingAddress['block'] ?? null,
+                'block'         => $checkoutState['block'] ?? $shippingAddress['block'] ?? null,
                 'address'       => $shippingAddress['address'] ?? $freeformAddress,
                 'address_line'  => $shippingAddress['address'] ?? $freeformAddress,
                 'postal_code'   => $postalCode,

@@ -624,10 +624,11 @@ class OrderCheckoutService
             'full_name' => $nameValue,
         ]));
 
-        $requiredFields = self::REQUIRED_FIELDS;
+        $normalizedState = $requireSallaShippingDetails ? \App\Services\SallaAddressParser::fillMissing($normalizedState) : $normalizedState;
+$requiredFields = self::REQUIRED_FIELDS;
         if ($requireSallaShippingDetails) {
             $requiredFields = array_merge($requiredFields, [
-                'email', 'postal_code', 'building_number',
+                'email', 'postal_code', 'building_number', 'block', 'district',
             ]);
 
             // Saudi National Address codes are not applicable to international
@@ -801,7 +802,7 @@ class OrderCheckoutService
             $offset = (int) $m[1][1];
             $before = strtolower(substr($text, max(0, $offset - 25), min(25, $offset)));
             // A five-digit number after "postal code"/"zip" is a postal code, not a building.
-            if (strlen(preg_replace('/\D/', '', $number)) === 5 || preg_match('/postal|zip|postcode|post code|بريد|رمز/', $before) === 1) {
+            if (strlen(preg_replace('/\D/', '', $number)) === 5) {
                 return null;
             }
 

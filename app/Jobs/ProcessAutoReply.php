@@ -1104,7 +1104,7 @@ class ProcessAutoReply implements ShouldQueue
                     $orderNumberMatch = null;
                     $phoneMatch       = null;
                     foreach ($recentMessages as $m) {
-                        if (!$orderNumberMatch && preg_match('/\b(\d{4,10})\b/', $m->content, $mo)) {
+                        if (!$orderNumberMatch && preg_match('/\b(?:order|orders|طلب|رقم\s+الطلب)\s*(?:number|no\.?|#|id)?\s*:?\s*#?\s*(\d{4,10})\b/iu', $m->content, $mo)) {
                             $orderNumberMatch = $mo[1];
                         }
                         if (!$phoneMatch && preg_match('/\b(05\d{8}|9665\d{8}|\+9665\d{8})\b/', $m->content, $mp)) {
@@ -2370,7 +2370,7 @@ if (!$isProductBrowseMessage && $commerceChannel && !$summaryConfirmTurn) {
                 . "Price: {$priceText}\n"
                 . "Store: {$storeName}\n"
                 . 'Name: ' . trim((string) ($checkoutState['full_name'] ?? '')) . "\n"
-                . 'Phone: ' . trim((string) ($checkoutState['phone'] ?? $checkoutState['customer_phone'] ?? '')) . "\n"
+                . 'Phone: ' . (\App\Services\OrderCheckoutService::isValidPhone($checkoutState['phone'] ?? $checkoutState['customer_phone'] ?? null) ? trim((string) ($checkoutState['phone'] ?? $checkoutState['customer_phone'])) : 'not provided yet') . "\n"
                 . 'Delivery address: ' . trim((string) ($checkoutState['address'] ?? $checkoutState['customer_address'] ?? '')) . "\n\n"
                 . 'Reply “confirm order” to place it, or “cancel” to stop.';
         }
@@ -3990,6 +3990,8 @@ $aiResponse = $intro
                         'conversation_id' => $conversation->id,
                         'channel_id'      => $sallaChannel->id,
                         'exception_type' => get_class($e),
+            'message' => \App\Services\OrderCheckoutService::maskSensitive($e->getMessage()),
+            'file' => basename($e->getFile()) . ':' . $e->getLine(),
                     ]);
                     // STRICT RULE: DO NOT generate a fake ID or pretend success when Salla fails!
                     return null;

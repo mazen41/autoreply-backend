@@ -927,15 +927,11 @@ class SallaService
 
         $postalCode = $checkoutState['postal_code'] ?? $shippingAddress['postal_code'] ?? null;
         $coordinates = $checkoutState['geo_coordinates'] ?? null;
-        if (
-            empty($postalCode)
-            || !is_array($coordinates)
-            || !isset($coordinates['lat'], $coordinates['lng'])
-        ) {
-            Log::info('SallaService: order is waiting for postal code and delivery coordinates', [
+        // Salla requires a postal code; delivery coordinates are optional and are sent only when known.
+        if (empty($postalCode)) {
+            Log::info('SallaService: order is waiting for postal code', [
                 'channel_id' => $channel->id,
-                'has_postal_code' => !empty($postalCode),
-                'has_coordinates' => is_array($coordinates) && isset($coordinates['lat'], $coordinates['lng']),
+                'has_postal_code' => false,
             ]);
             return null;
         }

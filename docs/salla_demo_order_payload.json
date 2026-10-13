@@ -1,0 +1,48 @@
+{
+  "customer": {
+    "name": "Sandbox Test Customer",
+    "mobile": "+966566666666",
+    "email": "sandbox-order-test@salla.dev"
+  },
+  "receiver": {
+    "name": "Sandbox Test Customer",
+    "country_code": "SA",
+    "phone": "966566666666",
+    "email": "sandbox-order-test@salla.dev",
+    "notify": false
+  },
+  "delivery_method": "shipping",
+  "courier_id": 326899803,
+  "ship_to": {
+    "country": 1473353380,
+    "city": 1473353380,
+    "district": 566146469,
+    "block": "1",
+    "street_number": "8230",
+    "building_number": "1234",
+    "short_address": "RRRR1234",
+    "additional_number": "5678",
+    "address": "حي النموذجية، طريق الملك فهد، الرياض",
+    "address_line": "طريق الملك فهد، حي النموذجية",
+    "postal_code": "12211",
+    "geo_coordinates": {
+      "lat": 24.7136,
+      "lng": 46.6753
+    }
+  },
+  "products": [
+    {
+      "identifier_type": "id",
+      "identifier": 1242785692,
+      "quantity": 1
+    }
+  ],
+  "payment": {
+    "method": "cod",
+    "status": "pending_payment",
+    "cash_on_delivery": {
+      "amount": 224.0,
+      "currency": "SAR"
+    }
+  }
+}

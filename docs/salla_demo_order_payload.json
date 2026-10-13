@@ -1,13 +1,13 @@
 {
   "customer": {
     "name": "Sandbox Test Customer",
-    "mobile": "+966566666666",
+    "mobile": "+966512345678",
     "email": "sandbox-order-test@salla.dev"
   },
   "receiver": {
     "name": "Sandbox Test Customer",
     "country_code": "SA",
-    "phone": "966566666666",
+    "phone": "966512345678",
     "email": "sandbox-order-test@salla.dev",
     "notify": false
   },

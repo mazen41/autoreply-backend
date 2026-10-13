@@ -509,31 +509,63 @@ class ChannelController extends Controller
 
             // Subscribe to supported Facebook and Instagram webhook fields.
             // `instagram_manage_messages` is a permission, not a webhook field.
+            // These are Page webhook fields. Instagram uses `messaging_seen` on
+            // its own subscription; sending it to the Page endpoint makes Meta
+            // reject the entire Page subscription, including `feed`.
             $subscribedFields = 'messages,messaging_postbacks,message_echoes,message_reads,feed';
-            if ($igAccountId) {
-                $subscribedFields .= ',messaging_seen';
-            }
             $pageSubscription = Http::post("{$graph}/{$pageId}/subscribed_apps", [
                 'subscribed_fields' => $subscribedFields,
                 'access_token'      => $longLivedToken,
             ]);
 
             $pageWebhookOk = $pageSubscription->successful() && (bool) $pageSubscription->json('success');
+            $pageSubscriptionError = $pageSubscription->json('error') ?? [];
             $pageMetadata = is_array($channel->metadata) ? $channel->metadata : [];
             $pageMetadata['comment_webhook_status'] = $pageWebhookOk ? 'subscribed' : 'error';
             $pageMetadata['comment_webhook_error_code'] = $pageWebhookOk ? null : (string) ($pageSubscription->json('error.code') ?? $pageSubscription->status());
+            $pageMetadata['comment_webhook_error_message'] = $pageWebhookOk ? null : ($pageSubscription->json('error.message') ?? null);
             $channel->update(['metadata' => $pageMetadata]);
 
+            if (!$pageWebhookOk) {
+                Log::warning('Meta Facebook Page webhook subscription failed', [
+                    'channel_id' => $channel->id,
+                    'http_status' => $pageSubscription->status(),
+                    'requested_fields' => $subscribedFields,
+                    'error_type' => $pageSubscriptionError['type'] ?? null,
+                    'error_code' => $pageSubscriptionError['code'] ?? null,
+                    'error_subcode' => $pageSubscriptionError['error_subcode'] ?? null,
+                    'error_message' => $pageSubscriptionError['message'] ?? null,
+                    'fbtrace_id' => $pageSubscriptionError['fbtrace_id'] ?? null,
+                ]);
+            }
+
             if (!empty($igAccountId) && isset($instagramChannel)) {
+                $igSubscribedFields = 'comments,live_comments,messages,messaging_postbacks,messaging_seen';
                 $igSubscription = Http::post("{$graph}/{$igAccountId}/subscribed_apps", [
-                    'subscribed_fields' => 'comments,live_comments,messages,messaging_postbacks,messaging_seen',
+                    'subscribed_fields' => $igSubscribedFields,
                     'access_token' => $longLivedToken,
                 ]);
                 $igWebhookOk = $igSubscription->successful() && (bool) $igSubscription->json('success');
+                $igSubscriptionError = $igSubscription->json('error') ?? [];
                 $igMetadata = is_array($instagramChannel->metadata) ? $instagramChannel->metadata : [];
                 $igMetadata['comment_webhook_status'] = $igWebhookOk ? 'subscribed' : 'error';
                 $igMetadata['comment_webhook_error_code'] = $igWebhookOk ? null : (string) ($igSubscription->json('error.code') ?? $igSubscription->status());
+                $igMetadata['comment_webhook_error_message'] = $igWebhookOk ? null : ($igSubscription->json('error.message') ?? null);
                 $instagramChannel->update(['metadata' => $igMetadata]);
+
+                if (!$igWebhookOk) {
+                    Log::warning('Meta Instagram webhook subscription failed', [
+                        'channel_id' => $instagramChannel->id,
+                        'http_status' => $igSubscription->status(),
+                        'requested_fields' => $igSubscribedFields,
+                        'error_type' => $igSubscriptionError['type'] ?? null,
+                        'error_code' => $igSubscriptionError['code'] ?? null,
+                        'error_subcode' => $igSubscriptionError['error_subcode'] ?? null,
+                        'error_message' => $igSubscriptionError['message'] ?? null,
+                        'fbtrace_id' => $igSubscriptionError['fbtrace_id'] ?? null,
+                    ]);
+                }
+
                 \Log::info('Meta comment webhook subscriptions recorded', [
                     'facebook_channel_id' => $channel->id,
                     'instagram_channel_id' => $instagramChannel->id,

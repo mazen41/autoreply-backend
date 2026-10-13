@@ -24,17 +24,22 @@ class SequenceService
     public function createSequence(array $data, int $businessId): Sequence
     {
         $this->validateConditionStepPayloads($data['steps'] ?? []);
+        $settings = $this->mergeSequenceSettings([], $data['settings'] ?? []);
+        $targetChannels = data_get($settings, 'target_channels');
+        $channel = is_array($targetChannels)
+            ? $this->legacyChannelFor($targetChannels)
+            : ($data['channel'] ?? null);
 
-        return DB::transaction(function () use ($data, $businessId) {
+        return DB::transaction(function () use ($data, $businessId, $settings, $channel) {
             $sequence = Sequence::create([
                 'business_id' => $businessId,
                 'name' => $data['name'],
                 'description' => $data['description'] ?? null,
                 'trigger_type' => $data['trigger_type'] ?? 'manual',
                 'trigger_config' => $data['trigger_config'] ?? null,
-                'channel' => $data['channel'] ?? null,
+                'channel' => $channel,
                 'status' => 'draft',
-                'settings' => $data['settings'] ?? null,
+                'settings' => $settings ?: null,
                 'timezone' => $data['timezone'] ?? 'UTC',
                 'business_hours' => $data['business_hours'] ?? null,
                 'bot_id' => $data['bot_id'] ?? null,
@@ -63,15 +68,20 @@ class SequenceService
     public function updateSequence(Sequence $sequence, array $data): Sequence
     {
         $this->validateConditionStepPayloads($data['steps'] ?? []);
+        $settings = $this->mergeSequenceSettings($sequence->settings ?? [], $data['settings'] ?? []);
+        $targetChannels = data_get($settings, 'target_channels');
+        $channel = is_array($targetChannels)
+            ? $this->legacyChannelFor($targetChannels)
+            : ($data['channel'] ?? $sequence->channel);
 
-        return DB::transaction(function () use ($sequence, $data) {
+        return DB::transaction(function () use ($sequence, $data, $settings, $channel) {
             $sequence->update([
                 'name' => $data['name'] ?? $sequence->name,
                 'description' => $data['description'] ?? $sequence->description,
                 'trigger_type' => $data['trigger_type'] ?? $sequence->trigger_type,
                 'trigger_config' => $data['trigger_config'] ?? $sequence->trigger_config,
-                'channel' => $data['channel'] ?? $sequence->channel,
-                'settings' => $data['settings'] ?? $sequence->settings,
+                'channel' => $channel,
+                'settings' => $settings ?: null,
                 'timezone' => $data['timezone'] ?? $sequence->timezone,
                 'business_hours' => $data['business_hours'] ?? $sequence->business_hours,
                 'bot_id' => $data['bot_id'] ?? $sequence->bot_id,
@@ -148,7 +158,8 @@ class SequenceService
 
     public function activateSequence(Sequence $sequence): Sequence
     {
-        if (!$sequence->canBeActivated()) {
+        $alreadyActive = $sequence->status === 'active';
+        if (!$alreadyActive && !$sequence->canBeActivated()) {
             throw new \Exception('Sequence cannot be activated in its current state');
         }
 
@@ -164,7 +175,7 @@ class SequenceService
         }
 
         // Validate that sequence has a configured channel
-        if (!$sequence->channel) {
+        if ($sequence->targetChannelTypes() === []) {
             throw new \Exception('Sequence must have a configured channel before activation');
         }
 
@@ -216,23 +227,24 @@ class SequenceService
             }
         }
 
-        return DB::transaction(function () use ($sequence) {
-            $sequence->activate();
+        return DB::transaction(function () use ($sequence, $alreadyActive) {
+            if (!$alreadyActive) {
+                $sequence->activate();
+                $pausedEnrollments = $sequence->enrollments()->where('status', 'paused')->get();
+                foreach ($pausedEnrollments as $enrollment) {
+                    $enrollment->resume();
+                    $step = $enrollment->getCurrentStep();
+                    if (!$step) {
+                        $enrollment->complete();
+                        continue;
+                    }
 
-            $pausedEnrollments = $sequence->enrollments()->where('status', 'paused')->get();
-            foreach ($pausedEnrollments as $enrollment) {
-                $enrollment->resume();
-                $step = $enrollment->getCurrentStep();
-                if (!$step) {
-                    $enrollment->complete();
-                    continue;
-                }
-
-                $execution = SequenceStepExecution::createForEnrollment($enrollment, $step, now(), [
-                    'resumed_after_sequence_pause' => true,
-                ]);
-                if ($execution) {
-                    DB::afterCommit(fn () => \App\Jobs\ExecuteSequenceStep::dispatch($execution->id));
+                    $execution = SequenceStepExecution::createForEnrollment($enrollment, $step, now(), [
+                        'resumed_after_sequence_pause' => true,
+                    ]);
+                    if ($execution) {
+                        DB::afterCommit(fn () => \App\Jobs\ExecuteSequenceStep::dispatch($execution->id));
+                    }
                 }
             }
 
@@ -363,6 +375,32 @@ class SequenceService
         }
 
         return $errors;
+    }
+
+    private function mergeSequenceSettings(array $existing, array $incoming): array
+    {
+        $settings = array_merge($existing, $incoming);
+        if (isset($settings['target_channels']) && is_array($settings['target_channels'])) {
+            $settings['target_channels'] = array_values(array_unique(array_map(
+                static fn ($channel) => strtolower(trim((string) $channel)),
+                $settings['target_channels']
+            )));
+        }
+
+        return $settings;
+    }
+
+    /** Keep the legacy enum column populated only with values it supports. */
+    private function legacyChannelFor(array $targetChannels): ?string
+    {
+        foreach ($targetChannels as $channel) {
+            $channel = strtolower(trim((string) $channel));
+            if (in_array($channel, ['whatsapp', 'telegram', 'email'], true)) {
+                return $channel;
+            }
+        }
+
+        return null;
     }
 
     private function validateConditionStepPayloads(array $steps): void

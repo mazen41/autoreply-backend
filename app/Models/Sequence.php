@@ -78,6 +78,45 @@ class Sequence extends Model
         return $this->hasMany(SequenceEnrollment::class)->where('status', 'active');
     }
 
+    /**
+     * Channel types this sequence may serve. `channel` remains the legacy
+     * single-channel value; new multi-channel sequences store their targets in
+     * settings so existing records and database schemas remain compatible.
+     */
+    public function targetChannelTypes(): array
+    {
+        $configured = data_get($this->settings, 'target_channels');
+        $channels = is_array($configured) && $configured !== []
+            ? $configured
+            : array_filter([$this->channel]);
+
+        return array_values(array_unique(array_map(function ($channel): string {
+            $channel = strtolower(trim((string) $channel));
+
+            return match ($channel) {
+                'messenger' => 'facebook',
+                'email' => 'gmail',
+                default => $channel,
+            };
+        }, $channels)));
+    }
+
+    public function targetsChannel(?string $channel): bool
+    {
+        if ($channel === null || trim($channel) === '') {
+            return false;
+        }
+
+        $channel = strtolower(trim($channel));
+        $channel = match ($channel) {
+            'email' => 'gmail',
+            'messenger' => 'facebook',
+            default => $channel,
+        };
+
+        return in_array($channel, $this->targetChannelTypes(), true);
+    }
+
     public function stepExecutions()
     {
         return $this->hasManyThrough(SequenceStepExecution::class, SequenceEnrollment::class);

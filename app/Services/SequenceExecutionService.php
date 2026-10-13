@@ -95,14 +95,8 @@ class SequenceExecutionService
         // A sequence belongs to the conversation's channel/account. Never
         // silently switch to another connected account of the same type.
         $channel = $conversation->channel;
-        $expectedChannelType = strtolower((string) $sequence->channel);
-        // The sequence editor calls its email channel "email" while connected
-        // Gmail accounts are persisted as "gmail" channels.
-        if ($expectedChannelType === 'email') {
-            $expectedChannelType = 'gmail';
-        }
         if (!$channel || (int) $channel->business_id !== (int) $sequence->business_id
-            || ($expectedChannelType !== '' && strtolower((string) $channel->type) !== $expectedChannelType)) {
+            || !$sequence->targetsChannel($channel->type)) {
             $this->pauseForUnavailableConversationChannel($execution, $enrollment, $conversation);
             return false;
         }

@@ -83,6 +83,8 @@ class SequenceController extends Controller
             'settings' => 'nullable|array',
             'settings.allow_reentry' => 'sometimes|boolean',
             'settings.stop_on_reply' => 'sometimes|boolean',
+            'settings.target_channels' => 'sometimes|array|min:1',
+            'settings.target_channels.*' => 'string|in:whatsapp,telegram,email,instagram,facebook,messenger',
             'steps' => 'nullable|array',
             'bot_id' => 'nullable|integer|exists:bots,id',
         ]);
@@ -130,6 +132,8 @@ class SequenceController extends Controller
             'settings' => 'nullable|array',
             'settings.allow_reentry' => 'sometimes|boolean',
             'settings.stop_on_reply' => 'sometimes|boolean',
+            'settings.target_channels' => 'sometimes|array|min:1',
+            'settings.target_channels.*' => 'string|in:whatsapp,telegram,email,instagram,facebook,messenger',
             'steps' => 'nullable|array',
         ]);
 

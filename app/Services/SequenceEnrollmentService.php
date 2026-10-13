@@ -323,6 +323,10 @@ class SequenceEnrollmentService
             return false;
         }
 
+        if (!$sequence->targetsChannel($conversation->channel?->type)) {
+            return false;
+        }
+
         if (!app(ConsentGate::class)->checkConversation($conversation, 'marketing')->allowed) {
             return false;
         }
@@ -349,6 +353,10 @@ class SequenceEnrollmentService
     {
         if ((int) $conversation->business_id !== (int) $sequence->business_id) {
             throw ValidationException::withMessages(['conversation_id' => 'Conversation does not belong to this sequence business.']);
+        }
+
+        if (!$sequence->targetsChannel($conversation->channel?->type)) {
+            throw ValidationException::withMessages(['conversation_id' => 'This sequence does not target the conversation channel.']);
         }
 
         if ($conversation->requires_human && \App\Models\FeatureFlag::isEnabled(

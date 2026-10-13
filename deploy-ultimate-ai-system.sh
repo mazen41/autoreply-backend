@@ -22,7 +22,7 @@ echo "✅ N8nIntegrationController.php added"
 echo "🧹 Clearing Laravel caches..."
 cd /var/www/autoreply
 php artisan config:clear
-php artisan cache:clear
+# php artisan cache:clear  # removed: clears the live file cache during traffic (see ops note)
 php artisan view:clear
 php artisan route:clear
 php artisan route:cache

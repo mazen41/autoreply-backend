@@ -45,7 +45,7 @@ echo "=========================================="
 echo " Step 4: Clear Laravel config + cache"
 echo "=========================================="
 php artisan config:clear
-php artisan cache:clear
+# php artisan cache:clear  # removed: clears the live file cache during traffic (see ops note)
 echo "✅ Config and cache cleared"
 
 echo ""

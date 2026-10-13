@@ -7,7 +7,7 @@
   "receiver": {
     "name": "Sandbox Test Customer",
     "country_code": "SA",
-    "phone": "966512345678",
+    "phone": "512345678",
     "email": "sandbox-order-test@salla.dev",
     "notify": false
   },

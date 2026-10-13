@@ -414,7 +414,7 @@ class CustomerResolutionTest extends TestCase
         $this->assertNull(Customer::find($conversation->customer_id)->name);
 
         Http::fake([
-            'graph.facebook.com/v19.0/ig-sender-90210*' => Http::response(['name' => 'Mona'], 200),
+            'graph.facebook.com/v26.0/ig-sender-90210*' => Http::response(['name' => 'Mona'], 200),
         ]);
 
         (new FetchSenderName($conversation->id, $channel->id, 'ig-sender-90210'))->handle();

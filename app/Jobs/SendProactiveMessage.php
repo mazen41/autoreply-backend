@@ -199,7 +199,7 @@ class SendProactiveMessage implements ShouldQueue
     private function sendMeta(Channel $channel, Conversation $conversation, Message $message): bool
     {
         $accessToken = $channel->access_token;
-        $url = "https://graph.facebook.com/v19.0/me/messages?access_token={$accessToken}";
+        $url = 'https://graph.facebook.com/' . config('services.meta.graph_version', 'v26.0') . "/me/messages?access_token={$accessToken}";
 
         $response = Http::timeout(10)
             ->post($url, [

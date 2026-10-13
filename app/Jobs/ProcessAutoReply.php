@@ -3293,7 +3293,7 @@ $aiResponse = $intro
                 } elseif (in_array($channel->type, ['facebook', 'instagram'], true)) {
                     $accessToken = $channel->access_token;
                     $response = Http::timeout(10)->post(
-                        "https://graph.facebook.com/v19.0/me/messages?access_token={$accessToken}",
+                        'https://graph.facebook.com/' . config('services.meta.graph_version', 'v26.0') . "/me/messages?access_token={$accessToken}",
                         [
                             'recipient' => ['id' => $recipientId],
                             'message' => [

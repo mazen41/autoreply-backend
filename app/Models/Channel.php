@@ -134,7 +134,8 @@ class Channel extends Model
     public function bots()
     {
         return $this->belongsToMany(Bot::class, 'bot_channels', 'channel_id', 'bot_id')
-            ->withPivot(['is_primary', 'ecommerce_connection_id'])
+            ->withPivot(['is_primary', 'ecommerce_connection_id', 'comment_automation_enabled', 'public_comment_reply_enabled', 'private_comment_reply_enabled', 'comment_settings'])
+            ->withCasts(['comment_automation_enabled' => 'boolean', 'public_comment_reply_enabled' => 'boolean', 'private_comment_reply_enabled' => 'boolean'])
             ->withTimestamps();
     }
 

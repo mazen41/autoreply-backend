@@ -108,7 +108,7 @@ class ChannelStabilityService
         $pageAccessToken = $channel->page_access_token;
         $pageId = $channel->page_id;
 
-        $response = Http::get("https://graph.facebook.com/v18.0/{$pageId}", [
+        $response = Http::get('https://graph.facebook.com/' . config('services.meta.graph_version', 'v26.0') . "/{$pageId}", [
             'access_token' => $pageAccessToken,
         ]);
 

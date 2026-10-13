@@ -198,6 +198,8 @@ Route::middleware('auth:sanctum')->group(function () {
     Route::get('/bots/{id}/knowledge', [\App\Http\Controllers\Api\BotController::class, 'knowledge']);
     Route::post('/bots/{id}/knowledge', [\App\Http\Controllers\Api\BotController::class, 'assignKnowledge']);
     Route::delete('/bots/{id}/knowledge/{fileId}', [\App\Http\Controllers\Api\BotController::class, 'removeKnowledge']);
+    Route::get('/bots/{botId}/comment-automation', [\App\Http\Controllers\Api\CommentAutomationSettingsController::class, 'show']);
+    Route::put('/bots/{botId}/comment-automation', [\App\Http\Controllers\Api\CommentAutomationSettingsController::class, 'update']);
 
     // Customer / CRM
     Route::get('/customers', [\App\Http\Controllers\Api\CustomerController::class, 'index']);

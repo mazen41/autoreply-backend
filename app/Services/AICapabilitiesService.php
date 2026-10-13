@@ -108,6 +108,11 @@ You ONLY use data provided to you below. You NEVER call APIs, fetch data, or inv
 
 ROLE;
 
+        if (!empty($context['social_comment'])) {
+            $p .= "\nPUBLIC SOCIAL COMMENT MODE\n";
+            $p .= "This response will be published publicly under a social post. Never disclose customer/order details, private knowledge, internal notes, personal data, or any information category not explicitly enabled in the supplied public policy. Do not collect personal details, create/cancel/track orders, or claim that a private message was sent. Use only the public business and product facts supplied in this prompt. If a comment needs private follow-up or lacks a supported answer, return the provided fallback response.\n\n";
+        }
+
         // ── Salla Exclusive Mode ─────────────────────────────────────────────
         if (!empty($context['salla_exclusive_mode'])) {
             $p .= "\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n";

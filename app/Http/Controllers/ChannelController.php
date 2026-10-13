@@ -199,6 +199,12 @@ class ChannelController extends Controller
                 'page_id'              => $channel->page_id,
                 'page_name'            => $channel->page_name,
                 'instagram_account_id' => $channel->instagram_account_id,
+                'comment_webhook_status' => in_array($channel->type, ['facebook', 'instagram'], true)
+                    ? ($channel->metadata['comment_webhook_status'] ?? 'unknown')
+                    : null,
+                'comment_webhook_error_code' => in_array($channel->type, ['facebook', 'instagram'], true)
+                    ? ($channel->metadata['comment_webhook_error_code'] ?? null)
+                    : null,
                 'status'               => in_array($channel->type, ['shopify', 'woocommerce'], true)
                     && (($channel->metadata['sync_status'] ?? '') === 'error'
                         || in_array(($channel->metadata['webhook_status'] ?? ''), ['error', 'partial'], true))
@@ -272,11 +278,13 @@ class ChannelController extends Controller
             'instagram_manage_messages',
             'pages_read_engagement',
             'pages_manage_metadata',
+            'pages_manage_engagement',
+            'instagram_manage_comments',
             'business_management',
             'public_profile',
         ]);
 
-        $url = 'https://www.facebook.com/v19.0/dialog/oauth?' . http_build_query([
+        $url = 'https://www.facebook.com/' . config('services.meta.graph_version', 'v26.0') . '/dialog/oauth?' . http_build_query([
             'client_id'     => $appId,
             'redirect_uri'  => $redirectUri,
             'scope'         => $scopes,
@@ -345,7 +353,8 @@ class ChannelController extends Controller
 
         // Step 1: Exchange code for user access token
         \Log::info('Exchanging code for token...');
-        $tokenResponse = Http::get('https://graph.facebook.com/v19.0/oauth/access_token', [
+        $graph = 'https://graph.facebook.com/' . config('services.meta.graph_version', 'v26.0');
+        $tokenResponse = Http::get($graph . '/oauth/access_token', [
             'client_id'     => $appId,
             'client_secret' => $appSecret,
             'redirect_uri'  => $redirectUri,
@@ -373,7 +382,7 @@ class ChannelController extends Controller
 
         // Step 2: Get pages this user manages (classic personal-admin Pages)
         \Log::info('Fetching user pages...');
-        $pagesResponse = Http::get('https://graph.facebook.com/v19.0/me/accounts', [
+        $pagesResponse = Http::get($graph . '/me/accounts', [
             'access_token' => $userAccessToken,
             'fields'       => 'id,name,access_token,instagram_business_account',
         ]);
@@ -390,7 +399,7 @@ class ChannelController extends Controller
         if (empty($pages)) {
             \Log::info('No pages via /me/accounts, trying Business Portfolio fallback...');
 
-            $businessesResponse = Http::get('https://graph.facebook.com/v19.0/me/businesses', [
+            $businessesResponse = Http::get($graph . '/me/businesses', [
                 'access_token' => $userAccessToken,
                 'fields'       => 'id,name',
             ]);
@@ -403,7 +412,7 @@ class ChannelController extends Controller
             $businesses = $businessesResponse->json()['data'] ?? [];
 
             foreach ($businesses as $business) {
-                $ownedPagesResponse = Http::get("https://graph.facebook.com/v19.0/{$business['id']}/owned_pages", [
+                $ownedPagesResponse = Http::get("{$graph}/{$business['id']}/owned_pages", [
                     'access_token' => $userAccessToken,
                     'fields'       => 'id,name,access_token,instagram_business_account',
                 ]);
@@ -436,7 +445,7 @@ class ChannelController extends Controller
             \Log::info('Processing Facebook page connection');
 
             // Exchange short-lived page token for long-lived token
-            $longLivedResponse = Http::get('https://graph.facebook.com/v19.0/oauth/access_token', [
+            $longLivedResponse = Http::get($graph . '/oauth/access_token', [
                 'grant_type'        => 'fb_exchange_token',
                 'client_id'         => $appId,
                 'client_secret'     => $appSecret,
@@ -469,7 +478,7 @@ class ChannelController extends Controller
             $igAccountId = $page['instagram_business_account']['id'] ?? null;
 
             if (!$igAccountId) {
-                $igResponse = Http::get("https://graph.facebook.com/v19.0/{$pageId}", [
+                $igResponse = Http::get("{$graph}/{$pageId}", [
                     'fields'       => 'instagram_business_account',
                     'access_token' => $longLivedToken,
                 ]);
@@ -477,7 +486,7 @@ class ChannelController extends Controller
             }
 
             if ($igAccountId) {
-                Channel::updateOrCreate(
+                $instagramChannel = Channel::updateOrCreate(
                     [
                         'user_id'             => $userId,
                         'type'                => 'instagram',
@@ -500,14 +509,38 @@ class ChannelController extends Controller
 
             // Subscribe to supported Facebook and Instagram webhook fields.
             // `instagram_manage_messages` is a permission, not a webhook field.
-            $subscribedFields = 'messages,messaging_postbacks,message_echoes,message_reads,feed,comments';
+            $subscribedFields = 'messages,messaging_postbacks,message_echoes,message_reads,feed';
             if ($igAccountId) {
                 $subscribedFields .= ',messaging_seen';
             }
-            Http::post("https://graph.facebook.com/v19.0/{$pageId}/subscribed_apps", [
+            $pageSubscription = Http::post("{$graph}/{$pageId}/subscribed_apps", [
                 'subscribed_fields' => $subscribedFields,
                 'access_token'      => $longLivedToken,
             ]);
+
+            $pageWebhookOk = $pageSubscription->successful() && (bool) $pageSubscription->json('success');
+            $pageMetadata = is_array($channel->metadata) ? $channel->metadata : [];
+            $pageMetadata['comment_webhook_status'] = $pageWebhookOk ? 'subscribed' : 'error';
+            $pageMetadata['comment_webhook_error_code'] = $pageWebhookOk ? null : (string) ($pageSubscription->json('error.code') ?? $pageSubscription->status());
+            $channel->update(['metadata' => $pageMetadata]);
+
+            if (!empty($igAccountId) && isset($instagramChannel)) {
+                $igSubscription = Http::post("{$graph}/{$igAccountId}/subscribed_apps", [
+                    'subscribed_fields' => 'comments,live_comments,messages,messaging_postbacks,messaging_seen',
+                    'access_token' => $longLivedToken,
+                ]);
+                $igWebhookOk = $igSubscription->successful() && (bool) $igSubscription->json('success');
+                $igMetadata = is_array($instagramChannel->metadata) ? $instagramChannel->metadata : [];
+                $igMetadata['comment_webhook_status'] = $igWebhookOk ? 'subscribed' : 'error';
+                $igMetadata['comment_webhook_error_code'] = $igWebhookOk ? null : (string) ($igSubscription->json('error.code') ?? $igSubscription->status());
+                $instagramChannel->update(['metadata' => $igMetadata]);
+                \Log::info('Meta comment webhook subscriptions recorded', [
+                    'facebook_channel_id' => $channel->id,
+                    'instagram_channel_id' => $instagramChannel->id,
+                    'page_subscribed' => $pageWebhookOk,
+                    'instagram_subscribed' => $igWebhookOk,
+                ]);
+            }
 
         }
 

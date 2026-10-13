@@ -509,7 +509,7 @@ class InboxController extends Controller
 
         $fbResponse = Http::timeout(10)
             ->post(
-                "https://graph.facebook.com/v19.0/me/messages?access_token={$accessToken}",
+                'https://graph.facebook.com/' . config('services.meta.graph_version', 'v26.0') . "/me/messages?access_token={$accessToken}",
                 [
                     'recipient' => ['id' => $conversation->sender_id],
                     'message'   => ['text' => $request->message],

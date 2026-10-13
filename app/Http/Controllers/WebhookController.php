@@ -11,6 +11,7 @@ use Illuminate\Support\Facades\Cache;
 
 class WebhookController extends Controller
 {
+    private bool $handlingCommentEvent = false;
     public function verify(Request $request)
     {
         $verifyToken = config('services.meta.webhook_verify_token');
@@ -90,7 +91,7 @@ class WebhookController extends Controller
 
                 $hasInstagramEntry = false;
                 foreach ($body['entry'] ?? [] as $entry) {
-                    if (in_array($entry['id'], $igIds, true)) {
+                    if (isset($entry['id']) && in_array((string) $entry['id'], $igIds, true)) {
                         $hasInstagramEntry = true;
                         break;
                     }
@@ -104,9 +105,13 @@ class WebhookController extends Controller
             }
 
             return response('EVENT_RECEIVED', 200);
-        } catch (\Exception $e) {
+        } catch (\Throwable $e) {
             Log::error('Webhook handler error', ['exception' => get_class($e)]);
-            return response('EVENT_RECEIVED', 200);
+            // Meta must retry comment events if durable persistence/dispatch failed. Preserve
+            // the existing acknowledgement behavior for unrelated messaging webhooks.
+            return $this->handlingCommentEvent
+                ? response('COMMENT_EVENT_RETRY', 500)
+                : response('EVENT_RECEIVED', 200);
         }
     }
 
@@ -244,8 +249,9 @@ class WebhookController extends Controller
 
     private function handleFacebook(array $body): void
     {
-        foreach ($body['entry'] as $entry) {
-            $pageId = $entry['id'];
+        foreach ($body['entry'] ?? [] as $entry) {
+            $pageId = (string) ($entry['id'] ?? '');
+            if ($pageId === '') continue;
 
             if (str_starts_with($pageId, 'TEST_')) continue;
 
@@ -283,47 +289,24 @@ class WebhookController extends Controller
                 $this->processMessage($channel, $senderId, $messageText, $incoming['mid'] ?? null, app(\App\Services\ReferencedMessageNormalizer::class)->meta($incoming), null, $media, $attachmentContext);
             }
 
-            // Handle comments
+            // Facebook Page comment activity is delivered through `feed` changes.
             foreach ($entry['changes'] ?? [] as $change) {
-                if ($change['field'] !== 'comments') continue;
-
-                $comment = $change['value'];
-                $commentText = $comment['text'] ?? '';
-                $commentId = $comment['comment_id'] ?? '';
-                $senderId = $comment['from']['id'] ?? '';
-                $parentId = $comment['parent_id'] ?? ''; // For replies to comments
-
-                // Skip if no text or if it's from our own page (to prevent loops)
-                if (empty($commentText) || empty($senderId)) continue;
-
-                // Get the page ID from the entry
-                $pageIdFromEntry = $entry['id'];
-
-                // Skip if comment is from our own page (prevent self-reply loops)
-                if ($senderId === $pageIdFromEntry) continue;
-
-                $channel = Channel::where('page_id', $pageIdFromEntry)
-                    ->where('type', 'facebook')
-                    ->where('status', 'connected')
-                    ->latest('connected_at')
-                    ->first();
-
-                if (!$channel) {
-                    Log::warning('No Facebook channel found for page_id: ' . $pageIdFromEntry);
-                    continue;
-                }
-
-                // For comments, we need to determine if this is a top-level comment or a reply
-                // For now, we'll treat all comments similarly, but we could enhance this later
-                $this->processComment($channel, $senderId, $commentText, $commentId);
+                if (!in_array(($change['field'] ?? ''), ['feed', 'comments'], true)) continue;
+                $normalized = app(\App\Services\MetaCommentEventNormalizer::class)
+                    ->facebookFeed($change['value'] ?? [], (string) ($entry['id'] ?? ''));
+                if (!$normalized) continue;
+                $this->handlingCommentEvent = true;
+                app(\App\Services\MetaCommentAutomationService::class)
+                    ->receive('facebook', (string) ($entry['id'] ?? ''), $normalized, $change['value'] ?? []);
             }
         }
     }
 
     private function handleInstagram(array $body): void
     {
-        foreach ($body['entry'] as $entry) {
-            $entryId = $entry['id']; // Page ID when object=page, IG account ID when object=instagram
+        foreach ($body['entry'] ?? [] as $entry) {
+            $entryId = (string) ($entry['id'] ?? ''); // Page ID when object=page, IG account ID when object=instagram
+            if ($entryId === '') continue;
 
             if (str_starts_with($entryId, 'TEST_')) continue;
 
@@ -382,30 +365,15 @@ class WebhookController extends Controller
                 $this->processMessage($channel, $senderId, $messageText, $platformMessageId, $replyToMid, null, $media, $attachmentContext);
             }
 
-            // Handle Instagram comments
+            // Instagram comment events carry media/comment IDs under distinct fields from Page feed events.
             foreach ($entry['changes'] ?? [] as $change) {
-                if ($change['field'] !== 'comments') continue;
-
-                $comment     = $change['value'];
-                $commentText = $comment['text'] ?? '';
-                $commentId   = $comment['comment_id'] ?? '';
-                $senderId    = $comment['from']['id'] ?? '';
-
-                if (empty($commentText) || empty($senderId)) continue;
-                if ($senderId === $entryId) continue;
-
-                $channel = Channel::where('instagram_account_id', $entryId)
-                    ->where('type', 'instagram')->where('status', 'connected')
-                    ->latest('connected_at')->first();
-
-                // Comments are routed only by instagram_account_id (no page_id or same-user fallback).
-
-                if (!$channel) {
-                    Log::warning('No Instagram channel found for comment', ['entry_id' => $entryId]);
-                    continue;
-                }
-
-                $this->processComment($channel, $senderId, $commentText, $commentId);
+                if (($change['field'] ?? '') !== 'comments') continue;
+                $normalized = app(\App\Services\MetaCommentEventNormalizer::class)
+                    ->instagram($change['value'] ?? [], $entryId);
+                if (!$normalized) continue;
+                $this->handlingCommentEvent = true;
+                app(\App\Services\MetaCommentAutomationService::class)
+                    ->receive('instagram', $entryId, $normalized, $change['value'] ?? []);
             }
         }
     }
@@ -785,7 +753,7 @@ class WebhookController extends Controller
         $accessToken = $channel->access_token;
         
         // /me/messages works for both Facebook and Instagram when using the Page Access Token
-        $url = "https://graph.facebook.com/v19.0/me/messages?access_token={$accessToken}";
+        $url = 'https://graph.facebook.com/' . config('services.meta.graph_version', 'v26.0') . "/me/messages?access_token={$accessToken}";
 
         try {
             $response = Http::timeout(10)
@@ -880,91 +848,6 @@ Reply:";
         } catch (\Exception $e) {
             Log::error('Gemini exception', ['exception_type' => get_class($e)]);
             return null;
-        }
-    }
-
-    /*
-     * Process a comment from Facebook or Instagram
-     * Similar to processMessage but for comments instead of direct messages
-     */
-    private function processComment(Channel $channel, string $senderId, string $commentText, string $commentId): void
-    {
-        Log::info('Processing comment', [
-            'channel_type' => $channel->type,
-            'channel_id'   => $channel->id,
-            'sender'       => $senderId,
-            'comment'      => $commentText,
-            'comment_id'   => $commentId,
-            'business_id'  => $channel->business_id,
-        ]);
-
-        // Check if we've already processed this comment (idempotency)
-        $processedKey = "processed_comment:{$commentId}";
-        if (Cache::has($processedKey)) {
-            Log::info('Comment already processed, skipping', [
-                'comment_id' => $commentId,
-                'channel_id' => $channel->id
-            ]);
-            return;
-        }
-
-        // Mark this comment as processed for 24 hours to prevent duplicates
-        Cache::put($processedKey, true, 60 * 60 * 24); // 24 hours
-
-        $conversation = \App\Models\Conversation::firstOrCreate(
-            ['channel_id' => $channel->id, 'sender_id' => $senderId],
-            ['business_id' => $channel->business_id, 'status' => 'open', 'last_message_at' => now()]
-        );
-
-        // Resolve/link the business-scoped Customer for this sender (Instagram/
-        // Facebook sender ids have no phone/email — platform-identity matching).
-        try {
-            app(\App\Services\CustomerService::class)->attachToConversation($conversation);
-        } catch (\Throwable $e) {
-            Log::warning('Customer resolution failed for Meta sender', [
-                'conversation_id' => $conversation->id,
-                'exception'       => get_class($e),
-            ]);
-        }
-
-        // If we don't have a name for this sender yet, queue a job to fetch it from the Graph API
-        if ($conversation->wasRecentlyCreated || empty($conversation->sender_name)) {
-            \App\Jobs\FetchSenderName::dispatch($conversation->id, $channel->id, $senderId);
-        }
-
-        $conversation->last_message_at = now();
-        $conversation->save();
-
-        $message = \App\Models\Message::create([
-            'conversation_id' => $conversation->id,
-            'content'         => $commentText,
-            'direction'       => 'inbound',
-            'is_ai'           => false,
-            'status'          => 'received',
-            // Store the comment ID for reference/idempotency
-            'metadata' => [
-                'comment_id' => $commentId,
-                'platform'   => $channel->type === 'facebook' ? 'facebook' : 'instagram'
-            ]
-        ]);
-
-        if ($channel->user_id) {
-            broadcast(new \App\Events\MessageReceived($message, $conversation, $channel->user_id));
-        }
-
-        // Implement comment debounce to prevent multiple AI replies to the same conversation
-        $debounceKey = "debounce:conversation:{$conversation->id}";
-        $debounceWindow = 10; // 10 seconds debounce window
-
-        if (Cache::has($debounceKey)) {
-            Log::info('Comment debounced - AI reply skipped', [
-                'conversation_id' => $conversation->id,
-                'message_id' => $message->id
-            ]);
-        } else {
-            \App\Jobs\ProcessAutoReply::dispatch($message->id);
-            Cache::put($debounceKey, true, $debounceWindow);
-            Log::info('ProcessAutoReply job dispatched for comment', ['message_id' => $message->id]);
         }
     }
 

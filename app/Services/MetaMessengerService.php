@@ -8,7 +8,7 @@ use Illuminate\Support\Facades\Log;
 
 /**
  * Send outbound messages through the Meta Graph Send API
- * (graph.facebook.com/v19.0/me/messages).
+ * (versioned Meta Graph Send API).
  *
  * This is the SINGLE sending implementation for both Facebook Messenger and
  * Instagram DMs (Instagram uses the same endpoint with the page/account token).
@@ -29,7 +29,7 @@ class MetaMessengerService
     public function sendTextWithResult(Channel $channel, string $recipientId, string $message, array $images = []): array
     {
         $accessToken = $channel->access_token;
-        $baseUrl = "https://graph.facebook.com/v19.0/me/messages?access_token={$accessToken}";
+        $baseUrl = 'https://graph.facebook.com/' . config('services.meta.graph_version', 'v26.0') . "/me/messages?access_token={$accessToken}";
         $messageIds = [];
         $firstError = null;
 

@@ -137,7 +137,7 @@ class RetryFailedMessage implements ShouldQueue
         $pageAccessToken = $channel->page_access_token;
         $pageId = $channel->page_id;
 
-        $response = Http::post("https://graph.facebook.com/v18.0/{$pageId}/messages", [
+        $response = Http::post('https://graph.facebook.com/' . config('services.meta.graph_version', 'v26.0') . "/{$pageId}/messages", [
             'recipient' => ['id' => $recipientId],
             'message' => ['text' => $content],
         ], [

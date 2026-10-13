@@ -56,7 +56,7 @@ class ProcessAutoReplyFieldStatusTest extends TestCase
 
         Http::assertNotSent(fn ($request) => str_contains($request->url(), 'api.groq.com')
             || str_contains($request->url(), 'generativelanguage.googleapis.com'));
-        Http::assertSent(fn ($request) => str_contains($request->url(), 'graph.facebook.com/v19.0/me/messages'));
+        Http::assertSent(fn ($request) => str_contains($request->url(), 'graph.facebook.com/v26.0/me/messages'));
 
         $replies = Message::query()
             ->where('conversation_id', $fixture['conversation']->id)
@@ -89,7 +89,7 @@ class ProcessAutoReplyFieldStatusTest extends TestCase
         Http::assertSent(fn ($request) => str_contains($request->url(), 'api.groq.com/openai/v1/chat/completions'));
 
         // Reply was dispatched through the Instagram (Meta Graph) send path.
-        Http::assertSent(fn ($request) => str_contains($request->url(), 'graph.facebook.com/v19.0/me/messages'));
+        Http::assertSent(fn ($request) => str_contains($request->url(), 'graph.facebook.com/v26.0/me/messages'));
 
         // AI reply persisted in the unified inbox.
         $reply = Message::where('conversation_id', $fixture['conversation']->id)
@@ -128,7 +128,7 @@ class ProcessAutoReplyFieldStatusTest extends TestCase
         (new ProcessAutoReply($fixture['message']->id))->handle();
 
         Http::assertSent(fn ($request) => str_contains($request->url(), 'api.groq.com/openai/v1/chat/completions'));
-        Http::assertSent(fn ($request) => str_contains($request->url(), 'graph.facebook.com/v19.0/me/messages'));
+        Http::assertSent(fn ($request) => str_contains($request->url(), 'graph.facebook.com/v26.0/me/messages'));
 
         $reply = Message::where('conversation_id', $fixture['conversation']->id)
             ->where('direction', 'outbound')

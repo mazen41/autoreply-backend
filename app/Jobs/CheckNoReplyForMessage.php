@@ -6,7 +6,6 @@ use App\Models\Conversation;
 use App\Models\Message;
 use App\Models\Sequence;
 use App\Models\SequenceEnrollment;
-use App\Services\ConsentGate;
 use App\Services\SequenceEnrollmentService;
 use Illuminate\Bus\Queueable;
 use Illuminate\Contracts\Queue\ShouldQueue;
@@ -99,9 +98,9 @@ class CheckNoReplyForMessage implements ShouldQueue
             return;
         }
 
-        $consent = app(ConsentGate::class)->checkConversation($conversation, 'marketing');
+        $consent = app(\App\Services\ConsentGate::class)->checkConversation($conversation, 'marketing');
 
-        if (!$consent->allowed) {
+        if (in_array($consent->reason, ['opted_out', 'suppressed'], true)) {
             DB::table('sequence_no_reply_cycles')
                 ->where('sequence_id', $this->sequenceId)
                 ->where('conversation_id', $this->conversationId)
@@ -110,7 +109,7 @@ class CheckNoReplyForMessage implements ShouldQueue
                 ->whereNull('processed_at')
                 ->update(['processed_at' => now(), 'updated_at' => now()]);
 
-            Log::info('CheckNoReplyForMessage: marketing consent blocked no-reply enrollment', [
+            Log::info('CheckNoReplyForMessage: opted-out or suppressed contact blocked from no-reply enrollment', [
                 'sequence_id' => $this->sequenceId,
                 'conversation_id' => $this->conversationId,
                 'reason' => $consent->reason,

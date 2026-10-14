@@ -105,8 +105,8 @@ class SequenceExecutionService
             return false;
         }
 
-        $consent = app(ConsentGate::class)->checkConversation($conversation, 'marketing');
-        if (!$consent->allowed) {
+        $consent = app(\App\Services\ConsentGate::class)->checkConversation($conversation, 'marketing');
+        if (in_array($consent->reason, ['opted_out', 'suppressed'], true)) {
             $reason = 'consent_' . $consent->reason;
             $execution->markAsSkipped($reason);
             $enrollment->stop($reason);
@@ -157,7 +157,7 @@ class SequenceExecutionService
                 'ai_provider' => 'automation',
                 'ai_model' => 'sequence-step',
                 'escalation_reason' => 'automated_sequence_step',
-                'consent_basis' => 'marketing_opt_in',
+                'consent_basis' => 'sequence_automation',
             ]);
 
             // Link the durable outbound row before contacting the provider. A

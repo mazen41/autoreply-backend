@@ -327,7 +327,8 @@ class SequenceEnrollmentService
             return false;
         }
 
-        if (!app(ConsentGate::class)->checkConversation($conversation, 'marketing')->allowed) {
+        $consent = app(ConsentGate::class)->checkConversation($conversation, 'marketing');
+        if (in_array($consent->reason, ['opted_out', 'suppressed'], true)) {
             return false;
         }
 
@@ -367,7 +368,7 @@ class SequenceEnrollmentService
         }
 
         $consent = app(ConsentGate::class)->checkConversation($conversation, 'marketing');
-        if (!$consent->allowed) {
+        if (in_array($consent->reason, ['opted_out', 'suppressed'], true)) {
             throw ValidationException::withMessages(['consent' => 'Sequence enrollment blocked: ' . $consent->reason . '.']);
         }
     }

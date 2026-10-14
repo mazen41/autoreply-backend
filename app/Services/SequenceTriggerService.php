@@ -404,6 +404,9 @@ class SequenceTriggerService
                     'sequence_id' => $sequence->id,
                     'conversation_id' => $conversation->id,
                     'exception_type' => get_class($e),
+                    'validation_errors' => $e instanceof \Illuminate\Validation\ValidationException
+                        ? $e->errors()
+                        : [],
                 ]);
             }
         }

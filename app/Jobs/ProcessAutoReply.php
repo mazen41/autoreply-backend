@@ -4007,6 +4007,61 @@ $aiResponse = $intro
                         $nameParts = preg_split('/\s+/', trim((string) ($checkoutState['full_name'] ?? '')), 2) ?: [];
                         $shop  = $shopifyChannel->page_id;
                         $token = $shopifyChannel->access_token;
+                        $apiBase = "https://{$shop}/admin/api/" . config('services.shopify.api_version', '2026-07');
+                        $normalizedPhone = \App\Services\ShopifyOrderPayload::normalizePhone(
+                            $checkoutState['phone'] ?? $checkoutState['customer_phone'] ?? null,
+                            $checkoutState['country'] ?? $checkoutState['address'] ?? null
+                        );
+                        $existingCustomerId = null;
+
+                        // Shopify rejects creating a new customer when the phone
+                        // already belongs to one. Search this resolved shop and
+                        // attach the new order to the exact matching customer.
+                        if ($normalizedPhone !== null) {
+                            try {
+                                $customerLookup = \App\Services\ShopifyHttp::client($token)
+                                    ->get("{$apiBase}/customers/search.json", [
+                                        'query' => "phone:{$normalizedPhone}",
+                                        'fields' => 'id,phone',
+                                        'limit' => 10,
+                                    ]);
+                                $matches = $customerLookup->json('customers', []);
+                                if ($customerLookup->successful() && is_array($matches)) {
+                                    foreach ($matches as $candidate) {
+                                        $candidatePhone = \App\Services\ShopifyOrderPayload::normalizePhone(
+                                            $candidate['phone'] ?? null,
+                                            $checkoutState['country'] ?? $checkoutState['address'] ?? null
+                                        );
+                                        if ($candidatePhone === $normalizedPhone && !empty($candidate['id'])) {
+                                            $existingCustomerId = (int) $candidate['id'];
+                                            break;
+                                        }
+                                    }
+                                } else {
+                                    Log::warning('ProcessAutoReply: Shopify customer lookup unavailable; will attempt new customer association', [
+                                        'conversation_id' => $conversation->id,
+                                        'connection_id' => $shopifyChannel->id,
+                                        'http_status' => $customerLookup->status(),
+                                        'error_fields' => is_array($customerLookup->json('errors'))
+                                            ? array_slice(array_map('strval', array_keys($customerLookup->json('errors'))), 0, 10)
+                                            : [],
+                                    ]);
+                                }
+                                Log::info('ProcessAutoReply: Shopify customer lookup completed', [
+                                    'conversation_id' => $conversation->id,
+                                    'connection_id' => $shopifyChannel->id,
+                                    'lookup_succeeded' => $customerLookup->successful(),
+                                    'candidate_count' => is_array($matches) ? count($matches) : 0,
+                                    'existing_customer_matched' => $existingCustomerId !== null,
+                                ]);
+                            } catch (\Throwable $lookupException) {
+                                Log::warning('ProcessAutoReply: Shopify customer lookup threw; will attempt new customer association', [
+                                    'conversation_id' => $conversation->id,
+                                    'connection_id' => $shopifyChannel->id,
+                                    'exception_type' => get_class($lookupException),
+                                ]);
+                            }
+                        }
                         Log::info('ProcessAutoReply: sending order request to Shopify', [
                             'conversation_id' => $conversation->id,
                             'connection_id' => $shopifyChannel->id,
@@ -4014,8 +4069,48 @@ $aiResponse = $intro
                             'api_version' => config('services.shopify.api_version', '2026-07'),
                             'variant_resolved' => true,
                             'quantity' => (int) ($checkoutState['quantity'] ?? 1),
+                            'existing_customer_matched' => $existingCustomerId !== null,
                         ]);
-                        $response = \App\Services\ShopifyHttp::client($token)->post("https://{$shop}/admin/api/" . config('services.shopify.api_version', '2026-07') . "/orders.json", \App\Services\ShopifyOrderPayload::build((int) $variantMatch[1], (int) ($checkoutState['quantity'] ?? 1), $checkoutState));
+                        $orderPayload = \App\Services\ShopifyOrderPayload::build(
+                            (int) $variantMatch[1],
+                            (int) ($checkoutState['quantity'] ?? 1),
+                            $checkoutState,
+                            $existingCustomerId
+                        );
+                        $response = \App\Services\ShopifyHttp::client($token)->post("{$apiBase}/orders.json", $orderPayload);
+
+                        // If customer lookup was unavailable and Shopify rejects
+                        // inline customer creation because this contact already
+                        // exists, retry once as an order attached to the supplied
+                        // shipping address. The 422 confirms no order was created.
+                        $customerErrors = $response->json('errors.customer', []);
+                        $duplicateCustomerContact = $response->status() === 422
+                            && is_array($customerErrors)
+                            && collect($customerErrors)->flatten()->contains(
+                                fn ($error) => is_string($error) && str_contains(strtolower($error), 'already been taken')
+                            );
+                        if ($duplicateCustomerContact && $existingCustomerId === null) {
+                            Log::warning('ProcessAutoReply: Shopify customer already exists but could not be matched; retrying order without creating a duplicate customer', [
+                                'conversation_id' => $conversation->id,
+                                'connection_id' => $shopifyChannel->id,
+                                'error_fields' => array_slice(array_map('strval', array_keys($customerErrors)), 0, 10),
+                            ]);
+                            $guestOrderPayload = \App\Services\ShopifyOrderPayload::build(
+                                (int) $variantMatch[1],
+                                (int) ($checkoutState['quantity'] ?? 1),
+                                $checkoutState,
+                                null,
+                                false
+                            );
+                            $response = \App\Services\ShopifyHttp::client($token)->post("{$apiBase}/orders.json", $guestOrderPayload);
+                            Log::info('ProcessAutoReply: Shopify duplicate-customer fallback response received', [
+                                'conversation_id' => $conversation->id,
+                                'connection_id' => $shopifyChannel->id,
+                                'http_status' => $response->status(),
+                                'successful' => $response->successful(),
+                                'order_id_present' => !empty($response->json('order.id')),
+                            ]);
+                        }
                         Log::info('ProcessAutoReply: Shopify order API response received', [
                             'conversation_id' => $conversation->id,
                             'connection_id' => $shopifyChannel->id,

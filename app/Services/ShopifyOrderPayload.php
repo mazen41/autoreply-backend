@@ -11,7 +11,7 @@ namespace App\Services;
  */
 class ShopifyOrderPayload
 {
-    public static function build(int $variantId, int $quantity, array $checkout): array
+    public static function build(int $variantId, int $quantity, array $checkout, ?int $existingCustomerId = null, bool $createCustomer = true): array
     {
         $phone = self::normalizePhone(
             $checkout['phone'] ?? $checkout['customer_phone'] ?? null,
@@ -36,21 +36,30 @@ class ShopifyOrderPayload
             'phone' => $phone,
         ]);
 
-        return [
+        $customer = $existingCustomerId !== null
+            ? ['id' => $existingCustomerId]
+            : ($createCustomer ? self::compact([
+                'first_name' => $first,
+                'last_name' => $last,
+                'phone' => $phone,
+                'email' => self::nullableTrim($checkout['email'] ?? null),
+            ]) : null);
+
+        $order = [
             'order' => [
                 'line_items' => [[
                     'variant_id' => $variantId,
                     'quantity' => max(1, $quantity),
                 ]],
-                'customer' => self::compact([
-                    'first_name' => $first,
-                    'last_name' => $last,
-                    'phone' => $phone,
-                    'email' => self::nullableTrim($checkout['email'] ?? null),
-                ]),
                 'shipping_address' => $shipping,
             ],
         ];
+
+        if ($customer !== null) {
+            $order['order']['customer'] = $customer;
+        }
+
+        return $order;
     }
 
     /** @return array{0: string, 1: string} */

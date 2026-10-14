@@ -120,6 +120,8 @@ class SequenceExecutionService
             return false;
         }
 
+        $renderedMessage = $this->renderSequenceMessage((string) $step->message, $conversation, $enrollment);
+
         // CRITICAL FIX: Move external provider call OUTSIDE DB transaction
         // to prevent rollback after provider success causing duplicate sends.
         // New order:
@@ -127,18 +129,21 @@ class SequenceExecutionService
         // 2. Call provider (outside transaction)
         // 3. Update status based on provider result (outside transaction)
 
-        $messageRecord = DB::transaction(function () use ($conversation, $step, $execution, $channel) {
+        $messageRecord = DB::transaction(function () use ($conversation, $step, $execution, $channel, $renderedMessage) {
             $existing = $execution->message_id
                 ? Message::query()->lockForUpdate()->find($execution->message_id)
                 : null;
 
             if ($existing) {
+                if (!$this->hasProviderAcceptanceEvidence($existing) && $existing->content !== $renderedMessage) {
+                    $existing->update(['content' => $renderedMessage]);
+                }
                 return $existing;
             }
 
             $message = Message::create([
                 'conversation_id' => $conversation->id,
-                'content' => $step->message,
+                'content' => $renderedMessage,
                 'type' => 'text',
                 'direction' => 'outbound',
                 'status' => 'pending',
@@ -206,7 +211,7 @@ class SequenceExecutionService
 
         // Now call the provider OUTSIDE the transaction
         try {
-            $this->sendMessageToConversation($conversation, $step->message, $channel, $execution->message_id, $step->config ?? []);
+            $this->sendMessageToConversation($conversation, $renderedMessage, $channel, $execution->message_id, $step->config ?? []);
         } catch (\Exception $e) {
             // Provider failed - update message status to failed
             Message::where('id', $execution->message_id)->update([
@@ -219,6 +224,60 @@ class SequenceExecutionService
         }
 
         return true;
+    }
+
+    /** Replace the sequence editor's supported placeholders before persisting or sending. */
+    protected function renderSequenceMessage(string $message, Conversation $conversation, SequenceEnrollment $enrollment): string
+    {
+        $conversation->loadMissing(['customer', 'business']);
+        $checkout = is_array($conversation->checkout_state) ? $conversation->checkout_state : [];
+        $enrollmentMetadata = is_array($enrollment->metadata) ? $enrollment->metadata : [];
+
+        $nameCandidates = [
+            $conversation->sender_name,
+            $conversation->customer?->name,
+            $enrollmentMetadata['conversation_sender'] ?? null,
+        ];
+        $customerName = null;
+        foreach ($nameCandidates as $candidate) {
+            $candidate = trim((string) $candidate);
+            if ($candidate !== '' && $candidate !== '.' && !preg_match('/^\\+?[0-9][0-9\\s\\-()]*$/', $candidate)) {
+                $customerName = $candidate;
+                break;
+            }
+        }
+
+        $business = $conversation->business;
+        $variables = [
+            'customer_name' => $customerName ?: 'there',
+            'business_name' => $business?->business_name ?: ($business?->name ?: 'our store'),
+            'product_name' => $checkout['product_name'] ?? $enrollmentMetadata['product_name'] ?? '',
+            'order_number' => $checkout['order_number'] ?? $checkout['order_id'] ?? $enrollmentMetadata['order_number'] ?? '',
+            'order_total' => $checkout['order_total'] ?? $checkout['total'] ?? $enrollmentMetadata['order_total'] ?? '',
+            'tracking_url' => $checkout['tracking_url'] ?? $enrollmentMetadata['tracking_url'] ?? '',
+        ];
+
+        $unresolved = [];
+        $rendered = preg_replace_callback('/\\{\\{\\s*([a-z0-9_]+)\\s*\\}\\}/i', function (array $match) use ($variables, &$unresolved): string {
+            $key = strtolower($match[1]);
+            if (!array_key_exists($key, $variables)) {
+                $unresolved[] = $key;
+                return '';
+            }
+
+            return is_scalar($variables[$key]) ? trim((string) $variables[$key]) : '';
+        }, $message);
+
+        if ($unresolved !== []) {
+            Log::warning('Sequence message contained unsupported template variables', [
+                'sequence_id' => $enrollment->sequence_id,
+                'enrollment_id' => $enrollment->id,
+                'conversation_id' => $conversation->id,
+                'variables' => array_values(array_unique($unresolved)),
+            ]);
+        }
+
+        return $rendered ?? $message;
     }
 
     private function pauseForUnavailableConversationChannel(

@@ -89,6 +89,19 @@ class Conversation extends Model
         return $this->hasOne(Message::class)->latestOfMany();
     }
 
+    public function latestChatMessage()
+    {
+        return $this->hasOne(Message::class)
+            ->where(function ($query): void {
+                $query->whereNull('source')->orWhereNotIn('source', [
+                    'social_comment',
+                    'comment_public_reply',
+                    'comment_private_reply',
+                ]);
+            })
+            ->latestOfMany();
+    }
+
     public function assignedAgent()
     {
         return $this->belongsTo(User::class, 'assigned_agent_id');

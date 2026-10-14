@@ -264,6 +264,7 @@ Route::middleware('auth:sanctum')->group(function () {
     Route::patch('/handoff-tasks/{taskId}/resolve', [\App\Http\Controllers\Api\HandoffTaskController::class, 'resolve']);
     Route::patch('/handoff-tasks/{taskId}/assign', [\App\Http\Controllers\Api\HandoffTaskController::class, 'assign']);
     Route::get('/inbox',                                [InboxController::class, 'index']);
+    Route::get('/social-comments', [\App\Http\Controllers\Api\SocialCommentController::class, 'index']);
     Route::get('/inbox/{conversationId}/messages',      [InboxController::class, 'messages']);
     Route::post('/businesses/{businessId}/conversations/{conversationId}/read', [InboxController::class, 'markRead'])
         ->middleware('business.access:conversation_read');

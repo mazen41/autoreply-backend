@@ -17,6 +17,15 @@ use Google\Service\Gmail;
 
 class InboxController extends Controller
 {
+    private const COMMENT_MESSAGE_SOURCES = ['social_comment', 'comment_public_reply', 'comment_private_reply'];
+
+    private function applyChatMessageFilter($query): void
+    {
+        $query->where(function ($messages): void {
+            $messages->whereNull('source')->orWhereNotIn('source', self::COMMENT_MESSAGE_SOURCES);
+        });
+    }
+
     private function conversationQuery(Request $request, string $permission = 'conversation_read')
     {
         $business = app(\App\Services\ActiveBusiness::class)->resolve($request, permission: $permission);
@@ -35,14 +44,18 @@ class InboxController extends Controller
             ->with([
                 'channel:id,type,page_name,page_id',
                 'bot:id,name',
-                'latestMessage',
+                'latestChatMessage',
                 'latestCommerceOrderAttempt',
             ])
+            ->whereHas('messages', function ($messages): void {
+                $this->applyChatMessageFilter($messages);
+            })
             ->select(['id', 'channel_id', 'business_id', 'bot_id', 'sender_id', 'sender_name', 'sender_email', 'subject', 'status', 'ai_enabled', 'requires_human', 'escalated_at', 'escalation_reason', 'last_message_at', 'assigned_agent_id', 'assigned_at', 'checkout_state'])
             // Unread count within the 24h unread window — matches the
             // `unread` filter below and the realtime contract's
             // unread_count (InboxBroadcastPayload::unreadCount).
             ->withCount(['messages as unread_count' => function ($q) use ($userId) {
+                $this->applyChatMessageFilter($q);
                 $q->where('direction', 'inbound')
                   ->where('created_at', '>=', now()->subHours(24))
                   ->whereRaw('messages.created_at > COALESCE((SELECT conversation_reads.read_at FROM conversation_reads WHERE conversation_reads.conversation_id = messages.conversation_id AND conversation_reads.user_id = ? LIMIT 1), ?)', [$userId, now()->subHours(24)]);
@@ -61,6 +74,7 @@ class InboxController extends Controller
                   ->orWhere('sender_email', 'like', "%{$searchTerm}%")
                   ->orWhere('sender_id', 'like', "%{$searchTerm}%")
                   ->orWhereHas('messages', function ($messageQuery) use ($searchTerm) {
+                      $this->applyChatMessageFilter($messageQuery);
                       $messageQuery->where('content', 'like', "%{$searchTerm}%");
                   });
             });
@@ -114,6 +128,7 @@ class InboxController extends Controller
         // Unread filter (conversations with recent inbound messages)
         if ($request->has('unread') && $request->boolean('unread')) {
             $query->whereHas('messages', function ($q) use ($userId) {
+                $this->applyChatMessageFilter($q);
                 $q->where('direction', 'inbound')
                   ->where('created_at', '>=', now()->subHours(24))
                   ->whereRaw('messages.created_at > COALESCE((SELECT conversation_reads.read_at FROM conversation_reads WHERE conversation_reads.conversation_id = messages.conversation_id AND conversation_reads.user_id = ? LIMIT 1), ?)', [$userId, now()->subHours(24)]);
@@ -141,6 +156,8 @@ class InboxController extends Controller
         $conversations = $query->paginate(50);
         $conversations->getCollection()->transform(function (Conversation $conversation): Conversation {
             $conversation->setAttribute('checkout_summary', $this->checkoutSummary($conversation));
+            $conversation->setAttribute('latest_message', $conversation->latestChatMessage);
+            $conversation->makeHidden(['latest_chat_message']);
             $conversation->makeHidden(['checkout_state']);
             return $conversation;
         });
@@ -154,6 +171,9 @@ class InboxController extends Controller
     public function messages(Request $request, $conversationId)
     {
         $conversation = $this->conversationQuery($request, 'conversation_read')
+            ->whereHas('messages', function ($messages): void {
+                $this->applyChatMessageFilter($messages);
+            })
             ->with(['channel:id,type,page_name', 'latestCommerceOrderAttempt'])
             ->findOrFail($conversationId);
 
@@ -161,6 +181,9 @@ class InboxController extends Controller
         $conversation->makeHidden(['checkout_state']);
 
         $messages = Message::where('conversation_id', $conversationId)
+            ->where(function ($messages): void {
+                $this->applyChatMessageFilter($messages);
+            })
             ->orderBy('created_at', 'asc')
             ->get();
 

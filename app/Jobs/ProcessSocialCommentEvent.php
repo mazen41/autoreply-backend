@@ -94,7 +94,9 @@ class ProcessSocialCommentEvent implements ShouldQueue
                 $event->update(['status' => 'skipped', 'failure_code' => 'conversation_tenant_mismatch', 'processed_at' => now()]);
                 return;
             }
-            $conversation->forceFill(['bot_id' => $bot->id, 'last_message_at' => now()])->save();
+            // A public comment is displayed in the Comments workspace, not as
+            // activity in the chat inbox. Preserve a real DM's timestamp.
+            $conversation->forceFill(['bot_id' => $bot->id])->save();
 
             $message = Message::query()
                 ->where('conversation_id', $conversation->id)
@@ -110,7 +112,6 @@ class ProcessSocialCommentEvent implements ShouldQueue
                 'source' => 'social_comment',
                 'metadata' => ['social_comment_event_id' => $event->id, 'comment_id' => $event->comment_id, 'post_id' => $event->post_id, 'platform' => $event->platform],
             ]);
-            if ($channel->user_id) broadcast(new \App\Events\MessageReceived($message, $conversation, $channel->user_id));
 
             $commerceContext = app(EcommerceChannelResolver::class)->resolveConversation($conversation, $bot);
             $allowed = $settings['public_information'] ?? [];
@@ -212,7 +213,6 @@ class ProcessSocialCommentEvent implements ShouldQueue
                     'private_reply_id' => $event->private_reply_id,
                 ],
             ]);
-            if ($channel->user_id) broadcast(new \App\Events\MessageReceived($outbound, $conversation, $channel->user_id));
             $event->update(['status' => 'processed', 'failure_code' => null, 'processed_at' => now()]);
         } catch (\Throwable $exception) {
             $retryable = in_array($exception->getMessage(), ['meta_transient_failure', 'ai_generation_failed'], true)

@@ -226,12 +226,25 @@ class ProcessSocialCommentEvent implements ShouldQueue
         } catch (\Throwable $exception) {
             $retryable = in_array($exception->getMessage(), ['meta_transient_failure', 'ai_generation_failed'], true)
                 || $exception instanceof ConnectionException || $exception instanceof QueryException;
+            $exceptionFile = basename($exception->getFile());
+            $exceptionLocation = $exceptionFile . ':' . $exception->getLine();
+            $safePhpDiagnostic = null;
+            if ($exception instanceof \ErrorException
+                && preg_match('/^(?:Undefined variable|Undefined array key|Trying to access array offset|Attempt to read property|Trying to get property)/i', $exception->getMessage())) {
+                $safePhpDiagnostic = mb_substr($exception->getMessage(), 0, 240);
+            }
             SocialCommentEvent::whereKey($this->eventId)->update([
                 'status' => $retryable ? 'retryable' : 'failed',
                 'failure_code' => $retryable ? 'transient_processing_error' : 'processing_error',
-                'failure_reason' => get_class($exception),
+                'failure_reason' => get_class($exception) . ' at ' . $exceptionLocation,
             ]);
-            Log::error('Social comment automation failed', ['event_id' => $this->eventId, 'exception_type' => get_class($exception)]);
+            Log::error('Social comment automation failed', [
+                'event_id' => $this->eventId,
+                'exception_type' => get_class($exception),
+                'exception_file' => $exceptionFile,
+                'exception_line' => $exception->getLine(),
+                'php_diagnostic' => $safePhpDiagnostic,
+            ]);
             if ($retryable && $this->attempts() < $this->tries) throw $exception;
         } finally {
             $lock->release();

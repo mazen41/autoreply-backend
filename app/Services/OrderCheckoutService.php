@@ -261,6 +261,17 @@ class OrderCheckoutService
         return null;
     }
 
+    /** Infer Shopify address location fields from explicit address text and phone country. */
+    public function resolveDeliveryLocation(string $address, ?string $phone = null): array
+    {
+        $country = $this->deliveryCountryForAddress($address, $phone);
+
+        return [
+            'city' => $this->extractDeliveryCity($address),
+            'country' => $country['name'] ?? null,
+        ];
+    }
+
     /**
      * Extract order fields from incoming message text and merge with existing checkout_state.
      */

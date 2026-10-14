@@ -4071,6 +4071,17 @@ $aiResponse = $intro
                             'quantity' => (int) ($checkoutState['quantity'] ?? 1),
                             'existing_customer_matched' => $existingCustomerId !== null,
                         ]);
+                        $freeformShippingAddress = (string) ($checkoutState['address'] ?? $checkoutState['customer_address'] ?? '');
+                        $inferredShippingLocation = app(\App\Services\OrderCheckoutService::class)->resolveDeliveryLocation(
+                            $freeformShippingAddress,
+                            (string) ($checkoutState['phone'] ?? $checkoutState['customer_phone'] ?? '')
+                        );
+                        if (empty($checkoutState['city']) && !empty($inferredShippingLocation['city'])) {
+                            $checkoutState['city'] = $inferredShippingLocation['city'];
+                        }
+                        if (empty($checkoutState['country']) && !empty($inferredShippingLocation['country'])) {
+                            $checkoutState['country'] = $inferredShippingLocation['country'];
+                        }
                         $orderPayload = \App\Services\ShopifyOrderPayload::build(
                             (int) $variantMatch[1],
                             (int) ($checkoutState['quantity'] ?? 1),
@@ -4081,6 +4092,8 @@ $aiResponse = $intro
                             'conversation_id' => $conversation->id,
                             'connection_id' => $shopifyChannel->id,
                             'address1_present' => !empty($orderPayload['order']['shipping_address']['address1'] ?? null),
+                            'first_name_present' => !empty($orderPayload['order']['shipping_address']['first_name'] ?? null),
+                            'last_name_present' => !empty($orderPayload['order']['shipping_address']['last_name'] ?? null),
                             'city_present' => !empty($orderPayload['order']['shipping_address']['city'] ?? null),
                             'country_present' => !empty($orderPayload['order']['shipping_address']['country'] ?? null),
                         ]);

@@ -150,4 +150,22 @@ class SallaOrderPayloadPhoneTest extends TestCase
         $this->assertArrayHasKey('city', $body['ship_to']);
         $this->assertArrayHasKey('address', $body['ship_to']);
     }
+
+    /** @test */
+    public function explicitly_supplied_block_in_checkout_data_is_preserved_in_ship_to(): void
+    {
+        $channel = $this->channel();
+        $this->fakeSalla();
+
+        $state = $this->state('+966505308084');
+        $state['block'] = 'Block 12';
+
+        app(SallaService::class)->createOrderForChannel($channel, $state);
+
+        $body = $this->sentOrderBody();
+        $this->assertSame('Block 12', $body['ship_to']['block'] ?? null,
+            'Explicitly provided checkout block must be preserved in ship_to.block');
+        $this->assertSame('36', $body['ship_to']['building_number'] ?? null);
+        $this->assertSame('11511', $body['ship_to']['postal_code'] ?? null);
+    }
 }

@@ -848,7 +848,7 @@ class SallaService
         // Do NOT fall back to first-N-words: Salla rejects invented block values and the
         // validation failure cascades into a misleading receiver.phone error.
         $block = null;
-        if (preg_match('/(?:district|block|neighborhood|حي|منطقة|شارع|فصل|فيصل|طريق)\s*[:\-]?\s*([A-Za-z\x{0600}-\x{06FF}\s]{2,30})/ui', $freeformAddress, $bm)) {
+        if (preg_match('/(?:district|block|neighborhood|حي|منطقة|بلوك|قطعة)\s*[:\-]?\s*([A-Za-z\x{0600}-\x{06FF}\s]{2,30})/ui', $freeformAddress, $bm)) {
             $block = trim($bm[1]);
         }
 

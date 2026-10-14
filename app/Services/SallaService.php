@@ -844,15 +844,12 @@ class SallaService
             $streetNumber = $sm[1];
         }
 
-        // 3. Parse block/district
+        // 3. Parse block/district — only set when an explicit label is present.
+        // Do NOT fall back to first-N-words: Salla rejects invented block values and the
+        // validation failure cascades into a misleading receiver.phone error.
         $block = null;
         if (preg_match('/(?:district|block|neighborhood|حي|منطقة|شارع|فصل|فيصل|طريق)\s*[:\-]?\s*([A-Za-z\x{0600}-\x{06FF}\s]{2,30})/ui', $freeformAddress, $bm)) {
             $block = trim($bm[1]);
-        } else {
-            $words = array_filter(explode(' ', trim($freeformAddress)));
-            if (count($words) >= 1) {
-                $block = implode(' ', array_slice($words, 0, 3));
-            }
         }
 
         // 4. Parse postal code (if 5-digit zip exists)

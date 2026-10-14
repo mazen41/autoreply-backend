@@ -29,7 +29,8 @@ class ShopifyOrderPayload
         $shipping = self::compact([
             'first_name' => $first,
             'last_name' => $last,
-            'address1' => self::nullableTrim($checkout['address'] ?? null),
+            'address1' => self::nullableTrim($checkout['address'] ?? null)
+                ?? self::nullableTrim($checkout['customer_address'] ?? null),
             'zip' => self::nullableTrim($checkout['postal_code'] ?? null),
             'city' => self::nullableTrim($checkout['city'] ?? null),
             'country' => self::nullableTrim($checkout['country'] ?? null),

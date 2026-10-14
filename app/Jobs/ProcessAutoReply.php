@@ -4077,6 +4077,13 @@ $aiResponse = $intro
                             $checkoutState,
                             $existingCustomerId
                         );
+                        Log::info('ProcessAutoReply: Shopify shipping address payload prepared', [
+                            'conversation_id' => $conversation->id,
+                            'connection_id' => $shopifyChannel->id,
+                            'address1_present' => !empty($orderPayload['order']['shipping_address']['address1'] ?? null),
+                            'city_present' => !empty($orderPayload['order']['shipping_address']['city'] ?? null),
+                            'country_present' => !empty($orderPayload['order']['shipping_address']['country'] ?? null),
+                        ]);
                         $response = \App\Services\ShopifyHttp::client($token)->post("{$apiBase}/orders.json", $orderPayload);
 
                         // If customer lookup was unavailable and Shopify rejects
@@ -4117,6 +4124,8 @@ $aiResponse = $intro
                             'http_status' => $response->status(),
                             'successful' => $response->successful(),
                             'order_id_present' => !empty($response->json('order.id')),
+                            'shipping_address_returned' => is_array($response->json('order.shipping_address'))
+                                && !empty($response->json('order.shipping_address.address1')),
                             'error_fields' => is_array($response->json('errors'))
                                 ? array_slice(array_map('strval', array_keys($response->json('errors'))), 0, 20)
                                 : [],

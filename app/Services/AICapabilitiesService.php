@@ -27,19 +27,21 @@ class AICapabilitiesService
             return $context['ai_model'];
         }
         $provider = self::getAIProvider($context);
-        if ($provider === 'groq') {
-            return config('services.groq.model', env('GROQ_MODEL', 'openai/gpt-oss-120b'));
-        }
-        return config('services.gemini.model', env('GEMINI_MODEL', 'gemini-2.5-flash'));
+        return match ($provider) {
+            'groq' => config('services.groq.model', env('GROQ_MODEL', 'openai/gpt-oss-120b')),
+            'claude' => config('services.claude.model', env('CLAUDE_MODEL', 'claude-haiku-4-5-20251001')),
+            default => config('services.gemini.model', env('GEMINI_MODEL', 'gemini-2.5-flash')),
+        };
     }
 
     private static function getAIAPIKey(array $context = []): string
     {
         $provider = self::getAIProvider($context);
-        if ($provider === 'groq') {
-            return config('services.groq.api_key', env('GROQ_API_KEY', ''));
-        }
-        return config('services.gemini.api_key', env('GEMINI_API_KEY', ''));
+        return match ($provider) {
+            'groq' => (string) config('services.groq.api_key', env('GROQ_API_KEY', '')),
+            'claude' => (string) config('services.claude.api_key', env('ANTHROPIC_API_KEY', '')),
+            default => (string) config('services.gemini.api_key', env('GEMINI_API_KEY', '')),
+        };
     }
 
     /**
@@ -851,7 +853,11 @@ JSON;
                 ['role' => 'user',   'content' => $message],
             ];
 
-            $response = self::callAIChatWithRetry($messages, $context);
+            $response = self::callAIChatWithRetry(
+                $messages,
+                $context,
+                max(1, (int) config('services.ai.retries', 3))
+            );
 
             // ── Robust JSON extraction ────────────────────────────────────────
             // Gemini sometimes wraps the JSON in markdown fences, adds a preamble
@@ -1170,25 +1176,82 @@ JSON;
     private static function callAIChat(array $messages, array $context = []): string
     {
         $provider = self::getAIProvider($context);
-
-        if ($provider === 'groq') {
-            try {
-                return self::callGroqChat($messages, $context);
-            } catch (\Exception $e) {
-                // If Groq fails (e.g. invalid API key), try Gemini as a fallback if configured
-                Log::warning('Groq API failed. Falling back to Gemini.', ['exception_type' => get_class($e)]);
-                $fallbackContext = $context;
-                $fallbackContext['ai_provider'] = 'gemini';
-                unset($fallbackContext['ai_model']);
-                return self::callGeminiChat($messages, $fallbackContext);
+        try {
+            return self::callProviderChat($provider, $messages, $context);
+        } catch (\Throwable $exception) {
+            $fallbackProvider = (string) config('services.ai.fallback_provider', 'gemini');
+            if (!in_array($fallbackProvider, ['groq', 'gemini', 'claude'], true) || $fallbackProvider === $provider) {
+                throw $exception;
             }
+
+            Log::warning('Primary AI provider failed; trying configured fallback.', [
+                'provider' => $provider,
+                'fallback_provider' => $fallbackProvider,
+                'exception_type' => get_class($exception),
+            ]);
+            $fallbackContext = $context;
+            $fallbackContext['ai_provider'] = $fallbackProvider;
+            unset($fallbackContext['ai_model']);
+
+            return self::callProviderChat($fallbackProvider, $messages, $fallbackContext);
+        }
+    }
+
+    private static function callProviderChat(string $provider, array $messages, array $context): string
+    {
+        return match ($provider) {
+            'groq' => self::callGroqChat($messages, $context),
+            'claude' => self::callClaudeChat($messages, $context),
+            default => self::callGeminiChat($messages, $context),
+        };
+    }
+
+    /** Call Anthropic Messages API for text replies. */
+    private static function callClaudeChat(array $messages, array $context = []): string
+    {
+        $apiKey = self::getAIAPIKey($context);
+        $model = self::getAIModel($context);
+        if ($apiKey === '') {
+            throw new \Exception('Anthropic API key is not configured (ANTHROPIC_API_KEY).');
         }
 
-        if ($provider === 'gemini') {
-            return self::callGeminiChat($messages, $context);
+        $system = '';
+        $turns = [];
+        foreach ($messages as $message) {
+            $role = ($message['role'] ?? '') === 'assistant' ? 'assistant' : 'user';
+            if (($message['role'] ?? '') === 'system') {
+                $system .= (string) ($message['content'] ?? '') . "\n";
+                continue;
+            }
+            $turns[] = ['role' => $role, 'content' => (string) ($message['content'] ?? '')];
         }
 
-        return self::callGeminiChat($messages, $context);
+        self::$lastRequestProvider = 'claude';
+        self::$lastRequestModel = $model;
+        $payload = [
+            'model' => $model,
+            'max_tokens' => (int) config('services.ai.max_tokens', 2048),
+            'messages' => $turns,
+        ];
+        if (trim($system) !== '') {
+            $payload['system'] = trim($system);
+        }
+
+        $response = Http::timeout((int) config('services.ai.timeout', 30))
+            ->connectTimeout(10)
+            ->withHeaders([
+                'x-api-key' => $apiKey,
+                'anthropic-version' => '2023-06-01',
+                'Content-Type' => 'application/json',
+            ])
+            ->post('https://api.anthropic.com/v1/messages', $payload);
+
+        if (!$response->successful()) {
+            Log::error('Claude API error', ['status' => $response->status()]);
+            throw new \Exception('Claude API error (HTTP ' . $response->status() . ')');
+        }
+
+        return (string) ($response->json('content.0.text') ?? '');
     }
 
     /**
@@ -1209,8 +1272,8 @@ JSON;
         $payload = [
             'model'       => $model,
             'messages'    => $messages,
-            'temperature' => (float) env('AI_TEMPERATURE', 0.7),
-            'max_tokens'  => (int) env('AI_MAX_TOKENS', 2048),
+            'temperature' => (float) config('services.ai.temperature', 0.7),
+            'max_tokens'  => (int) config('services.ai.max_tokens', 2048),
             'response_format' => ['type' => 'json_object'],
         ];
 
@@ -1265,8 +1328,8 @@ JSON;
         $payload = [
             'contents'         => $contents,
             'generationConfig' => [
-                'temperature'     => 0.7,
-                'maxOutputTokens' => 1024,
+                'temperature'     => (float) config('services.ai.temperature', 0.7),
+                'maxOutputTokens' => (int) config('services.ai.max_tokens', 1024),
             ],
         ];
 

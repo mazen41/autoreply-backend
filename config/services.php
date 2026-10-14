@@ -90,6 +90,11 @@ return [
         'gemini_model' => env('VISION_GEMINI_MODEL', 'gemini-3.8-flash'),
     ],
 
+    'voice' => [
+        'transcription_provider' => env('VOICE_TRANSCRIPTION_PROVIDER', 'openai'),
+        'transcription_model' => env('VOICE_TRANSCRIPTION_MODEL', 'whisper-1'),
+    ],
+
     'myfatoorah' => [
         'api_key'        => env('MYFATOORAH_API_KEY'),
         'base_url'       => env('MYFATOORAH_BASE_URL', 'https://api.myfatoorah.com'),

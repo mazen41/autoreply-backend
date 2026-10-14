@@ -28,6 +28,7 @@ class ToolsController extends Controller
             $result = match ($provider) {
                 'claude' => $this->callClaudeAPI($systemPrompt, $userMessage),
                 'gemini' => $this->callGeminiAPI($systemPrompt, $userMessage),
+                'groq' => $this->callGroqAPI($systemPrompt, $userMessage),
                 default => null,
             };
 
@@ -146,5 +147,38 @@ class ToolsController extends Controller
         }
 
         return null;
+    }
+
+    private function callGroqAPI(string $systemPrompt, string $userMessage): ?string
+    {
+        $apiKey = config('services.groq.api_key');
+        if (!$apiKey) {
+            Log::error('ToolsController: GROQ_API_KEY not set');
+            return null;
+        }
+
+        try {
+            $response = Http::timeout((int) config('services.ai.timeout', 30))
+                ->withToken($apiKey)
+                ->post('https://api.groq.com/openai/v1/chat/completions', [
+                    'model' => config('services.groq.model', 'openai/gpt-oss-120b'),
+                    'max_tokens' => (int) config('services.ai.max_tokens', 2000),
+                    'temperature' => (float) config('services.ai.temperature', 0.7),
+                    'messages' => [
+                        ['role' => 'system', 'content' => $systemPrompt],
+                        ['role' => 'user', 'content' => $userMessage],
+                    ],
+                ]);
+
+            if (!$response->successful()) {
+                Log::error('ToolsController: Groq API request failed', ['status' => $response->status()]);
+                return null;
+            }
+
+            return $response->json('choices.0.message.content');
+        } catch (\Throwable $exception) {
+            Log::error('ToolsController: Groq API exception', ['exception_type' => get_class($exception)]);
+            return null;
+        }
     }
 }

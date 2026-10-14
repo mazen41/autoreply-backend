@@ -17,6 +17,11 @@ class VoiceService
      */
     public static function transcribeAudio(string $audioFilePath): string
     {
+        $provider = (string) config('services.voice.transcription_provider', 'openai');
+        if ($provider !== 'openai') {
+            throw new \Exception('Unsupported voice transcription provider: ' . $provider);
+        }
+
         $apiKey = config('services.openai.api_key');
 
         if (!$apiKey) {
@@ -34,7 +39,7 @@ class VoiceService
                 ])
                 ->attach('file', file_get_contents($audioFilePath), basename($audioFilePath))
                 ->post('https://api.openai.com/v1/audio/transcriptions', [
-                    'model' => 'whisper-1',
+                    'model' => config('services.voice.transcription_model', 'whisper-1'),
                     'response_format' => 'text',
                 ]);
 

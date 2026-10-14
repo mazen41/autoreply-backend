@@ -24,7 +24,9 @@ class CommentAutomationSettingsController extends Controller
             'assigned' => true,
             'enabled' => (bool) $channel->pivot->comment_automation_enabled,
             'public_reply_enabled' => (bool) $channel->pivot->public_comment_reply_enabled,
-            'private_reply_enabled' => (bool) $channel->pivot->private_comment_reply_enabled,
+            // Comment automation is public-only. Keep the legacy field in the
+            // response for older clients, but never report it as enabled.
+            'private_reply_enabled' => false,
             'settings' => $this->decodeSettings($channel->pivot->comment_settings),
         ])->values()]);
     }
@@ -66,7 +68,7 @@ class CommentAutomationSettingsController extends Controller
                 $bot->channels()->updateExistingPivot((int) $item['channel_id'], [
                     'comment_automation_enabled' => (bool) $item['enabled'],
                     'public_comment_reply_enabled' => (bool) $item['public_reply_enabled'],
-                    'private_comment_reply_enabled' => (bool) $item['private_reply_enabled'],
+                    'private_comment_reply_enabled' => false,
                     'comment_settings' => json_encode($item['settings'] ?? [], JSON_THROW_ON_ERROR),
                 ]);
             }

@@ -914,33 +914,13 @@ class ProcessAutoReply implements ShouldQueue
         }
 
         // ── SALLA EXCLUSIVE MODE DETECTION ────────────────────────────────────
-        // Check if the conversation is actively in a Salla-related flow (products/orders/checkout).
-        // This structurally prevents the AI from hallucinating platform/unrelated text into store chats.
+        // Restrict this mode to the current turn's commerce intent. Inferring it
+        // from an earlier assistant reply mentioning products/orders suppresses
+        // the business profile and knowledge base on later general questions.
         $isSallaFlow = false;
-        
         if ($sallaChannel) {
-            // 1. Direct intent detection on this turn
             if ($isProductAggregate || $isOrderAggregate || $isOrderStatus || $isPlaceOrder || ($imageRequest ?? false)) {
                 $isSallaFlow = true;
-            } else {
-                // 2. Contextual detection: Was the recent conversation about Salla?
-                $recentAiMessage = Message::where('conversation_id', $conversation->id)
-                    ->where('is_ai', true)
-                    ->where('direction', 'outbound')
-                    ->orderBy('created_at', 'desc')
-                    ->first();
-
-                if ($recentAiMessage) {
-                    if (in_array($recentAiMessage->intent, ['order_status', 'place_order'])) {
-                        $isSallaFlow = true;
-                    } else {
-                        // For generic 'question' intent, check if the content looks Salla-related
-                        $recentLower = mb_strtolower($recentAiMessage->content);
-                        if (preg_match('/(sar|ريال|product|منتج|items?|order|طلب|cart|سلة)/i', $recentLower)) {
-                            $isSallaFlow = true;
-                        }
-                    }
-                }
             }
         }
 

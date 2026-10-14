@@ -32,7 +32,10 @@ class ProcessSocialCommentEvent implements ShouldQueue
 
     public function handle(MetaCommentAutomationService $replies): void
     {
-        $lock = Cache::lock("social-comment-event:{$this->eventId}", 120);
+        // Use the database lock store explicitly. The file cache can lose its
+        // sharded directory during cache cleanup while a worker is acquiring
+        // a lock, causing LockableFile::fopen() failures in production.
+        $lock = Cache::store('database')->lock("social-comment-event:{$this->eventId}", 120);
         if (!$lock->get()) return;
         try {
             $event = SocialCommentEvent::with(['channel', 'business'])->find($this->eventId);
@@ -111,14 +114,7 @@ class ProcessSocialCommentEvent implements ShouldQueue
 
             $commerceContext = app(EcommerceChannelResolver::class)->resolveConversation($conversation, $bot);
             $allowed = $settings['public_information'] ?? [];
-            $businessProfile = '';
-            if (in_array('general_business_info', $allowed, true)) {
-                $businessProfile = implode("\n", array_filter([
-                    'Business description: ' . ($event->business->description ?? ''),
-                    'Business type: ' . ($event->business->business_type ?? ''),
-                    'Country: ' . ($event->business->country ?? ''),
-                ]));
-            }
+            $businessProfile = $this->buildPublicBusinessProfile($event->business, $allowed);
             $productContext = [];
             $restrictedProductNames = [];
             $restrictedPrices = [];
@@ -175,19 +171,14 @@ class ProcessSocialCommentEvent implements ShouldQueue
             if ($assignment->public_comment_reply_enabled) {
                 $results[] = ['kind' => 'public', 'result' => $replies->publishPublic($event, $channel, $replyText)];
             }
-            if ($assignment->private_comment_reply_enabled) {
-                $results[] = ['kind' => 'private', 'result' => $replies->publishPrivate($event, $channel, $replyText)];
-            }
             if (!$results) {
-                $event->update(['status' => 'skipped', 'failure_code' => 'reply_modes_disabled', 'processed_at' => now()]);
+                $event->update(['status' => 'skipped', 'failure_code' => 'public_reply_disabled', 'processed_at' => now()]);
                 return;
             }
-            $privateReplyIneligible = false;
             $sentKinds = [];
             foreach ($results as $entry) {
                 if (!empty($entry['result']['retryable'])) throw new \RuntimeException('meta_transient_failure');
                 if (!empty($entry['result']['skipped'])) {
-                    $privateReplyIneligible = $privateReplyIneligible || $entry['kind'] === 'private';
                     continue;
                 }
                 if (empty($entry['result']['success'])) {
@@ -197,7 +188,7 @@ class ProcessSocialCommentEvent implements ShouldQueue
                 $sentKinds[] = $entry['kind'];
             }
             if (!$sentKinds) {
-                $event->update(['status' => 'skipped', 'failure_code' => 'private_reply_ineligible', 'processed_at' => now()]);
+                $event->update(['status' => 'skipped', 'failure_code' => 'public_reply_skipped', 'processed_at' => now()]);
                 return;
             }
 
@@ -222,7 +213,7 @@ class ProcessSocialCommentEvent implements ShouldQueue
                 ],
             ]);
             if ($channel->user_id) broadcast(new \App\Events\MessageReceived($outbound, $conversation, $channel->user_id));
-            $event->update(['status' => 'processed', 'failure_code' => $privateReplyIneligible ? 'private_reply_ineligible' : null, 'processed_at' => now()]);
+            $event->update(['status' => 'processed', 'failure_code' => null, 'processed_at' => now()]);
         } catch (\Throwable $exception) {
             $retryable = in_array($exception->getMessage(), ['meta_transient_failure', 'ai_generation_failed'], true)
                 || $exception instanceof ConnectionException || $exception instanceof QueryException;
@@ -264,5 +255,54 @@ class ProcessSocialCommentEvent implements ShouldQueue
         if (!is_string($value) || $value === '') return [];
         $decoded = json_decode($value, true);
         return is_array($decoded) ? $decoded : [];
+    }
+
+    /** Build only merchant-authored business facts explicitly allowed publicly. */
+    private function buildPublicBusinessProfile(?\App\Models\BusinessProfile $business, array $allowed): string
+    {
+        if (!$business || !in_array('general_business_info', $allowed, true)) {
+            return '';
+        }
+
+        $facts = [];
+        foreach ([
+            'Business name' => $business->business_name ?? $business->name,
+            'Business type' => $business->business_type,
+            'Description' => $business->description,
+            'About the business' => $business->knowledge_base,
+            'Country' => $business->country,
+        ] as $label => $value) {
+            if (is_string($value) && trim($value) !== '') {
+                $facts[] = $label . ': ' . mb_substr(trim($value), 0, 1000);
+            }
+        }
+
+        $services = $business->services;
+        if (is_array($services)) {
+            $services = implode(', ', array_filter(array_map(
+                fn ($service) => is_string($service) ? trim($service) : '',
+                $services
+            )));
+        }
+        if (is_string($services) && trim($services) !== '') {
+            $facts[] = 'Services: ' . mb_substr(trim($services), 0, 800);
+        }
+
+        $faqs = $business->faqs;
+        if (is_array($faqs)) {
+            $faqs = implode("\n", array_filter(array_map(function ($faq): string {
+                if (!is_array($faq)) return is_string($faq) ? trim($faq) : '';
+                $question = $faq['question'] ?? $faq['q'] ?? '';
+                $answer = $faq['answer'] ?? $faq['a'] ?? '';
+                return is_string($question) && is_string($answer) && $question !== '' && $answer !== ''
+                    ? 'Q: ' . trim($question) . ' A: ' . trim($answer)
+                    : '';
+            }, $faqs)));
+        }
+        if (is_string($faqs) && trim($faqs) !== '') {
+            $facts[] = 'FAQs: ' . mb_substr(trim($faqs), 0, 1000);
+        }
+
+        return mb_substr(implode("\n", $facts), 0, 3500);
     }
 }

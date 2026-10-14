@@ -138,6 +138,6 @@ if ($httpCode === 201 || $httpCode === 200) {
     echo "Total: " . ($bodyData['data']['total']['amount'] ?? 'N/A') . " " . ($bodyData['data']['total']['currency'] ?? 'SAR') . "\n";
 } else {
     echo "VALIDATION / API REJECTION (HTTP {$httpCode}):\n";
-    echo json_encode($bodyData, JSON_PRETTY_PRINT | JSON_UNESCAPED_UNICODE) . "\n";
+    echo (is_array($bodyData) ? json_encode($bodyData, JSON_PRETTY_PRINT | JSON_UNESCAPED_UNICODE) : $body) . "\n";
 }
 echo "================================================\n";

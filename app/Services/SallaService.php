@@ -6,6 +6,7 @@ use Illuminate\Support\Facades\Http;
 use Illuminate\Support\Facades\Log;
 use Illuminate\Support\Facades\DB;
 use App\Models\Channel;
+use App\Helpers\SallaPhoneHelper;
 
 class SallaService
 {
@@ -763,14 +764,7 @@ class SallaService
 
         // Match the phone's country to the locally synced Salla catalog, keeping
         // network pagination out of the checkout/order-creation path.
-        $phoneData = $this->normalizePhoneForCustomer($phone);
-        $countryCode = match ($phoneData['mobile_code_country']) {
-            '+20' => 'EG', '+966' => 'SA', '+971' => 'AE', '+965' => 'KW',
-            '+974' => 'QA', '+973' => 'BH', '+968' => 'OM', '+967' => 'YE',
-            '+962' => 'JO', '+961' => 'LB', '+964' => 'IQ', '+1' => 'US',
-            '+44' => 'GB', '+90' => 'TR', '+91' => 'IN', '+33' => 'FR',
-            '+49' => 'DE', default => null,
-        };
+        $countryCode = SallaPhoneHelper::getCountryCode($phone);
 
         if (!$countryCode) {
             $addressLower = mb_strtolower($freeformAddress);
@@ -978,12 +972,15 @@ class SallaService
         // Ask Salla for valid delivery options for the resolved city and the
         // customer's actual postal/geographic location. courier_id is a store
         // shipping company ID; the estimate's own ID is a shipping-details ID.
-        $ratesResponse = $this->apiCallForChannel($channel, 'GET', '/shipping/companies/estimate-rate', [
+        $estimateParams = [
             'city_id' => $shippingAddress['city_id'],
             'country_id' => $shippingAddress['country_id'],
-            'geocode' => $coordinates['lat'] . ',' . $coordinates['lng'],
             'postal_code' => $postalCode,
-        ]);
+        ];
+        if (!empty($coordinates['lat']) && !empty($coordinates['lng'])) {
+            $estimateParams['geocode'] = $coordinates['lat'] . ',' . $coordinates['lng'];
+        }
+        $ratesResponse = $this->apiCallForChannel($channel, 'GET', '/shipping/companies/estimate-rate', $estimateParams);
         $rates = $ratesResponse['data'] ?? [];
         $selectedRate = null;
         foreach ($rates as $rate) {
@@ -1008,21 +1005,28 @@ class SallaService
             return null;
         }
 
-        $phoneData = $this->normalizePhoneForCustomer($phone);
-        if (empty($phoneData['mobile_code_country'])) {
+        $phoneNormalized = SallaPhoneHelper::normalize($phone);
+        if ($phoneNormalized === null) {
             Log::info('SallaService: phone country could not be determined for customer', [
                 'channel_id' => $channel->id,
             ]);
             return null;
         }
-        $internationalMobile = $phoneData['mobile_code_country'] . $phoneData['mobile'];
-        $countryCode = match ($phoneData['mobile_code_country']) {
-            '+20' => 'EG', '+966' => 'SA', '+971' => 'AE', '+965' => 'KW',
-            '+974' => 'QA', '+973' => 'BH', '+968' => 'OM', '+967' => 'YE',
-            '+962' => 'JO', '+961' => 'LB', '+964' => 'IQ', '+1' => 'US',
-            '+44' => 'GB', '+90' => 'TR', '+91' => 'IN', '+33' => 'FR',
-            '+49' => 'DE', default => 'SA',
-        };
+
+        // Validate format before sending to Salla
+        if (!SallaPhoneHelper::isValidFormat($phone)) {
+            Log::warning('SallaService: phone number has invalid format for order creation', [
+                'channel_id' => $channel->id,
+            ]);
+            return null;
+        }
+
+        // receiver.phone: full number WITHOUT leading '+' (per Salla Tech Support)
+        $receiverPhone = SallaPhoneHelper::formatForReceiver($phone);
+        // customer.mobile: full number WITH leading '+' (separate Salla field)
+        $customerMobile = SallaPhoneHelper::formatForCustomerMobile($phone);
+        // ISO country code from phone, fallback to SA for Salla-based stores
+        $countryCode = SallaPhoneHelper::getCountryCode($phone) ?? 'SA';
 
         $products = [[
             'identifier_type' => 'id',
@@ -1054,13 +1058,13 @@ class SallaService
             'customer' => array_filter([
                 'id'     => $customerId,
                 'name'   => $fullName,
-                'mobile' => $internationalMobile,
+                'mobile' => $customerMobile,
                 'email'  => $email,
             ], fn ($value) => !is_null($value) && $value !== ''),
             'receiver' => array_filter([
                 'name'         => $fullName,
                 'country_code' => $countryCode,
-                'phone'        => ltrim($internationalMobile, '+'),
+                'phone'        => $receiverPhone,
                 'email'        => $email,
                 'notify'       => false,
             ], fn ($value) => !is_null($value) && $value !== ''),
@@ -1295,51 +1299,16 @@ class SallaService
      */
     protected function normalizePhoneForCustomer(string $phone): array
     {
-        $phone = trim($phone);
-        if (str_starts_with($phone, '00')) {
-            $phone = '+' . substr($phone, 2);
-        }
-        $digits = preg_replace('/[^0-9]/', '', $phone);
-
-        $callingCodes = [
-            '966' => '+966', '971' => '+971', '965' => '+965', '974' => '+974',
-            '973' => '+973', '968' => '+968', '967' => '+967', '962' => '+962',
-            '961' => '+961', '964' => '+964', '20' => '+20', '1' => '+1',
-            '44' => '+44', '90' => '+90', '91' => '+91', '33' => '+33', '49' => '+49',
-        ];
-
-        if (str_starts_with($phone, '+')) {
-            foreach ($callingCodes as $digitsCode => $formattedCode) {
-                if (str_starts_with($digits, $digitsCode)) {
-                    return [
-                        'mobile_code_country' => $formattedCode,
-                        'mobile' => substr($digits, strlen($digitsCode)),
-                    ];
-                }
-            }
-
-            // Unknown international prefix: use the longest plausible 1-3 digit code.
-            $codeLength = strlen($digits) >= 12 ? 3 : (strlen($digits) >= 11 ? 2 : 1);
+        $normalized = SallaPhoneHelper::normalize($phone);
+        if ($normalized !== null) {
             return [
-                'mobile_code_country' => '+' . substr($digits, 0, $codeLength),
-                'mobile' => substr($digits, $codeLength),
+                'mobile_code_country' => $normalized['calling_code'],
+                'mobile' => $normalized['national'],
             ];
         }
 
-        if (str_starts_with($digits, '9665')) {
-            return ['mobile_code_country' => '+966', 'mobile' => substr($digits, 3)];
-        }
-        if (str_starts_with($digits, '20') && strlen($digits) >= 12) {
-            return ['mobile_code_country' => '+20', 'mobile' => substr($digits, 2)];
-        }
-        if (preg_match('/^05[0-9]{8}$/', $digits)) {
-            return ['mobile_code_country' => '+966', 'mobile' => substr($digits, 1)];
-        }
-        if (preg_match('/^01[0-9]{9}$/', $digits)) {
-            return ['mobile_code_country' => '+20', 'mobile' => substr($digits, 1)];
-        }
-
-        // Default to Saudi calling code because Salla is Saudi-based.
+        // Fallback for unparseable phone
+        $digits = preg_replace('/[^0-9]/', '', $phone);
         return ['mobile_code_country' => null, 'mobile' => $digits];
     }
 

@@ -63,7 +63,14 @@ class SequenceController extends Controller
             $query->where('trigger_type', $filters['trigger_type']);
         }
 
-        $sequences = $query->with('steps')->orderBy('created_at', 'desc')->get();
+        $sequences = $query
+            ->with('steps')
+            ->withCount(['enrollments as total_enrollments'])
+            ->withCount(['enrollments as active_enrollments' => function ($q) {
+                $q->where('status', 'active');
+            }])
+            ->orderBy('created_at', 'desc')
+            ->get();
 
         return response()->json([
             'data' => $sequences,

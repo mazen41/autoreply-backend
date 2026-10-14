@@ -667,7 +667,7 @@ JSON;
      */
     public static function detectLanguage(string $message): array
     {
-        $arabicChars = preg_match_all('/[\u0600-\u06FF]/u', $message, $matches);
+        $arabicChars = preg_match_all('/\p{Arabic}/u', $message, $matches);
         $englishChars = preg_match_all('/[a-zA-Z]/', $message, $matches);
         $totalChars = $arabicChars + $englishChars;
 

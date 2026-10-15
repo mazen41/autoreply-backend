@@ -49,7 +49,46 @@ class CommentAutomationSettingsController extends Controller
             'channels.*.settings.trigger_keywords.*' => 'string|max:80',
             'channels.*.settings.excluded_keywords' => 'nullable|array|max:30',
             'channels.*.settings.excluded_keywords.*' => 'string|max:80',
+            'channels.*.settings.rules' => 'nullable|array|max:30',
+            'channels.*.settings.rules.*.id' => 'required|string|max:120',
+            'channels.*.settings.rules.*.name' => 'required|string|max:120',
+            'channels.*.settings.rules.*.keywords' => 'required|array|min:1|max:30',
+            'channels.*.settings.rules.*.keywords.*' => 'required|string|min:1|max:80',
+            'channels.*.settings.rules.*.excluded_keywords' => 'nullable|array|max:30',
+            'channels.*.settings.rules.*.excluded_keywords.*' => 'required|string|min:1|max:80',
+            'channels.*.settings.rules.*.match' => 'required|in:contains,equals',
+            'channels.*.settings.rules.*.action' => 'required|in:public,dm,both',
+            'channels.*.settings.rules.*.public_reply_variants' => 'nullable|array|max:10',
+            'channels.*.settings.rules.*.public_reply_variants.*' => 'required|string|min:1|max:500',
+            'channels.*.settings.rules.*.dm_message' => 'nullable|string|max:2000',
+            'channels.*.settings.rules.*.delay_minutes' => 'required|integer|min:0|max:10080',
+            'channels.*.settings.rules.*.post_ids' => 'nullable|array|max:100',
+            'channels.*.settings.rules.*.post_ids.*' => 'required|string|min:1|max:160',
+            'channels.*.settings.rules.*.enabled' => 'required|boolean',
         ]);
+
+        foreach ($request->input('channels', []) as $channelIndex => $channelInput) {
+            $rules = data_get($channelInput, 'settings.rules', []);
+            $ruleIds = array_map('strval', array_column($rules, 'id'));
+            if (count($ruleIds) !== count(array_unique($ruleIds))) {
+                return response()->json(['message' => "Rule IDs must be unique for channel {$channelIndex}."], 422);
+            }
+
+            foreach ($rules as $ruleIndex => $rule) {
+                foreach (['keywords', 'excluded_keywords', 'post_ids'] as $listKey) {
+                    $values = array_map(fn ($value) => mb_strtolower(trim((string) $value)), (array) ($rule[$listKey] ?? []));
+                    if (count($values) !== count(array_unique($values))) {
+                        return response()->json(['message' => "Rule {$ruleIndex} contains duplicate {$listKey}."], 422);
+                    }
+                }
+                if (($rule['action'] ?? null) !== 'dm' && empty($rule['public_reply_variants'])) {
+                    return response()->json(['message' => "Rule {$ruleIndex} requires at least one public reply variant."], 422);
+                }
+                if (in_array($rule['action'] ?? null, ['dm', 'both'], true) && trim((string) ($rule['dm_message'] ?? '')) === '') {
+                    return response()->json(['message' => "Rule {$ruleIndex} requires a private reply message."], 422);
+                }
+            }
+        }
 
         $items = collect($request->input('channels'));
         $ids = $items->pluck('channel_id')->map(fn ($id) => (int) $id)->unique()->values();
@@ -65,11 +104,15 @@ class CommentAutomationSettingsController extends Controller
 
         DB::transaction(function () use ($bot, $items): void {
             foreach ($items as $item) {
+                $settings = $item['settings'] ?? [];
+                if (array_key_exists('rules', $settings)) {
+                    $settings['schema_version'] = 1;
+                }
                 $bot->channels()->updateExistingPivot((int) $item['channel_id'], [
                     'comment_automation_enabled' => (bool) $item['enabled'],
                     'public_comment_reply_enabled' => (bool) $item['public_reply_enabled'],
                     'private_comment_reply_enabled' => false,
-                    'comment_settings' => json_encode($item['settings'] ?? [], JSON_THROW_ON_ERROR),
+                    'comment_settings' => json_encode($settings, JSON_THROW_ON_ERROR),
                 ]);
             }
         });

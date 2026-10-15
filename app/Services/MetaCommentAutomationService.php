@@ -35,6 +35,25 @@ class MetaCommentAutomationService
         $channel = $channels->first();
         if (!$channel->business_id) return null;
 
+        if (($normalized['event_type'] ?? null) === 'comment_remove') {
+            $pending = SocialCommentEvent::query()
+                ->where('platform', $platform)->where('channel_id', $channel->id)
+                ->where('comment_id', $commentId)->where('event_type', 'comment_created')->first();
+            if ($pending && !in_array($pending->status, ['processed', 'failed', 'skipped', 'cancelled'], true)) {
+                $payload = (array) $pending->payload;
+                $trace = (array) data_get($payload, 'decision_trace', []);
+                $trace['final_status'] = 'cancelled';
+                $trace['cancellation_reason'] = 'comment_deleted';
+                $trace['cancelled_at'] = now()->toIso8601String();
+                $pending->forceFill([
+                    'status' => 'cancelled', 'failure_code' => 'comment_deleted',
+                    'payload' => array_merge($payload, ['decision_trace' => $trace]),
+                    'processed_at' => now(),
+                ])->save();
+            }
+            return $pending;
+        }
+
         try {
             $event = SocialCommentEvent::firstOrCreate(
                 [

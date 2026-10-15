@@ -19,6 +19,37 @@ class EcommerceChannelResolver
 {
     private const PROVIDERS = ['salla', 'shopify', 'woocommerce'];
 
+    /** Resolve the commerce context for a bot/account pair without mutating a conversation. */
+    public function resolveForChannel(Bot $bot, Channel $channel, int $businessId): array
+    {
+        if ((int) $bot->business_profile_id !== $businessId || (int) $channel->business_id !== $businessId
+            || $bot->status !== 'active' || !$bot->channels()->where('channels.id', $channel->id)->exists()) {
+            return ['status' => 'unresolved', 'source' => 'unresolved', 'connection' => null];
+        }
+
+        $eligibleIds = $this->eligibleConnectionIds($bot, $businessId);
+        $route = DB::table('bot_channels')->where('bot_id', $bot->id)
+            ->where('channel_id', $channel->id)->value('ecommerce_connection_id');
+        if ($route) {
+            $connection = in_array((int) $route, $eligibleIds, true) ? $this->connectedAccount((int) $route, $businessId) : null;
+            return ['status' => $connection ? 'resolved' : 'unresolved', 'source' => $connection ? 'channel' : 'unresolved', 'connection' => $connection];
+        }
+
+        $defaultId = DB::table('bot_ecommerce_connections')->where('bot_id', $bot->id)
+            ->where('is_enabled', true)->where('is_default', true)->value('ecommerce_connection_id');
+        if ($defaultId && in_array((int) $defaultId, $eligibleIds, true)) {
+            $connection = $this->connectedAccount((int) $defaultId, $businessId);
+            if ($connection) return ['status' => 'resolved', 'source' => 'bot_default', 'connection' => $connection];
+        }
+
+        if (count($eligibleIds) === 1) {
+            $connection = $this->connectedAccount($eligibleIds[0], $businessId);
+            if ($connection) return ['status' => 'resolved', 'source' => 'single_available', 'connection' => $connection];
+        }
+
+        return ['status' => 'unresolved', 'source' => 'unresolved', 'connection' => null];
+    }
+
     public function resolveConversation(Conversation $conversation, ?Bot $bot = null): array
     {
         $bot ??= $conversation->bot;

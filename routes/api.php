@@ -265,6 +265,11 @@ Route::middleware('auth:sanctum')->group(function () {
     Route::patch('/handoff-tasks/{taskId}/assign', [\App\Http\Controllers\Api\HandoffTaskController::class, 'assign']);
     Route::get('/inbox',                                [InboxController::class, 'index']);
     Route::get('/social-comments', [\App\Http\Controllers\Api\SocialCommentController::class, 'index']);
+    Route::post('/social-comments/simulate', [\App\Http\Controllers\Api\SocialCommentController::class, 'simulate']);
+    Route::get('/social-comments/scenarios', [\App\Http\Controllers\Api\SocialCommentController::class, 'scenarios']);
+    Route::post('/social-comments/scenarios', [\App\Http\Controllers\Api\SocialCommentController::class, 'storeScenario']);
+    Route::post('/social-comments/scenarios/run', [\App\Http\Controllers\Api\SocialCommentController::class, 'runScenarios']);
+    Route::delete('/social-comments/scenarios/{scenarioId}', [\App\Http\Controllers\Api\SocialCommentController::class, 'deleteScenario']);
     Route::get('/inbox/{conversationId}/messages',      [InboxController::class, 'messages']);
     Route::post('/businesses/{businessId}/conversations/{conversationId}/read', [InboxController::class, 'markRead'])
         ->middleware('business.access:conversation_read');

@@ -53,8 +53,8 @@ class ProcessSocialCommentEvent implements ShouldQueue
                 $event->update(['status' => 'skipped', 'failure_code' => 'unsupported_or_empty_event', 'processed_at' => now()]);
                 return;
             }
-            if ($event->commenter_id === $event->account_id || $this->isGenericComment((string) $event->comment_text)) {
-                $event->update(['status' => 'skipped', 'failure_code' => 'self_or_generic_comment', 'processed_at' => now()]);
+            if ($event->commenter_id === $event->account_id) {
+                $event->update(['status' => 'skipped', 'failure_code' => 'self_comment', 'processed_at' => now()]);
                 return;
             }
 
@@ -112,6 +112,11 @@ class ProcessSocialCommentEvent implements ShouldQueue
                 'decision_trace' => array_merge($existingTrace, $decisionTrace),
             ]);
             $event->save();
+            if (!$evaluation['matched'] && $this->isGenericComment((string) $event->comment_text)) {
+                $this->recordFinalStatus($event, 'skipped');
+                $event->update(['status' => 'skipped', 'failure_code' => 'generic_comment', 'processed_at' => now()]);
+                return;
+            }
             if (!$evaluation['matched']) {
                 $this->recordFinalStatus($event, 'skipped');
                 $event->update(['status' => 'skipped', 'failure_code' => $evaluation['reason'], 'processed_at' => now()]);

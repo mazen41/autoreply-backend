@@ -39,20 +39,30 @@ class WooCommerceService
             $lineItem['variation_id'] = (int) $variationId;
         }
 
-                $currency = $this->storeCurrency($storeUrl, $consumerKey, $consumerSecret);
+        $currency = $this->storeCurrency($storeUrl, $consumerKey, $consumerSecret);
+
+        $email = trim((string) ($checkout['email'] ?? ''));
+        $phone = (string) ($checkout['phone'] ?? '');
+
+        $billing = [
+            'first_name' => $nameParts[0] ?? '',
+            'last_name' => $nameParts[1] ?? ($nameParts[0] ?? ''),
+            'address_1' => $address,
+        ];
+        // WooCommerce validates billing.email strictly — an empty string
+        // triggers HTTP 400 ("Invalid parameter(s): billing").  Only include
+        // these optional fields when they carry a real value.
+        if ($email !== '') {
+            $billing['email'] = $email;
+        }
+        if ($phone !== '') {
+            $billing['phone'] = $phone;
+        }
 
         $payload = [
             'currency' => $currency,
-            'payment_method' => '',
-            'payment_method_title' => '',
             'set_paid' => false,
-            'billing' => [
-                'first_name' => $nameParts[0] ?? '',
-                'last_name' => $nameParts[1] ?? ($nameParts[0] ?? ''),
-                'address_1' => $address,
-                'phone' => (string) ($checkout['phone'] ?? ''),
-                'email' => (string) ($checkout['email'] ?? ''),
-            ],
+            'billing' => $billing,
             'shipping' => [
                 'first_name' => $nameParts[0] ?? '',
                 'last_name' => $nameParts[1] ?? ($nameParts[0] ?? ''),
@@ -69,7 +79,29 @@ class WooCommerceService
             ->post("{$storeUrl}/wp-json/wc/v3/orders", $payload);
 
         if (!$response->successful()) {
-            throw new \RuntimeException('WooCommerce rejected order creation (HTTP ' . $response->status() . ').');
+            // Capture the WooCommerce error response for diagnostics.
+            // The body contains structured fields: code, message, data.params.
+            $errorBody = $response->json() ?? [];
+            $providerCode = is_string($errorBody['code'] ?? null) ? $errorBody['code'] : null;
+            $providerMessage = is_string($errorBody['message'] ?? null) ? $errorBody['message'] : null;
+            $providerParams = is_array($errorBody['data']['params'] ?? null)
+                ? array_keys($errorBody['data']['params'])
+                : null;
+
+            Log::error('WOOCOMMERCE_ORDER_API_REJECTED', [
+                'http_status'      => $response->status(),
+                'provider_code'    => $providerCode,
+                'provider_message' => $providerMessage ? OrderCheckoutService::maskSensitive($providerMessage) : null,
+                'rejected_params'  => $providerParams,
+                'product_id'       => (int) $productId,
+            ]);
+
+            $detail = $providerCode
+                ? " [{$providerCode}]" . ($providerMessage ? ": {$providerMessage}" : '')
+                : '';
+            throw new \RuntimeException(
+                'WooCommerce rejected order creation (HTTP ' . $response->status() . ').' . $detail
+            );
         }
 
         $order = $response->json();

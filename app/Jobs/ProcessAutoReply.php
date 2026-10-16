@@ -4211,11 +4211,48 @@ $aiResponse = $intro
                         $externalSource = 'woocommerce';
                     }
                 } catch (\Throwable $e) {
+                    // Classify exception to determine whether the provider definitely did not create an order.
+                    // RuntimeException throw points in WooCommerceService all fire before or during request
+                    // construction, or from explicit HTTP-rejection/parse checks — treat them as definite failures.
+                    // Connection/timeout exceptions are ambiguous (provider may have accepted the request).
+                    $isDefiniteFailure = ($e instanceof \RuntimeException);
+                    if ($isDefiniteFailure) {
+                        $attempt->update(['status' => 'failed']);
+                    }
+                    // Sanitize the message — strip any embedded secrets, tokens, or customer data.
+                    $safeMessage = \App\Services\OrderCheckoutService::maskSensitive($e->getMessage());
+                    // Extract safe diagnostic fields from HTTP exceptions where available.
+                    $httpStatus = null;
+                    $providerCode = null;
+                    if (method_exists($e, 'response') && $e->response !== null) {
+                        try {
+                            $httpStatus = $e->response->status();
+                            $providerCode = $e->response->json('code');
+                        } catch (\Throwable) {
+                        }
+                    }
                     Log::error('WOOCOMMERCE_ORDER_CREATION_FAILED', [
-                        'conversation_id' => $conversation->id,
-                        'channel_id' => $commerceChannel->id,
-                    'exception_type' => get_class($e),
+                        'conversation_id'    => $conversation->id,
+                        'messaging_channel_id' => $channel->id,      // Instagram channel (16)
+                        'connection_id'      => $commerceChannel->id, // WooCommerce connection (9)
+                        'provider'           => 'woocommerce',
+                        'local_product_id'   => $wooProduct?->id,
+                        'external_product_id' => $checkoutState['commerce_external_id'] ?? null,
+                        'exception_type'     => get_class($e),
+                        'message'            => $safeMessage,
+                        'file'               => basename($e->getFile()) . ':' . $e->getLine(),
+                        'http_status'        => $httpStatus,
+                        'provider_code'      => is_string($providerCode) ? $providerCode : null,
+                        'attempt_marked_failed' => $isDefiniteFailure,
                     ]);
+                    // If the failure is specifically a missing product variation, this is missing
+                    // customer input — not a generic technical failure. Signal it via a dedicated
+                    // sentinel so the caller can prompt the customer for their selection instead
+                    // of escalating to a human.
+                    if ($e instanceof \RuntimeException
+                        && str_contains($e->getMessage(), 'variation must be selected')) {
+                        return ['__needs_variation' => true, 'product_metadata' => $wooProduct?->metadata ?? []];
+                    }
                     return null;
                 }
             }

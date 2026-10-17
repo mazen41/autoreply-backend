@@ -41,6 +41,10 @@ class PollGmailInbox implements ShouldQueue
         // Only poll channels that have a resolvable business
         $channels = $channels->filter(fn($c) => !empty($c->business_id));
 
+        if ($channels->isEmpty()) {
+            return;
+        }
+
         Log::info('Gmail poll: checking ' . $channels->count() . ' channel(s)');
 
         foreach ($channels as $channel) {

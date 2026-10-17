@@ -139,7 +139,7 @@ return [
     'frontend_url' => env('FRONTEND_URL'),
 
     'operations' => [
-        'alert_email' => env('OPERATIONS_ALERT_EMAIL'),
+        'alert_email' => env('OPERATIONS_ALERT_EMAIL', env('ADMIN_EMAIL', env('MAIL_ALERT_TO'))),
         'queue_backlog_threshold' => (int) env('QUEUE_BACKLOG_ALERT_THRESHOLD', 1000),
         'failed_job_alert_threshold' => (int) env('FAILED_JOB_ALERT_THRESHOLD', 1),
         'send_failure_rate_percent' => (int) env('SEND_FAILURE_RATE_ALERT_PERCENT', 20),

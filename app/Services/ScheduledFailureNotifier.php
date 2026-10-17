@@ -13,13 +13,18 @@ class ScheduledFailureNotifier
         $recipient = config('services.operations.alert_email');
         $failedAt = now()->toIso8601String();
 
+        $isConfigured = is_string($recipient) && filter_var($recipient, FILTER_VALIDATE_EMAIL) !== false;
+
         Log::critical('Scheduled command failed', [
             'task' => $taskName,
             'failed_at' => $failedAt,
-            'alert_recipient_configured' => is_string($recipient) && filter_var($recipient, FILTER_VALIDATE_EMAIL) !== false,
+            'alert_recipient_configured' => $isConfigured,
         ]);
 
-        if (!is_string($recipient) || filter_var($recipient, FILTER_VALIDATE_EMAIL) === false) {
+        if (!$isConfigured) {
+            Log::warning('Scheduled failure alert email could not be sent: OPERATIONS_ALERT_EMAIL is not configured or invalid in .env', [
+                'task' => $taskName,
+            ]);
             return;
         }
 

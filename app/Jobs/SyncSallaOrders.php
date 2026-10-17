@@ -45,23 +45,9 @@ class SyncSallaOrders implements ShouldQueue
                 $params['page'] = $this->page;
             }
 
-            $response = $sallaService->getCustomers($channel->access_token, $params);
-            
-            // We need to get orders differently - let me fix this
-            // For now, let's get all orders directly
-            $ordersResponse = Http::withToken($channel->access_token)
-                ->accept('application/json')
-                ->get('https://api.salla.dev/orders', $params);
-
-            if (!$ordersResponse->successful()) {
-                Log::error('Failed to fetch Salla orders', [
-                    'status' => $ordersResponse->status(),
-                ]);
-                return;
-            }
-
-            $orders = $ordersResponse->json()['data'] ?? [];
-            $pagination = $ordersResponse->json()['pagination'] ?? [];
+            $ordersResponse = $sallaService->getOrdersForChannel($channel, $params);
+            $orders = $ordersResponse['data'] ?? [];
+            $pagination = $ordersResponse['pagination'] ?? [];
 
             Log::info('Syncing Salla orders', [
                 'channel_id' => $this->channelId,

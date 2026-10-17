@@ -41,7 +41,8 @@ class WebhookController extends Controller
             // Illuminate\Foundation\Http\Middleware\TransformsRequest::clean().)
             $signature = trim((string) $request->header('X-Hub-Signature-256', ''));
             $payload = $request->getContent();
-            $appSecret = config('services.meta.app_secret');
+            $rawSecret = config('services.meta.app_secret');
+            $appSecret = is_string($rawSecret) ? trim($rawSecret, "\"' \t\n\r\0\x0B") : '';
 
             if (!$appSecret) {
                 Log::critical('Meta webhook rejected: app secret is not configured');
@@ -56,12 +57,18 @@ class WebhookController extends Controller
                     return response('Invalid signature', 403);
                 }
 
-                $expectedSignature = 'sha256=' . hash_hmac('sha256', $payload, $appSecret);
+                $signatureHash = str_starts_with($signature, 'sha256=')
+                    ? substr($signature, 7)
+                    : $signature;
+                $expectedHash = hash_hmac('sha256', $payload, $appSecret);
 
-                if (!hash_equals($expectedSignature, $signature)) {
+                if (!hash_equals(strtolower($expectedHash), strtolower(trim($signatureHash)))) {
                     app(\App\Support\OperationalMetricCounter::class)->increment('webhook_signature_failures');
                     Log::warning('Invalid Meta webhook signature', [
                         'payload_length' => strlen($payload),
+                        'signature_prefix' => substr($signature, 0, 10),
+                        'ip' => $request->ip(),
+                        'user_agent' => $request->userAgent(),
                     ]);
                     return response('Invalid signature', 403);
                 }

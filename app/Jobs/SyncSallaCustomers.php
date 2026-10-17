@@ -41,7 +41,7 @@ class SyncSallaCustomers implements ShouldQueue
                 $params['page'] = $this->page;
             }
 
-            $response = $sallaService->getCustomers($channel->access_token, $params);
+            $response = $sallaService->getCustomersForChannel($channel, $params);
             $customers = $response['data'] ?? [];
             $pagination = $response['pagination'] ?? [];
 

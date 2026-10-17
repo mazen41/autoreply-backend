@@ -51,6 +51,21 @@ class SystemHealthMonitoringService
             $health['overall_status'] = 'warning';
         }
 
+        $health['status'] = $health['overall_status'];
+
+        $issues = [];
+        foreach ($health['components'] as $componentName => $componentData) {
+            if (($componentData['status'] ?? 'healthy') !== 'healthy') {
+                $issues[] = [
+                    'component' => $componentName,
+                    'severity' => $componentData['status'],
+                    'message' => $componentData['message'] ?? "{$componentName} is {$componentData['status']}",
+                    'details' => $componentData['details'] ?? [],
+                ];
+            }
+        }
+        $health['issues'] = $issues;
+
         // Log health check result
         $this->logHealthCheck($health);
 
@@ -202,8 +217,12 @@ class SystemHealthMonitoringService
             \DB::connection()->getPdo();
 
             // Check connection count
-            $connections = \DB::select('SHOW STATUS LIKE "Threads_connected"');
-            $connectionCount = $connections[0]->Value ?? 0;
+            if (\DB::connection()->getDriverName() === 'mysql') {
+                $connections = \DB::select('SHOW STATUS LIKE "Threads_connected"');
+                $connectionCount = $connections[0]->Value ?? 0;
+            } else {
+                $connectionCount = 1;
+            }
             
             $health['details']['connections'] = $connectionCount;
 

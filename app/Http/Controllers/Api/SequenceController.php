@@ -366,9 +366,18 @@ class SequenceController extends Controller
             ->count();
 
         $healthScore = 100;
-        if ($failedExecutions > 10) $healthScore -= 20;
-        if ($stuckExecutions > 0) $healthScore -= 30;
-        if ($overdueExecutions > 5) $healthScore -= 15;
+        if ($failedExecutions > 0) {
+            $healthScore -= min(40, 5 + ($failedExecutions * 3));
+        }
+        if ($stuckExecutions > 0) {
+            $healthScore -= 30;
+        }
+        if ($overdueExecutions > 5) {
+            $healthScore -= 15;
+        } elseif ($overdueExecutions > 0) {
+            $healthScore -= 5;
+        }
+        $healthScore = max(0, $healthScore);
 
         return response()->json([
             'executions' => [

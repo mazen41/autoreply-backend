@@ -88,20 +88,28 @@ class MonitorSequenceQueue extends Command
         $healthScore = 100;
         $issues = [];
 
-        if ($failedExecutions > 10) {
-            $healthScore -= 20;
-            $issues[] = 'High number of failed executions';
+        if ($failedExecutions > 0) {
+            $failureDeduction = min(40, 5 + ($failedExecutions * 3));
+            $healthScore -= $failureDeduction;
+            $issues[] = $failedExecutions > 10
+                ? "High number of failed executions ({$failedExecutions})"
+                : "{$failedExecutions} failed execution(s) detected";
         }
 
         if ($stuckExecutions > 0) {
             $healthScore -= 30;
-            $issues[] = 'Stuck executions detected';
+            $issues[] = "{$stuckExecutions} stuck execution(s) detected";
         }
 
         if ($overdueExecutions > 5) {
             $healthScore -= 15;
-            $issues[] = 'Many overdue executions';
+            $issues[] = "Many overdue executions ({$overdueExecutions})";
+        } elseif ($overdueExecutions > 0) {
+            $healthScore -= 5;
+            $issues[] = "{$overdueExecutions} overdue execution(s)";
         }
+
+        $healthScore = max(0, $healthScore);
 
         if ($healthScore >= 80) {
             $this->info('✓ Health: GOOD (' . $healthScore . '%)');

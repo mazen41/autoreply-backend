@@ -44,8 +44,8 @@ class SystemHealthCheck extends Command
             return Command::SUCCESS;
 
         } catch (\Exception $e) {
-            $this->error('Health check failed. See the application log for the exception type.');
-            Log::error('System health check failed', ['exception_type' => get_class($e)]);
+            $this->error('Health check failed: ' . $e->getMessage());
+            Log::error('System health check failed', ['exception_type' => get_class($e), 'message' => $e->getMessage()]);
             return Command::FAILURE;
         }
     }

@@ -1156,6 +1156,15 @@ class SallaService
     }
 
     /**
+     * Channel-aware (auto-refresh) customer LIST endpoint.
+     * Correct endpoint: GET /admin/v2/customers
+     */
+    public function getCustomersForChannel(Channel $channel, array $params = []): array
+    {
+        return $this->apiCallForChannel($channel, 'GET', '/customers', $params);
+    }
+
+    /**
      * Normalise a raw GET /products list response into a small, AI-safe structure:
      * total count (from pagination metadata, falling back to the returned page size),
      * the returned count, and up to 10 items for display.

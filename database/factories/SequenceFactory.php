@@ -18,7 +18,8 @@ class SequenceFactory extends Factory
             'description' => fake()->optional()->sentence(),
             'trigger_type' => fake()->randomElement(['new_user', 'tag_added', 'no_reply', 'manual']),
             'trigger_config' => fake()->boolean() ? ['key' => fake()->word()] : null,
-            'channel' => fake()->optional()->randomElement(['whatsapp', 'telegram', 'email']),
+            // Always target a real channel; a null channel targets nothing and blocks enrollment.
+            'channel' => 'whatsapp',
             'status' => fake()->randomElement(['draft', 'active', 'paused', 'archived']),
             // Model casts settings to array; pass an array, not a pre-encoded JSON string.
             'settings' => fake()->boolean() ? ['key' => fake()->word()] : null,

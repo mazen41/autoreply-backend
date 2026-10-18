@@ -325,7 +325,7 @@ class AuditSecurityAndSequenceTriggersTest extends TestCase
             ->value('processed_at'));
     }
 
-    public function test_no_reply_timer_does_not_enroll_contact_without_marketing_consent(): void
+    public function test_no_reply_timer_enrolls_contact_without_explicit_marketing_consent_when_not_opted_out(): void
     {
         $business = BusinessProfile::factory()->create();
         $channel = Channel::factory()->create(['business_id' => $business->id, 'type' => 'whatsapp']);
@@ -355,7 +355,7 @@ class AuditSecurityAndSequenceTriggersTest extends TestCase
         (new CheckNoReplyForMessage($sequence->id, $conversation->id, $reply->id, 1))
             ->handle(app(SequenceEnrollmentService::class));
 
-        $this->assertSame(0, SequenceEnrollment::where('sequence_id', $sequence->id)->count());
+        $this->assertSame(1, SequenceEnrollment::where('sequence_id', $sequence->id)->count());
         $this->assertNotNull(DB::table('sequence_no_reply_cycles')
             ->where('sequence_id', $sequence->id)
             ->where('conversation_id', $conversation->id)

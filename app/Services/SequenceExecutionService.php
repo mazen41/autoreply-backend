@@ -120,6 +120,14 @@ class SequenceExecutionService
             return false;
         }
 
+        // Record the real basis for sending: an explicit opt-in, an active
+        // conversation window, or sequence automation under the enrollment policy.
+        $consentBasis = match ($consent->reason) {
+            'opted_in' => 'marketing_opt_in',
+            'active_conversation' => 'marketing_active_conversation',
+            default => 'sequence_automation',
+        };
+
         $renderedMessage = $this->renderSequenceMessage((string) $step->message, $conversation, $enrollment);
 
         // CRITICAL FIX: Move external provider call OUTSIDE DB transaction
@@ -129,7 +137,7 @@ class SequenceExecutionService
         // 2. Call provider (outside transaction)
         // 3. Update status based on provider result (outside transaction)
 
-        $messageRecord = DB::transaction(function () use ($conversation, $step, $execution, $channel, $renderedMessage) {
+        $messageRecord = DB::transaction(function () use ($conversation, $step, $execution, $channel, $renderedMessage, $consentBasis) {
             $existing = $execution->message_id
                 ? Message::query()->lockForUpdate()->find($execution->message_id)
                 : null;
@@ -162,7 +170,7 @@ class SequenceExecutionService
                 'ai_provider' => 'automation',
                 'ai_model' => 'sequence-step',
                 'escalation_reason' => 'automated_sequence_step',
-                'consent_basis' => 'sequence_automation',
+                'consent_basis' => $consentBasis,
             ]);
 
             // Link the durable outbound row before contacting the provider. A

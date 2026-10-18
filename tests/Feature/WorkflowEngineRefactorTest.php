@@ -603,6 +603,8 @@ class WorkflowEngineRefactorTest extends TestCase
 
     public function test_replay_retries_only_failed_actions_and_rechecks_consent(): void
     {
+        // Without this, the fresh conversation is "active" and auto opt-in would let the first send through.
+        config(['consent.auto_opt_in_active_conversations' => false]);
         Http::fake([
             '*/message/sendText/*' => Http::response(['key' => ['id' => 'replayed-provider-message']], 200),
             '*' => Http::response([], 200),
@@ -848,6 +850,8 @@ class WorkflowEngineRefactorTest extends TestCase
 
     public function test_workflow_send_message_is_blocked_without_marketing_consent(): void
     {
+        // Turn off the 24h active-conversation auto opt-in so the contact truly has no marketing consent.
+        config(['consent.auto_opt_in_active_conversations' => false]);
         AutomationWorkflow::factory()->create([
             'business_id' => $this->business->id,
             'trigger_config' => ['type' => 'keyword', 'conditions' => ['keywords' => ['offer'], 'match_type' => 'any']],

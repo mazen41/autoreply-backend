@@ -917,22 +917,39 @@ class SequenceHardeningTest extends TestCase
         ]);
     }
 
-    public function test_manual_enrollment_is_blocked_without_marketing_consent(): void
+    public function test_manual_enrollment_is_allowed_without_marketing_consent(): void
     {
+        // Policy: sequence enrollment does not require a marketing opt-in.
+        Http::fake([
+            '*/message/sendText/*' => Http::response(['key' => ['id' => 'fake-enroll-msg']], 200),
+            '*' => Http::response([], 200),
+        ]);
         ContactConsent::query()->where('business_id', $this->business->id)->delete();
         SequenceStep::factory()->create(['sequence_id' => $this->sequence->id, 'step_order' => 1]);
 
         $service = app(SequenceEnrollmentService::class);
 
-        $this->assertFalse($service->canEnroll($this->sequence, $this->conversation));
-        try {
-            $service->enrollConversation($this->sequence, $this->conversation);
-            $this->fail('Enrollment should be rejected without opt-in.');
-        } catch (\Illuminate\Validation\ValidationException $exception) {
-            $this->assertStringContainsString('no_consent', $exception->getMessage());
-        }
+        $this->assertTrue($service->canEnroll($this->sequence, $this->conversation));
+        $service->enrollConversation($this->sequence, $this->conversation);
 
-        $this->assertSame(0, SequenceEnrollment::where('conversation_id', $this->conversation->id)->count());
+        $this->assertSame(1, SequenceEnrollment::where('conversation_id', $this->conversation->id)->count());
+    }
+
+    public function test_manual_enrollment_is_blocked_for_opted_out_contacts(): void
+    {
+        ContactConsent::query()->where('business_id', $this->business->id)->delete();
+        ContactConsent::create([
+            'business_id' => $this->business->id,
+            'channel' => 'whatsapp',
+            'contact_identifier' => app(\App\Services\ConsentGate::class)->normalizeIdentifier($this->conversation->sender_id, 'whatsapp'),
+            'scope' => 'marketing',
+            'status' => 'opted_out',
+            'source' => 'form',
+            'captured_at' => now(),
+        ]);
+        SequenceStep::factory()->create(['sequence_id' => $this->sequence->id, 'step_order' => 1]);
+
+        $this->assertFalse(app(SequenceEnrollmentService::class)->canEnroll($this->sequence, $this->conversation));
     }
 
     public function test_customer_reply_stops_only_sequences_configured_to_stop_on_reply(): void

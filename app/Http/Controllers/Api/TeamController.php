@@ -26,11 +26,20 @@ class TeamController extends Controller
         $business = app(\App\Services\BusinessAccessService::class)
             ->authorize($request->user(), $businessId, 'manage_team');
 
-        $teamMembers = TeamMember::where('business_id', $businessId)
+        $ownerUser = User::find($business->user_id);
+
+        // The business owner is not a team row; exclude any stray owner row so they appear once.
+        $teamMembers = TeamMember::where('business_id', $business->id)
+            ->where('user_id', '!=', $business->user_id)
             ->with('user')
+            ->orderByDesc('is_active')
+            ->orderBy('id')
             ->get();
 
-        return response()->json($teamMembers);
+        return response()->json([
+            'owner' => $ownerUser ? ['id' => $ownerUser->id, 'name' => $ownerUser->name, 'email' => $ownerUser->email] : null,
+            'members' => $teamMembers,
+        ]);
     }
 
     /**

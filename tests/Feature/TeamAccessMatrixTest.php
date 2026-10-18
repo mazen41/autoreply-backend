@@ -188,6 +188,23 @@ class TeamAccessMatrixTest extends TestCase
         $this->assertNotContains('manage_team', $response->json('permissions'));
     }
 
+    public function test_team_index_returns_owner_once_and_excludes_owner_row(): void
+    {
+        // Stray owner membership row must not produce a duplicate owner entry.
+        TeamMember::create([
+            'business_id' => $this->business->id, 'user_id' => $this->owner->id, 'role' => 'owner', 'is_active' => true,
+        ]);
+        $this->member('agent');
+
+        Sanctum::actingAs($this->owner);
+        $response = $this->getJson("/api/businesses/{$this->business->id}/team")->assertOk();
+
+        $response->assertJsonPath('owner.id', $this->owner->id);
+        $members = $response->json('members');
+        $this->assertCount(1, $members);
+        $this->assertNotEquals($this->owner->id, $members[0]['user_id']);
+    }
+
     public function test_owner_me_endpoint_returns_owner_role(): void
     {
         Sanctum::actingAs($this->owner);

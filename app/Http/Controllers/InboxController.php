@@ -236,10 +236,11 @@ class InboxController extends Controller
      */
     public function reply(Request $request, $conversationId)
     {
-        $request->validate(['message' => 'required|string|max:2000']);
-
+        // Authorize before validating so a denied user never sees validation details.
         $conversation = $this->conversationQuery($request, 'conversation_write')
             ->findOrFail($conversationId);
+
+        $request->validate(['message' => 'required|string|max:2000']);
 
         $channel = $conversation->channel;
 

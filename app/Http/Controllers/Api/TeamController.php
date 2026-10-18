@@ -376,7 +376,8 @@ class TeamController extends Controller
             }
 
             $memberUser = User::whereKey($lockedMember->user_id)->lockForUpdate()->first();
-            $lockedMember->delete();
+            // Soft removal: keep the row for history; access checks require is_active.
+            $lockedMember->update(['is_active' => false]);
 
             if ($memberUser && (int) $memberUser->business_id === (int) $businessId) {
                 // Fall back to another active membership, then to a business the user owns, else null.

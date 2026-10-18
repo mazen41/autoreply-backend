@@ -39,7 +39,7 @@ class PlanEnforcement
         $currentUsage = match ($limitType) {
             'max_bots' => Bot::where('business_profile_id', $businessId)->count(),
             'max_channels' => $usageMeter->canUse($business, UsageMeter::CHANNELS)['used'],
-            'max_team_members' => TeamMember::where('business_id', $businessId)->count(),
+            'max_team_members' => TeamMember::where('business_id', $businessId)->where('is_active', true)->count(),
             'max_monthly_messages' => $usageMeter->canUse($business, UsageMeter::OUTBOUND_MESSAGES)['used'],
             default => 0,
         };

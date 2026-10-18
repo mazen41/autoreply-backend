@@ -61,7 +61,7 @@ class TeamMember extends Model
     /** Single source of truth for role abilities. */
     public const ROLE_PERMISSIONS = [
         'owner' => ['read', 'write', 'delete', 'manage_team', 'manage_billing', 'conversation_read', 'conversation_write', 'assigned_work', 'automation_read', 'automation_write'],
-        'manager' => ['read', 'write', 'delete', 'conversation_read', 'conversation_write', 'assigned_work', 'automation_read', 'automation_write'],
+        'manager' => ['read', 'write', 'conversation_read', 'conversation_write', 'assigned_work', 'automation_read', 'automation_write'],
         // Agents handle conversations and assigned work; no business admin, no campaign/generic write.
         'agent' => ['conversation_read', 'conversation_write', 'assigned_work', 'automation_read'],
         // Viewers are read-only.

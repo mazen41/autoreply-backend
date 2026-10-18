@@ -37,7 +37,8 @@ class TeamBusinessMembershipLifecycleTest extends TestCase
         Sanctum::actingAs($owner);
         $this->deleteJson("/api/businesses/{$firstBusiness->id}/team/{$removedMembership->id}")->assertOk();
 
-        $this->assertDatabaseMissing('team_members', ['id' => $removedMembership->id]);
+        // Soft removal: row kept for history, but deactivated (no access).
+        $this->assertDatabaseHas('team_members', ['id' => $removedMembership->id, 'is_active' => false]);
         $this->assertSame($secondBusiness->id, (int) $member->fresh()->business_id);
     }
 

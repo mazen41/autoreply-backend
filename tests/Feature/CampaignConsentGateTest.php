@@ -51,7 +51,7 @@ class CampaignConsentGateTest extends TestCase
         $noConsent = Conversation::create([
             'channel_id' => $channel->id, 'business_id' => $business->id, 'sender_id' => 'no-consent-contact',
         ]);
-        Message::create(['conversation_id' => $noConsent->id, 'content' => 'Hi', 'direction' => 'inbound', 'created_at' => now()]);
+        Message::create(['conversation_id' => $noConsent->id, 'content' => 'Hi', 'direction' => 'inbound', 'created_at' => now()->subHours(30)]);
 
         $outsideWindow = Conversation::create([
             'channel_id' => $channel->id, 'business_id' => $business->id, 'sender_id' => 'window-contact',

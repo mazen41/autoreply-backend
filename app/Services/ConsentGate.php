@@ -21,10 +21,10 @@ class ConsentGate
             ? (string) ($conversation->sender_email ?? '')
             : (string) ($conversation->sender_id ?? '');
 
-        return $this->check((int) $conversation->business_id, $contact, $consentChannel, $scope);
+        return $this->check((int) $conversation->business_id, $contact, $consentChannel, $scope, $conversation);
     }
 
-    public function check(BusinessProfile|int $business, string $contact, string $channel, string $scope = 'marketing'): ConsentDecision
+    public function check(BusinessProfile|int $business, string $contact, string $channel, string $scope = 'marketing', ?\App\Models\Conversation $conversation = null): ConsentDecision
     {
         $businessId = $business instanceof BusinessProfile ? $business->id : $business;
         $channel = strtolower(trim($channel));
@@ -49,14 +49,77 @@ class ConsentGate
             ->value('status');
 
         if ($scope === 'marketing') {
-            return $consent === 'opted_in'
-                ? new ConsentDecision(true, 'opted_in')
-                : new ConsentDecision(false, $consent === 'opted_out' ? 'opted_out' : 'no_consent');
+            if ($consent === 'opted_in') {
+                return new ConsentDecision(true, 'opted_in');
+            }
+
+            if ($consent === 'opted_out') {
+                return new ConsentDecision(false, 'opted_out');
+            }
+
+            // Automatic opt-in for open conversations active within 24 hours
+            if (config('consent.auto_opt_in_active_conversations', true)) {
+                if (!$conversation) {
+                    $conversation = \App\Models\Conversation::where('business_id', $businessId)
+                        ->where(function ($q) use ($identifier, $contact) {
+                            $q->where('sender_id', $identifier)
+                              ->orWhere('sender_id', $contact)
+                              ->orWhere('sender_email', $identifier);
+                        })
+                        ->latest('last_message_at')
+                        ->first();
+                }
+
+                if ($this->isConversationActiveWithin24Hours($conversation)) {
+                    ContactConsent::updateOrCreate(
+                        [
+                            'business_id' => $businessId,
+                            'channel' => $channel,
+                            'contact_identifier' => $identifier,
+                            'scope' => 'marketing',
+                        ],
+                        [
+                            'status' => 'opted_in',
+                            'source' => 'active_24h_window',
+                            'captured_at' => now(),
+                            'evidence' => 'Auto-opted from active conversation within 24h window',
+                        ]
+                    );
+
+                    return new ConsentDecision(true, 'active_conversation');
+                }
+            }
+
+            return new ConsentDecision(false, 'no_consent');
         }
 
         return $consent === 'opted_out'
             ? new ConsentDecision(false, 'opted_out')
             : new ConsentDecision(true, 'service_policy');
+    }
+
+    public function isConversationActiveWithin24Hours(?\App\Models\Conversation $conversation): bool
+    {
+        if (!$conversation) {
+            return false;
+        }
+
+        $cutoff = now()->subHours(24);
+
+        $status = strtolower((string) ($conversation->status ?? 'open'));
+        $isOpen = in_array($status, ['open', 'active', 'pending', ''], true);
+
+        if (!$isOpen) {
+            return false;
+        }
+
+        if ($conversation->last_message_at && $conversation->last_message_at >= $cutoff) {
+            return true;
+        }
+
+        return \App\Models\Message::where('conversation_id', $conversation->id)
+            ->where('created_at', '>=', $cutoff)
+            ->exists();
     }
 
     public function normalizeIdentifier(string $contact, string $channel): string

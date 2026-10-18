@@ -17,10 +17,11 @@ class SequenceFactory extends Factory
             'name' => fake()->sentence(3),
             'description' => fake()->optional()->sentence(),
             'trigger_type' => fake()->randomElement(['new_user', 'tag_added', 'no_reply', 'manual']),
-            'trigger_config' => fake()->boolean() ? json_encode(['key' => fake()->word()]) : null,
+            'trigger_config' => fake()->boolean() ? ['key' => fake()->word()] : null,
             'channel' => fake()->optional()->randomElement(['whatsapp', 'telegram', 'email']),
             'status' => fake()->randomElement(['draft', 'active', 'paused', 'archived']),
-            'settings' => fake()->boolean() ? json_encode(['key' => fake()->word()]) : null,
+            // Model casts settings to array; pass an array, not a pre-encoded JSON string.
+            'settings' => fake()->boolean() ? ['key' => fake()->word()] : null,
         ];
     }
 }

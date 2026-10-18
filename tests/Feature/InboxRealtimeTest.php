@@ -91,6 +91,12 @@ class InboxRealtimeTest extends TestCase
     public function test_active_team_member_can_read_selected_business_inbox(): void
     {
         $conversation = $this->makeConversation();
+        // The inbox lists only conversations that have chat messages.
+        Message::factory()->create([
+            'conversation_id' => $conversation->id,
+            'direction' => 'inbound',
+            'source' => 'web_chat',
+        ]);
         $agent = User::factory()->create();
         TeamMember::factory()->create([
             'business_id' => $this->business->id,

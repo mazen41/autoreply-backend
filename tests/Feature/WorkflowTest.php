@@ -28,11 +28,11 @@ class WorkflowTest extends TestCase
         parent::setUp();
 
         // Enable the gated advanced automation feature for workflow CRUD tests.
-        FeatureFlag::create([
-            'key' => 'advanced_automation',
-            'name' => 'Advanced Automation',
-            'is_globally_enabled' => true,
-        ]);
+        // The migration already registers this flag; make the test idempotent.
+        FeatureFlag::updateOrCreate(
+            ['key' => 'advanced_automation'],
+            ['name' => 'Advanced Automation', 'is_globally_enabled' => true],
+        );
 
         $this->user = User::factory()->create();
         $this->business = BusinessProfile::factory()->create([

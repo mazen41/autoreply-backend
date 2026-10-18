@@ -415,7 +415,7 @@ class TelegramController extends Controller
     public function disconnect($id)
     {
         $channel = Channel::where('id', $id)
-            ->where('user_id', auth()->id())
+            ->whereIn('business_id', app(\App\Services\BusinessAccessService::class)->accessibleBusinessIds(auth()->user(), 'write'))
             ->where('type', 'telegram')
             ->first();
 

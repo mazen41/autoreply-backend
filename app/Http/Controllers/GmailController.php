@@ -226,7 +226,7 @@ class GmailController extends Controller
         // Otherwise only auto-resolve when there is exactly one Gmail account.
         $channelId = $request->query('channel_id');
         if ($channelId) {
-            $channel = Channel::where('user_id', auth()->id())
+            $channel = Channel::whereIn('business_id', app(\App\Services\BusinessAccessService::class)->accessibleBusinessIds(auth()->user(), 'write'))
                 ->where('id', $channelId)
                 ->where('type', 'gmail')
                 ->where('status', 'connected')
@@ -235,7 +235,7 @@ class GmailController extends Controller
                 return response()->json(['message' => 'Gmail channel not found'], 404);
             }
         } else {
-            $candidates = Channel::where('user_id', auth()->id())
+            $candidates = Channel::whereIn('business_id', app(\App\Services\BusinessAccessService::class)->accessibleBusinessIds(auth()->user(), 'write'))
                 ->where('type', 'gmail')
                 ->where('status', 'connected')
                 ->get();

@@ -22,8 +22,11 @@ class FeedbackController extends Controller
             'issue_type' => 'nullable|in:inaccurate,inappropriate,off_topic,poor_quality,other',
         ]);
 
-        $message = Message::whereHas('conversation.channel', function ($q) {
-                $q->where('user_id', Auth::id());
+        $businessIds = app(\App\Services\BusinessAccessService::class)
+            ->accessibleBusinessIds($request->user(), 'conversation_write');
+
+        $message = Message::whereHas('conversation', function ($q) use ($businessIds) {
+                $q->whereIn('business_id', $businessIds);
             })
             ->findOrFail($messageId);
 
@@ -66,19 +69,17 @@ class FeedbackController extends Controller
     public function statistics(Request $request)
     {
         $businessId = $request->query('business_id');
+        $allowedIds = app(\App\Services\BusinessAccessService::class)
+            ->accessibleBusinessIds($request->user(), 'conversation_read');
 
         if ($businessId) {
-            \App\Models\BusinessProfile::where('user_id', Auth::id())
-                ->where('id', $businessId)
-                ->firstOrFail();
+            abort_unless(in_array((int) $businessId, $allowedIds, true), 404);
+            $allowedIds = [(int) $businessId];
         }
 
-        $scope = function ($q) use ($businessId) {
-            $q->whereHas('message.conversation.channel', function ($q2) use ($businessId) {
-                $q2->where('user_id', Auth::id());
-                if ($businessId) {
-                    $q2->where('business_id', $businessId);
-                }
+        $scope = function ($q) use ($allowedIds) {
+            $q->whereHas('message.conversation', function ($q2) use ($allowedIds) {
+                $q2->whereIn('business_id', $allowedIds);
             });
         };
 
@@ -133,8 +134,11 @@ class FeedbackController extends Controller
     {
         $limit = $request->query('limit', 20);
         
-        $feedback = MessageFeedback::whereHas('message.conversation.channel', function ($q) {
-                $q->where('user_id', Auth::id());
+        $allowedIds = app(\App\Services\BusinessAccessService::class)
+            ->accessibleBusinessIds($request->user(), 'conversation_read');
+
+        $feedback = MessageFeedback::whereHas('message.conversation', function ($q) use ($allowedIds) {
+                $q->whereIn('business_id', $allowedIds);
             })
             ->with(['message.conversation', 'user'])
             ->orderBy('created_at', 'desc')

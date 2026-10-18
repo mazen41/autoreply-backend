@@ -58,15 +58,23 @@ class TeamMember extends Model
         return $query->where('role', 'viewer');
     }
 
+    /** Single source of truth for role abilities. */
+    public const ROLE_PERMISSIONS = [
+        'owner' => ['read', 'write', 'delete', 'manage_team', 'manage_billing', 'conversation_read', 'conversation_write', 'assigned_work', 'automation_read', 'automation_write'],
+        'manager' => ['read', 'write', 'delete', 'conversation_read', 'conversation_write', 'assigned_work', 'automation_read', 'automation_write'],
+        // Agents handle conversations and assigned work; no business admin, no campaign/generic write.
+        'agent' => ['conversation_read', 'conversation_write', 'assigned_work', 'automation_read'],
+        // Viewers are read-only.
+        'viewer' => ['read', 'conversation_read', 'automation_read'],
+    ];
+
+    public static function permissionsFor(?string $role): array
+    {
+        return self::ROLE_PERMISSIONS[$role] ?? [];
+    }
+
     public function hasPermission($permission): bool
     {
-        $permissions = [
-            'owner' => ['read', 'write', 'delete', 'manage_team', 'manage_billing', 'conversation_read', 'conversation_write', 'assigned_work', 'automation_read', 'automation_write'],
-            'manager' => ['read', 'write', 'delete', 'conversation_read', 'conversation_write', 'assigned_work', 'automation_read', 'automation_write'],
-            'agent' => ['conversation_read', 'conversation_write', 'assigned_work', 'automation_read'],
-            'viewer' => ['read', 'conversation_read', 'automation_read'],
-        ];
-
-        return in_array($permission, $permissions[$this->role] ?? []);
+        return in_array($permission, self::permissionsFor($this->role), true);
     }
 }

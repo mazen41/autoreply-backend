@@ -326,14 +326,26 @@ class TeamController extends Controller
             ->where('business_id', $businessId)
             ->findOrFail($memberId);
 
-        // Prevent removing owner role from the last owner
+        $actorIsBusinessOwner = (int) $business->user_id === (int) $request->user()->id;
+
+        // No self-escalation or self-demotion through this endpoint.
+        if ((int) $teamMember->user_id === (int) $request->user()->id) {
+            return response()->json(['error' => 'You cannot change your own role'], 403);
+        }
+
+        // Only the business owner can grant or hold the owner role.
+        if ($request->role === 'owner' && !$actorIsBusinessOwner) {
+            return response()->json(['error' => 'Only the business owner can assign the owner role'], 403);
+        }
+
+        // Last-owner protection counts the business owner plus team owners.
         if ($teamMember->role === 'owner' && $request->role !== 'owner') {
-            $ownerCount = TeamMember::where('business_id', $businessId)
+            $ownerCount = 1 + TeamMember::where('business_id', $businessId)
                 ->where('role', 'owner')
                 ->count();
-            
+
             if ($ownerCount <= 1) {
-                return response()->json(['error' => 'Cannot remove the last owner'], 400);
+                return response()->json(['error' => 'Cannot demote the last owner'], 400);
             }
         }
 
@@ -356,21 +368,24 @@ class TeamController extends Controller
 
         $removed = DB::transaction(function () use ($teamMember, $businessId) {
             $lockedMember = TeamMember::whereKey($teamMember->id)->lockForUpdate()->firstOrFail();
-            if ($lockedMember->role === 'owner') {
-                $ownerCount = TeamMember::where('business_id', $businessId)->where('role', 'owner')->lockForUpdate()->count();
-                if ($ownerCount <= 1) {
-                    return false;
-                }
+            // The business owner is never a team row and always remains an owner,
+            // so the business owner can never be removed through this endpoint.
+            $business = BusinessProfile::whereKey($businessId)->lockForUpdate()->firstOrFail();
+            if ((int) $business->user_id === (int) $lockedMember->user_id) {
+                return false;
             }
 
             $memberUser = User::whereKey($lockedMember->user_id)->lockForUpdate()->first();
             $lockedMember->delete();
+
             if ($memberUser && (int) $memberUser->business_id === (int) $businessId) {
+                // Fall back to another active membership, then to a business the user owns, else null.
                 $nextBusinessId = TeamMember::where('user_id', $memberUser->id)
                     ->where('is_active', true)
                     ->orderByDesc('joined_at')
                     ->orderBy('id')
-                    ->value('business_id');
+                    ->value('business_id')
+                    ?? BusinessProfile::where('user_id', $memberUser->id)->value('id');
                 $memberUser->forceFill(['business_id' => $nextBusinessId])->save();
             }
 
@@ -398,15 +413,20 @@ class TeamController extends Controller
             'agent_id' => 'required|exists:users,id',
         ]);
 
-        $conversation = \App\Models\Conversation::whereHas('channel', function ($q) {
-                $q->where('user_id', Auth::id());
-            })
-            ->findOrFail($conversationId);
+        $conversation = \App\Models\Conversation::findOrFail($conversationId);
 
-        // Verify the agent is a team member
+        // Business-based authorization: owner or member with conversation_write.
         $businessId = $conversation->business_id;
-        $isTeamMember = TeamMember::where('business_id', $businessId)
+        app(\App\Services\BusinessAccessService::class)
+            ->authorize($request->user(), $businessId, 'conversation_write');
+
+        // Assignee must be a business owner or an active team member.
+        $assigneeIsOwner = BusinessProfile::where('id', $businessId)
             ->where('user_id', $request->agent_id)
+            ->exists();
+        $isTeamMember = $assigneeIsOwner || TeamMember::where('business_id', $businessId)
+            ->where('user_id', $request->agent_id)
+            ->where('is_active', true)
             ->exists();
 
         if (!$isTeamMember) {
@@ -441,5 +461,30 @@ class TeamController extends Controller
             ->paginate(50);
 
         return response()->json($assignments);
+    }
+
+    /**
+     * The current user's role and abilities for one business. The frontend
+     * uses this list instead of its own role logic.
+     */
+    public function myAccess(Request $request, $businessId)
+    {
+        $business = app(\App\Services\BusinessAccessService::class)
+            ->authorize($request->user(), $businessId, 'read');
+
+        if ((int) $business->user_id === (int) $request->user()->id) {
+            $role = 'owner';
+        } else {
+            $role = TeamMember::where('business_id', $business->id)
+                ->where('user_id', $request->user()->id)
+                ->where('is_active', true)
+                ->value('role');
+        }
+
+        return response()->json([
+            'business_id' => (int) $business->id,
+            'role' => $role,
+            'permissions' => TeamMember::permissionsFor($role),
+        ]);
     }
 }

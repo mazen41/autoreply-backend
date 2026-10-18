@@ -34,4 +34,25 @@ class BusinessAccessService
 
         return $business;
     }
+
+    /**
+     * Business ids the user may act on with the given permission:
+     * owned businesses plus active memberships that grant it.
+     *
+     * @return array<int>
+     */
+    public function accessibleBusinessIds(User $user, string $permission): array
+    {
+        $ids = BusinessProfile::where('user_id', $user->id)->pluck('id')->all();
+
+        $memberIds = TeamMember::query()
+            ->where('user_id', $user->id)
+            ->where('is_active', true)
+            ->get()
+            ->filter(fn (TeamMember $m) => $m->hasPermission($permission))
+            ->pluck('business_id')
+            ->all();
+
+        return array_values(array_unique(array_map('intval', array_merge($ids, $memberIds))));
+    }
 }

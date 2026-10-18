@@ -297,12 +297,13 @@ Route::middleware('auth:sanctum')->group(function () {
     Route::middleware('business.access:manage_team')->group(function () {
           Route::get('/businesses/{businessId}/team', [TeamController::class, 'index']);
           Route::get('/businesses/{businessId}/team/invitations', [TeamController::class, 'pendingInvitations']);
-        Route::post('/businesses/{businessId}/team/invite', [TeamController::class, 'invite'])->middleware('plan.enforce:max_team_members');
+        Route::post('/businesses/{businessId}/team/invite', [TeamController::class, 'invite']);
         Route::post('/businesses/{businessId}/team/invitations/{invitationId}/resend', [TeamController::class, 'resendInvitation']);
         Route::delete('/businesses/{businessId}/team/invitations/{invitationId}', [TeamController::class, 'revokeInvitation']);
         Route::patch('/businesses/{businessId}/team/{memberId}/role', [TeamController::class, 'updateRole']);
         Route::delete('/businesses/{businessId}/team/{memberId}', [TeamController::class, 'remove']);
     });
+    Route::get('/businesses/{businessId}/me', [TeamController::class, 'myAccess']);
     Route::post('/conversations/{conversationId}/assign', [TeamController::class, 'assignConversation']);
     Route::get('/team/assignments',                    [TeamController::class, 'myAssignments']);
       Route::post('/team/invitations/accept', [TeamController::class, 'acceptInvitation']);

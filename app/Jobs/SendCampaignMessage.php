@@ -308,9 +308,14 @@ class SendCampaignMessage implements ShouldQueue
     }
 
     /**
-     * Replace the {name} personalization token with the recipient's known
-     * name. Falls back to a safe generic greeting so the literal token is
-     * never sent, and strips any stray token if replacement still fails.
+     * Replace personalization tokens with the recipient's known data.
+     *
+     * Supported tokens (both {{var}} and {var} syntax):
+     *   - name / customer_name  → sender_name or "there"
+     *   - business_name         → business profile name or "our store"
+     *
+     * Falls back to safe generic values so a literal placeholder is never
+     * sent to a recipient.
      */
     private function personalize(string $content, Conversation $conversation): string
     {
@@ -323,10 +328,31 @@ class SendCampaignMessage implements ShouldQueue
             $name = 'there';
         }
 
-        $replaced = preg_replace('/\{\s*name\s*\}/i', $name, $content) ?? $content;
+        $business = $conversation->business;
+        $businessName = trim((string) ($business->business_name ?? $business->name ?? ''));
+        if ($businessName === '') {
+            $businessName = 'our store';
+        }
 
-        // Final safety net: never let a literal {name} reach a recipient.
-        return preg_replace('/\{\s*name\s*\}/i', 'there', $replaced) ?? $replaced;
+        $variables = [
+            'name' => $name,
+            'customer_name' => $name,
+            'business_name' => $businessName,
+        ];
+
+        // Replace {{variable}} tokens (double curly braces, the primary syntax)
+        $result = preg_replace_callback('/\{\{\s*([a-z_]+)\s*\}\}/i', function (array $m) use ($variables): string {
+            $key = strtolower($m[1]);
+            return $variables[$key] ?? '';
+        }, $content) ?? $content;
+
+        // Also replace legacy {variable} tokens (single curly braces)
+        $result = preg_replace_callback('/\{\s*([a-z_]+)\s*\}/i', function (array $m) use ($variables): string {
+            $key = strtolower($m[1]);
+            return $variables[$key] ?? '';
+        }, $result) ?? $result;
+
+        return $result;
     }
 
     /**

@@ -106,15 +106,14 @@ class ConsentGate
 
         $cutoff = now()->subHours(24);
 
-        $status = strtolower((string) ($conversation->status ?? 'open'));
-        $isOpen = in_array($status, ['open', 'active', 'pending', ''], true);
+        if ($conversation->last_message_at) {
+            $lastAt = $conversation->last_message_at instanceof \Carbon\CarbonInterface
+                ? $conversation->last_message_at
+                : \Carbon\Carbon::parse($conversation->last_message_at);
 
-        if (!$isOpen) {
-            return false;
-        }
-
-        if ($conversation->last_message_at && $conversation->last_message_at >= $cutoff) {
-            return true;
+            if ($lastAt->greaterThanOrEqualTo($cutoff)) {
+                return true;
+            }
         }
 
         return \App\Models\Message::where('conversation_id', $conversation->id)

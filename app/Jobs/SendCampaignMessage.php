@@ -171,6 +171,9 @@ class SendCampaignMessage implements ShouldQueue
                 'error_message' => 'Marketing send blocked: ' . $consent->reason,
             ]);
             $campaign->increment('failed_count');
+            Campaign::whereKey($campaign->id)
+                ->whereNull('error_message')
+                ->update(['error_message' => 'Marketing send blocked: ' . $consent->reason]);
             Log::info('SendCampaignMessage: consent gate blocked recipient', [
                 'campaign_id' => $campaign->id,
                 'campaign_log_id' => $campaignLog->id,

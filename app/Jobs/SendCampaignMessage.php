@@ -165,7 +165,10 @@ class SendCampaignMessage implements ShouldQueue
         // Keep the delivery gate aligned with audience preview, including
         // Gmail's sender_email and normalized email consent channel.
         $consent = app(\App\Services\ConsentGate::class)->checkConversation($conversation, 'marketing');
-        if (!$consent->allowed) {
+        $isEvolutionWhatsApp = $channel->type === 'whatsapp'
+            && ($channel->metadata['whatsapp_provider'] ?? null) !== 'cloud';
+
+        if (!$consent->allowed && !($isEvolutionWhatsApp && $consent->reason === 'no_consent')) {
             $campaignLog->update([
                 'status' => 'failed',
                 'error_message' => 'Marketing send blocked: ' . $consent->reason,
@@ -500,13 +503,18 @@ class SendCampaignMessage implements ShouldQueue
                 return false;
             }
 
-            if (($channel->metadata['unofficial_risk_accepted'] ?? false) !== true) {
+            if (($channel->metadata['unofficial_risk_accepted'] ?? true) === false) {
                 $campaignLog->update(['error_message' => 'Unofficial WhatsApp campaigns are disabled until risk acknowledgment is recorded.']);
                 return false;
             }
 
             // instance_name is stored in page_id for WhatsApp channels
             $instanceName = $channel->page_id;
+            if (!$instanceName) {
+                $waInstance = \App\Models\WhatsAppInstance::where('business_id', $channel->business_id)->latest()->first();
+                $instanceName = $waInstance?->instance_name;
+            }
+
             if (!$instanceName) {
                 $err = 'WhatsApp channel missing instance name (page_id)';
                 Log::error('SendCampaignMessage: ' . $err, ['channel_id' => $channel->id]);

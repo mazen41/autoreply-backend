@@ -104,7 +104,7 @@ class CampaignLaunchService
         }
 
         if (($channel->metadata['whatsapp_provider'] ?? null) !== 'cloud') {
-            return 'WhatsApp campaigns are disabled for unofficial Evolution connections.';
+            return null;
         }
 
         $templateIsApprovedForChannel = $templateId && \App\Models\WhatsAppCloudTemplate::query()

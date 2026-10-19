@@ -20,7 +20,7 @@ class WhatsAppCampaignPolicyTest extends TestCase
 {
     use RefreshDatabase;
 
-    public function test_unofficial_evolution_channel_cannot_create_a_bulk_campaign(): void
+    public function test_unofficial_evolution_channel_can_create_a_bulk_campaign(): void
     {
         $owner = User::factory()->create();
         $business = BusinessProfile::factory()->create(['user_id' => $owner->id]);
@@ -41,8 +41,77 @@ class WhatsAppCampaignPolicyTest extends TestCase
                 'message' => 'Buy now',
             ]);
 
-        $response->assertUnprocessable()->assertJsonPath('error', 'WhatsApp campaigns are disabled for unofficial Evolution connections.');
-        $this->assertDatabaseCount('campaigns', 0);
+        $response->assertOk()->assertJsonPath('success', true);
+        $this->assertDatabaseCount('campaigns', 1);
+    }
+
+    public function test_evolution_campaign_audience_preview_and_sending_includes_existing_contacts(): void
+    {
+        Http::fake([
+            '*/message/sendText/*' => Http::response(['key' => ['id' => 'evo-msg-123']], 200),
+        ]);
+
+        $owner = User::factory()->create();
+        $business = BusinessProfile::factory()->create(['user_id' => $owner->id]);
+        $channel = Channel::create([
+            'user_id' => $owner->id,
+            'business_id' => $business->id,
+            'type' => 'whatsapp',
+            'page_id' => 'evolution-instance',
+            'access_token' => '',
+            'status' => 'connected',
+            'metadata' => ['whatsapp_provider' => 'evolution', 'unofficial_risk_accepted' => true],
+        ]);
+
+        // Existing conversation without explicit opt-in
+        $existingConversation = Conversation::create([
+            'business_id' => $business->id,
+            'channel_id' => $channel->id,
+            'sender_id' => '201234567890',
+        ]);
+
+        // Conversation that opted out
+        $optedOutConversation = Conversation::create([
+            'business_id' => $business->id,
+            'channel_id' => $channel->id,
+            'sender_id' => '201999999999',
+        ]);
+        ContactConsent::create([
+            'business_id' => $business->id,
+            'channel' => 'whatsapp',
+            'contact_identifier' => '201999999999',
+            'scope' => 'marketing',
+            'status' => 'opted_out',
+            'source' => 'chat',
+            'captured_at' => now(),
+        ]);
+
+        $preview = app(\App\Services\CampaignAudiencePreviewService::class)->preview($channel);
+        $this->assertSame(2, $preview['total_matched']);
+        $this->assertSame(1, $preview['eligible']);
+        $this->assertSame(1, $preview['excluded']['opted_out']);
+        $this->assertTrue($preview['campaign_ready']);
+        $this->assertNull($preview['configuration_reason']);
+
+        // Test sending campaign to existing contact
+        $campaign = Campaign::create([
+            'business_id' => $business->id,
+            'channel_id' => $channel->id,
+            'name' => 'Flash Sale',
+            'message' => 'Hello existing customer',
+            'status' => 'sending',
+            'total_recipients' => 1,
+        ]);
+        $log = CampaignLog::create([
+            'campaign_id' => $campaign->id,
+            'conversation_id' => $existingConversation->id,
+            'status' => 'queued',
+        ]);
+
+        (new SendCampaignMessage($log->id))->handle();
+
+        $this->assertSame('sent', $log->fresh()->status);
+        $this->assertSame('evo-msg-123', $log->fresh()->provider_message_id);
     }
 
     public function test_cloud_campaign_requires_an_approved_template_belonging_to_same_channel(): void

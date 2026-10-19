@@ -46,7 +46,7 @@ class CampaignAudiencePreviewService
         $channelConnected = $channel->status === 'connected';
         $isMeta = in_array(strtolower((string) $channel->type), ['facebook', 'instagram'], true);
 
-        $query->with('channel')->chunkById(500, function ($conversations) use (&$counts, &$total, &$eligible, $channelConnected, $isMeta): void {
+        $query->with('channel')->chunkById(500, function ($conversations) use (&$counts, &$total, &$eligible, $channelConnected, $isMeta, $channel): void {
             foreach ($conversations as $conversation) {
                 $total++;
                 $reason = null;
@@ -55,10 +55,17 @@ class CampaignAudiencePreviewService
                     $reason = 'channel_not_connected';
                 } else {
                     $consent = $this->consentGate->checkConversation($conversation, 'marketing');
+                    $isEvolutionWhatsApp = $channel->type === 'whatsapp'
+                        && ($channel->metadata['whatsapp_provider'] ?? null) !== 'cloud';
+
                     if (!$consent->allowed) {
-                        $reason = in_array($consent->reason, ['no_consent', 'opted_out', 'suppressed'], true)
-                            ? $consent->reason
-                            : 'invalid_contact_context';
+                        if ($isEvolutionWhatsApp && $consent->reason === 'no_consent') {
+                            $reason = null;
+                        } else {
+                            $reason = in_array($consent->reason, ['no_consent', 'opted_out', 'suppressed'], true)
+                                ? $consent->reason
+                                : 'invalid_contact_context';
+                        }
                     } elseif ($isMeta && !$this->insideMetaMessagingWindow($conversation->id)) {
                         $reason = 'messaging_window_expired';
                     }
@@ -77,14 +84,13 @@ class CampaignAudiencePreviewService
         if (!$channelConnected) {
             $configurationReason = 'The selected account is not connected.';
         } elseif ($channel->type === 'whatsapp') {
-            if (($channel->metadata['whatsapp_provider'] ?? null) !== 'cloud') {
-                $configurationReason = 'Campaign sends require an official WhatsApp Cloud API account.';
-            } elseif (!$templateId || !WhatsAppCloudTemplate::query()
+            $isCloud = ($channel->metadata['whatsapp_provider'] ?? null) === 'cloud';
+            if ($isCloud && (!$templateId || !WhatsAppCloudTemplate::query()
                 ->where('id', $templateId)
                 ->where('business_id', $channel->business_id)
                 ->where('channel_id', $channel->id)
                 ->where('status', 'APPROVED')
-                ->exists()) {
+                ->exists())) {
                 $configurationReason = 'Select an approved WhatsApp Cloud API template for this account.';
             }
         }

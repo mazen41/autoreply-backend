@@ -13,6 +13,7 @@ class Customer extends Model
 
     protected $fillable = [
         'business_profile_id',
+        'assigned_to',
         'commerce_channel_id',
         'commerce_external_id',
         'name',
@@ -48,6 +49,11 @@ class Customer extends Model
     public function identities(): HasMany
     {
         return $this->hasMany(CustomerIdentity::class);
+    }
+
+    public function assignee(): BelongsTo
+    {
+        return $this->belongsTo(User::class, 'assigned_to');
     }
 
 }

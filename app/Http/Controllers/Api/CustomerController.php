@@ -9,6 +9,7 @@ use App\Models\CustomerNote;
 use App\Models\Channel;
 use App\Models\CommerceOrder;
 use App\Models\ContactConsent;
+use App\Models\TeamMember;
 use App\Services\AuditLoggerService;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Http\Request;
@@ -58,7 +59,7 @@ class CustomerController extends Controller
         if ($request->boolean('has_email')) $query->whereNotNull('email')->where('email', '!=', '');
         if ($request->boolean('has_phone')) $query->whereNotNull('phone')->where('phone', '!=', '');
 
-        $customers = $query->withCount('conversations')
+        $customers = $query->with('assignee:id,name')->withCount('conversations')
             ->withMax('conversations', 'last_message_at')
             ->orderBy('created_at', 'desc')
             ->paginate(min(max($request->integer('per_page', 25), 1), 100));
@@ -83,6 +84,7 @@ class CustomerController extends Controller
                     $q->with('author:id,name')->orderBy('created_at', 'desc')->limit(20);
                 },
                 'identities' => fn ($q) => $q->with('channel:id,type,page_name,page_id')->orderBy('id'),
+                'assignee:id,name,email',
             ])
             ->findOrFail($id);
 
@@ -233,7 +235,12 @@ class CustomerController extends Controller
             'lifecycle_stage' => 'nullable|string|in:new_lead,qualified,customer,lost',
             'language' => 'nullable|string|max:20',
             'source' => 'nullable|string|max:100',
+            'assigned_to' => 'nullable|integer',
         ]);
+
+        if (array_key_exists('assigned_to', $data)) {
+            $this->validateAssignee($business->id, (int) $business->user_id, $data['assigned_to']);
+        }
 
         $phone = $data['phone'] ?? null;
         $email = isset($data['email']) ? mb_strtolower(trim($data['email'])) : null;
@@ -248,15 +255,36 @@ class CustomerController extends Controller
         foreach (['lifecycle_stage', 'language', 'source'] as $field) {
             if (array_key_exists($field, $data)) $customFields[$field] = $data[$field];
         }
-        $customer->fill(array_intersect_key($data, array_flip(['name', 'email', 'phone', 'avatar', 'tags', 'lead_score'])));
+        $customer->fill(array_intersect_key($data, array_flip(['name', 'email', 'phone', 'avatar', 'tags', 'lead_score', 'assigned_to'])));
         $customer->custom_fields = $customFields;
         $customer->save();
 
         AuditLoggerService::log('customer.profile_updated', $customer, [
-            'updated_fields' => array_values(array_intersect(array_keys($data), ['name', 'email', 'phone', 'avatar', 'tags', 'lead_score', 'lifecycle_stage', 'language', 'source'])),
+            'updated_fields' => array_values(array_intersect(array_keys($data), ['name', 'email', 'phone', 'avatar', 'tags', 'lead_score', 'lifecycle_stage', 'language', 'source', 'assigned_to'])),
         ], Auth::id(), (int) $business->id);
 
-        return response()->json(['customer' => $customer->fresh()]);
+        return response()->json(['customer' => $customer->fresh()->load('assignee:id,name,email')]);
+    }
+
+    public function assignees(Request $request)
+    {
+        $business = $this->getResolvedBusinessProfile($request, 'read');
+        $members = TeamMember::query()->where('business_id', $business->id)->where('is_active', true)
+            ->whereIn('role', ['owner', 'manager', 'agent'])->with('user:id,name,email')
+            ->get()->map(fn (TeamMember $member) => ['id' => $member->user_id, 'name' => $member->user?->name, 'email' => $member->user?->email, 'role' => $member->role])->values();
+        $owner = \App\Models\User::query()->find($business->user_id);
+        if ($owner && !$members->contains(fn ($member) => (int) $member['id'] === (int) $owner->id)) {
+            $members->prepend(['id' => $owner->id, 'name' => $owner->name, 'email' => $owner->email, 'role' => 'owner']);
+        }
+
+        return response()->json(['assignees' => $members->values()]);
+    }
+
+    private function validateAssignee(int $businessId, int $ownerId, ?int $userId): void
+    {
+        if ($userId === null || $userId === $ownerId) return;
+        TeamMember::query()->where('business_id', $businessId)->where('user_id', $userId)->where('is_active', true)
+            ->whereIn('role', ['owner', 'manager', 'agent'])->firstOrFail();
     }
 
     public function export(Request $request)

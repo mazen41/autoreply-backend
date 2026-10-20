@@ -11,6 +11,7 @@ use App\Models\Customer;
 use App\Models\CustomerIdentity;
 use App\Models\CustomerNote;
 use App\Models\SocialCommentEvent;
+use App\Models\TeamMember;
 use App\Models\User;
 use Illuminate\Foundation\Testing\RefreshDatabase;
 use Illuminate\Http\UploadedFile;
@@ -187,5 +188,31 @@ class CustomerCrmApiTest extends TestCase
         $response->assertOk()->assertJsonCount(1, 'comments')->assertJsonPath('comments.0.comment_text', 'Own account comment');
         $this->assertStringNotContainsString('Other account comment', $response->getContent());
         $this->assertStringNotContainsString('not returned', $response->getContent());
+    }
+
+    public function test_contact_assignment_accepts_only_active_business_members_with_assignment_roles(): void
+    {
+        $f = $this->fixture();
+        $customer = Customer::create(['business_profile_id' => $f['business']->id, 'name' => 'Assigned contact']);
+        $agent = User::factory()->create();
+        TeamMember::create(['business_id' => $f['business']->id, 'user_id' => $agent->id, 'role' => 'agent', 'is_active' => true]);
+
+        $this->getJson('/api/customers/assignees?business_id=' . $f['business']->id, $this->headers($f['business']->id))
+            ->assertOk()->assertJsonFragment(['id' => $f['user']->id, 'role' => 'owner'])
+            ->assertJsonFragment(['id' => $agent->id, 'role' => 'agent']);
+        $this->patchJson('/api/customers/' . $customer->id . '?business_id=' . $f['business']->id, [
+            'assigned_to' => $agent->id,
+        ], $this->headers($f['business']->id))->assertOk()->assertJsonPath('customer.assigned_to', $agent->id);
+
+        $otherUser = User::factory()->create();
+        $this->patchJson('/api/customers/' . $customer->id . '?business_id=' . $f['business']->id, [
+            'assigned_to' => $otherUser->id,
+        ], $this->headers($f['business']->id))->assertNotFound();
+
+        $viewer = User::factory()->create();
+        TeamMember::create(['business_id' => $f['business']->id, 'user_id' => $viewer->id, 'role' => 'viewer', 'is_active' => true]);
+        $this->patchJson('/api/customers/' . $customer->id . '?business_id=' . $f['business']->id, [
+            'assigned_to' => $viewer->id,
+        ], $this->headers($f['business']->id))->assertNotFound();
     }
 }

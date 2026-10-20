@@ -215,6 +215,7 @@ Route::middleware('auth:sanctum')->group(function () {
 
     // Customer / CRM
     Route::get('/customers', [\App\Http\Controllers\Api\CustomerController::class, 'index']);
+    Route::get('/customers/assignees', [\App\Http\Controllers\Api\CustomerController::class, 'assignees']);
     Route::get('/customers/export', [\App\Http\Controllers\Api\CustomerController::class, 'export']);
     Route::post('/customers/import', [\App\Http\Controllers\Api\CustomerController::class, 'import']);
     Route::get('/customers/{id}', [\App\Http\Controllers\Api\CustomerController::class, 'show']);

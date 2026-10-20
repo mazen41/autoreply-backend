@@ -77,6 +77,6 @@ return Application::configure(basePath: dirname(__DIR__))
         $command('sequences:check-no-reply', 'check-no-reply-sequences', 20, static fn ($event) => $event->everyTenMinutes());
         $command('salla:sync-orders', 'sync-salla-orders', 30, static fn ($event) => $event->everyFifteenMinutes());
         $command('salla:sync-customers', 'sync-salla-customers', 45, static fn ($event) => $event->everyThirtyMinutes());
-        $command('db:create-performance-indexes', 'create-performance-indexes', 180, static fn ($event) => $event->dailyAt('03:00'));
+        $command('performance:create-indexes', 'create-performance-indexes', 180, static fn ($event) => $event->dailyAt('03:00'));
         $command('telegram:resync-webhooks', 'resync-telegram-webhooks', 60, static fn ($event) => $event->twiceDaily(0, 12));
     })->create();

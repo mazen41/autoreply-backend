@@ -8,7 +8,9 @@ use App\Models\CommerceOrder;
 use App\Models\ContactConsent;
 use App\Models\Conversation;
 use App\Models\Customer;
+use App\Models\CustomerIdentity;
 use App\Models\CustomerNote;
+use App\Models\SocialCommentEvent;
 use App\Models\User;
 use Illuminate\Foundation\Testing\RefreshDatabase;
 use Illuminate\Http\UploadedFile;
@@ -150,5 +152,40 @@ class CustomerCrmApiTest extends TestCase
         ], $this->headers($f['business']->id))->assertUnprocessable();
         $this->assertSame('one@example.test', $one->fresh()->email);
         $this->assertSame('two@example.test', $two->fresh()->email);
+    }
+
+    public function test_contact_profile_includes_comment_history_only_for_its_account_identity(): void
+    {
+        $f = $this->fixture();
+        $firstChannel = Channel::create([
+            'user_id' => $f['user']->id, 'business_id' => $f['business']->id, 'type' => 'facebook',
+            'page_id' => 'crm-comments-one', 'access_token' => 'test', 'status' => 'connected',
+        ]);
+        $secondChannel = Channel::create([
+            'user_id' => $f['user']->id, 'business_id' => $f['business']->id, 'type' => 'facebook',
+            'page_id' => 'crm-comments-two', 'access_token' => 'test', 'status' => 'connected',
+        ]);
+        $customer = Customer::create(['business_profile_id' => $f['business']->id, 'name' => 'Commenter']);
+        CustomerIdentity::create([
+            'business_profile_id' => $f['business']->id, 'customer_id' => $customer->id,
+            'channel_id' => $firstChannel->id, 'platform' => 'facebook', 'external_id' => 'same-commenter-id',
+            'external_id_hash' => hash('sha256', 'same-commenter-id'),
+        ]);
+
+        foreach ([[$firstChannel, 'Own account comment'], [$secondChannel, 'Other account comment']] as [$channel, $text]) {
+            SocialCommentEvent::create([
+                'channel_id' => $channel->id, 'business_id' => $f['business']->id, 'platform' => 'facebook',
+                'event_type' => 'comment_created', 'account_id' => $channel->page_id,
+                'comment_id' => 'comment-' . $channel->id, 'commenter_id' => 'same-commenter-id',
+                'comment_text' => $text, 'status' => 'processed', 'payload' => ['private' => 'not returned'],
+                'platform_created_at' => now(),
+            ]);
+        }
+
+        $response = $this->getJson('/api/customers/' . $customer->id . '?business_id=' . $f['business']->id, $this->headers($f['business']->id));
+
+        $response->assertOk()->assertJsonCount(1, 'comments')->assertJsonPath('comments.0.comment_text', 'Own account comment');
+        $this->assertStringNotContainsString('Other account comment', $response->getContent());
+        $this->assertStringNotContainsString('not returned', $response->getContent());
     }
 }

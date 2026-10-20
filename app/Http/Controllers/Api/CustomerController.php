@@ -4,6 +4,7 @@ namespace App\Http\Controllers\Api;
 
 use App\Http\Controllers\Controller;
 use App\Models\Customer;
+use App\Models\SocialCommentEvent;
 use App\Models\CustomerNote;
 use App\Models\Channel;
 use App\Models\CommerceOrder;
@@ -108,10 +109,32 @@ class CustomerController extends Controller
             ->whereIn('contact_identifier', $identifiers)
             ->orderByDesc('captured_at')->get(['channel', 'scope', 'status', 'source', 'captured_at']);
 
+        // Comment activity belongs to a contact only when the commenter ID
+        // matches a stable identity from that exact connected account.
+        $identityRows = $customer->identities;
+        $comments = collect();
+        if ($identityRows->isNotEmpty()) {
+            $comments = SocialCommentEvent::query()
+                ->where('business_id', $business->id)
+                ->where(function ($query) use ($identityRows): void {
+                    foreach ($identityRows as $identity) {
+                        $query->orWhere(function ($identityQuery) use ($identity): void {
+                            $identityQuery->where('channel_id', $identity->channel_id)
+                                ->where('platform', $identity->platform)
+                                ->where('commenter_id', $identity->external_id);
+                        });
+                    }
+                })
+                ->orderByDesc('platform_created_at')
+                ->limit(20)
+                ->get(['id', 'channel_id', 'platform', 'post_id', 'comment_id', 'comment_text', 'platform_created_at', 'status', 'public_reply_id']);
+        }
+
         return response()->json([
             'customer' => $customer,
             'orders' => $orders,
             'consents' => $consents,
+            'comments' => $comments,
         ]);
     }
 

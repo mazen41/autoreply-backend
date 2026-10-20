@@ -186,7 +186,7 @@ class SequenceHardeningTest extends TestCase
             'sequence_step_id' => $step->id,
             'status' => 'pending',
         ]);
-        $lock = Cache::lock("sequence_step_execution:{$enrollment->id}:{$step->id}", 60);
+        $lock = Cache::store('database')->lock("sequence_step_execution:{$enrollment->id}:{$step->id}", 60);
         $this->assertTrue($lock->get());
 
         $job = (new ExecuteSequenceStep($execution->id))->withFakeQueueInteractions();

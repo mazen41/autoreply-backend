@@ -11,6 +11,7 @@ use Carbon\CarbonImmutable;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\Auth;
 use Illuminate\Support\Facades\DB;
+use Illuminate\Validation\Rule;
 
 class ReportsController extends Controller
 {
@@ -31,10 +32,14 @@ class ReportsController extends Controller
         return (int) $business->id;
     }
 
-    private function userMessages()
+    private function userMessages(array $filters = [])
     {
         $businessId = $this->businessId();
-        return Message::whereHas('conversation', fn ($q) => $q->where('business_id', $businessId));
+        return Message::whereHas('conversation', function ($query) use ($businessId, $filters): void {
+            $query->where('business_id', $businessId)
+                ->when(!empty($filters['channel_id']), fn ($conversation) => $conversation->where('channel_id', $filters['channel_id']))
+                ->when(!empty($filters['bot_id']), fn ($conversation) => $conversation->where('bot_id', $filters['bot_id']));
+        });
     }
 
     private function dashboardRange(Request $request, int $defaultDays = 7): array
@@ -42,6 +47,8 @@ class ReportsController extends Controller
         $validated = $request->validate([
             'days' => 'sometimes|integer|min:1|max:365',
             'timezone' => 'sometimes|string|max:64',
+            'channel_id' => ['sometimes', 'nullable', 'integer', Rule::exists('channels', 'id')->where('business_id', $this->businessId())],
+            'bot_id' => ['sometimes', 'nullable', 'integer', Rule::exists('bots', 'id')->where('business_profile_id', $this->businessId())],
         ]);
         $days = (int) ($validated['days'] ?? $defaultDays);
         $business = $request->attributes->get('active_business')
@@ -69,12 +76,14 @@ class ReportsController extends Controller
             'previous_end_utc' => $previousEndUtc,
             'period_start' => $startLocal->toDateString(),
             'period_end' => $nowLocal->toDateString(),
+            'channel_id' => isset($validated['channel_id']) ? (int) $validated['channel_id'] : null,
+            'bot_id' => isset($validated['bot_id']) ? (int) $validated['bot_id'] : null,
         ];
     }
 
     private function messagesForRange(array $range)
     {
-        return $this->userMessages()->whereBetween('created_at', [$range['start_utc'], $range['end_utc']]);
+        return $this->userMessages($range)->whereBetween('created_at', [$range['start_utc'], $range['end_utc']]);
     }
 
     private function rangeResponseFields(array $range): array
@@ -145,7 +154,9 @@ class ReportsController extends Controller
         return app(\App\Services\AnalyticsService::class)->medianResponseTimeSeconds(
             $this->businessId(),
             $range['start_utc'],
-            $range['end_utc']
+            $range['end_utc'],
+            $range['channel_id'] ?? null,
+            $range['bot_id'] ?? null,
         ) ?? 0.0;
     }
 
@@ -175,6 +186,8 @@ class ReportsController extends Controller
         $avgResponseTime = $this->averageResponseTimeSeconds($range);
         $shareOfReplies = $totalReplies > 0 ? ($autoReplies / $totalReplies) * 100 : 0;
         $aiConversations = Conversation::where('business_id', $this->businessId())
+            ->when(!empty($range['channel_id']), fn ($query) => $query->where('channel_id', $range['channel_id']))
+            ->when(!empty($range['bot_id']), fn ($query) => $query->where('bot_id', $range['bot_id']))
             ->whereHas('messages', fn ($query) => $query->where('direction', 'outbound')->where('is_ai', true)
                 ->where(fn ($source) => $source->whereNull('source')->orWhereNotIn('source', $automatedSources))
                 ->whereBetween('created_at', [$range['start_utc'], $range['end_utc']]))
@@ -391,7 +404,7 @@ class ReportsController extends Controller
         $hoursSaved = round(($aiReplies * $replyTimeMinutes) / 60, 1);
 
         $thisWeek = $this->messagesForRange($range)->count();
-        $lastWeek = $this->userMessages()->whereBetween('created_at', [
+        $lastWeek = $this->userMessages($range)->whereBetween('created_at', [
             $range['previous_start_utc'], $range['previous_end_utc'],
         ])->count();
         $messagesTrend = null;

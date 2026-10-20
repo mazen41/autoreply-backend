@@ -11,11 +11,88 @@ use App\Services\EmbeddingsService;
 use App\Services\KnowledgeFileIngestionService;
 use Illuminate\Foundation\Testing\RefreshDatabase;
 use Illuminate\Support\Facades\Queue;
+use Laravel\Sanctum\Sanctum;
 use Tests\TestCase;
 
 class ProcessKnowledgeFileTest extends TestCase
 {
     use RefreshDatabase;
+
+    public function test_business_owner_can_retry_a_failed_knowledge_file(): void
+    {
+        Queue::fake();
+        $user = User::factory()->create();
+        $business = BusinessProfile::factory()->create(['user_id' => $user->id]);
+        $file = BusinessKnowledgeFile::create([
+            'business_profile_id' => $business->id,
+            'filename' => 'catalog.pdf',
+            'file_type' => 'pdf',
+            'extracted_text' => 'Text to index again.',
+            'status' => 'failed',
+            'error_message' => 'Previous indexing failure.',
+        ]);
+        Sanctum::actingAs($user);
+
+        $this->postJson("/api/knowledge/files/{$file->id}/retry", [], ['X-Business-Id' => (string) $business->id])
+            ->assertAccepted()
+            ->assertJsonPath('file_id', $file->id);
+
+        $this->assertSame('pending', $file->fresh()->status);
+        $this->assertNull($file->fresh()->error_message);
+        Queue::assertPushed(ProcessKnowledgeFile::class);
+    }
+
+    public function test_business_owner_can_retry_knowledge_file_stuck_processing_for_over_thirty_minutes(): void
+    {
+        Queue::fake();
+        $user = User::factory()->create();
+        $business = BusinessProfile::factory()->create(['user_id' => $user->id]);
+        $file = BusinessKnowledgeFile::create([
+            'business_profile_id' => $business->id,
+            'filename' => 'stuck.pdf',
+            'file_type' => 'pdf',
+            'extracted_text' => 'Text to index again.',
+            'status' => 'processing',
+        ]);
+        $file->forceFill(['updated_at' => now()->subMinutes(31)])->save();
+        Sanctum::actingAs($user);
+
+        $this->postJson("/api/knowledge/files/{$file->id}/retry", [], ['X-Business-Id' => (string) $business->id])
+            ->assertAccepted();
+
+        $this->assertSame('pending', $file->fresh()->status);
+        Queue::assertPushed(ProcessKnowledgeFile::class);
+    }
+
+    public function test_knowledge_retry_rejects_fresh_jobs_and_files_from_another_business(): void
+    {
+        Queue::fake();
+        $user = User::factory()->create();
+        $business = BusinessProfile::factory()->create(['user_id' => $user->id]);
+        $otherBusiness = BusinessProfile::factory()->create(['user_id' => User::factory()->create()->id]);
+        $freshFile = BusinessKnowledgeFile::create([
+            'business_profile_id' => $business->id,
+            'filename' => 'fresh.pdf',
+            'file_type' => 'pdf',
+            'extracted_text' => 'Still running.',
+            'status' => 'processing',
+        ]);
+        $foreignFile = BusinessKnowledgeFile::create([
+            'business_profile_id' => $otherBusiness->id,
+            'filename' => 'private.pdf',
+            'file_type' => 'pdf',
+            'extracted_text' => 'Private.',
+            'status' => 'failed',
+        ]);
+        Sanctum::actingAs($user);
+
+        $this->postJson("/api/knowledge/files/{$freshFile->id}/retry", [], ['X-Business-Id' => (string) $business->id])
+            ->assertStatus(409);
+        $this->postJson("/api/knowledge/files/{$foreignFile->id}/retry", [], ['X-Business-Id' => (string) $business->id])
+            ->assertNotFound();
+
+        Queue::assertNothingPushed();
+    }
 
     public function test_failed_reindex_keeps_the_previous_chunks_searchable(): void
     {

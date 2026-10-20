@@ -15,6 +15,9 @@ class WebChatCors
 
         $businessId = $request->query('business_id') ?? $request->input('business_id');
         $sessionId = $request->input('session_id') ?? $request->route('sessionId');
+        if (!$sessionId && preg_match('#^api/web-chat/sessions/([^/]+)/(?:messages|status)$#', $request->path(), $matches)) {
+            $sessionId = rawurldecode($matches[1]);
+        }
         if (!$businessId && is_string($sessionId) && $sessionId !== '') {
             $businessId = \App\Models\WebChatSession::query()->where('session_id', $sessionId)->value('business_id');
         }
@@ -37,9 +40,18 @@ class WebChatCors
     private function isPublicWidgetRoute(Request $request): bool
     {
         if (!$request->is('api/web-chat/*')) return false;
-        return $request->isMethod('OPTIONS')
+        $publicWidgetEndpoint = $request->is('api/web-chat/sessions')
+            || $request->is('api/web-chat/messages')
+            || $request->is('api/web-chat/sessions/*/status')
+            || $request->is('api/web-chat/sessions/*/messages');
+
+        // Dashboard configuration/attribution calls live under /web-chat too,
+        // but their OPTIONS requests must be handled by Laravel's normal API CORS middleware.
+        return $publicWidgetEndpoint && (
+            $request->isMethod('OPTIONS')
             || $request->isMethod('POST') && ($request->is('api/web-chat/sessions') || $request->is('api/web-chat/messages') || $request->is('api/web-chat/sessions/*/status'))
-            || $request->isMethod('GET') && $request->is('api/web-chat/sessions/*/messages');
+            || $request->isMethod('GET') && $request->is('api/web-chat/sessions/*/messages')
+        );
     }
 
     private function originAllowed(string $origin, BusinessProfile $business): bool

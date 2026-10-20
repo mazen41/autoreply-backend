@@ -22,10 +22,12 @@ class KnowledgeController extends Controller
         $profile = $this->profile($request, 'read');
         $files = $profile->knowledgeFiles()
             ->orderBy('uploaded_at', 'desc')
-            ->get(['id', 'filename', 'file_type', 'uploaded_at', 'status', 'error_message'])
+            ->get(['id', 'filename', 'file_type', 'uploaded_at', 'updated_at', 'status', 'error_message'])
             ->map(function ($file) {
                 // Add chunks count
                 $file->chunks_count = \App\Models\BusinessKnowledgeChunk::where('business_knowledge_file_id', $file->id)->count();
+                $file->retryable = $file->status === 'failed'
+                    || ($file->status === 'processing' && $file->updated_at?->lte(now()->subMinutes(30)));
                 return $file;
             });
 
@@ -100,6 +102,34 @@ class KnowledgeController extends Controller
         $file->delete();
 
         return response()->json(['message' => 'File deleted successfully']);
+    }
+
+    /** Retry failed indexing or a processing job older than its unique lock. */
+    public function retry(Request $request, int $id)
+    {
+        $profile = $this->profile($request, 'write');
+        $file = $profile->knowledgeFiles()->findOrFail($id);
+        $staleProcessing = $file->status === 'processing'
+            && $file->updated_at?->lte(now()->subMinutes(30));
+
+        abort_unless(
+            $file->status === 'failed' || $staleProcessing,
+            409,
+            $file->status === 'processing'
+                ? 'This document is still being indexed. Try again after 30 minutes if it remains stuck.'
+                : 'Only failed or stale processing documents can be retried.'
+        );
+
+        $file->update(['status' => 'pending', 'error_message' => null]);
+        \App\Jobs\ProcessKnowledgeFile::dispatch($file->id);
+
+        Log::info('Knowledge file reindex retry queued', [
+            'file_id' => $file->id,
+            'business_profile_id' => $profile->id,
+            'previous_status' => $staleProcessing ? 'stale_processing' : 'failed',
+        ]);
+
+        return response()->json(['message' => 'Document reindexing queued.', 'file_id' => $file->id], 202);
     }
 
     /** Update AI instructions */

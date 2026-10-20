@@ -57,6 +57,17 @@ class WebChatPublicFlowTest extends TestCase
         $this->withHeader('Origin', 'https://attacker.example.net')->options('/api/web-chat/sessions?business_id=' . $business->id)->assertForbidden();
     }
 
+    public function test_dashboard_web_chat_settings_preflight_uses_api_cors_instead_of_widget_domain_validation(): void
+    {
+        $this->withHeaders([
+            'Origin' => 'https://nazbiz.io',
+            'Access-Control-Request-Method' => 'GET',
+            'Access-Control-Request-Headers' => 'authorization,x-business-id,accept',
+        ])->options('/api/web-chat/configuration')
+            ->assertNoContent()
+            ->assertHeader('Access-Control-Allow-Origin', 'https://nazbiz.io');
+    }
+
     public function test_hosted_iframe_checks_the_parent_site_against_the_allowlist(): void
     {
         $business = BusinessProfile::factory()->create(['web_chat_enabled' => true, 'web_chat_allowed_domains' => ['shop.example.com']]);

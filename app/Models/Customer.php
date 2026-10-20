@@ -14,6 +14,7 @@ class Customer extends Model
     protected $fillable = [
         'business_profile_id',
         'assigned_to',
+        'merged_into_customer_id',
         'commerce_channel_id',
         'commerce_external_id',
         'name',
@@ -54,6 +55,16 @@ class Customer extends Model
     public function assignee(): BelongsTo
     {
         return $this->belongsTo(User::class, 'assigned_to');
+    }
+
+    public function mergedInto(): BelongsTo
+    {
+        return $this->belongsTo(self::class, 'merged_into_customer_id');
+    }
+
+    public function mergeRecordsAsTarget(): HasMany
+    {
+        return $this->hasMany(CustomerMergeRecord::class, 'target_customer_id');
     }
 
 }

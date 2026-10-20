@@ -215,4 +215,68 @@ class CustomerCrmApiTest extends TestCase
             'assigned_to' => $viewer->id,
         ], $this->headers($f['business']->id))->assertNotFound();
     }
+
+    public function test_contact_merge_moves_linked_records_and_can_be_undone_without_overwriting_later_edits(): void
+    {
+        $f = $this->fixture();
+        $channel = Channel::create([
+            'user_id' => $f['user']->id, 'business_id' => $f['business']->id, 'type' => 'instagram',
+            'page_id' => 'crm-merge-page', 'access_token' => 'test', 'status' => 'connected',
+        ]);
+        $source = Customer::create([
+            'business_profile_id' => $f['business']->id, 'name' => 'Source person', 'email' => 'source@example.test',
+            'tags' => ['source-tag'], 'lead_score' => 42, 'custom_fields' => ['language' => 'en'],
+        ]);
+        $target = Customer::create([
+            'business_profile_id' => $f['business']->id, 'name' => 'Primary person', 'tags' => ['primary-tag'],
+            'lead_score' => 10, 'custom_fields' => ['source' => 'inbox'],
+        ]);
+        $conversation = Conversation::create([
+            'channel_id' => $channel->id, 'business_id' => $f['business']->id, 'customer_id' => $source->id,
+            'sender_id' => 'merge-sender', 'status' => 'open',
+        ]);
+        $note = CustomerNote::create(['customer_id' => $source->id, 'user_id' => $f['user']->id, 'content' => 'Preserve this note']);
+        $identity = CustomerIdentity::create([
+            'business_profile_id' => $f['business']->id, 'customer_id' => $source->id,
+            'channel_id' => $channel->id, 'platform' => 'instagram', 'external_id' => 'merge-sender',
+            'external_id_hash' => hash('sha256', 'merge-sender'),
+        ]);
+
+        $mergeResponse = $this->postJson('/api/customers/' . $source->id . '/merge?business_id=' . $f['business']->id, [
+            'target_customer_id' => $target->id,
+        ], $this->headers($f['business']->id))->assertCreated()->assertJsonPath('merge.source_customer_id', $source->id);
+        $mergeId = $mergeResponse->json('merge.id');
+        $this->assertSame($target->id, $conversation->fresh()->customer_id);
+        $this->assertSame($target->id, $note->fresh()->customer_id);
+        $this->assertSame($target->id, $identity->fresh()->customer_id);
+        $this->assertSame($target->id, $source->fresh()->merged_into_customer_id);
+        $this->assertSame('source@example.test', $target->fresh()->email);
+        $this->assertSame(['primary-tag', 'source-tag'], $target->fresh()->tags);
+        $this->getJson('/api/customers?business_id=' . $f['business']->id, $this->headers($f['business']->id))
+            ->assertOk()->assertJsonMissing(['id' => $source->id]);
+
+        $target->update(['name' => 'Edited after merge']);
+        $this->postJson('/api/customer-merges/' . $mergeId . '/unmerge?business_id=' . $f['business']->id, [], $this->headers($f['business']->id))
+            ->assertOk();
+        $this->assertNull($source->fresh()->merged_into_customer_id);
+        $this->assertSame($source->id, $conversation->fresh()->customer_id);
+        $this->assertSame($source->id, $note->fresh()->customer_id);
+        $this->assertSame($source->id, $identity->fresh()->customer_id);
+        $this->assertSame('Edited after merge', $target->fresh()->name);
+        $this->assertNull($target->fresh()->email);
+        $this->assertSame('source@example.test', $source->fresh()->email);
+    }
+
+    public function test_contact_merge_rejects_another_business_target_without_changing_source(): void
+    {
+        $f = $this->fixture();
+        $source = Customer::create(['business_profile_id' => $f['business']->id, 'name' => 'Source']);
+        $other = Customer::create(['business_profile_id' => $f['otherBusiness']->id, 'name' => 'Other business']);
+
+        $this->postJson('/api/customers/' . $source->id . '/merge?business_id=' . $f['business']->id, [
+            'target_customer_id' => $other->id,
+        ], $this->headers($f['business']->id))->assertNotFound();
+        $this->assertNull($source->fresh()->merged_into_customer_id);
+        $this->assertSame(0, \App\Models\CustomerMergeRecord::count());
+    }
 }

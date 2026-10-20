@@ -220,6 +220,8 @@ Route::middleware('auth:sanctum')->group(function () {
     Route::post('/customers/import', [\App\Http\Controllers\Api\CustomerController::class, 'import']);
     Route::get('/customers/{id}', [\App\Http\Controllers\Api\CustomerController::class, 'show']);
     Route::post('/customers/{customerId}/notes', [\App\Http\Controllers\Api\CustomerController::class, 'storeNote']);
+    Route::post('/customers/{customerId}/merge', [\App\Http\Controllers\Api\CustomerController::class, 'merge']);
+    Route::post('/customer-merges/{mergeId}/unmerge', [\App\Http\Controllers\Api\CustomerController::class, 'unmerge']);
     Route::patch('/customers/{customerId}/tags', [\App\Http\Controllers\Api\CustomerController::class, 'updateTags']);
     Route::patch('/customers/{customerId}', [\App\Http\Controllers\Api\CustomerController::class, 'updateProfile']);
 

@@ -4,6 +4,7 @@ namespace App\Http\Controllers\Api;
 
 use App\Http\Controllers\Controller;
 use App\Models\Customer;
+use App\Models\CustomerMergeRecord;
 use App\Models\SocialCommentEvent;
 use App\Models\CustomerNote;
 use App\Models\Channel;
@@ -32,7 +33,7 @@ class CustomerController extends Controller
     {
         $business = $this->getResolvedBusinessProfile($request, 'read');
 
-        $query = Customer::query()->where('business_profile_id', $business->id);
+        $query = Customer::query()->where('business_profile_id', $business->id)->whereNull('merged_into_customer_id');
 
         // Search filter
         if ($request->has('search') && !empty($request->search)) {
@@ -85,6 +86,8 @@ class CustomerController extends Controller
                 },
                 'identities' => fn ($q) => $q->with('channel:id,type,page_name,page_id')->orderBy('id'),
                 'assignee:id,name,email',
+                'mergedInto:id,name,email',
+                'mergeRecordsAsTarget' => fn ($query) => $query->whereNull('reversed_at')->with('source:id,name,email')->orderByDesc('id'),
             ])
             ->findOrFail($id);
 
@@ -148,6 +151,7 @@ class CustomerController extends Controller
         $business = $this->getResolvedBusinessProfile($request, 'write');
 
         $customer = Customer::where('business_profile_id', $business->id)->findOrFail($customerId);
+        $this->assertNotMerged($customer);
 
         $data = $request->validate([
             'content' => 'required|string|max:5000',
@@ -187,6 +191,7 @@ class CustomerController extends Controller
         $business = $this->getResolvedBusinessProfile($request, 'write');
 
         $customer = Customer::where('business_profile_id', $business->id)->findOrFail($customerId);
+        $this->assertNotMerged($customer);
 
         $request->validate([
             'tags' => 'nullable|array',
@@ -224,6 +229,7 @@ class CustomerController extends Controller
     {
         $business = $this->getResolvedBusinessProfile($request, 'write');
         $customer = Customer::query()->where('business_profile_id', $business->id)->findOrFail($customerId);
+        $this->assertNotMerged($customer);
         $data = $request->validate([
             'name' => 'nullable|string|max:255',
             'email' => 'nullable|email|max:255',
@@ -287,10 +293,127 @@ class CustomerController extends Controller
             ->whereIn('role', ['owner', 'manager', 'agent'])->firstOrFail();
     }
 
+    public function merge(Request $request, int $customerId)
+    {
+        $business = $this->getResolvedBusinessProfile($request, 'write');
+        $data = $request->validate(['target_customer_id' => ['required', 'integer']]);
+        abort_if((int) $data['target_customer_id'] === $customerId, 422, 'Choose a different contact to merge into.');
+
+        $record = DB::transaction(function () use ($business, $customerId, $data, $request): CustomerMergeRecord {
+            $locked = Customer::query()->where('business_profile_id', $business->id)
+                ->whereIn('id', [$customerId, (int) $data['target_customer_id']])->orderBy('id')->lockForUpdate()->get()->keyBy('id');
+            $source = $locked->get($customerId);
+            $target = $locked->get((int) $data['target_customer_id']);
+            abort_unless($source && $target, 404);
+            $this->assertNotMerged($source);
+            $this->assertNotMerged($target);
+            abort_if($source->mergeRecordsAsTarget()->whereNull('reversed_at')->exists(), 409, 'Undo merges into this contact before merging it elsewhere.');
+
+            $targetBefore = $this->mergeableSnapshot($target);
+            $targetValues = $targetBefore;
+            foreach (['name', 'email', 'phone', 'avatar', 'assigned_to'] as $field) {
+                if (($targetValues[$field] === null || $targetValues[$field] === '') && $source->getAttribute($field) !== null && $source->getAttribute($field) !== '') {
+                    $targetValues[$field] = $source->getAttribute($field);
+                }
+            }
+            $targetValues['lead_score'] = max((int) ($targetBefore['lead_score'] ?? 0), (int) ($source->lead_score ?? 0));
+            $targetValues['tags'] = array_values(array_unique(array_merge($targetBefore['tags'] ?? [], $source->tags ?? [])));
+            $targetValues['custom_fields'] = array_replace($source->custom_fields ?? [], $targetBefore['custom_fields'] ?? []);
+            $target->fill($targetValues)->save();
+            $targetAfter = $this->mergeableSnapshot($target->fresh());
+
+            $conversationIds = \App\Models\Conversation::query()->where('business_id', $business->id)
+                ->where('customer_id', $source->id)->orderBy('id')->pluck('id')->all();
+            if ($conversationIds) \App\Models\Conversation::query()->whereIn('id', $conversationIds)->update(['customer_id' => $target->id]);
+
+            $noteIds = CustomerNote::query()->where('customer_id', $source->id)->orderBy('id')->pluck('id')->all();
+            if ($noteIds) CustomerNote::query()->whereIn('id', $noteIds)->update(['customer_id' => $target->id]);
+
+            $identityIds = \App\Models\CustomerIdentity::query()->where('business_profile_id', $business->id)
+                ->where('customer_id', $source->id)->orderBy('id')->pluck('id')->all();
+            if ($identityIds) \App\Models\CustomerIdentity::query()->whereIn('id', $identityIds)->update(['customer_id' => $target->id]);
+
+            $source->update(['merged_into_customer_id' => $target->id]);
+            $merge = CustomerMergeRecord::create([
+                'business_profile_id' => $business->id,
+                'source_customer_id' => $source->id,
+                'target_customer_id' => $target->id,
+                'performed_by' => $request->user()->id,
+                'target_before' => $targetBefore,
+                'target_after' => $targetAfter,
+                'conversation_ids' => $conversationIds,
+                'note_ids' => $noteIds,
+                'identity_ids' => $identityIds,
+            ]);
+            AuditLoggerService::log('customer.merged', $merge, [
+                'source_customer_id' => $source->id, 'target_customer_id' => $target->id,
+                'moved_conversations' => count($conversationIds), 'moved_notes' => count($noteIds), 'moved_identities' => count($identityIds),
+            ], Auth::id(), (int) $business->id);
+
+            return $merge;
+        });
+
+        return response()->json([
+            'message' => 'Contacts merged. You can undo this merge from the target contact profile.',
+            'merge' => $record->load('source:id,name,email', 'target:id,name,email'),
+        ], 201);
+    }
+
+    public function unmerge(Request $request, int $mergeId)
+    {
+        $business = $this->getResolvedBusinessProfile($request, 'write');
+        $record = DB::transaction(function () use ($business, $mergeId, $request): CustomerMergeRecord {
+            $merge = CustomerMergeRecord::query()->where('business_profile_id', $business->id)->lockForUpdate()->findOrFail($mergeId);
+            abort_if($merge->reversed_at, 409, 'This contact merge has already been undone.');
+            $source = Customer::query()->where('business_profile_id', $business->id)->lockForUpdate()->findOrFail($merge->source_customer_id);
+            $target = Customer::query()->where('business_profile_id', $business->id)->lockForUpdate()->findOrFail($merge->target_customer_id);
+            abort_unless((int) $source->merged_into_customer_id === (int) $target->id, 409, 'The contacts have changed since this merge.');
+
+            $this->restoreTargetFieldsIfUnchanged($target, $merge->target_before, $merge->target_after);
+            if ($merge->conversation_ids) \App\Models\Conversation::query()->where('business_id', $business->id)->where('customer_id', $target->id)->whereIn('id', $merge->conversation_ids)->update(['customer_id' => $source->id]);
+            if ($merge->note_ids) CustomerNote::query()->where('customer_id', $target->id)->whereIn('id', $merge->note_ids)->update(['customer_id' => $source->id]);
+            if ($merge->identity_ids) \App\Models\CustomerIdentity::query()->where('business_profile_id', $business->id)->where('customer_id', $target->id)->whereIn('id', $merge->identity_ids)->update(['customer_id' => $source->id]);
+            $source->update(['merged_into_customer_id' => null]);
+            $merge->update(['reversed_at' => now()]);
+            AuditLoggerService::log('customer.merge_reversed', $merge, [
+                'source_customer_id' => $source->id, 'target_customer_id' => $target->id,
+            ], Auth::id(), (int) $business->id);
+
+            return $merge;
+        });
+
+        return response()->json(['message' => 'Contact merge undone.', 'merge' => $record->fresh()]);
+    }
+
+    private function mergeableSnapshot(Customer $customer): array
+    {
+        return [
+            'name' => $customer->name, 'email' => $customer->email, 'phone' => $customer->phone,
+            'avatar' => $customer->avatar, 'assigned_to' => $customer->assigned_to,
+            'lead_score' => $customer->lead_score, 'tags' => $customer->tags ?? [],
+            'custom_fields' => $customer->custom_fields ?? [],
+        ];
+    }
+
+    private function restoreTargetFieldsIfUnchanged(Customer $target, array $before, array $after): void
+    {
+        $restore = [];
+        foreach ($after as $field => $mergedValue) {
+            $current = $target->getAttribute($field);
+            if ($current == $mergedValue) $restore[$field] = $before[$field] ?? null;
+        }
+        if ($restore) $target->fill($restore)->save();
+    }
+
+    private function assertNotMerged(Customer $customer): void
+    {
+        abort_if($customer->merged_into_customer_id, 409, 'This contact was merged into another profile.');
+    }
+
     public function export(Request $request)
     {
         $business = $this->getResolvedBusinessProfile($request, 'read');
-        $query = Customer::query()->where('business_profile_id', $business->id)->orderBy('id');
+        $query = Customer::query()->where('business_profile_id', $business->id)->whereNull('merged_into_customer_id')->orderBy('id');
         if ($request->filled('search')) {
             $search = trim($request->string('search')->toString());
             $query->where(fn ($q) => $q->where('name', 'like', "%{$search}%")->orWhere('phone', 'like', "%{$search}%")->orWhere('email', 'like', "%{$search}%"));

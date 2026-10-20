@@ -15,12 +15,6 @@ class TeamInvitationAcceptanceTest extends TestCase
 {
     use RefreshDatabase;
 
-    protected function setUp(): void
-    {
-        parent::setUp();
-        $this->withoutMiddleware(\App\Http\Middleware\PlanEnforcement::class);
-    }
-
     public function test_existing_user_is_not_added_until_invitation_is_accepted(): void
     {
         Mail::fake();
@@ -36,6 +30,11 @@ class TeamInvitationAcceptanceTest extends TestCase
 
         $this->assertDatabaseMissing('team_members', ['business_id' => $business->id, 'user_id' => $invitee->id]);
         $invitation = TeamInvitation::firstOrFail();
+        $this->assertDatabaseHas('audit_logs', [
+            'user_id' => $owner->id,
+            'business_profile_id' => $business->id,
+            'action' => 'team.invitation.created',
+        ]);
         $token = str_repeat('a', 64);
         $invitation->update(['token_hash' => hash('sha256', $token)]);
         $this->assertSame('invitee@example.test', $invitation->email);
@@ -132,5 +131,7 @@ class TeamInvitationAcceptanceTest extends TestCase
         $this->assertNotSame($old->id, $replacementId);
         $this->deleteJson("/api/businesses/{$business->id}/team/invitations/{$replacementId}")->assertOk();
         $this->assertDatabaseHas('team_invitations', ['id' => $replacementId, 'status' => 'revoked']);
+        $this->assertDatabaseHas('audit_logs', ['action' => 'team.invitation.resent', 'business_profile_id' => $business->id]);
+        $this->assertDatabaseHas('audit_logs', ['action' => 'team.invitation.revoked', 'business_profile_id' => $business->id]);
     }
 }

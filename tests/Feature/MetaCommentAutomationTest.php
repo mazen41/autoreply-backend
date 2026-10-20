@@ -138,6 +138,23 @@ class MetaCommentAutomationTest extends TestCase
         $this->assertNotContains('https://graph.facebook.com/v26.0/me/messages', $urls);
     }
 
+    public function test_global_pause_holds_comment_event_without_public_reply(): void
+    {
+        Http::fake();
+        $user = User::factory()->create();
+        $business = BusinessProfile::factory()->create(['user_id' => $user->id, 'automation_paused_at' => now()]);
+        $channel = Channel::factory()->create([
+            'user_id' => $user->id, 'business_id' => $business->id, 'type' => 'facebook',
+            'page_id' => 'paused-comment-page', 'status' => 'connected', 'access_token' => 'test-token',
+        ]);
+        $event = $this->commentEvent($channel, $business, 'facebook', 'paused-comment-1');
+
+        (new ProcessSocialCommentEvent($event->id))->handle(app(MetaCommentAutomationService::class));
+
+        $this->assertSame('received', $event->fresh()->status);
+        Http::assertNothingSent();
+    }
+
     public function test_private_reply_outside_eligibility_window_is_skipped_without_http_call(): void
     {
         Http::fake();

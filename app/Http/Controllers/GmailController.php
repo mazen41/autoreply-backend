@@ -80,17 +80,53 @@ class GmailController extends Controller
             $profile = $gmail->users->getProfile('me');
             $email   = $profile->getEmailAddress();
 
-            $channel = Channel::updateOrCreate(
-                ['user_id' => $userId, 'type' => 'gmail', 'page_id' => $email],
-                [
-                    'page_name'     => $email,
-                    'access_token'  => json_encode($token),   // mutator encrypts this automatically
-                    'refresh_token' => isset($token['refresh_token']) ? encrypt($token['refresh_token']) : null,
-                    'status'        => 'connected',
-                    'connected_at'  => now(),
-                    'business_id'   => $businessProfile ? $businessProfile->id : null,
-                ]
-            );
+            $accountInAnotherBusiness = Channel::query()
+                ->where('type', 'gmail')
+                ->where('page_id', $email)
+                ->whereNotNull('business_id')
+                ->where('business_id', '!=', $businessProfile->id)
+                ->exists();
+            if ($accountInAnotherBusiness) {
+                Log::warning('Gmail account connection rejected because the mailbox is already linked to another workspace', [
+                    'business_id' => $businessProfile->id,
+                    'email_hash' => hash('sha256', strtolower($email)),
+                ]);
+                return redirect(env('FRONTEND_URL') . '/dashboard/channels?error=gmail_account_in_another_workspace');
+            }
+
+            $channelQuery = Channel::query()
+                ->where('type', 'gmail')
+                ->where('page_id', $email)
+                ->where('business_id', $businessProfile->id);
+            $channel = $channelQuery->first();
+            // Adopt a pre-business-scoping connection only when it belongs to
+            // this same user and Gmail address. Never select another workspace.
+            if (!$channel) {
+                $channel = Channel::query()
+                    ->where('user_id', $userId)
+                    ->where('type', 'gmail')
+                    ->where('page_id', $email)
+                    ->whereNull('business_id')
+                    ->first();
+            }
+            $channel ??= new Channel([
+                'user_id' => $userId,
+                'type' => 'gmail',
+                'page_id' => $email,
+            ]);
+
+            $existingTokenData = json_decode((string) $channel->access_token, true) ?: [];
+            $tokenData = array_merge($existingTokenData, $token);
+            $channel->fill([
+                'page_name' => $email,
+                'access_token' => json_encode($tokenData),
+                // The model mutator encrypts the value. Google may omit the
+                // refresh token on reauthorization; keep the known-good one.
+                'refresh_token' => $token['refresh_token'] ?? $channel->refresh_token,
+                'status' => 'connected',
+                'connected_at' => now(),
+                'business_id' => $businessProfile->id,
+            ])->save();
 
             // Set up Gmail Push Notifications via watch()
             $this->setupGmailWatch($channel);
@@ -277,7 +313,7 @@ class GmailController extends Controller
                 $msgId = $msgRef->getId();
 
                 // Skip if already saved
-                if (Message::where('gmail_message_id', $msgId)->exists()) {
+                if (Message::where('channel_id', $channel->id)->where('platform_message_id', $msgId)->exists()) {
                     continue;
                 }
 
@@ -343,6 +379,9 @@ class GmailController extends Controller
 
                 $message = Message::create([
                     'conversation_id'  => $conversation->id,
+                    'channel_id'       => $channel->id,
+                    'platform_message_id' => $msgId,
+                    'gmail_message_id' => $msgId,
                     // Plain text always populated (falls back to a stripped
                     // version of the HTML) — AI context and previews rely on this.
                     'content'          => $body ?: $this->htmlToPlainText($bodyHtml),
@@ -350,8 +389,8 @@ class GmailController extends Controller
                     'direction'        => 'inbound',
                     'is_ai'            => false,
                     'status'           => 'received',
-                    'gmail_message_id' => $gmailMsgId,
                     'metadata' => array_filter([
+                        'gmail_rfc_message_id' => $gmailMsgId,
                         'gmail_thread_id' => $threadId,
                         'gmail_in_reply_to' => $gmailInReplyTo,
                         'referenced_platform_message_id' => $gmailInReplyTo,

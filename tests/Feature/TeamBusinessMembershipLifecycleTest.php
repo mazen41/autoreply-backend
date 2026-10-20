@@ -13,12 +13,6 @@ class TeamBusinessMembershipLifecycleTest extends TestCase
 {
     use RefreshDatabase;
 
-    protected function setUp(): void
-    {
-        parent::setUp();
-        $this->withoutMiddleware(\App\Http\Middleware\PlanEnforcement::class);
-    }
-
     public function test_removal_replaces_primary_business_with_another_active_membership(): void
     {
         $owner = User::factory()->create();

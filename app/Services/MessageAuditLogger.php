@@ -79,6 +79,7 @@ class MessageAuditLogger
 
         return [
             'message_id' => $message->id,
+            'correlation_id' => $message->correlation_id,
             'conversation_id' => $message->conversation_id,
             'channel_id' => $conversation?->channel_id,
             'channel_type' => $conversation?->channel?->type,

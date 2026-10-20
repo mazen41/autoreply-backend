@@ -57,6 +57,8 @@ class BusinessProfile extends Model
         'ai_setup_tested_config_hash',
         'automation_paused_at',
         'auto_order_confirmation_enabled',
+        'web_chat_enabled',
+        'web_chat_allowed_domains',
     ];
 
     protected $casts = [
@@ -73,6 +75,8 @@ class BusinessProfile extends Model
         'consent_policy_acknowledged_at' => 'datetime',
         'automation_paused_at' => 'datetime',
         'auto_order_confirmation_enabled' => 'boolean',
+        'web_chat_enabled' => 'boolean',
+        'web_chat_allowed_domains' => 'array',
     ];
 
     public function user(): BelongsTo

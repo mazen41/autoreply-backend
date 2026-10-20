@@ -78,10 +78,13 @@ class ChannelMessageService
                     'delivery_status' => 'sent',
                     'error_details' => null,
                 ]);
+                $channel->update(['last_error_at' => null, 'last_error_code' => null]);
                 Log::info('ChannelMessageService: message sent successfully', [
                     'platform' => $channel->type,
                     'message_id' => $message->id,
                     'conversation_id' => $conversation->id,
+                    'correlation_id' => $message->correlation_id,
+                    'provider_message_id_present' => !empty($message->fresh()->platform_message_id),
                 ]);
             } else {
                 $fresh = $message->fresh();
@@ -92,9 +95,12 @@ class ChannelMessageService
                     'delivery_status' => $blocked ? $fresh?->delivery_status : 'failed',
                     'error_details' => $fresh?->error_details ?: ($blocked ? 'send_blocked_by_policy' : 'provider_rejected'),
                 ]);
+                $channel->update(['last_error_at' => now(), 'last_error_code' => $blocked ? 'send_blocked_by_policy' : 'provider_rejected']);
                 Log::error('ChannelMessageService: message send failed', [
                     'platform' => $channel->type,
                     'message_id' => $message->id,
+                    'correlation_id' => $message->correlation_id,
+                    'delivery_status' => $blocked ? 'blocked' : 'failed',
                 ]);
             }
 
@@ -105,12 +111,14 @@ class ChannelMessageService
                 'status' => 'failed',
                 'send_status' => 'failed',
                 'delivery_status' => 'failed',
-                'error_details' => $e->getMessage(),
+                'error_details' => 'provider_exception:' . class_basename($e),
             ]);
+            $channel->update(['last_error_at' => now(), 'last_error_code' => class_basename($e)]);
             Log::error('ChannelMessageService: send message exception', [
                 'exception_type' => get_class($e),
                 'platform' => $channel->type,
                 'message_id' => $message->id,
+                'correlation_id' => $message->correlation_id,
             ]);
             return false;
         }
@@ -128,6 +136,8 @@ class ChannelMessageService
             }
             $messageRecord->update([
                 'metadata' => $metadata,
+                'platform_message_id' => $result['message_id'] ?? null,
+                'platform_message_hash' => !empty($result['message_id']) ? hash('sha256', (string) $result['message_id']) : null,
                 'error_details' => $result['error'] ?? null,
             ]);
         }
@@ -191,6 +201,8 @@ class ChannelMessageService
                 $metadata['provider_message_ids'] = [(string) $providerMessageId];
                 $messageRecord->update([
                     'gmail_message_id' => (string) $providerMessageId,
+                    'platform_message_id' => (string) $providerMessageId,
+                    'platform_message_hash' => hash('sha256', (string) $providerMessageId),
                     'metadata' => $metadata,
                 ]);
             }
@@ -228,7 +240,11 @@ class ChannelMessageService
                 }
                 $result = $cloud->sendText($channel, $recipientId, $message);
                 if ($result['success'] && !empty($result['message_id'])) {
-                    $messageRecord->update(['whatsapp_message_id' => $result['message_id']]);
+                    $messageRecord->update([
+                        'whatsapp_message_id' => $result['message_id'],
+                        'platform_message_id' => $result['message_id'],
+                        'platform_message_hash' => hash('sha256', (string) $result['message_id']),
+                    ]);
                 }
                 if (!$result['success']) {
                     $messageRecord->update(['error_details' => 'WhatsApp Cloud text send failed: ' . ($result['reason'] ?? 'provider_rejected')]);
@@ -268,6 +284,8 @@ class ChannelMessageService
             if (isset($response['key']['id'])) {
                 $messageRecord->update([
                     'whatsapp_message_id' => $response['key']['id'],
+                    'platform_message_id' => $response['key']['id'],
+                    'platform_message_hash' => hash('sha256', (string) $response['key']['id']),
                     'whatsapp_remote_jid' => $response['key']['remoteJid'] ?? $recipientId,
                     'whatsapp_from_me' => true,
                 ]);

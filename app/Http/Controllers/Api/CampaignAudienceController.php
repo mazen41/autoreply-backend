@@ -6,6 +6,7 @@ use App\Http\Controllers\Controller;
 use App\Models\CampaignTemplate;
 use App\Models\Segment;
 use Illuminate\Http\Request;
+use Illuminate\Validation\Rule;
 
 class CampaignAudienceController extends Controller
 {
@@ -27,6 +28,13 @@ class CampaignAudienceController extends Controller
             'rules.last_order_days_ago' => ['nullable', 'integer', 'min:0'],
             'rules.min_orders' => ['nullable', 'integer', 'min:0'],
             'rules.location' => ['nullable', 'string', 'max:120'],
+            'rules.lifecycle_stage' => ['nullable', 'string', 'in:new_lead,qualified,customer,lost'],
+            'rules.language' => ['nullable', 'string', 'max:20'],
+            'rules.source' => ['nullable', 'string', 'max:100'],
+            'rules.has_email' => ['nullable', 'boolean'],
+            'rules.has_phone' => ['nullable', 'boolean'],
+            'rules.min_lead_score' => ['nullable', 'integer', 'min:0', 'max:100'],
+            'rules.channel_id' => ['nullable', 'integer', Rule::exists('channels', 'id')->where('business_profile_id', $business->id)],
         ]);
 
         $segment = Segment::create([
@@ -50,6 +58,13 @@ class CampaignAudienceController extends Controller
             'rules.last_order_days_ago' => ['nullable', 'integer', 'min:0'],
             'rules.min_orders' => ['nullable', 'integer', 'min:0'],
             'rules.location' => ['nullable', 'string', 'max:120'],
+            'rules.lifecycle_stage' => ['nullable', 'string', 'in:new_lead,qualified,customer,lost'],
+            'rules.language' => ['nullable', 'string', 'max:20'],
+            'rules.source' => ['nullable', 'string', 'max:100'],
+            'rules.has_email' => ['nullable', 'boolean'],
+            'rules.has_phone' => ['nullable', 'boolean'],
+            'rules.min_lead_score' => ['nullable', 'integer', 'min:0', 'max:100'],
+            'rules.channel_id' => ['nullable', 'integer', Rule::exists('channels', 'id')->where('business_profile_id', $business->id)],
         ]);
         $segment->update($validated);
         return response()->json(['data' => $segment->fresh()]);

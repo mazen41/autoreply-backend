@@ -22,6 +22,10 @@ Broadcast::channel('inbox.{userId}', function ($user, $userId) {
     return (int) $user->id === (int) $userId;
 });
 
+Broadcast::channel('user.{userId}', function ($user, $userId) {
+    return (int) $user->id === (int) $userId;
+});
+
 Broadcast::channel('business.{businessId}', function ($user, $businessId) {
     // Only allow business owner and team members to subscribe
     $business = \App\Models\BusinessProfile::find($businessId);

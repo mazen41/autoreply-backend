@@ -7,7 +7,9 @@ use App\Models\BusinessProfile;
 use App\Models\Campaign;
 use App\Models\Channel;
 use App\Models\Conversation;
+use App\Models\Message;
 use App\Models\AutomationWorkflow;
+use App\Jobs\ProcessAutoReply;
 use App\Models\User;
 use Illuminate\Foundation\Testing\RefreshDatabase;
 use Tests\TestCase;
@@ -117,5 +119,27 @@ class AutomationRunControlTest extends TestCase
 
         $this->assertSame([], $results);
         $this->assertDatabaseCount('workflow_executions', 0);
+    }
+
+    public function test_global_pause_drops_queued_ai_turn_without_sending_a_late_reply(): void
+    {
+        $owner = User::factory()->create();
+        $business = BusinessProfile::factory()->create(['user_id' => $owner->id, 'automation_paused_at' => now()]);
+        $channel = Channel::create([
+            'user_id' => $owner->id, 'business_id' => $business->id, 'type' => 'instagram',
+            'page_id' => 'paused-ai-channel', 'access_token' => 'test-token', 'status' => 'connected', 'ai_enabled' => true,
+        ]);
+        $conversation = Conversation::create([
+            'business_id' => $business->id, 'channel_id' => $channel->id, 'sender_id' => 'customer-paused',
+        ]);
+        $inbound = Message::create([
+            'conversation_id' => $conversation->id, 'content' => 'Hi', 'direction' => 'inbound',
+            'status' => 'received', 'send_status' => 'received', 'is_ai' => false,
+        ]);
+
+        (new ProcessAutoReply($inbound->id))->handle();
+
+        $this->assertSame(1, Message::where('conversation_id', $conversation->id)->count());
+        $this->assertSame(0, Message::where('conversation_id', $conversation->id)->where('direction', 'outbound')->count());
     }
 }

@@ -6,6 +6,7 @@ use App\Http\Controllers\Controller;
 use App\Models\Channel;
 use App\Models\Conversation;
 use App\Models\Message;
+use App\Models\SystemHealthLog;
 use App\Models\Package;
 use App\Models\Subscription;
 use App\Models\User;
@@ -79,9 +80,137 @@ class AdminController extends Controller
             ->orderBy('failed_at', 'desc')
             ->paginate(20);
 
+        $failedJobs->setCollection($failedJobs->getCollection()->map(function ($job): array {
+            $payload = json_decode((string) $job->payload, true) ?: [];
+            preg_match('/^([A-Za-z0-9_\\\\]+(?:Exception|Error)):/m', (string) $job->exception, $matches);
+            return [
+                'id' => $job->id,
+                'queue' => $job->queue,
+                'job_name' => isset($payload['displayName']) ? class_basename($payload['displayName']) : 'Queued job',
+                'exception_type' => isset($matches[1]) ? class_basename($matches[1]) : 'Unclassified failure',
+                'retry_safe' => $this->isKnownSafeRetry($payload['displayName'] ?? null),
+                'failed_at' => $job->failed_at,
+            ];
+        }));
         $queueStats['failed_jobs_list'] = $failedJobs;
 
         return response()->json($queueStats);
+    }
+
+    /** Safe operational overview: connection state is distinct from delivery evidence. */
+    public function systemHealth(Request $request)
+    {
+        $filters = $request->validate([
+            'provider' => ['nullable', 'string', 'max:40'],
+            'status' => ['nullable', 'in:connected,disconnected'],
+        ]);
+
+        $channelQuery = Channel::query()->select(['id', 'business_id', 'type', 'page_name', 'page_id', 'status', 'connected_at', 'last_event_at', 'last_sync_at', 'last_error_at', 'last_error_code', 'metadata']);
+        if (!empty($filters['provider'])) $channelQuery->where('type', $filters['provider']);
+        if (!empty($filters['status'])) $channelQuery->where('status', $filters['status']);
+
+        $channels = $channelQuery->orderBy('type')->orderBy('page_name')->get()->map(function (Channel $channel): array {
+            $lastMessage = Message::query()->where(function ($query) use ($channel): void {
+                $query->where('channel_id', $channel->id)
+                    ->orWhereHas('conversation', fn ($conversations) => $conversations->where('channel_id', $channel->id));
+            })->latest('created_at')->first(['id', 'created_at', 'direction', 'send_status', 'delivery_status']);
+
+            $metadata = $channel->metadata ?? [];
+            return [
+                'id' => $channel->id,
+                'business_id' => $channel->business_id,
+                'provider' => $channel->type,
+                'label' => $channel->page_name ?: $channel->page_id,
+                'authorization_status' => $channel->status,
+                'connected_at' => $channel->connected_at?->toISOString(),
+                'last_event_at' => $channel->last_event_at?->toISOString() ?: $lastMessage?->created_at?->toISOString(),
+                'last_delivery_status' => $lastMessage?->direction === 'outbound'
+                    ? ($lastMessage->delivery_status ?: $lastMessage->send_status)
+                    : null,
+                'last_sync_at' => $channel->last_sync_at?->toISOString() ?: $this->safeDate($metadata['last_synced_at'] ?? $metadata['last_sync_at'] ?? null),
+                'last_error_at' => $channel->last_error_at?->toISOString(),
+                'last_error_code' => $channel->last_error_code,
+                'webhook_status' => $metadata['webhook_status'] ?? $metadata['comment_webhook_status'] ?? null,
+                'evidence' => $lastMessage ? 'message_recorded' : 'no_message_recorded',
+            ];
+        });
+
+        $failedJobs = \DB::table('failed_jobs')->orderByDesc('failed_at')->limit(10)->get([
+            'id', 'queue', 'payload', 'exception', 'failed_at',
+        ])->map(function ($job): array {
+            $payload = json_decode((string) $job->payload, true) ?: [];
+            preg_match('/^([A-Za-z0-9_\\\\]+(?:Exception|Error)):/m', (string) $job->exception, $matches);
+            return [
+                'id' => $job->id,
+                'queue' => $job->queue,
+                'job_name' => isset($payload['displayName']) ? class_basename($payload['displayName']) : 'Queued job',
+                'exception_type' => isset($matches[1]) ? class_basename($matches[1]) : 'Unclassified failure',
+                'retry_safe' => $this->isKnownSafeRetry($payload['displayName'] ?? null),
+                'failed_at' => $job->failed_at,
+            ];
+        });
+
+        $events = SystemHealthLog::query()
+            ->latest()
+            ->limit(50)
+            ->get(['id', 'component', 'status', 'message', 'details', 'is_resolved', 'created_at'])
+            ->map(fn (SystemHealthLog $event): array => [
+                'id' => $event->id,
+                'component' => $event->component,
+                'status' => $event->status,
+                'message' => $this->safeHealthMessage($event->component, $event->message),
+                'details' => $this->safeHealthDetails($event->details ?? []),
+                'is_resolved' => $event->is_resolved,
+                'created_at' => $event->created_at?->toISOString(),
+            ]);
+
+        return response()->json([
+            'generated_at' => now()->toISOString(),
+            'queue' => [
+                'pending_jobs' => \DB::table('jobs')->count(),
+                'failed_jobs' => \DB::table('failed_jobs')->count(),
+                'queues' => \DB::table('jobs')->select('queue', \DB::raw('count(*) as pending'))->groupBy('queue')->get(),
+            ],
+            'channels' => $channels,
+            'failed_jobs' => $failedJobs,
+            'events' => $events,
+        ]);
+    }
+
+    private function safeDate(mixed $value): ?string
+    {
+        if (!is_string($value) || $value === '') return null;
+        try { return \Illuminate\Support\Carbon::parse($value)->toISOString(); } catch (\Throwable) { return null; }
+    }
+
+    private function safeHealthMessage(string $component, ?string $message): string
+    {
+        if (in_array($component, ['scheduler', 'gmail', 'provider', 'webhook', 'queue'], true)) {
+            return match ($component) {
+                'scheduler' => 'A scheduled task reported a failure.',
+                'gmail' => 'A Gmail account poll reported a failure.',
+                'provider' => 'A provider operation reported a failure.',
+                'webhook' => 'A webhook operation reported a failure.',
+                default => 'A queue operation reported a failure.',
+            };
+        }
+        return $message ?: 'Health check reported an issue.';
+    }
+
+    private function safeHealthDetails(array $details): array
+    {
+        $allowed = ['task', 'failed_at', 'exception_type', 'channel_id', 'provider', 'http_status', 'reason_code', 'correlation_id', 'failed_jobs', 'pending_jobs'];
+        return array_intersect_key($details, array_flip($allowed));
+    }
+
+    private function isKnownSafeRetry(mixed $jobClass): bool
+    {
+        return is_string($jobClass) && in_array($jobClass, [
+            \App\Jobs\PollGmailInbox::class,
+            \App\Jobs\SyncGmailHistory::class,
+            \App\Jobs\SyncCommerceStore::class,
+            \App\Jobs\FetchSenderName::class,
+        ], true);
     }
 
     /**
@@ -90,10 +219,19 @@ class AdminController extends Controller
     public function retryFailedJob($id)
     {
         try {
+            $failedJob = \DB::table('failed_jobs')->where('id', $id)->first(['payload']);
+            if (!$failedJob) return response()->json(['error' => 'Failed job not found'], 404);
+            $payload = json_decode((string) $failedJob->payload, true) ?: [];
+            if (!$this->isKnownSafeRetry($payload['displayName'] ?? null)) {
+                return response()->json([
+                    'error' => 'Automatic retry is blocked for this job because its external side effects may not be idempotent. Inspect and retry it manually after verification.',
+                    'error_code' => 'RETRY_REQUIRES_REVIEW',
+                ], 409);
+            }
             Artisan::call('queue:retry', ['id' => $id]);
             return response()->json(['message' => 'Job retried successfully']);
-        } catch (\Exception $e) {
-            return response()->json(['error' => $e->getMessage()], 500);
+        } catch (\Throwable $e) {
+            return response()->json(['error' => 'Failed job could not be retried.', 'exception_type' => class_basename($e)], 500);
         }
     }
 
@@ -134,6 +272,8 @@ class AdminController extends Controller
         $parsedLogs = [];
         foreach ($allLines as $line) {
             if (empty(trim($line))) continue;
+
+            $line = \App\Support\SensitiveLogContext::redactText($line);
 
             // Parse log level from the line
             $logLevel = null;

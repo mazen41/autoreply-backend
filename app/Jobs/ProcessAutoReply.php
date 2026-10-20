@@ -100,6 +100,21 @@ class ProcessAutoReply implements ShouldQueue
             return;
         }
 
+        // Global human-only/emergency pause must also cover inbound AI replies
+        // and deterministic attachment acknowledgements. Drop this turn while
+        // paused so queued messages are never sent late after an operator
+        // resumes automation; new customer messages after resume are handled
+        // normally.
+        $business = $conversation->business ?? $channel?->business;
+        if ($business && app(\App\Services\AutomationRunControl::class)->isBusinessPaused($business)) {
+            Log::info('ProcessAutoReply: customer-facing automation paused; message left for human handling', [
+                'business_id' => $business->id,
+                'conversation_id' => $conversation->id,
+                'message_id' => $message->id,
+            ]);
+            return;
+        }
+
         if ($channel->status !== 'connected') {
             Log::warning('ProcessAutoReply: channel not connected', ['channel_id' => $channel->id, 'status' => $channel->status]);
             return;
@@ -3416,6 +3431,20 @@ $aiResponse = $intro
         $content = $replyMessage->content;
 
         $business = $conversation->business;
+        if ($business && app(\App\Services\AutomationRunControl::class)->isBusinessPaused($business)) {
+            $replyMessage->forceFill([
+                'status' => 'failed',
+                'send_status' => 'blocked',
+                'delivery_status' => 'blocked',
+                'error_details' => 'automation_paused',
+            ])->save();
+            Log::info('ProcessAutoReply: prevented send because global automation pause became active', [
+                'business_id' => $business->id,
+                'conversation_id' => $conversation->id,
+                'message_id' => $replyMessage->id,
+            ]);
+            return false;
+        }
         if ($business && app(\App\Services\UsageMeter::class)->blockMessageIfOverLimit($business, $replyMessage)) {
             return false;
         }

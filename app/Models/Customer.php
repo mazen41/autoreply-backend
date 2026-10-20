@@ -45,8 +45,9 @@ class Customer extends Model
         return $this->hasMany(CustomerNote::class)->orderBy('created_at', 'desc');
     }
 
-    public function orders(): HasMany
+    public function identities(): HasMany
     {
-        return $this->hasMany(CustomerOrder::class);
+        return $this->hasMany(CustomerIdentity::class);
     }
+
 }

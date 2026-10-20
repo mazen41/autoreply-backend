@@ -145,12 +145,54 @@ class TeamAccessMatrixTest extends TestCase
     {
         $agent = $this->member('agent');
         $membership = TeamMember::where('user_id', $agent->id)->firstOrFail();
+        $this->conversation->update(['assigned_agent_id' => $agent->id]);
 
         Sanctum::actingAs($this->owner);
         $this->deleteJson("/api/businesses/{$this->business->id}/team/{$membership->id}")->assertOk();
+        $this->assertDatabaseHas('audit_logs', [
+            'user_id' => $this->owner->id,
+            'business_profile_id' => $this->business->id,
+            'action' => 'team.member.removed',
+        ]);
 
         Sanctum::actingAs($agent);
         $this->getJson("/api/businesses/{$this->business->id}/me")->assertStatus(404);
+        $this->getJson('/api/team/assignments')->assertOk()->assertJsonPath('data', []);
+    }
+
+    public function test_assignments_only_include_businesses_with_current_conversation_read_access(): void
+    {
+        $agent = $this->member('agent');
+        $secondOwner = User::factory()->create();
+        $secondBusiness = BusinessProfile::factory()->create(['user_id' => $secondOwner->id]);
+        $secondChannel = Channel::factory()->create([
+            'business_id' => $secondBusiness->id,
+            'user_id' => $secondOwner->id,
+        ]);
+        $secondConversation = Conversation::factory()->create([
+            'business_id' => $secondBusiness->id,
+            'channel_id' => $secondChannel->id,
+            'assigned_agent_id' => $agent->id,
+        ]);
+        $secondMembership = TeamMember::create([
+            'business_id' => $secondBusiness->id,
+            'user_id' => $agent->id,
+            'role' => 'viewer',
+            'is_active' => true,
+            'joined_at' => now(),
+        ]);
+        $this->conversation->update(['assigned_agent_id' => $agent->id]);
+
+        Sanctum::actingAs($agent);
+        $response = $this->getJson('/api/team/assignments')->assertOk();
+        $this->assertEqualsCanonicalizing(
+            [$this->conversation->id, $secondConversation->id],
+            collect($response->json('data'))->pluck('id')->all(),
+        );
+
+        $secondMembership->update(['is_active' => false]);
+        $response = $this->getJson('/api/team/assignments')->assertOk();
+        $this->assertSame([$this->conversation->id], collect($response->json('data'))->pluck('id')->all());
     }
 
     public function test_user_cannot_change_own_role(): void
@@ -173,6 +215,23 @@ class TeamAccessMatrixTest extends TestCase
         Sanctum::actingAs($manager);
         $this->patchJson("/api/businesses/{$this->business->id}/team/{$membership->id}/role", ['role' => 'owner'])
             ->assertStatus(403);
+    }
+
+    public function test_owner_role_change_is_audited_with_old_and_new_role(): void
+    {
+        $agent = $this->member('agent');
+        $membership = TeamMember::where('user_id', $agent->id)->firstOrFail();
+
+        Sanctum::actingAs($this->owner);
+        $this->patchJson("/api/businesses/{$this->business->id}/team/{$membership->id}/role", ['role' => 'manager'])
+            ->assertOk();
+
+        $audit = \App\Models\AuditLog::where('action', 'team.member.role_changed')->firstOrFail();
+        $this->assertSame($this->business->id, (int) $audit->business_profile_id);
+        $this->assertSame($this->owner->id, (int) $audit->user_id);
+        $this->assertSame('agent', $audit->payload['from_role']);
+        $this->assertSame('manager', $audit->payload['to_role']);
+        $this->assertSame($agent->id, $audit->payload['member_user_id']);
     }
 
     public function test_me_endpoint_returns_role_and_permissions(): void

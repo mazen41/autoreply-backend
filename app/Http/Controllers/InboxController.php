@@ -1170,6 +1170,7 @@ class InboxController extends Controller
 
             // Verify the bot exists, is active, and is assigned to this conversation's channel
             $bot = \App\Models\Bot::where('id', $botId)
+                ->where('business_profile_id', $conversation->business_id)
                 ->where('status', 'active')
                 ->whereHas('channels', function ($q) use ($conversation) {
                     $q->where('channel_id', $conversation->channel_id);

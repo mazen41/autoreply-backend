@@ -4,6 +4,7 @@ namespace App\Models;
 
 use Illuminate\Database\Eloquent\Factories\HasFactory;
 use Illuminate\Database\Eloquent\Model;
+use Illuminate\Support\Str;
 
 class Message extends Model
 {
@@ -12,6 +13,20 @@ class Message extends Model
     protected static function booted(): void
     {
         static::creating(function (Message $message): void {
+            if (!$message->channel_id && $message->conversation_id) {
+                $message->channel_id = $message->conversation?->channel_id;
+            }
+            if (!$message->correlation_id) {
+                $message->correlation_id = (string) Str::uuid();
+            }
+            if (!$message->platform_message_id) {
+                $message->platform_message_id = $message->gmail_message_id
+                    ?: $message->whatsapp_message_id
+                    ?: ($message->metadata['platform_message_id'] ?? null);
+            }
+            if ($message->channel_id && $message->platform_message_id) {
+                $message->platform_message_hash = hash('sha256', (string) $message->platform_message_id);
+            }
             // New outbound rows are immediately visible as queued, while the
             // legacy `pending` value remains readable for existing rows.
             if ($message->direction === 'outbound' && in_array($message->send_status, [null, 'pending'], true)) {
@@ -22,6 +37,11 @@ class Message extends Model
         static::created(function (Message $message): void {
             app(\App\Services\MessageAuditLogger::class)->created($message);
             app(\App\Services\InboundConsentKeywordHandler::class)->handle($message);
+            if ($message->channel_id) {
+                \App\Models\Channel::whereKey($message->channel_id)->update([
+                    'last_event_at' => $message->created_at ?? now(),
+                ]);
+            }
         });
 
         static::updated(function (Message $message): void {
@@ -41,6 +61,10 @@ class Message extends Model
 
     protected $fillable = [
         'conversation_id',
+        'channel_id',
+        'platform_message_id',
+        'platform_message_hash',
+        'correlation_id',
         'content',
         'content_html',
         'type',

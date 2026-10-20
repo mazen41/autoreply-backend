@@ -4,6 +4,7 @@ namespace App\Services;
 
 use App\Models\Conversation;
 use App\Models\Customer;
+use App\Models\CustomerIdentity;
 use Illuminate\Support\Facades\Log;
 
 /**
@@ -32,7 +33,7 @@ class CustomerService
      * @param string   $senderId   Platform sender identifier
      * @param array    $attributes Optional overrides: name, phone, email
      */
-    public function resolve(?int $businessId, string $platform, string $senderId, array $attributes = []): ?Customer
+    public function resolve(?int $businessId, string $platform, string $senderId, array $attributes = [], ?int $channelId = null): ?Customer
     {
         if (!$businessId) {
             return null;
@@ -44,7 +45,20 @@ class CustomerService
 
         $customer = null;
 
-        if ($phone) {
+        // A platform sender ID is only unique within its connected account.
+        // Resolve that identity first so two Pages with overlapping IDs never
+        // merge people, even if an incoming payload also contains weak data.
+        if ($channelId && trim($senderId) !== '') {
+            $identity = CustomerIdentity::query()
+                ->where('business_profile_id', $businessId)
+                ->where('channel_id', $channelId)
+                ->where('platform', $platform)
+                ->where('external_id_hash', hash('sha256', trim($senderId)))
+                ->first();
+            $customer = $identity?->customer;
+        }
+
+        if (!$customer && $phone) {
             $customer = Customer::where('business_profile_id', $businessId)
                 ->where(function ($q) use ($phone, $attributes) {
                     $q->where('phone', $phone)
@@ -59,7 +73,7 @@ class CustomerService
                 ->first();
         }
 
-        if (!$customer) {
+        if (!$customer && !$channelId) {
             $customer = $this->findByPlatformIdentity($businessId, $platform, $senderId);
         }
 
@@ -75,7 +89,7 @@ class CustomerService
             if (!$customer->name && $name) {
                 $customer->name = $name;
             }
-            $this->adoptIdentity($customer, $platform, $senderId);
+            $this->adoptIdentity($customer, $platform, $senderId, $channelId);
             if ($customer->isDirty()) {
                 $customer->save();
             }
@@ -87,8 +101,10 @@ class CustomerService
             'name'                => $name,
             'phone'               => $phone,
             'email'               => $email,
-            'custom_fields'       => ['platform_ids' => [$platform => $senderId]],
+            'custom_fields'       => $channelId ? [] : ['platform_ids' => [$platform => $senderId]],
         ]);
+        $this->adoptIdentity($customer, $platform, $senderId, $channelId);
+        if ($customer->isDirty()) $customer->save();
 
         Log::info('CustomerService: created customer', [
             'business_profile_id' => $businessId,
@@ -121,7 +137,7 @@ class CustomerService
             'phone' => $phone,
         ];
 
-        $customer = $this->resolve($conversation->business_id, $platform, $senderId, $attributes);
+        $customer = $this->resolve($conversation->business_id, $platform, $senderId, $attributes, $conversation->channel_id);
 
         if ($customer && $conversation->customer_id !== $customer->id) {
             $conversation->update(['customer_id' => $customer->id]);
@@ -155,7 +171,7 @@ class CustomerService
                     ->first();
                 if (!$owner) {
                     $customer->phone = $phone;
-                    $this->adoptIdentity($customer, $conversation->channel?->type ?? 'unknown', (string) $conversation->sender_id);
+                    $this->adoptIdentity($customer, $conversation->channel?->type ?? 'unknown', (string) $conversation->sender_id, $conversation->channel_id);
                     $customer->save();
                 }
             }
@@ -177,7 +193,8 @@ class CustomerService
             $conversation->business_id,
             $conversation->channel?->type ?? 'web_chat',
             (string) $conversation->sender_id,
-            ['phone' => $phone, 'name' => $name]
+            ['phone' => $phone, 'name' => $name],
+            $conversation->channel_id
         );
 
         if ($customer && $conversation->customer_id !== $customer->id) {
@@ -202,8 +219,37 @@ class CustomerService
      * Record the platform sender id on the customer so future phone-less
      * messages from this platform resolve to the same record.
      */
-    public function adoptIdentity(Customer $customer, string $platform, string $senderId): void
+    public function adoptIdentity(Customer $customer, string $platform, string $senderId, ?int $channelId = null): void
     {
+        $senderId = trim($senderId);
+        if ($senderId === '') return;
+
+        if ($channelId) {
+            $hash = hash('sha256', $senderId);
+            $existing = CustomerIdentity::query()
+                ->where('business_profile_id', $customer->business_profile_id)
+                ->where('channel_id', $channelId)
+                ->where('platform', $platform)
+                ->where('external_id_hash', $hash)
+                ->first();
+            if ($existing) return; // Never transfer an account identity.
+
+            try {
+                CustomerIdentity::create([
+                    'business_profile_id' => $customer->business_profile_id,
+                    'customer_id' => $customer->id,
+                    'channel_id' => $channelId,
+                    'platform' => $platform,
+                    'external_id' => $senderId,
+                    'external_id_hash' => $hash,
+                ]);
+            } catch (\Illuminate\Database\UniqueConstraintViolationException $e) {
+                // Another worker inserted the same identity concurrently.
+                // The unique account key is authoritative; don't reassign it.
+            }
+            return;
+        }
+
         $fields = is_array($customer->custom_fields) ? $customer->custom_fields : [];
         $ids = is_array($fields['platform_ids'] ?? null) ? $fields['platform_ids'] : [];
 

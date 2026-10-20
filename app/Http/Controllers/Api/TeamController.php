@@ -8,8 +8,9 @@ use App\Models\User;
 use App\Models\BusinessProfile;
 use App\Models\TeamInvitation;
 use App\Models\Notification;
+use App\Services\AuditLoggerService;
+use App\Services\BusinessAccessService;
 use Illuminate\Http\Request;
-use Illuminate\Support\Facades\Auth;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Hash;
 use Illuminate\Support\Facades\Log;
@@ -56,15 +57,31 @@ class TeamController extends Controller
             ->authorize($request->user(), $businessId, 'manage_team');
 
         $email = mb_strtolower(trim($request->email));
-        if (TeamMember::where('business_id', $businessId)->whereHas('user', fn ($q) => $q->whereRaw('LOWER(email) = ?', [$email]))
-            ->where('is_active', true)->exists()) {
-            return response()->json(['error' => 'User is already a team member'], 409);
-        }
-        if (TeamInvitation::where('business_id', $businessId)->where('email', $email)->where('status', 'pending')->exists()) {
-            return response()->json(['error' => 'A pending invitation already exists'], 409);
-        }
+        $result = DB::transaction(function () use ($request, $business, $email): array {
+            // Serialize invitations for this workspace so concurrent requests
+            // cannot create duplicate active memberships or pending invites.
+            $lockedBusiness = BusinessProfile::whereKey($business->id)->lockForUpdate()->firstOrFail();
 
-        $invitation = $this->createInvitation($request, $business, $email, $request->role);
+            if (TeamMember::where('business_id', $lockedBusiness->id)
+                ->whereHas('user', fn ($query) => $query->whereRaw('LOWER(email) = ?', [$email]))
+                ->where('is_active', true)
+                ->exists()) {
+                return ['error' => 'User is already a team member'];
+            }
+            if (TeamInvitation::where('business_id', $lockedBusiness->id)
+                ->where('email', $email)
+                ->where('status', 'pending')
+                ->exists()) {
+                return ['error' => 'A pending invitation already exists'];
+            }
+
+            return ['invitation' => $this->createInvitation($request, $lockedBusiness, $email, $request->role)];
+        });
+        if (isset($result['error'])) {
+            return response()->json(['error' => $result['error']], 409);
+        }
+        $business = BusinessProfile::findOrFail($business->id);
+        $invitation = $result['invitation'];
         try {
             $this->sendInvitationEmail($invitation, $business);
         } catch (\Throwable $e) {
@@ -100,6 +117,13 @@ class TeamController extends Controller
             'expires_at' => now()->addDays(7),
             'status' => 'pending',
         ]);
+        AuditLoggerService::log(
+            'team.invitation.created',
+            $invitation,
+            ['role' => $role],
+            (int) $request->user()->id,
+            (int) $business->id,
+        );
         $invitation->setAttribute('delivery_token', $token);
         return $invitation;
     }
@@ -129,6 +153,13 @@ class TeamController extends Controller
         }
         if ($invitation->expires_at->isPast()) {
             $invitation->update(['status' => 'expired']);
+            AuditLoggerService::log(
+                'team.invitation.expired',
+                $invitation,
+                ['role' => $invitation->role],
+                null,
+                (int) $invitation->business_id,
+            );
             return response()->json(['message' => 'Invitation has expired. Ask the owner to resend it.'], 410);
         }
 
@@ -150,13 +181,21 @@ class TeamController extends Controller
             'password' => ['required', 'string', 'min:8', 'max:255'],
         ]);
 
-        $result = DB::transaction(function () use ($token, $validated) {
+        $result = DB::transaction(function () use ($token, $validated): array {
             $invitation = TeamInvitation::where('token_hash', hash('sha256', $token))->lockForUpdate()->first();
-            if (!$invitation || $invitation->status !== 'pending' || $invitation->expires_at->isPast()) {
-                if ($invitation && $invitation->status === 'pending') {
-                    $invitation->update(['status' => 'expired']);
-                }
-                abort(410, 'Invitation is invalid or expired. Ask the owner to resend it.');
+            if (!$invitation || $invitation->status !== 'pending') {
+                return ['error' => 'Invitation is invalid or expired. Ask the owner to resend it.'];
+            }
+            if ($invitation->expires_at->isPast()) {
+                $invitation->update(['status' => 'expired']);
+                AuditLoggerService::log(
+                    'team.invitation.expired',
+                    $invitation,
+                    ['role' => $invitation->role],
+                    null,
+                    (int) $invitation->business_id,
+                );
+                return ['error' => 'Invitation is invalid or expired. Ask the owner to resend it.'];
             }
 
             $email = mb_strtolower(trim($invitation->email));
@@ -185,11 +224,25 @@ class TeamController extends Controller
                 ['role' => $invitation->role, 'is_active' => true, 'joined_at' => now()]
             );
             $invitation->update(['status' => 'accepted', 'accepted_at' => now()]);
+            AuditLoggerService::log(
+                'team.invitation.accepted',
+                $member,
+                ['invitation_id' => $invitation->id, 'role' => $member->role],
+                (int) $user->id,
+                (int) $invitation->business_id,
+            );
 
-            return [$user, $member];
+            return ['user' => $user, 'member' => $member];
         });
 
-        [$user, $member] = $result;
+        if (isset($result['error'])) {
+            return response()->json(['message' => $result['error']], 410);
+        }
+
+        /** @var User $user */
+        $user = $result['user'];
+        /** @var TeamMember $member */
+        $member = $result['member'];
         return response()->json([
             'success' => true,
             'user' => $user,
@@ -208,6 +261,13 @@ class TeamController extends Controller
                 return false;
             }
             $invitation->update(['status' => 'revoked']);
+            AuditLoggerService::log(
+                'team.invitation.rejected',
+                $invitation,
+                ['role' => $invitation->role],
+                null,
+                (int) $invitation->business_id,
+            );
             return true;
         });
 
@@ -220,9 +280,24 @@ class TeamController extends Controller
     public function resendInvitation(Request $request, $businessId, $invitationId)
     {
         $business = app(\App\Services\BusinessAccessService::class)->authorize($request->user(), $businessId, 'manage_team');
-        $invitation = TeamInvitation::where('business_id', $business->id)->whereKey($invitationId)->where('status', 'pending')->firstOrFail();
-        $invitation->update(['status' => 'expired']);
-        $replacement = $this->createInvitation($request, $business, $invitation->email, $invitation->role);
+        [$invitation, $replacement] = DB::transaction(function () use ($request, $business, $invitationId): array {
+            $lockedBusiness = BusinessProfile::whereKey($business->id)->lockForUpdate()->firstOrFail();
+            $invitation = TeamInvitation::where('business_id', $lockedBusiness->id)
+                ->whereKey($invitationId)
+                ->where('status', 'pending')
+                ->lockForUpdate()
+                ->firstOrFail();
+            $invitation->update(['status' => 'expired']);
+            $replacement = $this->createInvitation($request, $lockedBusiness, $invitation->email, $invitation->role);
+            AuditLoggerService::log(
+                'team.invitation.resent',
+                $replacement,
+                ['replaces_invitation_id' => $invitation->id, 'role' => $replacement->role],
+                (int) $request->user()->id,
+                (int) $lockedBusiness->id,
+            );
+            return [$invitation, $replacement];
+        });
         try {
             $this->sendInvitationEmail($replacement, $business);
         } catch (\Throwable $e) {
@@ -235,8 +310,22 @@ class TeamController extends Controller
     public function revokeInvitation(Request $request, $businessId, $invitationId)
     {
         $business = app(\App\Services\BusinessAccessService::class)->authorize($request->user(), $businessId, 'manage_team');
-        $invitation = TeamInvitation::where('business_id', $business->id)->whereKey($invitationId)->where('status', 'pending')->firstOrFail();
-        $invitation->update(['status' => 'revoked']);
+        DB::transaction(function () use ($request, $business, $invitationId): void {
+            BusinessProfile::whereKey($business->id)->lockForUpdate()->firstOrFail();
+            $invitation = TeamInvitation::where('business_id', $business->id)
+                ->whereKey($invitationId)
+                ->where('status', 'pending')
+                ->lockForUpdate()
+                ->firstOrFail();
+            $invitation->update(['status' => 'revoked']);
+            AuditLoggerService::log(
+                'team.invitation.revoked',
+                $invitation,
+                ['role' => $invitation->role],
+                (int) $request->user()->id,
+                (int) $business->id,
+            );
+        });
         return response()->json(['success' => true]);
     }
 
@@ -290,6 +379,13 @@ class TeamController extends Controller
         }
         if ($invitation->expires_at->isPast()) {
             $invitation->update(['status' => 'expired']);
+            AuditLoggerService::log(
+                'team.invitation.expired',
+                $invitation,
+                ['role' => $invitation->role],
+                null,
+                (int) $invitation->business_id,
+            );
             return response()->json(['error' => 'Invitation has expired. Ask the owner to resend it.'], 410);
         }
         $user = $request->user();
@@ -313,6 +409,13 @@ class TeamController extends Controller
                 ['role' => $locked->role, 'is_active' => true, 'joined_at' => now()]
             );
             $locked->update(['status' => 'accepted', 'accepted_at' => now()]);
+            AuditLoggerService::log(
+                'team.invitation.accepted',
+                $member,
+                ['invitation_id' => $locked->id, 'role' => $member->role],
+                (int) $user->id,
+                (int) $locked->business_id,
+            );
             return $member;
         });
 
@@ -331,36 +434,53 @@ class TeamController extends Controller
         $business = app(\App\Services\BusinessAccessService::class)
             ->authorize($request->user(), $businessId, 'manage_team');
 
-        $teamMember = TeamMember::where('id', $memberId)
-            ->where('business_id', $businessId)
-            ->findOrFail($memberId);
+        $result = DB::transaction(function () use ($request, $business, $businessId, $memberId): TeamMember|array {
+            // Lock the workspace row to serialize owner-role changes and
+            // preserve the last-owner invariant under concurrent requests.
+            $lockedBusiness = BusinessProfile::whereKey($businessId)->lockForUpdate()->firstOrFail();
+            $teamMember = TeamMember::where('business_id', $businessId)
+                ->whereKey($memberId)
+                ->lockForUpdate()
+                ->firstOrFail();
 
-        $actorIsBusinessOwner = (int) $business->user_id === (int) $request->user()->id;
-
-        // No self-escalation or self-demotion through this endpoint.
-        if ((int) $teamMember->user_id === (int) $request->user()->id) {
-            return response()->json(['error' => 'You cannot change your own role'], 403);
-        }
-
-        // Only the business owner can grant or hold the owner role.
-        if ($request->role === 'owner' && !$actorIsBusinessOwner) {
-            return response()->json(['error' => 'Only the business owner can assign the owner role'], 403);
-        }
-
-        // Last-owner protection counts the business owner plus team owners.
-        if ($teamMember->role === 'owner' && $request->role !== 'owner') {
-            $ownerCount = 1 + TeamMember::where('business_id', $businessId)
-                ->where('role', 'owner')
-                ->count();
-
-            if ($ownerCount <= 1) {
-                return response()->json(['error' => 'Cannot demote the last owner'], 400);
+            if ((int) $teamMember->user_id === (int) $request->user()->id) {
+                return ['error' => 'You cannot change your own role', 'status' => 403];
             }
+            if ($request->role === 'owner' && (int) $lockedBusiness->user_id !== (int) $request->user()->id) {
+                return ['error' => 'Only the business owner can assign the owner role', 'status' => 403];
+            }
+            if ($teamMember->role === 'owner' && $request->role !== 'owner') {
+                $ownerCount = 1 + TeamMember::where('business_id', $businessId)
+                    ->where('role', 'owner')
+                    ->count();
+                if ($ownerCount <= 1) {
+                    return ['error' => 'Cannot demote the last owner', 'status' => 400];
+                }
+            }
+
+            $previousRole = $teamMember->role;
+            if ($previousRole !== $request->role) {
+                $teamMember->update(['role' => $request->role]);
+                AuditLoggerService::log(
+                    'team.member.role_changed',
+                    $teamMember,
+                    [
+                        'member_user_id' => (int) $teamMember->user_id,
+                        'from_role' => $previousRole,
+                        'to_role' => $request->role,
+                    ],
+                    (int) $request->user()->id,
+                    (int) $lockedBusiness->id,
+                );
+            }
+
+            return $teamMember->fresh();
+        });
+        if (is_array($result)) {
+            return response()->json(['error' => $result['error']], $result['status']);
         }
 
-        $teamMember->update(['role' => $request->role]);
-
-        return response()->json(['success' => true, 'team_member' => $teamMember]);
+        return response()->json(['success' => true, 'team_member' => $result]);
     }
 
     /**
@@ -375,7 +495,8 @@ class TeamController extends Controller
             ->where('business_id', $businessId)
             ->findOrFail($memberId);
 
-        $removed = DB::transaction(function () use ($teamMember, $businessId) {
+        $actorId = (int) $request->user()->id;
+        $removed = DB::transaction(function () use ($teamMember, $businessId, $actorId) {
             $lockedMember = TeamMember::whereKey($teamMember->id)->lockForUpdate()->firstOrFail();
             // The business owner is never a team row and always remains an owner,
             // so the business owner can never be removed through this endpoint.
@@ -385,6 +506,7 @@ class TeamController extends Controller
             }
 
             $memberUser = User::whereKey($lockedMember->user_id)->lockForUpdate()->first();
+            $removedRole = $lockedMember->role;
             // Soft removal: keep the row for history; access checks require is_active.
             $lockedMember->update(['is_active' => false]);
 
@@ -398,6 +520,17 @@ class TeamController extends Controller
                     ?? BusinessProfile::where('user_id', $memberUser->id)->value('id');
                 $memberUser->forceFill(['business_id' => $nextBusinessId])->save();
             }
+
+            AuditLoggerService::log(
+                'team.member.removed',
+                $lockedMember,
+                [
+                    'member_user_id' => (int) $lockedMember->user_id,
+                    'role' => $removedRole,
+                ],
+                $actorId,
+                (int) $businessId,
+            );
 
             return true;
         });
@@ -465,7 +598,11 @@ class TeamController extends Controller
      */
     public function myAssignments(Request $request)
     {
-        $assignments = \App\Models\Conversation::where('assigned_agent_id', Auth::id())
+        $businessIds = app(BusinessAccessService::class)
+            ->accessibleBusinessIds($request->user(), 'conversation_read');
+
+        $assignments = \App\Models\Conversation::whereIn('business_id', $businessIds)
+            ->where('assigned_agent_id', $request->user()->id)
             ->with(['channel', 'latestMessage'])
             ->orderBy('assigned_at', 'desc')
             ->paginate(50);

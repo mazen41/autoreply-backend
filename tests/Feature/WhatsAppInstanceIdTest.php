@@ -15,6 +15,8 @@ use App\Models\WhatsAppMessage;
 use App\Services\EvolutionApiService;
 use Illuminate\Foundation\Testing\RefreshDatabase;
 use Illuminate\Support\Facades\Http;
+use Illuminate\Support\Facades\Cache;
+use Illuminate\Support\Facades\Queue;
 use Tests\TestCase;
 
 /**
@@ -250,5 +252,137 @@ class WhatsAppInstanceIdTest extends TestCase
         // Instance doesn't exist → early return. No records.
         $this->assertEquals($initialCount, Message::count(),
             'fromMe=true MESSAGES_UPSERT on unknown instance must not create records');
+    }
+
+    public function test_inbound_webhook_replay_is_idempotent_per_channel(): void
+    {
+        Queue::fake();
+        $fixture = $this->makeFixture();
+        $instance = WhatsAppInstance::create([
+            'user_id' => $fixture['user']->id,
+            'business_id' => $fixture['business']->id,
+            'instance_name' => 'instance-idempotency-test',
+            'status' => 'connected',
+        ]);
+        $channel = Channel::create([
+            'user_id' => $fixture['user']->id,
+            'business_id' => $fixture['business']->id,
+            'type' => 'whatsapp',
+            'page_id' => $instance->instance_name,
+            'status' => 'connected',
+            'access_token' => '',
+            'ai_enabled' => true,
+            'metadata' => ['whatsapp_provider' => 'evolution'],
+        ]);
+        $payload = [
+            'event' => 'MESSAGES_UPSERT',
+            'instance' => $instance->instance_name,
+            'data' => [
+                'key' => [
+                    'id' => 'provider-message-duplicate-test',
+                    'fromMe' => false,
+                    'remoteJid' => '966500000009@s.whatsapp.net',
+                ],
+                'pushName' => 'Customer',
+                'message' => ['conversation' => 'Hi'],
+            ],
+        ];
+
+        $service = new EvolutionApiService();
+        $service->processWebhookEvent($payload);
+        $service->processWebhookEvent($payload);
+
+        $this->assertSame(1, Message::query()->where('channel_id', $channel->id)
+            ->where('platform_message_id', 'provider-message-duplicate-test')->count());
+        $this->assertSame(1, WhatsAppMessage::query()->where('whatsapp_instance_id', $instance->id)
+            ->where('message_id', 'provider-message-duplicate-test')->count());
+        Queue::assertPushed(ProcessAutoReply::class, 1);
+    }
+
+    public function test_same_provider_message_id_is_isolated_between_whatsapp_channels(): void
+    {
+        Queue::fake();
+        $fixture = $this->makeFixture();
+        $payload = [
+            'event' => 'MESSAGES_UPSERT',
+            'data' => [
+                'key' => [
+                    'id' => 'same-provider-id-different-channel',
+                    'fromMe' => false,
+                    'remoteJid' => '966500000010@s.whatsapp.net',
+                ],
+                'message' => ['conversation' => 'Hi'],
+            ],
+        ];
+
+        $firstInstance = WhatsAppInstance::create([
+            'user_id' => $fixture['user']->id,
+            'business_id' => $fixture['business']->id,
+            'instance_name' => $fixture['channel']->page_id,
+            'status' => 'connected',
+        ]);
+        $secondBusiness = BusinessProfile::create([
+            'user_id' => $fixture['user']->id,
+            'business_name' => 'Second Test Biz',
+        ]);
+        $secondInstance = WhatsAppInstance::create([
+            'user_id' => $fixture['user']->id,
+            'business_id' => $secondBusiness->id,
+            'instance_name' => 'instance-second-channel-idempotency',
+            'status' => 'connected',
+        ]);
+        $secondChannel = Channel::create([
+            'user_id' => $fixture['user']->id,
+            'business_id' => $secondBusiness->id,
+            'type' => 'whatsapp',
+            'page_id' => $secondInstance->instance_name,
+            'status' => 'connected',
+            'access_token' => '',
+            'ai_enabled' => true,
+            'metadata' => ['whatsapp_provider' => 'evolution'],
+        ]);
+
+        $service = new EvolutionApiService();
+        $service->processWebhookEvent($payload + ['instance' => $fixture['channel']->page_id]);
+        $service->processWebhookEvent($payload + ['instance' => $secondInstance->instance_name]);
+
+        $this->assertSame(1, Message::query()->where('channel_id', $fixture['channel']->id)
+            ->where('platform_message_id', 'same-provider-id-different-channel')->count());
+        $this->assertSame(1, Message::query()->where('channel_id', $secondChannel->id)
+            ->where('platform_message_id', 'same-provider-id-different-channel')->count());
+        Queue::assertPushed(ProcessAutoReply::class, 2);
+    }
+
+    public function test_webhook_replay_recovers_ai_dispatch_after_persisted_message(): void
+    {
+        Queue::fake();
+        $fixture = $this->makeFixture();
+        $instance = WhatsAppInstance::create([
+            'user_id' => $fixture['user']->id,
+            'business_id' => $fixture['business']->id,
+            'instance_name' => $fixture['channel']->page_id,
+            'status' => 'connected',
+        ]);
+        $payload = [
+            'event' => 'MESSAGES_UPSERT',
+            'instance' => $instance->instance_name,
+            'data' => [
+                'key' => [
+                    'id' => 'provider-message-dispatch-recovery',
+                    'fromMe' => false,
+                    'remoteJid' => '966500000011@s.whatsapp.net',
+                ],
+                'message' => ['conversation' => 'Hi'],
+            ],
+        ];
+
+        $service = new EvolutionApiService();
+        $service->processWebhookEvent($payload);
+        Cache::forget('debounce:conversation:' . Conversation::query()->where('channel_id', $fixture['channel']->id)->where('sender_id', '966500000011@s.whatsapp.net')->value('id'));
+        $service->processWebhookEvent($payload);
+
+        $this->assertSame(1, Message::query()->where('channel_id', $fixture['channel']->id)
+            ->where('platform_message_id', 'provider-message-dispatch-recovery')->count());
+        Queue::assertPushed(ProcessAutoReply::class, 2);
     }
 }

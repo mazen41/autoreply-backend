@@ -39,14 +39,21 @@ class SallaImageSendTest extends TestCase
 
     private function makeFreePackage(): Package
     {
-        return Package::create([
+        $package = Package::create([
             'name' => 'Free',
             'name_ar' => 'مجاني',
             'price_monthly' => 0,
             'price_yearly' => 0,
             'ai_replies_limit' => -1,
+            'outbound_messages_limit' => -1,
             'is_active' => true,
         ]);
+        // UsageMeter intentionally falls back to the first legacy Free row,
+        // which may be seeded by the test database before this fixture runs.
+        // Keep every fallback candidate deterministic for this unlimited-plan case.
+        Package::where('name', 'Free')->update(['outbound_messages_limit' => -1]);
+
+        return $package;
     }
 
     private function makeFixture(string $inboundContent, string $priorAiMessage): array
@@ -177,7 +184,10 @@ class SallaImageSendTest extends TestCase
                 ],
                 'pagination' => ['total' => 2, 'per_page' => 10, 'current_page' => 1],
             ], 200),
-            'localhost:8080/message/sendMedia/*' => Http::response(['key' => ['id' => 'MEDIA_MSG_1']], 200),
+            'localhost:8080/message/sendMedia/*' => function () {
+                static $mediaMessageId = 0;
+                return Http::response(['key' => ['id' => 'MEDIA_MSG_' . ++$mediaMessageId]], 200);
+            },
             'localhost:8080/message/sendText/*' => Http::response(['key' => ['id' => 'TEXT_MSG_1']], 200),
         ]);
 

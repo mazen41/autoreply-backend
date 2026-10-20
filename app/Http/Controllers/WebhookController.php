@@ -8,10 +8,13 @@ use Illuminate\Http\Request;
 use Illuminate\Support\Facades\Http;
 use Illuminate\Support\Facades\Log;
 use Illuminate\Support\Facades\Cache;
+use Illuminate\Database\QueryException;
+use Illuminate\Support\Str;
 
 class WebhookController extends Controller
 {
     private bool $handlingCommentEvent = false;
+    private bool $handlingInboundEvent = false;
     public function verify(Request $request)
     {
         $verifyToken = config('services.meta.webhook_verify_token');
@@ -28,6 +31,8 @@ class WebhookController extends Controller
 
     public function handle(Request $request)
     {
+        $this->handlingCommentEvent = false;
+        $this->handlingInboundEvent = false;
         try {
             // Verify webhook signature for security.
             //
@@ -78,6 +83,7 @@ class WebhookController extends Controller
 
             $body = $request->all();
             $object = $body['object'] ?? '';
+            $this->handlingInboundEvent = $this->containsInboundMessageEvent($body);
             Log::info('Meta Webhook received', [
                 'object' => $object,
                 'entry_count' => count($body['entry'] ?? []),
@@ -116,9 +122,10 @@ class WebhookController extends Controller
             Log::error('Webhook handler error', ['exception' => get_class($e)]);
             // Meta must retry comment events if durable persistence/dispatch failed. Preserve
             // the existing acknowledgement behavior for unrelated messaging webhooks.
-            return $this->handlingCommentEvent
-                ? response('COMMENT_EVENT_RETRY', 500)
-                : response('EVENT_RECEIVED', 200);
+            if ($this->handlingCommentEvent || $this->handlingInboundEvent) {
+                return response($this->handlingCommentEvent ? 'COMMENT_EVENT_RETRY' : 'INBOUND_EVENT_RETRY', 500);
+            }
+            return response('EVENT_RECEIVED', 200);
         }
     }
 
@@ -138,12 +145,11 @@ class WebhookController extends Controller
                     continue;
                 }
 
-                $channel = Channel::query()
+                $channel = $this->findUniqueChannel(Channel::query()
                     ->where('type', 'whatsapp')
                     ->where('page_id', $phoneNumberId)
                     ->where('status', 'connected')
-                    ->whereJsonContains('metadata->whatsapp_provider', 'cloud')
-                    ->first();
+                    ->whereJsonContains('metadata->whatsapp_provider', 'cloud'), 'whatsapp_cloud', $phoneNumberId);
 
                 if (!$channel) {
                     Log::warning('WhatsApp Cloud webhook has no matching connected channel', [
@@ -279,11 +285,9 @@ class WebhookController extends Controller
 
                 if (str_starts_with($senderId, 'TEST_')) continue;
 
-                $channel = Channel::where('page_id', $recipientId)
+                $channel = $this->findUniqueChannel(Channel::where('page_id', $recipientId)
                     ->where('type', 'facebook')
-                    ->where('status', 'connected')
-                    ->latest('connected_at')
-                    ->first();
+                    ->where('status', 'connected'), 'facebook', $recipientId);
 
                 if (!$channel) {
                     Log::warning('No Facebook channel found for page_id: ' . $recipientId);
@@ -349,11 +353,9 @@ class WebhookController extends Controller
                 ]);
 
                 // Strategy 1: entry ID is the Instagram account ID (object=instagram)
-                $channel = Channel::where('instagram_account_id', $entryId)
+                $channel = $this->findUniqueChannel(Channel::where('instagram_account_id', $entryId)
                     ->where('type', 'instagram')
-                    ->where('status', 'connected')
-                    ->latest('connected_at')
-                    ->first();
+                    ->where('status', 'connected'), 'instagram', $entryId);
 
                   // Instagram rows are routed only by instagram_account_id. There is no page_id or
                   // same-user guessing fallback: an unmatched event is logged and skipped below.
@@ -446,8 +448,24 @@ class WebhookController extends Controller
         // Use platform message ID to detect duplicate webhook deliveries.
         // Same ID arriving twice = duplicate, skip it.
         // Different IDs = different customer messages, always process.
-        if ($platformMessageId) {
-            $idempotencyKey = "webhook:{$channel->type}:{$platformMessageId}";
+        $platformMessageHash = $platformMessageId ? hash('sha256', $platformMessageId) : null;
+        if ($platformMessageHash && \App\Models\Message::where('channel_id', $channel->id)
+            ->where('platform_message_hash', $platformMessageHash)->exists()) {
+            $existing = \App\Models\Message::where('channel_id', $channel->id)
+                ->where('platform_message_hash', $platformMessageHash)->first();
+            Log::info('Duplicate inbound provider message — skipping', [
+                'channel_id' => $channel->id,
+                'provider' => $channel->type,
+                'has_platform_message_id' => true,
+                'correlation_id' => $existing?->correlation_id,
+            ]);
+            if ($existing) {
+                $this->dispatchInboundReplyIfNeeded($existing);
+            }
+            return;
+        }
+        if ($platformMessageHash) {
+            $idempotencyKey = "webhook:v2:{$channel->id}:{$platformMessageHash}";
             if ($this->safeCacheHas($idempotencyKey)) {
                 Log::info('Duplicate webhook delivery — skipping', [
                     'channel_type' => $channel->type,
@@ -455,8 +473,8 @@ class WebhookController extends Controller
                 ]);
                 return;
             }
-            $this->safeCachePut($idempotencyKey, true, now()->addMinutes(5));
         }
+        $correlationId = (string) Str::uuid();
 
         $conversation = \App\Models\Conversation::firstOrCreate(
             ['channel_id' => $channel->id, 'sender_id' => $senderId],
@@ -502,8 +520,12 @@ class WebhookController extends Controller
             $metadata['attachment'] = $attachmentContext;
         }
 
+        try {
         $message = \App\Models\Message::create([
             'conversation_id' => $conversation->id,
+            'channel_id' => $channel->id,
+            'platform_message_id' => $platformMessageId,
+            'correlation_id' => $correlationId,
             'content'         => $messageText,
             'type'            => $media['type'] ?? 'text',
             'direction'       => 'inbound',
@@ -524,6 +546,27 @@ class WebhookController extends Controller
             'whatsapp_remote_jid' => $channel->type === 'whatsapp' ? $senderId : null,
             'whatsapp_from_me' => false,
         ]);
+        } catch (QueryException $exception) {
+            if ($platformMessageHash && \App\Models\Message::where('channel_id', $channel->id)
+                ->where('platform_message_hash', $platformMessageHash)->exists()) {
+                Log::info('Concurrent duplicate inbound message was ignored', [
+                    'channel_id' => $channel->id,
+                    'provider' => $channel->type,
+                    'correlation_id' => $correlationId,
+                ]);
+                $existing = \App\Models\Message::where('channel_id', $channel->id)
+                    ->where('platform_message_hash', $platformMessageHash)->first();
+                if ($existing) {
+                    $this->dispatchInboundReplyIfNeeded($existing);
+                }
+                return;
+            }
+            throw $exception;
+        }
+
+        if ($platformMessageHash) {
+            $this->safeCachePut("webhook:v2:{$channel->id}:{$platformMessageHash}", true, now()->addMinutes(5));
+        }
 
         if ($attachmentContext !== null) {
             Log::info('Attachment handled', [
@@ -537,21 +580,75 @@ class WebhookController extends Controller
             broadcast(new \App\Events\MessageReceived($message, $conversation, $channel->user_id));
         }
 
-        // ── DEBOUNCE FIX ───────────────────────────────────────────────────
-        // Only debounce if the SAME message is being processed again (retry/duplicate).
-        // Different customer messages are always dispatched — they will be handled
-        // sequentially by the queue worker.
+        $this->dispatchInboundReplyIfNeeded($message);
+    }
+
+    private function dispatchInboundReplyIfNeeded(\App\Models\Message $message): void
+    {
         $debounceKey = "debounce:message:{$message->id}";
         if ($this->safeCacheHas($debounceKey)) {
-            Log::info('Message already being processed — skipping duplicate job', [
-                'conversation_id' => $conversation->id,
-                'message_id' => $message->id
+            Log::info('Message already queued for processing', [
+                'conversation_id' => $message->conversation_id,
+                'message_id' => $message->id,
+                'correlation_id' => $message->correlation_id,
             ]);
-        } else {
-            \App\Jobs\ProcessAutoReply::dispatch($message->id);
-            $this->safeCachePut($debounceKey, true, 30); // 30s — only prevents duplicate job dispatch
-            Log::info('ProcessAutoReply job dispatched', ['message_id' => $message->id]);
+            return;
         }
+
+        $hasOutboundReply = \App\Models\Message::where('conversation_id', $message->conversation_id)
+            ->where('direction', 'outbound')
+            ->where('created_at', '>=', $message->created_at)
+            ->exists();
+        if ($hasOutboundReply) return;
+
+        \App\Jobs\ProcessAutoReply::dispatch($message->id);
+        $this->safeCachePut($debounceKey, true, 30);
+        Log::info('ProcessAutoReply job dispatched', [
+            'message_id' => $message->id,
+            'correlation_id' => $message->correlation_id,
+        ]);
+    }
+
+    private function containsInboundMessageEvent(array $body): bool
+    {
+        foreach ($body['entry'] ?? [] as $entry) {
+            foreach ($entry['messaging'] ?? [] as $event) {
+                if (isset($event['message']) && !($event['message']['is_echo'] ?? false)) {
+                    return true;
+                }
+            }
+            foreach ($entry['changes'] ?? [] as $change) {
+                if (($change['field'] ?? null) === 'messages' && !empty($change['value']['messages'])) {
+                    return true;
+                }
+            }
+        }
+        return false;
+    }
+
+    private function findUniqueChannel(\Illuminate\Database\Eloquent\Builder $query, string $provider, string $externalAccountId): ?Channel
+    {
+        $matches = $query->limit(2)->get();
+        if ($matches->count() === 1) return $matches->first();
+
+        if ($matches->count() > 1) {
+            try {
+                \App\Models\SystemHealthLog::create([
+                    'component' => 'provider',
+                    'status' => 'critical',
+                    'message' => 'A provider account is linked to multiple workspaces; webhook routing was stopped.',
+                    'details' => ['provider' => $provider, 'reason_code' => 'provider_account_ambiguous', 'candidate_count' => $matches->count()],
+                ]);
+            } catch (\Throwable) {
+            }
+        }
+
+        Log::warning('Provider webhook account could not be routed uniquely', [
+            'provider' => $provider,
+            'candidate_count' => $matches->count(),
+            'account_id_hash' => hash('sha256', $externalAccountId),
+        ]);
+        return null;
     }
 
     /** Read Instagram/Messenger location attachment coordinates into ordinary message text. */
@@ -901,15 +998,32 @@ Reply:";
             ]);
 
             // Find the channel by email address
-            $channel = Channel::where('type', 'gmail')
+            $channels = Channel::where('type', 'gmail')
                 ->where('page_name', $emailAddress)
                 ->where('status', 'connected')
-                ->first();
+                ->whereNotNull('business_id')
+                ->get();
 
-            if (!$channel) {
+            if ($channels->isEmpty()) {
                 Log::warning('Gmail webhook: no channel found for email');
                 return response('OK', 200);
             }
+            if ($channels->count() > 1) {
+                try {
+                    \App\Models\SystemHealthLog::create([
+                        'component' => 'gmail',
+                        'status' => 'critical',
+                        'message' => 'A Gmail mailbox is linked to multiple workspaces; webhook routing was stopped.',
+                        'details' => ['reason_code' => 'gmail_account_ambiguous', 'candidate_count' => $channels->count()],
+                    ]);
+                } catch (\Throwable) {
+                }
+                Log::warning('Gmail webhook: account maps to multiple business connections; refusing ambiguous routing', [
+                    'candidate_count' => $channels->count(),
+                ]);
+                return response('OK', 200);
+            }
+            $channel = $channels->first();
 
             // Get the last history ID from the channel
             $lastHistoryId = $channel->gmail_history_id;
@@ -964,7 +1078,7 @@ Reply:";
             Log::error('Gmail webhook error', [
                 'exception' => get_class($e),
             ]);
-            return response('OK', 200); // Always return 200 to avoid retries
+            return response('GMAIL_EVENT_RETRY', 500);
         }
     }
 
@@ -1044,15 +1158,22 @@ Reply:";
             }
 
             // Check if message already exists (deduplication)
-            $existingMessage = \App\Models\Message::where('gmail_message_id', $messageId)->first();
+            $existingMessage = \App\Models\Message::where('channel_id', $channel->id)
+                ->where('platform_message_id', $messageId)->first();
             if ($existingMessage) {
-                Log::info('Gmail message already processed');
+                Log::info('Gmail provider message already persisted', [
+                    'channel_id' => $channel->id,
+                    'message_id' => $existingMessage->id,
+                    'correlation_id' => $existingMessage->correlation_id,
+                ]);
                 return;
             }
 
             // Create message
             $messageModel = \App\Models\Message::create([
                 'conversation_id' => $conversation->id,
+                'channel_id' => $channel->id,
+                'platform_message_id' => $messageId,
                 'content' => $body,
                 'direction' => 'inbound',
                 'is_ai' => false,
@@ -1093,6 +1214,7 @@ Reply:";
             Log::error('Error processing Gmail message', [
                 'exception' => get_class($e),
             ]);
+            throw $e;
         }
     }
 

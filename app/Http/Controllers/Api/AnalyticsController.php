@@ -14,6 +14,7 @@ use App\Models\Message;
 use App\Models\Channel;
 use App\Services\BusinessAccessService;
 use Illuminate\Http\Request;
+use Illuminate\Validation\Rule;
 use Carbon\Carbon;
 
 class AnalyticsController extends Controller
@@ -37,26 +38,37 @@ class AnalyticsController extends Controller
     public function getDashboard(Request $request, $businessId)
     {
         $business = app(BusinessAccessService::class)->authorize($request->user(), $businessId, 'read');
+        $filters = $request->validate([
+            'preset' => ['sometimes', 'string', Rule::in(['today', 'yesterday', 'last_7_days', 'this_month', 'last_30_days'])],
+            'channel_id' => ['nullable', 'integer', Rule::exists('channels', 'id')->where('business_id', $businessId)],
+            'bot_id' => ['nullable', 'integer', Rule::exists('bots', 'id')->where('business_profile_id', $businessId)],
+        ]);
         $timezone = in_array($business->timezone, timezone_identifiers_list(), true) ? $business->timezone : 'UTC';
         [$startDate, $endDate, $rangeStartLocal, $rangeEndLocal] = $this->resolveDateRangeFromPreset(
-            $request->query('preset', 'last_30_days'),
+            $filters['preset'] ?? 'last_30_days',
             $timezone
         );
 
-        $conversationsInRange = Conversation::where('business_id', $businessId)
-            ->whereBetween('created_at', [$startDate, $endDate]);
+        $applyConversationFilters = static function ($query) use ($businessId, $filters): void {
+            $query->where('business_id', $businessId)
+                ->when(isset($filters['channel_id']), fn ($builder) => $builder->where('channel_id', $filters['channel_id']))
+                ->when(isset($filters['bot_id']), fn ($builder) => $builder->where('bot_id', $filters['bot_id']));
+        };
+        $conversationsInRange = Conversation::query();
+        $applyConversationFilters($conversationsInRange);
+        $conversationsInRange->whereBetween('created_at', [$startDate, $endDate]);
 
         $newConversations = (clone $conversationsInRange)->count();
         $totalConversations = $newConversations;
         $openConversations = (clone $conversationsInRange)->where('status', 'open')->count();
         $closedConversations = (clone $conversationsInRange)->where('status', 'closed')->count();
-        $escalatedConversations = Conversation::where('business_id', $businessId)
-            ->whereNotNull('escalated_at')
-            ->whereBetween('escalated_at', [$startDate, $endDate])
-            ->count();
+        $escalatedQuery = Conversation::query();
+        $applyConversationFilters($escalatedQuery);
+        $escalatedConversations = $escalatedQuery->whereNotNull('escalated_at')
+            ->whereBetween('escalated_at', [$startDate, $endDate])->count();
 
-        $messagesInRange = Message::whereHas('conversation', function ($q) use ($businessId) {
-                $q->where('business_id', $businessId);
+        $messagesInRange = Message::whereHas('conversation', function ($query) use ($applyConversationFilters) {
+                $applyConversationFilters($query);
             })
             ->whereBetween('created_at', [$startDate, $endDate]);
 
@@ -65,8 +77,9 @@ class AnalyticsController extends Controller
             ->where(fn ($query) => $query->whereNull('source')->orWhereNotIn('source', $automatedSources))->count();
         $totalOutbound = (clone $messagesInRange)->where('direction', 'outbound')
             ->where(fn ($query) => $query->whereNull('source')->orWhereNotIn('source', $automatedSources))->count();
-        $aiConversationsCount = Conversation::where('business_id', $businessId)
-            ->whereBetween('created_at', [$startDate, $endDate])
+        $aiConversationsQuery = Conversation::query();
+        $applyConversationFilters($aiConversationsQuery);
+        $aiConversationsCount = $aiConversationsQuery->whereBetween('created_at', [$startDate, $endDate])
             ->whereHas('messages', fn ($query) => $query->where('direction', 'outbound')->where('is_ai', true)
                 ->where(fn ($source) => $source->whereNull('source')->orWhereNotIn('source', $automatedSources))
                 ->whereBetween('created_at', [$startDate, $endDate]))
@@ -75,10 +88,20 @@ class AnalyticsController extends Controller
         $aiShareOfReplies = $totalOutbound > 0 ? ($aiResponses / $totalOutbound) * 100 : 0;
 
         // Average response time: first outbound reply after each conversation's first inbound message.
-        $medianResponseMinutes = $this->medianResponseTimeMinutes($businessId, $startDate, $endDate);
+        $medianResponseMinutes = $this->medianResponseTimeMinutes(
+            $businessId,
+            $startDate,
+            $endDate,
+            isset($filters['channel_id']) ? (int) $filters['channel_id'] : null,
+            isset($filters['bot_id']) ? (int) $filters['bot_id'] : null,
+        );
 
         return response()->json([
             'range' => ['start' => $rangeStartLocal, 'end' => $rangeEndLocal, 'timezone' => $timezone],
+            'filters' => [
+                'channel_id' => isset($filters['channel_id']) ? (int) $filters['channel_id'] : null,
+                'bot_id' => isset($filters['bot_id']) ? (int) $filters['bot_id'] : null,
+            ],
             'conversations' => [
                 'total' => $totalConversations,
                 'new' => $newConversations,
@@ -116,9 +139,9 @@ class AnalyticsController extends Controller
         return [$startLocal->copy()->utc(), $endLocal->copy()->utc(), $startLocal->toDateString(), $endLocal->toDateString()];
     }
 
-    private function medianResponseTimeMinutes(int $businessId, Carbon $start, Carbon $end): ?float
+    private function medianResponseTimeMinutes(int $businessId, Carbon $start, Carbon $end, ?int $channelId = null, ?int $botId = null): ?float
     {
-        $seconds = $this->analyticsService->medianResponseTimeSeconds($businessId, $start, $end);
+        $seconds = $this->analyticsService->medianResponseTimeSeconds($businessId, $start, $end, $channelId, $botId);
         return $seconds === null ? null : round($seconds / 60, 1);
     }
 
@@ -128,9 +151,18 @@ class AnalyticsController extends Controller
     public function getCsatScore(Request $request, $businessId)
     {
         app(BusinessAccessService::class)->authorize($request->user(), $businessId, 'read');
-        $days = $request->validate(['days' => 'sometimes|integer|min:1|max:365'])['days'] ?? 30;
-        
-        $csatData = $this->analyticsService->getCsatScore($businessId, $days);
+        $filters = $request->validate([
+            'days' => 'sometimes|integer|min:1|max:365',
+            'channel_id' => ['nullable', 'integer', Rule::exists('channels', 'id')->where('business_id', $businessId)],
+            'bot_id' => ['nullable', 'integer', Rule::exists('bots', 'id')->where('business_profile_id', $businessId)],
+        ]);
+
+        $csatData = $this->analyticsService->getCsatScore(
+            (int) $businessId,
+            (int) ($filters['days'] ?? 30),
+            isset($filters['channel_id']) ? (int) $filters['channel_id'] : null,
+            isset($filters['bot_id']) ? (int) $filters['bot_id'] : null,
+        );
 
         return response()->json($csatData);
     }

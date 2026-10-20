@@ -117,6 +117,29 @@ class CustomerResolutionTest extends TestCase
         $this->assertSame(2, Customer::where('business_profile_id', $businessId)->count());
     }
 
+    public function test_platform_sender_identity_is_scoped_to_connected_account(): void
+    {
+        $fixture = $this->makeBusiness();
+        $firstAccount = $this->makeChannel($fixture, 'instagram');
+        $secondAccount = $this->makeChannel($fixture, 'instagram');
+        $service = app(CustomerService::class);
+
+        $first = $service->resolve($fixture['business']->id, 'instagram', 'same-platform-id', [], $firstAccount->id);
+        $second = $service->resolve($fixture['business']->id, 'instagram', 'same-platform-id', [], $secondAccount->id);
+        $sameFirst = $service->resolve($fixture['business']->id, 'instagram', 'same-platform-id', [], $firstAccount->id);
+
+        $this->assertNotSame($first->id, $second->id);
+        $this->assertSame($first->id, $sameFirst->id);
+        $this->assertDatabaseHas('customer_identities', [
+            'business_profile_id' => $fixture['business']->id,
+            'customer_id' => $first->id,
+            'channel_id' => $firstAccount->id,
+            'platform' => 'instagram',
+            'external_id' => 'same-platform-id',
+        ]);
+        $this->assertSame(2, Customer::where('business_profile_id', $fixture['business']->id)->count());
+    }
+
     public function test_customers_are_never_shared_across_businesses(): void
     {
         $fixtureA = $this->makeBusiness();
@@ -185,7 +208,12 @@ class CustomerResolutionTest extends TestCase
         $this->assertNotNull($conversation->customer_id, 'Conversation must be linked to a customer at inbound time');
 
         $customer = Customer::find($conversation->customer_id);
-        $this->assertSame('ig-sender-777', $customer->custom_fields['platform_ids']['instagram'] ?? null);
+        $this->assertDatabaseHas('customer_identities', [
+            'customer_id' => $customer->id,
+            'channel_id' => $conversation->channel_id,
+            'platform' => 'instagram',
+            'external_id' => 'ig-sender-777',
+        ]);
     }
 
     public function test_meta_webhook_duplicate_delivery_keeps_single_customer(): void

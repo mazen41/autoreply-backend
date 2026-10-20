@@ -790,6 +790,16 @@ class AutomationEngine
             'error' => null
         ];
 
+        // Recheck before every action, not only when the workflow starts. This
+        // closes the gap where an operator activates the kill switch while a
+        // multi-action workflow is already in progress. Dry-runs remain safe
+        // and available while paused.
+        if (!$testMode && $conversation->business_id
+            && app(AutomationRunControl::class)->isBusinessPaused((int) $conversation->business_id)) {
+            $result['error'] = 'automation_paused';
+            return $result;
+        }
+
         try {
             switch ($actionType) {
                 case 'send_message':

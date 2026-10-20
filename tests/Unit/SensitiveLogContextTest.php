@@ -31,4 +31,15 @@ class SensitiveLogContextTest extends TestCase
         self::assertSame('[redacted]', $result['message']);
         self::assertSame('connected', $result['status']);
     }
+
+    public function test_redacts_credentials_from_unstructured_log_text(): void
+    {
+        $log = 'request {"access_token":"provider-secret","client_secret": private-secret} Authorization: Bearer eyJhbGciOiJIUzI1NiJ9';
+        $redacted = SensitiveLogContext::redactText($log);
+
+        self::assertStringNotContainsString('provider-secret', $redacted);
+        self::assertStringNotContainsString('private-secret', $redacted);
+        self::assertStringNotContainsString('eyJhbGciOiJIUzI1NiJ9', $redacted);
+        self::assertSame(3, substr_count($redacted, '[redacted]'));
+    }
 }

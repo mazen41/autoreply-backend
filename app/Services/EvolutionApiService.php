@@ -10,6 +10,7 @@ use App\Models\WhatsAppMessage;
 use App\Models\Channel;
 use App\Models\Conversation;
 use App\Models\Message;
+use App\Jobs\ProcessAutoReply;
 use Exception;
 use Illuminate\Support\Facades\Storage;
 use Illuminate\Support\Str;
@@ -373,11 +374,12 @@ class EvolutionApiService
                 default:
                     Log::info("Unhandled webhook event type: {$eventType} (raw: {$rawEventType})");
             }
-        } catch (Exception $e) {
+        } catch (\Throwable $e) {
             Log::error('Failed to process webhook event', [
                 'event' => is_string($event) ? $event : 'unknown',
                 'exception' => get_class($e),
             ]);
+            throw $e;
         }
     }
 
@@ -438,6 +440,59 @@ class EvolutionApiService
             return;
         }
 
+        $platformMessageId = $message['id'] ?? null;
+        $matchingChannels = Channel::query()
+            ->where('user_id', $instance->user_id)
+            ->where('type', 'whatsapp')
+            ->where('page_id', $instance->instance_name)
+            ->get();
+        $channel = $matchingChannels->count() === 1 ? $matchingChannels->first() : null;
+
+        if (!$channel
+            || ($instance->business_id && (int) $channel->business_id !== (int) $instance->business_id)
+            || ($channel->metadata['whatsapp_provider'] ?? 'evolution') !== 'evolution') {
+            Log::warning('Evolution inbound event has no unique eligible WhatsApp channel', [
+                'instance_id' => $instance->id,
+                'business_id' => $instance->business_id,
+            ]);
+            return;
+        }
+
+        if (is_string($platformMessageId) && $platformMessageId !== '') {
+            $platformMessageHash = hash('sha256', $platformMessageId);
+            $alreadyPersisted = Message::query()
+                ->where('channel_id', $channel->id)
+                ->where('platform_message_hash', $platformMessageHash)
+                ->where('direction', 'inbound')
+                ->first();
+
+            if ($alreadyPersisted) {
+                Log::info('Duplicate Evolution inbound event skipped by durable channel-scoped key', [
+                    'channel_id' => $channel->id,
+                    'instance_id' => $instance->id,
+                ]);
+
+                // If persistence succeeded but queue dispatch failed, Evolution
+                // may retry the webhook. Recover the AI job only when no reply
+                // exists and this conversation is not already in its debounce window.
+                $hasReply = Message::query()
+                    ->where('conversation_id', $alreadyPersisted->conversation_id)
+                    ->where('direction', 'outbound')
+                    ->where('created_at', '>=', $alreadyPersisted->created_at)
+                    ->exists();
+                $debounceKey = "debounce:conversation:{$alreadyPersisted->conversation_id}";
+                if ($channel->ai_enabled && !$hasReply && !Cache::has($debounceKey)) {
+                    ProcessAutoReply::dispatch($alreadyPersisted->id);
+                    Cache::put($debounceKey, true, 10);
+                    Log::info('Evolution webhook replay recovered missing auto-reply dispatch', [
+                        'channel_id' => $channel->id,
+                        'message_id' => $alreadyPersisted->id,
+                    ]);
+                }
+                return;
+            }
+        }
+
         $body = $messageContent['conversation'] ?? $messageContent['extendedTextMessage']['text'] ?? null;
         $messageType = $this->detectMessageType($messageContent);
         $media = $this->extractAndStoreMedia($messageContent, $event, $instanceName, $message);
@@ -462,39 +517,46 @@ class EvolutionApiService
 
         // Store only safe metadata — never the full event (contains media
         // payload, base64 data, phone numbers, and message content).
-        $whatsappMessage = WhatsAppMessage::create([
-            'whatsapp_instance_id' => $instance->id,
-            'user_id' => $instance->user_id,
-            'message_id' => $message['id'] ?? null,
-            'remote_message_id' => $message['id'] ?? null,
-            'direction' => $fromMe ? 'outgoing' : 'incoming',
-            'from_phone' => $fromPhone,
-            'from_name' => $fromName,
-            'to_phone' => $instance->phone_number,
-            'body' => $body,
-            'message_type' => $messageType,
-            'media' => $media ? [
-                'type'     => $media['type'] ?? null,
-                'mimetype' => $media['mimetype'] ?? null,
-                'file_size' => $media['file_size'] ?? null,
-                'duration'  => $media['duration'] ?? null,
-                'url'       => $media['url'] ?? null,
-                // Never store base64 data or encrypted media URLs in metadata
-            ] : null,
-            'metadata' => [
-                'message_id'  => $message['id'] ?? null,
-                'remote_jid'  => $message['remoteJid'] ?? null,
-                'from_me'     => $fromMe,
+        $legacyMessage = WhatsAppMessage::query()
+            ->where('whatsapp_instance_id', $instance->id)
+            ->where('message_id', $platformMessageId)
+            ->first();
+
+        if (!$legacyMessage) {
+            WhatsAppMessage::create([
+                'whatsapp_instance_id' => $instance->id,
+                'user_id' => $instance->user_id,
+                'message_id' => $message['id'] ?? null,
+                'remote_message_id' => $message['id'] ?? null,
+                'direction' => $fromMe ? 'outgoing' : 'incoming',
+                'from_phone' => $fromPhone,
+                'from_name' => $fromName,
+                'to_phone' => $instance->phone_number,
+                'body' => $body,
                 'message_type' => $messageType,
-                'quoted_message_id' => $quotedMessageId,
-                // raw event/message_key deliberately omitted
-            ],
-            'status' => 'pending',
-            'sent_at' => now(),
-        ]);
+                'media' => $media ? [
+                    'type' => $media['type'] ?? null,
+                    'mimetype' => $media['mimetype'] ?? null,
+                    'file_size' => $media['file_size'] ?? null,
+                    'duration' => $media['duration'] ?? null,
+                    'url' => $media['url'] ?? null,
+                    // Never store base64 data or encrypted media URLs in metadata
+                ] : null,
+                'metadata' => [
+                    'message_id' => $message['id'] ?? null,
+                    'remote_jid' => $message['remoteJid'] ?? null,
+                    'from_me' => $fromMe,
+                    'message_type' => $messageType,
+                    'quoted_message_id' => $quotedMessageId,
+                    // raw event/message_key deliberately omitted
+                ],
+                'status' => 'pending',
+                'sent_at' => now(),
+            ]);
+        }
 
         // Also save to unified inbox system
-        $this->saveToUnifiedInbox($instance, $fromPhone, $fromName, $body, $messageType, $media, $message, $fromMe, $quotedMessageId);
+        $this->saveToUnifiedInbox($instance, $fromPhone, $fromName, $body, $messageType, $media, $message, $fromMe, $quotedMessageId, $channel);
 
         Log::info('WhatsApp message received', [
             'instance_id' => $instance->id,
@@ -507,34 +569,10 @@ class EvolutionApiService
     /**
      * Save WhatsApp message to unified inbox (Conversation/Message)
      */
-    protected function saveToUnifiedInbox(WhatsAppInstance $instance, ?string $fromPhone, ?string $fromName, ?string $body, string $messageType, ?array $media = null, array $messageKey = [], bool $fromMe = false, ?string $quotedMessageId = null): void
+    protected function saveToUnifiedInbox(WhatsAppInstance $instance, ?string $fromPhone, ?string $fromName, ?string $body, string $messageType, ?array $media = null, array $messageKey = [], bool $fromMe = false, ?string $quotedMessageId = null, ?Channel $resolvedChannel = null): void
     {
         try {
-            // Deduplicate: the same WhatsApp message ID can arrive on multiple
-            // Evolution instances (e.g. user_1 and user_2 both subscribed to
-            // the same webhook URL). Use a cache lock on the message ID so only
-            // the first instance processes it and creates the inbox record.
-            $waMessageId = $messageKey['id'] ?? null;
-            if ($waMessageId) {
-                $lockKey = 'wa_msg_processed:' . $waMessageId;
-
-                // Use an atomic lock so two webhook workers racing on the same
-                // message ID cannot both pass the has() check before either
-                // has written the put(). Cache::add() is atomic: it only writes
-                // when the key does NOT yet exist and returns true/false.
-                $isFirst = \Illuminate\Support\Facades\Cache::add($lockKey, 1, now()->addMinutes(5));
-                if (!$isFirst) {
-                    Log::info('Duplicate WhatsApp message skipped (already processed by another instance)', [
-                        'instance_id' => $instance->id,
-                    ]);
-                    return;
-                }
-            }
-            // Find the WhatsApp channel
-            $channel = Channel::where('user_id', $instance->user_id)
-                ->where('type', 'whatsapp')
-                ->where('page_id', $instance->instance_name)
-                ->first();
+            $channel = $resolvedChannel;
 
             if (($channel?->metadata['whatsapp_provider'] ?? null) === 'cloud') {
                 Log::error('ensureWhatsAppChannel: refusing to overwrite a Cloud API channel with an Evolution session', [
@@ -618,6 +656,18 @@ class EvolutionApiService
             }
 
             // Create message in unified inbox
+            $providerMessageId = $messageKey['id'] ?? null;
+            if (is_string($providerMessageId) && $providerMessageId !== '') {
+                $providerHash = hash('sha256', $providerMessageId);
+                if (Message::query()->where('channel_id', $channel->id)->where('platform_message_hash', $providerHash)->exists()) {
+                    Log::info('Duplicate Evolution inbox message skipped before dispatch', [
+                        'channel_id' => $channel->id,
+                        'instance_id' => $instance->id,
+                    ]);
+                    return;
+                }
+            }
+
             $message = Message::create([
                 'conversation_id' => $conversation->id,
                 'content' => $body ?? $media['caption'] ?? '',
@@ -639,7 +689,8 @@ class EvolutionApiService
                 'file_name' => is_string($media['filename'] ?? null) ? $media['filename'] : null,
                 'file_size' => is_int($media['file_size'] ?? null) ? $media['file_size'] : null,
                 'duration' => is_int($media['duration'] ?? null) ? $media['duration'] : null,
-                'whatsapp_message_id' => $messageKey['id'] ?? null,
+                'whatsapp_message_id' => $providerMessageId,
+                'platform_message_id' => $providerMessageId,
                 'whatsapp_remote_jid' => $messageKey['remoteJid'] ?? $fromPhone,
                 'whatsapp_from_me' => $fromMe,
                 'metadata' => [
@@ -685,11 +736,12 @@ class EvolutionApiService
                 'conversation_id' => $conversation->id,
             ]);
 
-        } catch (\Exception $e) {
+        } catch (\Throwable $e) {
             Log::error('Failed to save WhatsApp message to unified inbox', [
                 'instance_id' => $instance->id,
                 'exception' => get_class($e),
             ]);
+            throw $e;
         }
     }
 

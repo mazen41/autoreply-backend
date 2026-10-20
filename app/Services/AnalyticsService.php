@@ -204,7 +204,7 @@ class AnalyticsService
     /**
      * Get CSAT score for a business
      */
-    public function getCsatScore(int $businessId, int $days = 30): array
+    public function getCsatScore(int $businessId, int $days = 30, ?int $channelId = null, ?int $botId = null): array
     {
         $business = \App\Models\BusinessProfile::query()->findOrFail($businessId);
         $timezone = in_array($business->timezone, timezone_identifiers_list(), true)
@@ -214,14 +214,21 @@ class AnalyticsService
         
         $ratings = CsatRating::where('business_id', $businessId)
             ->where('rated_at', '>=', $startDate)
+            ->when($channelId !== null || $botId !== null, function ($query) use ($channelId, $botId): void {
+                $query->whereHas('conversation', function ($conversations) use ($channelId, $botId): void {
+                    $conversations
+                        ->when($channelId !== null, fn ($builder) => $builder->where('channel_id', $channelId))
+                        ->when($botId !== null, fn ($builder) => $builder->where('bot_id', $botId));
+                });
+            })
             ->get();
 
         $totalRatings = $ratings->count();
         $positiveRatings = $ratings->where('rating', 'positive')->count();
         
-        $csatScore = $totalRatings > 0 
-            ? round(($positiveRatings / $totalRatings) * 100, 2) 
-            : 0;
+        $csatScore = $totalRatings > 0
+            ? round(($positiveRatings / $totalRatings) * 100, 2)
+            : null;
 
         return [
             'csat_score' => $csatScore,
@@ -273,11 +280,13 @@ class AnalyticsService
     }
 
     /** The median first human-or-AI reply latency for inbound customer messages in the range. */
-    public function medianResponseTimeSeconds(int $businessId, \DateTimeInterface $start, \DateTimeInterface $end): ?float
+    public function medianResponseTimeSeconds(int $businessId, \DateTimeInterface $start, \DateTimeInterface $end, ?int $channelId = null, ?int $botId = null): ?float
     {
         $firstInbound = DB::table('messages as inbound')
             ->join('conversations', 'conversations.id', '=', 'inbound.conversation_id')
             ->where('conversations.business_id', $businessId)
+            ->when($channelId !== null, fn ($query) => $query->where('conversations.channel_id', $channelId))
+            ->when($botId !== null, fn ($query) => $query->where('conversations.bot_id', $botId))
             ->where('inbound.direction', 'inbound')
             ->whereBetween('inbound.created_at', [$start, $end])
             ->select('inbound.id as inbound_id', 'inbound.conversation_id', 'inbound.created_at as inbound_at');

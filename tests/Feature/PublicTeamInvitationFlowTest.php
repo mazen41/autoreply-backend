@@ -47,6 +47,7 @@ class PublicTeamInvitationFlowTest extends TestCase
     public function test_existing_account_must_prove_password_before_acceptance(): void
     {
         $existing = User::factory()->create(['email' => 'existing@example.com', 'password' => 'current-password']);
+        $originalProfile = $existing->only(['name', 'email', 'business_id']);
         [$business, $token, $invitation] = $this->makeInvitation('existing@example.com');
 
         $this->getJson("/api/team-invitations/check/{$token}")
@@ -61,6 +62,12 @@ class PublicTeamInvitationFlowTest extends TestCase
             'name' => $existing->name, 'password' => 'current-password',
         ])->assertOk()->assertJsonPath('user.id', $existing->id);
         $this->assertDatabaseHas('team_members', ['business_id' => $business->id, 'user_id' => $existing->id]);
+        $this->assertSame($originalProfile, $existing->fresh()->only(['name', 'email', 'business_id']));
+        $this->assertDatabaseHas('audit_logs', [
+            'user_id' => $existing->id,
+            'business_profile_id' => $business->id,
+            'action' => 'team.invitation.accepted',
+        ]);
     }
 
     public function test_invitation_cannot_be_accepted_or_rejected_twice(): void
@@ -72,6 +79,27 @@ class PublicTeamInvitationFlowTest extends TestCase
             'name' => 'Once', 'password' => 'a-strong-password',
         ])->assertStatus(410);
         $this->assertSame('revoked', $invitation->fresh()->status);
+        $this->assertDatabaseHas('audit_logs', [
+            'business_profile_id' => $invitation->business_id,
+            'action' => 'team.invitation.rejected',
+        ]);
+    }
+
+    public function test_expired_public_invitation_is_persisted_as_expired_and_audited(): void
+    {
+        [$business, $token, $invitation] = $this->makeInvitation('expired@example.com');
+        $invitation->update(['expires_at' => now()->subSecond()]);
+
+        $this->postJson("/api/team-invitations/{$token}/accept", [
+            'name' => 'Expired Invitee', 'password' => 'a-strong-password',
+        ])->assertStatus(410);
+
+        $this->assertSame('expired', $invitation->fresh()->status);
+        $this->assertDatabaseHas('audit_logs', [
+            'business_profile_id' => $business->id,
+            'action' => 'team.invitation.expired',
+        ]);
+        $this->assertDatabaseMissing('users', ['email' => 'expired@example.com']);
     }
 
     private function makeInvitation(string $email): array

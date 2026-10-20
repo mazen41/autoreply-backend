@@ -17,6 +17,9 @@ return Application::configure(basePath: dirname(__DIR__))
         ['middleware' => ['auth:sanctum']],
     )
     ->withMiddleware(function (Middleware $middleware): void {
+        // Public website-chat widgets need a tenant-owned origin allowlist,
+        // which cannot be represented by the app-wide static CORS config.
+        $middleware->prepend(\App\Http\Middleware\WebChatCors::class);
         // NOTE: statefulApi() removed — this app authenticates entirely via
         // Sanctum personal access tokens (Bearer header), never SPA cookie
         // sessions. Leaving it on made Laravel treat any request whose Origin

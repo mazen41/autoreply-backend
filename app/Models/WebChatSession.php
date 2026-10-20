@@ -17,6 +17,10 @@ class WebChatSession extends Model
         'user_agent',
         'is_online',
         'last_activity_at',
+        'utm_source',
+        'utm_medium',
+        'utm_campaign',
+        'referrer_url',
     ];
 
     protected $casts = [

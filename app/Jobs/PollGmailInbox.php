@@ -27,25 +27,34 @@ class PollGmailInbox implements ShouldQueue
             ->where('status', 'connected')
             ->get();
 
-        // Backfill business_id on any channel that's missing it
-        foreach ($channels as $channel) {
-            if (!$channel->business_id) {
-                $business = \App\Models\BusinessProfile::where('user_id', $channel->user_id)->first();
-                if ($business) {
-                    $channel->update(['business_id' => $business->id]);
-                    $channel->business_id = $business->id;
-                }
+        $missingBusinessCount = $channels->whereNull('business_id')->count();
+        $channels = $channels->filter(fn ($channel) => !empty($channel->business_id));
+
+        $ambiguousAddresses = $channels->groupBy(fn ($channel) => strtolower((string) $channel->page_id))
+            ->filter(fn ($group) => $group->count() > 1);
+        if ($ambiguousAddresses->isNotEmpty()) {
+            foreach ($ambiguousAddresses as $email => $duplicates) {
+                $channels = $channels->reject(fn ($channel) => strtolower((string) $channel->page_id) === $email);
+                $this->recordFailure($duplicates->first(), 'gmail_account_ambiguous');
             }
+            Log::warning('Gmail poll: duplicate mailbox connections across workspaces were skipped', [
+                'ambiguous_mailboxes' => $ambiguousAddresses->count(),
+                'skipped_connections' => $ambiguousAddresses->sum(fn ($group) => $group->count()),
+            ]);
         }
 
-        // Only poll channels that have a resolvable business
-        $channels = $channels->filter(fn($c) => !empty($c->business_id));
-
         if ($channels->isEmpty()) {
+            Log::info('Gmail poll: no eligible connected accounts', [
+                'connected_accounts' => Channel::where('type', 'gmail')->where('status', 'connected')->count(),
+                'missing_business_scope' => $missingBusinessCount,
+            ]);
             return;
         }
 
-        Log::info('Gmail poll: checking ' . $channels->count() . ' channel(s)');
+        Log::info('Gmail poll: checking connected accounts', [
+            'eligible_accounts' => $channels->count(),
+            'missing_business_scope' => $missingBusinessCount,
+        ]);
 
         foreach ($channels as $channel) {
             $this->pollChannel($channel);
@@ -59,7 +68,8 @@ class PollGmailInbox implements ShouldQueue
 
         if (!$client) {
             Log::error('Gmail poll: could not get client, marking as disconnected', ['channel_id' => $channel->id]);
-            $channel->update(['status' => 'disconnected']);
+            $channel->update(['status' => 'disconnected', 'last_error_at' => now(), 'last_error_code' => 'gmail_auth_unavailable']);
+            $this->recordFailure($channel, 'gmail_auth_unavailable');
             return;
         }
 
@@ -72,13 +82,14 @@ class PollGmailInbox implements ShouldQueue
 
             $messages = $results->getMessages();
             if (empty($messages)) {
-                Log::info('Gmail poll: no new emails', ['channel_id' => $channel->id]);
+                $channel->update(['last_sync_at' => now(), 'last_error_at' => null, 'last_error_code' => null]);
+                Log::info('Gmail poll: account checked with no new emails', ['channel_id' => $channel->id]);
                 return;
             }
 
             foreach ($messages as $msgRef) {
                 $msgId  = $msgRef->getId();
-                $exists = Message::where('gmail_message_id', $msgId)->exists();
+                $exists = Message::where('channel_id', $channel->id)->where('platform_message_id', $msgId)->exists();
                 if ($exists) continue;
 
                 $full = $gmail->users_messages->get('me', $msgId, ['format' => 'full']);
@@ -90,8 +101,27 @@ class PollGmailInbox implements ShouldQueue
                 $gmail->users_messages->modify('me', $msgId, $modify);
             }
 
+            $channel->update(['last_sync_at' => now(), 'last_error_at' => null, 'last_error_code' => null]);
+
         } catch (\Exception $e) {
-            Log::error('Gmail poll exception', ['exception_type' => get_class($e), 'channel_id' => $channel->id]);
+            $errorCode = class_basename($e);
+            $channel->update(['last_error_at' => now(), 'last_error_code' => $errorCode]);
+            $this->recordFailure($channel, $errorCode);
+            Log::error('Gmail poll failed', ['exception_type' => get_class($e), 'channel_id' => $channel->id]);
+        }
+    }
+
+    private function recordFailure(Channel $channel, string $errorCode): void
+    {
+        try {
+            \App\Models\SystemHealthLog::create([
+                'component' => 'gmail',
+                'status' => 'warning',
+                'message' => 'A Gmail account poll reported a failure.',
+                'details' => ['channel_id' => $channel->id, 'exception_type' => $errorCode],
+            ]);
+        } catch (\Throwable) {
+            // Structured application logs remain available if health storage is down.
         }
     }
 
@@ -151,6 +181,8 @@ class PollGmailInbox implements ShouldQueue
 
         $message = Message::create([
             'conversation_id'  => $conversation->id,
+            'channel_id'       => $channel->id,
+            'platform_message_id' => $msgId,
             'content'          => $body,
             'direction'        => 'inbound',
             'is_ai'            => false,

@@ -6,7 +6,9 @@ import process from 'node:process';
 const backendRoot = process.cwd();
 const frontendRoot = path.resolve(process.argv[2] ?? path.join(backendRoot, '..', 'autoreply-frontend'));
 const sourceExtensions = new Set(['.js', '.jsx', '.ts', '.tsx', '.mjs', '.cjs']);
-const excludedDirectories = new Set(['.git', '.next', 'node_modules', 'out', 'build', 'dist']);
+// Contract fixtures often include deliberate endpoint examples that are not
+// runtime requests. Scan shipped frontend source, not test descriptions.
+const excludedDirectories = new Set(['.git', '.next', 'node_modules', 'out', 'build', 'dist', 'tests', '__tests__']);
 
 function sourceFiles(directory) {
   const files = [];

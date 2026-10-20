@@ -38,4 +38,15 @@ class SensitiveLogContext
 
         return $value;
     }
+
+    public static function redactText(string $text): string
+    {
+        $text = preg_replace(
+            '/(["\']?(?:access[_-]?token|refresh[_-]?token|client[_-]?secret|api[_-]?key|password|authorization|webhook[_-]?(?:verify[_-]?)?token|signature|hmac)["\']?\s*[:=]\s*)("(?:\\\\.|[^"\\\\])*"|\'(?:\\\\.|[^\'\\\\])*\'|Bearer\s+[A-Za-z0-9._~+\/-]+=*|[^,\s}\]]+)/i',
+            '$1[redacted]',
+            $text,
+        ) ?? $text;
+
+        return preg_replace('/\bBearer\s+[A-Za-z0-9._~+\/-]+=*/i', 'Bearer [redacted]', $text) ?? $text;
+    }
 }

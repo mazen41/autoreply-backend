@@ -138,6 +138,17 @@ Route::get('/email-campaigns/track/click/{recipientId}/{linkToken}', [EmailCampa
 Route::match(['get', 'post'], '/email-campaigns/unsubscribe/{trackingToken}', [EmailCampaignController::class, 'unsubscribe'])
     ->where('trackingToken', '[A-Za-z0-9]{48}');
 
+// Public website chat uses a high-entropy session ID as its visitor capability.
+Route::post('/web-chat/sessions', [WebChatController::class, 'createSession'])->middleware('throttle:20,1');
+Route::post('/web-chat/messages', [WebChatController::class, 'sendMessage'])->middleware('throttle:30,1');
+Route::get('/web-chat/sessions/{sessionId}/messages', [WebChatController::class, 'getMessages'])->middleware('throttle:60,1');
+Route::post('/web-chat/sessions/{sessionId}/status', [WebChatController::class, 'updateOnlineStatus'])->middleware('throttle:30,1');
+Route::get('/public/help-center/{businessId}', [\App\Http\Controllers\Api\HelpCenterController::class, 'publicIndex'])->middleware('throttle:60,1');
+Route::get('/public/help-center/{businessId}/{slug}', [\App\Http\Controllers\Api\HelpCenterController::class, 'publicShow'])->middleware('throttle:60,1');
+Route::get('/public/csat-surveys/{token}', [CsatController::class, 'publicSurvey'])->middleware('throttle:30,1');
+Route::post('/public/csat-surveys/{token}/response', [CsatController::class, 'submitPublicSurvey'])->middleware('throttle:10,1');
+Route::post('/public/csat-surveys/{token}/opt-out', [CsatController::class, 'optOutPublicSurvey'])->middleware('throttle:10,1');
+
 // ── Protected routes ──────────────────────────────────────────────────────────
 Route::middleware('auth:sanctum')->group(function () {
     Route::get('/businesses', [BusinessController::class, 'index']);
@@ -203,9 +214,12 @@ Route::middleware('auth:sanctum')->group(function () {
 
     // Customer / CRM
     Route::get('/customers', [\App\Http\Controllers\Api\CustomerController::class, 'index']);
+    Route::get('/customers/export', [\App\Http\Controllers\Api\CustomerController::class, 'export']);
+    Route::post('/customers/import', [\App\Http\Controllers\Api\CustomerController::class, 'import']);
     Route::get('/customers/{id}', [\App\Http\Controllers\Api\CustomerController::class, 'show']);
     Route::post('/customers/{customerId}/notes', [\App\Http\Controllers\Api\CustomerController::class, 'storeNote']);
     Route::patch('/customers/{customerId}/tags', [\App\Http\Controllers\Api\CustomerController::class, 'updateTags']);
+    Route::patch('/customers/{customerId}', [\App\Http\Controllers\Api\CustomerController::class, 'updateProfile']);
 
     // Channels – listing and disconnect
     Route::get('/channels/connect/gmail',     [GmailController::class, 'connect'])->middleware('plan.enforce:max_channels');
@@ -259,6 +273,12 @@ Route::middleware('auth:sanctum')->group(function () {
 
     // Inbox — conversations + messages + manual reply
     Route::get('/handoff-tasks', [\App\Http\Controllers\Api\HandoffTaskController::class, 'index']);
+    Route::get('/cases', [\App\Http\Controllers\Api\SupportCaseController::class, 'index']);
+    Route::get('/cases/options', [\App\Http\Controllers\Api\SupportCaseController::class, 'options']);
+    Route::post('/cases', [\App\Http\Controllers\Api\SupportCaseController::class, 'store']);
+    Route::get('/cases/{caseId}', [\App\Http\Controllers\Api\SupportCaseController::class, 'show']);
+    Route::patch('/cases/{caseId}', [\App\Http\Controllers\Api\SupportCaseController::class, 'update']);
+    Route::post('/cases/{caseId}/comments', [\App\Http\Controllers\Api\SupportCaseController::class, 'comment']);
     Route::get('/handoff-tasks/assignees', [\App\Http\Controllers\Api\HandoffTaskController::class, 'assignees']);
     Route::patch('/handoff-tasks/{taskId}', [\App\Http\Controllers\Api\HandoffTaskController::class, 'update']);
     Route::patch('/handoff-tasks/{taskId}/resolve', [\App\Http\Controllers\Api\HandoffTaskController::class, 'resolve']);
@@ -404,6 +424,7 @@ Route::middleware('auth:sanctum')->group(function () {
     // CSAT Ratings
     Route::post('/conversations/{conversationId}/csat', [CsatController::class, 'submitRating']);
     Route::get('/conversations/{conversationId}/csat', [CsatController::class, 'getRating']);
+    Route::post('/conversations/{conversationId}/csat-survey', [CsatController::class, 'createSurveyLink']);
 
     // Billing
     Route::middleware('business.access:read')->group(function () {
@@ -437,13 +458,13 @@ Route::middleware('auth:sanctum')->group(function () {
     Route::post('/onboarding/skip', [OnboardingController::class, 'skip']);
     Route::post('/onboarding/initialize', [OnboardingController::class, 'initialize']);
 
-    // Web Chat
-    Route::prefix('web-chat')->group(function () {
-        Route::post('/sessions', [WebChatController::class, 'createSession']);
-        Route::post('/messages', [WebChatController::class, 'sendMessage']);
-        Route::get('/sessions/{sessionId}/messages', [WebChatController::class, 'getMessages']);
-        Route::post('/sessions/{sessionId}/status', [WebChatController::class, 'updateOnlineStatus']);
-    });
+    Route::get('/web-chat/configuration', [WebChatController::class, 'configuration']);
+    Route::put('/web-chat/configuration', [WebChatController::class, 'updateConfiguration']);
+    Route::get('/web-chat/attribution', [WebChatController::class, 'attribution']);
+    Route::get('/help-center/articles', [\App\Http\Controllers\Api\HelpCenterController::class, 'index']);
+    Route::post('/help-center/articles', [\App\Http\Controllers\Api\HelpCenterController::class, 'store']);
+    Route::patch('/help-center/articles/{articleId}', [\App\Http\Controllers\Api\HelpCenterController::class, 'update']);
+    Route::delete('/help-center/articles/{articleId}', [\App\Http\Controllers\Api\HelpCenterController::class, 'destroy']);
 
     // AI Actions
     Route::middleware('business.access:read')->group(function () {
@@ -590,6 +611,7 @@ Route::middleware(['auth:sanctum', 'admin'])->prefix('admin')->group(function ()
 
     // Queue Management
     Route::get('/queue/stats', [AdminController::class, 'queueStats']);
+    Route::get('/system-health', [AdminController::class, 'systemHealth']);
     Route::post('/queue/retry/{id}', [AdminController::class, 'retryFailedJob']);
     Route::delete('/queue/failed/{id}', [AdminController::class, 'deleteFailedJob']);
 

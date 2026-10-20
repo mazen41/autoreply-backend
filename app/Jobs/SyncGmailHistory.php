@@ -61,7 +61,7 @@ class SyncGmailHistory implements ShouldQueue
                 $msgId = $msgRef->getId();
 
                 // Skip if already exists in DB
-                if (Message::where('gmail_message_id', $msgId)->exists()) {
+                if (Message::where('channel_id', $channel->id)->where('platform_message_id', $msgId)->exists()) {
                     continue;
                 }
 
@@ -114,12 +114,15 @@ class SyncGmailHistory implements ShouldQueue
                 // Create message without auto-reply dispatch
                 Message::create([
                     'conversation_id'  => $conversation->id,
+                    'channel_id'       => $channel->id,
+                    'platform_message_id' => $msgId,
                     'content'          => $body ?: trim(strip_tags($bodyHtml)),
                     'content_html'     => $bodyHtml ?: null,
                     'direction'        => 'inbound',
                     'is_ai'            => false,
                     'status'           => 'received',
-                    'gmail_message_id' => $gmailMsgId,
+                    'gmail_message_id' => $msgId,
+                    'metadata' => ['gmail_rfc_message_id' => $gmailMsgId],
                     'created_at'       => $sentAt,
                     'updated_at'       => $sentAt,
                 ]);

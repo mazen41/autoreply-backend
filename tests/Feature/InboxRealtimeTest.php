@@ -323,6 +323,31 @@ class InboxRealtimeTest extends TestCase
         });
     }
 
+    public function test_bot_switch_rejects_active_bot_from_another_business_even_if_channel_is_attached(): void
+    {
+        $conversation = $this->makeConversation();
+        $otherOwner = User::factory()->create();
+        $otherBusiness = BusinessProfile::factory()->create(['user_id' => $otherOwner->id]);
+        $foreignBot = Bot::create([
+            'business_profile_id' => $otherBusiness->id,
+            'name' => 'Foreign Bot',
+            'status' => 'active',
+        ]);
+
+        // Simulate a corrupted or malicious pivot row. Tenant ownership must
+        // still be enforced by updateBot, not inferred from channel assignment.
+        $foreignBot->channels()->attach($this->channel->id);
+
+        $this->actingAs($this->user, 'sanctum')
+            ->patchJson("/api/conversations/{$conversation->id}/bot", [
+                'bot_id' => $foreignBot->id,
+            ])
+            ->assertUnprocessable()
+            ->assertJsonPath('error', 'Bot not found, inactive, or not assigned to this conversation\'s channel');
+
+        $this->assertSame($this->bot->id, $conversation->fresh()->bot_id);
+    }
+
     public function test_tag_add_and_remove_broadcast_conversation_updated()
     {
         $conversation = $this->makeConversation();

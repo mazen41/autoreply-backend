@@ -680,11 +680,14 @@ class SequenceHardeningTest extends TestCase
         $this->assertEquals(1, $enrollment->current_step);
 
         Http::fake([
-            '*/message/sendText/*' => Http::response([
-                'key'     => ['id' => 'fake-msg-id'],
-                'message' => ['conversation' => 'faked'],
-                'status'  => 'PENDING',
-            ], 200),
+            '*/message/sendText/*' => function () {
+                static $providerMessageId = 0;
+                return Http::response([
+                    'key' => ['id' => 'fake-msg-' . ++$providerMessageId],
+                    'message' => ['conversation' => 'faked'],
+                    'status' => 'PENDING',
+                ], 200);
+            },
             '*' => Http::response([], 200),
         ]);
 

@@ -7,7 +7,6 @@ use App\Models\Channel;
 use App\Models\Subscription;
 use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\Log;
-use Illuminate\Support\Facades\Queue;
 
 class SystemHealthMonitoringService
 {
@@ -77,55 +76,16 @@ class SystemHealthMonitoringService
      */
     private function checkAIService(): array
     {
-        $health = [
-            'status' => 'healthy',
-            'message' => 'AI service operational',
-            'details' => [],
+        $providers = ['openai', 'gemini', 'claude', 'groq', 'deepseek'];
+        $configured = collect($providers)->filter(fn (string $provider) => (bool) config("services.{$provider}.api_key"))->values()->all();
+        $recentConfidence = Cache::get('recent_ai_confidence', []);
+        $avgConfidence = count($recentConfidence) > 0 ? array_sum($recentConfidence) / count($recentConfidence) : null;
+
+        return [
+            'status' => $configured === [] ? 'warning' : 'healthy',
+            'message' => $configured === [] ? 'No AI provider credentials are configured.' : 'AI provider credentials are configured; recent reply delivery is tracked separately.',
+            'details' => ['configured_providers' => $configured, 'avg_confidence' => $avgConfidence],
         ];
-
-        try {
-            // Check if AI is responding
-            $testResponse = $this->testAIService();
-            
-            if (!$testResponse['success']) {
-                $health['status'] = 'critical';
-                $health['message'] = 'AI service not responding';
-                $health['details']['error'] = $testResponse['error'];
-            }
-
-            // Check AI confidence scores
-            $recentConfidence = Cache::get('recent_ai_confidence', []);
-            $avgConfidence = count($recentConfidence) > 0 
-                ? array_sum($recentConfidence) / count($recentConfidence) 
-                : 0;
-
-            $health['details']['avg_confidence'] = $avgConfidence;
-
-            if ($avgConfidence < 50) {
-                $health['status'] = 'warning';
-                $health['message'] = 'AI confidence below threshold';
-            }
-        } catch (\Exception $e) {
-            $health['status'] = 'critical';
-            $health['message'] = 'AI service error';
-            $health['details']['error'] = $e->getMessage();
-        }
-
-        return $health;
-    }
-
-    /**
-     * Test AI service
-     */
-    private function testAIService(): array
-    {
-        try {
-            // Simple test call to AI service
-            $testResult = \App\Services\AICapabilitiesService::testConnection();
-            return $testResult;
-        } catch (\Exception $e) {
-            return ['success' => false, 'error' => $e->getMessage()];
-        }
     }
 
     /**
@@ -139,9 +99,8 @@ class SystemHealthMonitoringService
             'details' => [],
         ];
 
-        $channels = Channel::all();
-        $connectedCount = $channels->where('status', 'connected')->count();
-        $totalCount = $channels->count();
+        $totalCount = Channel::count();
+        $connectedCount = Channel::where('status', 'connected')->count();
 
         $health['details']['total_channels'] = $totalCount;
         $health['details']['connected_channels'] = $connectedCount;
@@ -171,7 +130,7 @@ class SystemHealthMonitoringService
 
         try {
             // Check queue size
-            $queueSize = Queue::size();
+            $queueSize = \Illuminate\Support\Facades\DB::table('jobs')->count();
             $health['details']['queue_size'] = $queueSize;
 
             if ($queueSize > 1000) {
@@ -185,7 +144,7 @@ class SystemHealthMonitoringService
             }
 
             // Check failed jobs
-            $failedJobs = Cache::get('failed_jobs_count', 0);
+            $failedJobs = \Illuminate\Support\Facades\DB::table('failed_jobs')->count();
             $health['details']['failed_jobs'] = $failedJobs;
 
             if ($failedJobs > 100) {
@@ -195,7 +154,7 @@ class SystemHealthMonitoringService
         } catch (\Exception $e) {
             $health['status'] = 'critical';
             $health['message'] = 'Queue service error';
-            $health['details']['error'] = $e->getMessage();
+            $health['details']['exception_type'] = get_class($e);
         }
 
         return $health;
@@ -233,7 +192,7 @@ class SystemHealthMonitoringService
         } catch (\Exception $e) {
             $health['status'] = 'critical';
             $health['message'] = 'Database connection failed';
-            $health['details']['error'] = $e->getMessage();
+            $health['details']['exception_type'] = get_class($e);
         }
 
         return $health;
@@ -271,7 +230,7 @@ class SystemHealthMonitoringService
         } catch (\Exception $e) {
             $health['status'] = 'warning';
             $health['message'] = 'Could not check webhook health';
-            $health['details']['error'] = $e->getMessage();
+            $health['details']['exception_type'] = get_class($e);
         }
 
         return $health;
@@ -284,11 +243,24 @@ class SystemHealthMonitoringService
     {
         foreach ($health['components'] as $component => $data) {
             if ($data['status'] !== 'healthy') {
-                SystemHealthLog::create([
+                $existing = SystemHealthLog::unresolved()->where('component', $component)->latest()->first();
+                $attributes = [
                     'component' => $component,
                     'status' => $data['status'],
                     'message' => $data['message'],
                     'details' => $data['details'],
+                    'is_resolved' => false,
+                    'resolved_at' => null,
+                ];
+                if ($existing) {
+                    $existing->update($attributes);
+                } else {
+                    SystemHealthLog::create($attributes);
+                }
+            } else {
+                SystemHealthLog::unresolved()->where('component', $component)->update([
+                    'is_resolved' => true,
+                    'resolved_at' => now(),
                 ]);
             }
         }

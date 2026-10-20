@@ -523,8 +523,12 @@ class ChannelController extends Controller
             $pageMetadata = is_array($channel->metadata) ? $channel->metadata : [];
             $pageMetadata['comment_webhook_status'] = $pageWebhookOk ? 'subscribed' : 'error';
             $pageMetadata['comment_webhook_error_code'] = $pageWebhookOk ? null : (string) ($pageSubscription->json('error.code') ?? $pageSubscription->status());
-            $pageMetadata['comment_webhook_error_message'] = $pageWebhookOk ? null : ($pageSubscription->json('error.message') ?? null);
-            $channel->update(['metadata' => $pageMetadata]);
+            unset($pageMetadata['comment_webhook_error_message']);
+            $channel->update([
+                'metadata' => $pageMetadata,
+                'last_error_at' => $pageWebhookOk ? null : now(),
+                'last_error_code' => $pageWebhookOk ? null : 'meta_page_webhook_subscription_failed',
+            ]);
 
             if (!$pageWebhookOk) {
                 Log::warning('Meta Facebook Page webhook subscription failed', [
@@ -534,7 +538,6 @@ class ChannelController extends Controller
                     'error_type' => $pageSubscriptionError['type'] ?? null,
                     'error_code' => $pageSubscriptionError['code'] ?? null,
                     'error_subcode' => $pageSubscriptionError['error_subcode'] ?? null,
-                    'error_message' => $pageSubscriptionError['message'] ?? null,
                     'fbtrace_id' => $pageSubscriptionError['fbtrace_id'] ?? null,
                 ]);
             }
@@ -550,8 +553,12 @@ class ChannelController extends Controller
                 $igMetadata = is_array($instagramChannel->metadata) ? $instagramChannel->metadata : [];
                 $igMetadata['comment_webhook_status'] = $igWebhookOk ? 'subscribed' : 'error';
                 $igMetadata['comment_webhook_error_code'] = $igWebhookOk ? null : (string) ($igSubscription->json('error.code') ?? $igSubscription->status());
-                $igMetadata['comment_webhook_error_message'] = $igWebhookOk ? null : ($igSubscription->json('error.message') ?? null);
-                $instagramChannel->update(['metadata' => $igMetadata]);
+                unset($igMetadata['comment_webhook_error_message']);
+                $instagramChannel->update([
+                    'metadata' => $igMetadata,
+                    'last_error_at' => $igWebhookOk ? null : now(),
+                    'last_error_code' => $igWebhookOk ? null : 'meta_instagram_webhook_subscription_failed',
+                ]);
 
                 if (!$igWebhookOk) {
                     Log::warning('Meta Instagram webhook subscription failed', [
@@ -561,7 +568,6 @@ class ChannelController extends Controller
                         'error_type' => $igSubscriptionError['type'] ?? null,
                         'error_code' => $igSubscriptionError['code'] ?? null,
                         'error_subcode' => $igSubscriptionError['error_subcode'] ?? null,
-                        'error_message' => $igSubscriptionError['message'] ?? null,
                         'fbtrace_id' => $igSubscriptionError['fbtrace_id'] ?? null,
                     ]);
                 }

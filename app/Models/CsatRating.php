@@ -12,6 +12,7 @@ class CsatRating extends Model
         'user_id',
         'rating',
         'feedback',
+        'source',
         'rated_at',
     ];
 

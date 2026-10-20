@@ -28,6 +28,14 @@ class ProcessSocialCommentEvent implements ShouldQueue
     public int $tries = 5;
     public array $backoff = [10, 30, 90, 180];
 
+    public function retryUntil(): \DateTimeInterface
+    {
+        // A global emergency pause may last longer than the ordinary provider
+        // retry budget. Keep already scheduled comment actions queued for up to
+        // one week, then let the normal retry/dead-letter path take over.
+        return now()->addDays(7);
+    }
+
     public function __construct(public int $eventId) {}
 
     public function handle(MetaCommentAutomationService $replies): void
@@ -40,6 +48,15 @@ class ProcessSocialCommentEvent implements ShouldQueue
         try {
             $event = SocialCommentEvent::with(['channel', 'business'])->find($this->eventId);
             if (!$event || in_array($event->status, ['processed', 'skipped', 'failed', 'cancelled'], true)) return;
+            if ($event->business && app(\App\Services\AutomationRunControl::class)->isBusinessPaused($event->business)) {
+                Log::info('Social comment automation held by global pause', [
+                    'event_id' => $event->id,
+                    'business_id' => $event->business_id,
+                    'channel_id' => $event->channel_id,
+                ]);
+                $this->release(60);
+                return;
+            }
             $scheduledFor = data_get($event->payload, 'decision_trace.scheduled_for');
             if ($event->status === 'scheduled' && $scheduledFor && now()->lt($scheduledFor)) return;
             $channel = $event->channel;
@@ -272,6 +289,15 @@ class ProcessSocialCommentEvent implements ShouldQueue
                 $event->refresh();
                 $channel->refresh();
                 if (in_array($event->status, ['cancelled', 'processed', 'skipped', 'failed'], true)) return;
+                if (app(\App\Services\AutomationRunControl::class)->isBusinessPaused((int) $event->business_id)) {
+                    Log::info('Social comment reply held because global pause became active before send', [
+                        'event_id' => $event->id,
+                        'business_id' => $event->business_id,
+                        'channel_id' => $channel->id,
+                    ]);
+                    $this->release(60);
+                    return;
+                }
                 $expectedAccountId = $event->platform === 'facebook' ? $channel->page_id : $channel->instagram_account_id;
                 if ($channel->status !== 'connected' || trim((string) $channel->access_token) === ''
                     || (int) $channel->business_id !== (int) $event->business_id

@@ -29,6 +29,8 @@ class WebChatReferencedMessageTest extends TestCase
             'user_id' => $user->id,
             'business_name' => 'Web Chat Store',
             'ai_enabled' => false,
+            'web_chat_enabled' => true,
+            'web_chat_allowed_domains' => [],
         ]);
         $store = Channel::create([
             'user_id' => $user->id,
@@ -77,7 +79,7 @@ class WebChatReferencedMessageTest extends TestCase
             ->shouldReceive('newMessage')->once();
 
         $this->actingAs($user);
-        $response = $this->postJson('/api/web-chat/messages', [
+        $response = $this->withHeader('Origin', (string) config('app.frontend_url'))->postJson('/api/web-chat/messages?business_id=' . $business->id, [
             'session_id' => $session->session_id,
             'message' => 'I want to order this',
             'referenced_message_id' => (string) $productImage->id,

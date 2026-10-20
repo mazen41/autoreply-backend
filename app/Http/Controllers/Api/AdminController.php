@@ -122,13 +122,13 @@ class AdminController extends Controller
                 'provider' => $channel->type,
                 'label' => $channel->page_name ?: $channel->page_id,
                 'authorization_status' => $channel->status,
-                'connected_at' => $channel->connected_at?->toISOString(),
-                'last_event_at' => $channel->last_event_at?->toISOString() ?: $lastMessage?->created_at?->toISOString(),
+                'connected_at' => $this->safeDate($channel->connected_at),
+                'last_event_at' => $this->safeDate($channel->last_event_at) ?: $this->safeDate($lastMessage?->created_at),
                 'last_delivery_status' => $lastMessage?->direction === 'outbound'
                     ? ($lastMessage->delivery_status ?: $lastMessage->send_status)
                     : null,
-                'last_sync_at' => $channel->last_sync_at?->toISOString() ?: $this->safeDate($metadata['last_synced_at'] ?? $metadata['last_sync_at'] ?? null),
-                'last_error_at' => $channel->last_error_at?->toISOString(),
+                'last_sync_at' => $this->safeDate($channel->last_sync_at) ?: $this->safeDate($metadata['last_synced_at'] ?? $metadata['last_sync_at'] ?? null),
+                'last_error_at' => $this->safeDate($channel->last_error_at),
                 'last_error_code' => $channel->last_error_code,
                 'webhook_status' => $metadata['webhook_status'] ?? $metadata['comment_webhook_status'] ?? null,
                 'evidence' => $lastMessage ? 'message_recorded' : 'no_message_recorded',
@@ -161,7 +161,7 @@ class AdminController extends Controller
                 'message' => $this->safeHealthMessage($event->component, $event->message),
                 'details' => $this->safeHealthDetails($event->details ?? []),
                 'is_resolved' => $event->is_resolved,
-                'created_at' => $event->created_at?->toISOString(),
+                'created_at' => $this->safeDate($event->created_at),
             ]);
 
         return response()->json([
@@ -179,8 +179,15 @@ class AdminController extends Controller
 
     private function safeDate(mixed $value): ?string
     {
-        if (!is_string($value) || $value === '') return null;
-        try { return \Illuminate\Support\Carbon::parse($value)->toISOString(); } catch (\Throwable) { return null; }
+        if ($value === null || $value === '') return null;
+        try {
+            $date = $value instanceof \DateTimeInterface
+                ? \Illuminate\Support\Carbon::instance($value)
+                : \Illuminate\Support\Carbon::parse($value);
+            return $date->toISOString();
+        } catch (\Throwable) {
+            return null;
+        }
     }
 
     private function safeHealthMessage(string $component, ?string $message): string

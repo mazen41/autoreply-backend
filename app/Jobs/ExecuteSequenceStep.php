@@ -104,7 +104,7 @@ class ExecuteSequenceStep implements ShouldQueue
 
         // Concurrency lock: prevent multiple workers from executing the same step simultaneously
         $lockKey = "sequence_step_execution:{$enrollment->id}:{$step->id}";
-        $lock = Cache::lock($lockKey, self::LOCK_TTL_SECONDS);
+        $lock = Cache::store('database')->lock($lockKey, self::LOCK_TTL_SECONDS);
 
         if (!$lock->get()) {
             Log::warning("Sequence step execution already in progress, skipping", [

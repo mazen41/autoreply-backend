@@ -126,7 +126,7 @@ class ProcessAutoReply implements ShouldQueue
         // summary while an order is in progress.
         if (trim((string) $message->content) === ''
             && data_get($message->metadata, 'attachment.status') === 'attachment_without_text') {
-            $lock = Cache::lock('attachment_without_text_reply:' . $message->id, 60);
+            $lock = Cache::store('database')->lock('attachment_without_text_reply:' . $message->id, 60);
             if (!$lock->get()) {
                 Log::info('ProcessAutoReply: attachment acknowledgement already in progress', [
                     'message_id' => $message->id,
@@ -3006,7 +3006,7 @@ $aiResponse = $intro
      * auto-reply must be skipped), false if no matching sequence exists or
      * if enrollment failed.
      *
-     * Idempotency: a cache lock keyed by conversation id prevents duplicate
+     * Idempotency: a database cache lock keyed by conversation id prevents duplicate
      * enrollment attempts on job retries. SequenceEnrollmentService also
      * enforces uniqueness at the DB level (throws on duplicate active enrollment).
      */
@@ -3017,7 +3017,7 @@ $aiResponse = $intro
         // enough to cover the job retry window (backoff = 30s, tries = 3).
         $lockKey = "seq_new_user_lock:conv:{$conversation->id}";
 
-        if (!Cache::add($lockKey, 1, now()->addMinutes(5))) {
+        if (!Cache::store('database')->add($lockKey, 1, now()->addMinutes(5))) {
             // Another attempt already claimed or completed the enrollment.
             Log::info('ProcessAutoReply: new-user sequence lock already held — treating as already-triggered', [
                 'conversation_id' => $conversation->id,
@@ -3099,7 +3099,7 @@ $aiResponse = $intro
                 // The sequence was likely partially set up; better to skip the
                 // AI reply than to double-respond. Release the lock so a later
                 // retry can try again.
-                Cache::forget($lockKey);
+                Cache::store('database')->forget($lockKey);
                 // Propagate: let the job retry mechanism handle it.
                 throw $e;
             }
@@ -3109,7 +3109,7 @@ $aiResponse = $intro
             // All sequences were ineligible (e.g. already enrolled from a race).
             // Release the lock so future new messages from this conversation
             // don't get stuck thinking a sequence is pending.
-            Cache::forget($lockKey);
+            Cache::store('database')->forget($lockKey);
         }
 
         return $enrolled;
@@ -3829,7 +3829,7 @@ $aiResponse = $intro
             'delivery_address_present' => !empty($checkoutState['address'] ?? $checkoutState['customer_address'] ?? ''),
         ]);
         $lockKey = "create_order_lock_conv_{$conversation->id}";
-        $lock = Cache::lock($lockKey, 10);
+        $lock = Cache::store('database')->lock($lockKey, 10);
 
         if (!$lock->get()) {
             Log::warning('ProcessAutoReply: order creation skipped because conversation lock is held', [

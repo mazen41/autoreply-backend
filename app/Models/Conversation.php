@@ -4,14 +4,16 @@ namespace App\Models;
 
 use Illuminate\Database\Eloquent\Factories\HasFactory;
 use Illuminate\Database\Eloquent\Model;
+use Illuminate\Database\Eloquent\SoftDeletes;
 
 class Conversation extends Model
 {
-    use HasFactory;
+    use HasFactory, SoftDeletes;
     protected $fillable = [
         'channel_id',
         'business_id',
         'bot_id',
+        'is_blocked',
         'customer_id',
         'sender_id',
         'sender_name',
@@ -38,6 +40,7 @@ class Conversation extends Model
         'escalated_at'         => 'datetime',
         'assigned_at'          => 'datetime',
         'ai_enabled'           => 'boolean',
+        'is_blocked'            => 'boolean',
         'requires_human'       => 'boolean',
         'escalation_notified'  => 'boolean',
         'checkout_state'       => 'array',

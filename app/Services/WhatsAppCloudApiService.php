@@ -11,15 +11,20 @@ use Illuminate\Support\Facades\Log;
 
 class WhatsAppCloudApiService
 {
-    public function sendText(Channel $channel, string $recipient, string $text): array
+    public function sendText(Channel $channel, string $recipient, string $text, ?string $replyToMessageId = null): array
     {
-        return $this->send($channel, [
+        $payload = [
             'messaging_product' => 'whatsapp',
             'recipient_type' => 'individual',
             'to' => $recipient,
             'type' => 'text',
             'text' => ['preview_url' => false, 'body' => $text],
-        ]);
+        ];
+        if ($replyToMessageId !== null && $replyToMessageId !== '') {
+            $payload['context'] = ['message_id' => $replyToMessageId];
+        }
+
+        return $this->send($channel, $payload);
     }
 
     public function sendImage(Channel $channel, string $recipient, string $imageUrl, string $caption = ''): array

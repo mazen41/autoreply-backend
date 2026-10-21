@@ -78,6 +78,14 @@ class CustomerService
         }
 
         if ($customer) {
+            if ($platform === 'whatsapp'
+                && preg_match('/@(g\.us|broadcast|lid)$/i', trim($senderId)) === 1
+                && $customer->phone
+                && preg_replace('/\D+/', '', (string) $customer->phone) === preg_replace('/\D+/', '', trim($senderId))) {
+                // Remove old group/LID identifiers that earlier versions stored
+                // as phone numbers. A real phone is left untouched.
+                $customer->phone = null;
+            }
             // The phone/email being adopted here could not have matched another
             // customer — those matches ran first and found nothing.
             if (!$customer->phone && $phone) {
@@ -126,16 +134,22 @@ class CustomerService
         $platform = $channel?->type ?? 'web_chat';
         $senderId = (string) $conversation->sender_id;
 
-        // WhatsApp and Salla conversations key on the customer's phone number
-        // (Evolution JID / Salla customer mobile) — that is a real phone identity.
+        // A direct WhatsApp JID carries a phone number; group, broadcast, and
+        // LID JIDs are account identifiers and must never be stored as phones.
+        $whatsappPhone = $platform === 'whatsapp'
+            && preg_match('/@(g\.us|broadcast|lid)$/i', $senderId) !== 1
+                ? preg_replace('/@s\.whatsapp\.net$/i', '', $senderId)
+                : null;
         $phone = $attributes['phone']
-            ?? (in_array($platform, ['whatsapp', 'salla']) ? $senderId : null);
-
+            ?? ($platform === 'whatsapp' ? $whatsappPhone : ($platform === 'salla' ? $senderId : null));
         $attributes += [
             'name'  => $this->cleanName($conversation->sender_name),
             'email' => $conversation->sender_email,
             'phone' => $phone,
         ];
+        if ($platform === 'whatsapp' && preg_match('/@(g\.us|broadcast|lid)$/i', $senderId) === 1) {
+            $attributes['phone'] = null;
+        }
 
         $customer = $this->resolve($conversation->business_id, $platform, $senderId, $attributes, $conversation->channel_id);
 

@@ -25,6 +25,19 @@ class ChannelMessageService
      */
     public function sendMessage(Channel $channel, Conversation $conversation, Message $message, array $images = []): bool
     {
+        if ($channel->type === 'whatsapp' && $conversation->is_blocked) {
+            $message->update([
+                'send_status' => 'blocked',
+                'delivery_status' => 'failed',
+                'error_details' => 'whatsapp_contact_blocked',
+            ]);
+            Log::info('ChannelMessageService: skipped reply to blocked WhatsApp contact', [
+                'conversation_id' => $conversation->id,
+                'message_id' => $message->id,
+            ]);
+            return false;
+        }
+
         $senderId = $conversation->sender_id;
         $content = $message->content;
 
@@ -238,7 +251,11 @@ class ChannelMessageService
                         return false;
                     }
                 }
-                $result = $cloud->sendText($channel, $recipientId, $message);
+                $replyToLocalId = data_get($messageRecord->metadata, 'reply_to_message_id');
+                $replyToPlatformId = $replyToLocalId
+                    ? Message::where('conversation_id', $messageRecord->conversation_id)->whereKey($replyToLocalId)->value('platform_message_id')
+                    : null;
+                $result = $cloud->sendText($channel, $recipientId, $message, $replyToPlatformId);
                 if ($result['success'] && !empty($result['message_id'])) {
                     $messageRecord->update([
                         'whatsapp_message_id' => $result['message_id'],

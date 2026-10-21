@@ -42,7 +42,7 @@ class InboxController extends Controller
         $userId = (int) $request->user()->id;
         $query = Conversation::where('business_id', $business->id)
             ->with([
-                'channel:id,type,page_name,page_id',
+                'channel:id,type,page_name,page_id,metadata',
                 'bot:id,name',
                 'latestChatMessage',
                 'latestCommerceOrderAttempt',
@@ -50,7 +50,7 @@ class InboxController extends Controller
             ->whereHas('messages', function ($messages): void {
                 $this->applyChatMessageFilter($messages);
             })
-            ->select(['id', 'channel_id', 'business_id', 'bot_id', 'sender_id', 'sender_name', 'sender_email', 'subject', 'status', 'ai_enabled', 'requires_human', 'escalated_at', 'escalation_reason', 'last_message_at', 'assigned_agent_id', 'assigned_at', 'checkout_state'])
+            ->select(['id', 'channel_id', 'business_id', 'bot_id', 'sender_id', 'sender_name', 'sender_email', 'subject', 'status', 'ai_enabled', 'is_blocked', 'requires_human', 'escalated_at', 'escalation_reason', 'last_message_at', 'assigned_agent_id', 'assigned_at', 'checkout_state'])
             // Unread count within the 24h unread window — matches the
             // `unread` filter below and the realtime contract's
             // unread_count (InboxBroadcastPayload::unreadCount).
@@ -156,6 +156,13 @@ class InboxController extends Controller
         $conversations = $query->paginate(50);
         $conversations->getCollection()->transform(function (Conversation $conversation): Conversation {
             $conversation->setAttribute('checkout_summary', $this->checkoutSummary($conversation));
+            $conversation->setAttribute('is_group', preg_match('/@(g\.us|broadcast)$/i', (string) $conversation->sender_id) === 1);
+            $conversation->setAttribute('can_block_contact', $conversation->channel?->type === 'whatsapp'
+                && ($conversation->channel?->metadata['whatsapp_provider'] ?? null) !== 'cloud'
+                && preg_match('/@(g\.us|broadcast)$/i', (string) $conversation->sender_id) !== 1);
+            $conversation->setAttribute('can_delete_messages', $conversation->channel?->type === 'whatsapp'
+                && ($conversation->channel?->metadata['whatsapp_provider'] ?? null) !== 'cloud');
+            $conversation->channel?->makeHidden(['metadata']);
             $conversation->setAttribute('latest_message', $conversation->latestChatMessage);
             $conversation->makeHidden(['latest_chat_message']);
             $conversation->makeHidden(['checkout_state']);
@@ -240,9 +247,20 @@ class InboxController extends Controller
         $conversation = $this->conversationQuery($request, 'conversation_write')
             ->findOrFail($conversationId);
 
-        $request->validate(['message' => 'required|string|max:2000']);
+        $request->validate([
+            'message' => 'required|string|max:2000',
+            'reply_to_message_id' => 'nullable|integer',
+        ]);
+
+        $replyTo = $request->filled('reply_to_message_id')
+            ? Message::where('conversation_id', $conversation->id)->findOrFail((int) $request->input('reply_to_message_id'))
+            : null;
 
         $channel = $conversation->channel;
+
+        if ($conversation->is_blocked) {
+            return response()->json(['error' => 'This WhatsApp contact is blocked. Unblock the contact before sending a reply.'], 422);
+        }
 
         // Handle different channel types
         if ($channel->type === 'gmail') {
@@ -250,11 +268,15 @@ class InboxController extends Controller
         }
 
         if ($channel->type === 'whatsapp') {
-            return $this->sendWhatsAppReply($request, $conversation, $channel);
+            return $this->sendWhatsAppReply($request, $conversation, $channel, $replyTo);
+        }
+
+        if ($channel->type === 'telegram') {
+            return $this->sendTelegramReply($request, $conversation, $channel, $replyTo);
         }
 
         // Handle Facebook/Instagram
-        return $this->sendFacebookReply($request, $conversation, $channel);
+        return $this->sendFacebookReply($request, $conversation, $channel, $replyTo);
     }
 
     /**
@@ -273,6 +295,9 @@ class InboxController extends Controller
             ->findOrFail($conversationId);
 
         $channel = $conversation->channel;
+        if ($channel?->type === 'whatsapp' && $conversation->is_blocked) {
+            return response()->json(['error' => 'This WhatsApp contact is blocked. Unblock the contact before sending a reply.'], 422);
+        }
         if ($channel->type !== 'whatsapp') {
             return response()->json(['error' => 'Media uploads are only supported for WhatsApp conversations right now'], 400);
         }
@@ -521,7 +546,7 @@ class InboxController extends Controller
     /**
      * Send reply via Facebook Graph API
      */
-    private function sendFacebookReply(Request $request, Conversation $conversation, Channel $channel)
+    private function sendFacebookReply(Request $request, Conversation $conversation, Channel $channel, ?Message $replyTo = null)
     {
         if ($blocked = $this->planUsageBlock($channel, $conversation, $request->message, 'facebook')) {
             return $blocked;
@@ -556,7 +581,10 @@ class InboxController extends Controller
             'status'          => 'manual',
             'send_status'     => 'sent',
             'delivery_status' => 'sent',
-            'metadata'        => ['platform_message_id' => $fbResponse->json('message_id')],
+            'metadata'        => array_filter([
+                'platform_message_id' => $fbResponse->json('message_id'),
+                'reply_to_message_id' => $replyTo?->id,
+            ], fn ($value) => $value !== null),
         ]);
 
         $conversation->update(['last_message_at' => now()]);
@@ -571,7 +599,7 @@ class InboxController extends Controller
     /**
      * Send reply via WhatsApp Evolution API
      */
-    private function sendWhatsAppReply(Request $request, Conversation $conversation, Channel $channel)
+    private function sendWhatsAppReply(Request $request, Conversation $conversation, Channel $channel, ?Message $replyTo = null)
     {
         try {
             if ($blocked = $this->planUsageBlock($channel, $conversation, $request->message, 'whatsapp')) {
@@ -600,6 +628,7 @@ class InboxController extends Controller
                     'status' => 'manual',
                     'source' => 'whatsapp',
                     'send_status' => 'pending',
+                    'metadata' => array_filter(['reply_to_message_id' => $replyTo?->id], fn ($value) => $value !== null),
                 ]);
                 $sent = app(\App\Services\ChannelMessageService::class)
                     ->sendMessage($channel, $conversation, $message);
@@ -625,7 +654,15 @@ class InboxController extends Controller
             $response = $whatsappService->sendTextMessage(
                 $instanceName,
                 $conversation->sender_id,
-                $request->message
+                $request->message,
+                $replyTo ? [
+                    'key' => [
+                        'remoteJid' => $replyTo->whatsapp_remote_jid ?: $conversation->sender_id,
+                        'fromMe' => (bool) $replyTo->whatsapp_from_me,
+                        'id' => $replyTo->whatsapp_message_id ?: $replyTo->platform_message_id,
+                    ],
+                    'message' => ['conversation' => $replyTo->content],
+                ] : null,
             );
 
             if (!isset($response['key']['id'])) {
@@ -648,7 +685,10 @@ class InboxController extends Controller
                 'whatsapp_message_id' => $response['key']['id'] ?? null,
                 'whatsapp_remote_jid' => $response['key']['remoteJid'] ?? $conversation->sender_id,
                 'whatsapp_from_me' => $response['key']['fromMe'] ?? true,
-                'metadata' => ['evolution_response' => $response],
+                'metadata' => array_filter([
+                    'evolution_response' => $response,
+                    'reply_to_message_id' => $replyTo?->id,
+                ], fn ($value) => $value !== null),
             ]);
 
             $conversation->update(['last_message_at' => now()]);
@@ -687,6 +727,50 @@ class InboxController extends Controller
             $failed = $this->recordFailedOutboundMessage($channel, $conversation, $request->message, $reason, 'whatsapp');
             return response()->json(['error' => $reason, 'message' => $failed], 502);
         }
+    }
+
+    /** Send a Telegram reply, quoting the selected message when its Telegram ID is known. */
+    private function sendTelegramReply(Request $request, Conversation $conversation, Channel $channel, ?Message $replyTo = null)
+    {
+        if ($blocked = $this->planUsageBlock($channel, $conversation, $request->message, 'telegram')) {
+            return $blocked;
+        }
+
+        $payload = ['chat_id' => $conversation->sender_id, 'text' => $request->message];
+        if ($replyTo && is_numeric($replyTo->platform_message_id)) {
+            $payload['reply_parameters'] = [
+                'message_id' => (int) $replyTo->platform_message_id,
+                'allow_sending_without_reply' => true,
+            ];
+        }
+
+        $response = Http::timeout(10)->post(
+            'https://api.telegram.org/bot' . $channel->access_token . '/sendMessage',
+            $payload,
+        );
+        if (!$response->successful() || !$response->json('ok')) {
+            $reason = (string) ($response->json('description') ?? 'Telegram rejected the reply.');
+            $failed = $this->recordFailedOutboundMessage($channel, $conversation, $request->message, $reason, 'telegram');
+            return response()->json(['error' => 'Failed to send message via Telegram', 'message' => $failed], 502);
+        }
+
+        $message = Message::create([
+            'conversation_id' => $conversation->id,
+            'content' => $request->message,
+            'direction' => 'outbound',
+            'is_ai' => false,
+            'status' => 'manual',
+            'send_status' => 'sent',
+            'delivery_status' => 'sent',
+            'platform_message_id' => (string) ($response->json('result.message_id') ?? ''),
+            'metadata' => array_filter(['reply_to_message_id' => $replyTo?->id], fn ($value) => $value !== null),
+        ]);
+        $conversation->update(['last_message_at' => now()]);
+        if ($channel->user_id) {
+            broadcast(new \App\Events\MessageReceived($message, $conversation, $channel->user_id));
+        }
+
+        return response()->json(['success' => true, 'message' => $message]);
     }
 
     private function withinWhatsAppCustomerCareWindow(Conversation $conversation): bool
@@ -1029,6 +1113,106 @@ class InboxController extends Controller
         ]);
     }
 
+    /** Remove a conversation from the inbox while retaining its records for recovery. */
+    public function deleteConversation(Request $request, $conversationId)
+    {
+        $conversation = $this->conversationQuery($request, 'conversation_write')->findOrFail($conversationId);
+        $conversation->delete();
+
+        return response()->json(['success' => true, 'conversation_id' => (int) $conversationId]);
+    }
+
+    /** Block or unblock a one-to-one WhatsApp contact on Evolution API. */
+    public function updateBlockStatus(Request $request, $conversationId)
+    {
+        $request->validate(['blocked' => 'required|boolean']);
+        $conversation = $this->conversationQuery($request, 'conversation_write')
+            ->with('channel')
+            ->findOrFail($conversationId);
+        $channel = $conversation->channel;
+        if ($channel?->type !== 'whatsapp'
+            || ($channel->metadata['whatsapp_provider'] ?? null) === 'cloud'
+            || preg_match('/@(g\.us|broadcast)$/i', (string) $conversation->sender_id) === 1) {
+            return response()->json(['error' => 'Blocking is supported for one-to-one Evolution WhatsApp chats only.'], 422);
+        }
+
+        try {
+            app(EvolutionApiService::class)->updateBlockStatus(
+                (string) $channel->page_id,
+                (string) $conversation->sender_id,
+                $request->boolean('blocked'),
+            );
+        } catch (\Throwable $exception) {
+            Log::warning('Inbox WhatsApp block status update failed', [
+                'conversation_id' => $conversation->id,
+                'channel_id' => $channel->id,
+                'exception_type' => get_class($exception),
+            ]);
+            return response()->json(['error' => 'WhatsApp could not update the contact block status.'], 502);
+        }
+
+        $conversation->update(['is_blocked' => $request->boolean('blocked')]);
+        broadcast(new \App\Events\ConversationUpdated($conversation->fresh('channel:id,type,page_name')));
+
+        return response()->json(['success' => true, 'is_blocked' => $conversation->is_blocked]);
+    }
+
+    /** Delete one of the business's own Evolution WhatsApp messages for everyone. */
+    public function deleteWhatsAppMessage(Request $request, $messageId)
+    {
+        $message = Message::query()->findOrFail($messageId);
+        $conversation = $this->conversationQuery($request, 'conversation_write')
+            ->whereKey($message->conversation_id)
+            ->with('channel')
+            ->firstOrFail();
+        $channel = $conversation->channel;
+        if ($channel?->type !== 'whatsapp'
+            || ($channel->metadata['whatsapp_provider'] ?? null) === 'cloud') {
+            return response()->json(['error' => 'Delete-for-everyone is available for Evolution WhatsApp messages only.'], 422);
+        }
+
+        $messageId = $message->whatsapp_message_id ?: $message->platform_message_id;
+        if ($message->direction !== 'outbound' || !$message->whatsapp_from_me || !$messageId) {
+            return response()->json(['error' => 'Only a sent message from this WhatsApp account can be deleted for everyone.'], 422);
+        }
+
+        $remoteJid = $message->whatsapp_remote_jid ?: $conversation->sender_id;
+        $whatsappKey = is_array($message->metadata) ? ($message->metadata['whatsapp_key'] ?? []) : [];
+        $messageKey = [
+            'id' => (string) $messageId,
+            'fromMe' => true,
+            'remoteJid' => (string) $remoteJid,
+        ];
+        if (!empty($whatsappKey['participant'])) {
+            $messageKey['participant'] = (string) $whatsappKey['participant'];
+        }
+        try {
+            app(EvolutionApiService::class)->deleteMessageForEveryone((string) $channel->page_id, $messageKey);
+        } catch (\Throwable $exception) {
+            Log::warning('Inbox WhatsApp message deletion failed', [
+                'conversation_id' => $conversation->id,
+                'message_id' => $message->id,
+                'channel_id' => $channel->id,
+                'exception_type' => get_class($exception),
+            ]);
+            return response()->json(['error' => 'WhatsApp could not delete this message for everyone.'], 502);
+        }
+
+        $metadata = is_array($message->metadata) ? $message->metadata : [];
+        $metadata['deleted_for_everyone'] = true;
+        $message->update([
+            'content' => 'This message was deleted',
+            'media_url' => null,
+            'media_type' => null,
+            'metadata' => $metadata,
+        ]);
+        if ($channel->user_id) {
+            broadcast(new \App\Events\MessageReceived($message->fresh(), $conversation, $channel->user_id));
+        }
+
+        return response()->json(['success' => true, 'message' => $message->fresh()]);
+    }
+
     /**
      * Get authenticated Gmail client
      */
@@ -1151,7 +1335,7 @@ class InboxController extends Controller
      * Update the Bot assigned to a conversation.
      *
      * Allows switching the active Bot for a conversation, or clearing it (null).
-     * Validates that the new Bot is active and assigned to the conversation's channel.
+     * Validates that the new Bot is active and belongs to the conversation's business.
      */
     public function updateBot(Request $request, $id)
     {
@@ -1168,18 +1352,16 @@ class InboxController extends Controller
         if ($botId !== null) {
             $botId = (int) $botId;
 
-            // Verify the bot exists, is active, and is assigned to this conversation's channel
+            // Assignment is per conversation. Do not require a bot-channel mapping;
+            // tenant ownership and active status prevent cross-business access.
             $bot = \App\Models\Bot::where('id', $botId)
                 ->where('business_profile_id', $conversation->business_id)
                 ->where('status', 'active')
-                ->whereHas('channels', function ($q) use ($conversation) {
-                    $q->where('channel_id', $conversation->channel_id);
-                })
                 ->first();
 
             if (!$bot) {
                 return response()->json([
-                    'error' => 'Bot not found, inactive, or not assigned to this conversation\'s channel',
+                    'error' => 'Bot not found, inactive, or not available to this business',
                 ], 422);
             }
         }

@@ -303,8 +303,11 @@ Route::middleware('auth:sanctum')->group(function () {
     Route::post('/inbox/{conversationId}/media',        [InboxController::class, 'mediaReply']);
     Route::patch('/inbox/{conversationId}/toggle-ai',   [InboxController::class, 'toggleAi']);
     Route::patch('/inbox/{conversationId}/status',      [InboxController::class, 'updateStatus']);
+    Route::delete('/inbox/{conversationId}', [InboxController::class, 'deleteConversation']);
+    Route::patch('/inbox/{conversationId}/block', [InboxController::class, 'updateBlockStatus']);
     Route::patch('/conversations/{id}/bot',             [InboxController::class, 'updateBot']);
     Route::post('/messages/{messageId}/react',          [InboxController::class, 'reactToMessage']);
+    Route::delete('/messages/{messageId}/whatsapp', [InboxController::class, 'deleteWhatsAppMessage']);
     
     // Tag management
     Route::get('/inbox/{conversationId}/tags',         [InboxController::class, 'getTags']);

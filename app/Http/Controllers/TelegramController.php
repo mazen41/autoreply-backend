@@ -313,6 +313,15 @@ class TelegramController extends Controller
             $fileId = $message['document']['file_id'] ?? null;
             $mimeType = $message['document']['mime_type'] ?? 'application/octet-stream';
             $fileName = $message['document']['file_name'] ?? null;
+        } elseif (!empty($message['sticker']) && is_array($message['sticker'])) {
+            $mediaType = 'sticker';
+            $fileId = $message['sticker']['file_id'] ?? null;
+            $mimeType = !empty($message['sticker']['is_video'])
+                ? 'video/webm'
+                : (!empty($message['sticker']['is_animated']) ? 'application/x-tgsticker' : 'image/webp');
+            $fileName = !empty($message['sticker']['is_video'])
+                ? 'sticker.webm'
+                : (!empty($message['sticker']['is_animated']) ? 'sticker.tgs' : 'sticker.webp');
         }
 
         if ($mediaType === null) {
@@ -344,7 +353,8 @@ class TelegramController extends Controller
             $extension = match ($mime) {
                 'image/jpeg' => 'jpg', 'image/png' => 'png', 'image/webp' => 'webp',
                 'audio/ogg' => 'ogg', 'audio/mpeg' => 'mp3', 'audio/mp4' => 'm4a',
-                'video/mp4' => 'mp4', 'application/pdf' => 'pdf',
+                'video/mp4' => 'mp4', 'video/webm' => 'webm',
+                'application/x-tgsticker' => 'tgs', 'application/pdf' => 'pdf',
                 default => strtolower(pathinfo($fileName ?? $filePath, PATHINFO_EXTENSION)) ?: 'bin',
             };
             $storage = app(IncomingMediaStorage::class);

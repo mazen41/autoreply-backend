@@ -107,7 +107,7 @@ class EvolutionApiService
     /**
      * Send a text message
      */
-    public function sendTextMessage(string $instanceName, string $number, string $text): array
+    public function sendTextMessage(string $instanceName, string $number, string $text, ?array $quoted = null): array
     {
         $url = "{$this->baseUrl}/message/sendText/{$instanceName}";
         
@@ -123,6 +123,9 @@ class EvolutionApiService
                 'linkPreview' => false,
             ],
         ];
+        if ($quoted !== null) {
+            $payload['quoted'] = $quoted;
+        }
 
         Log::info('EvolutionApiService: sendTextMessage', [
             'recipient_present' => $cleanNumber !== '',
@@ -137,6 +140,21 @@ class EvolutionApiService
         ]);
 
         return $response;
+    }
+
+    /** Block or unblock a WhatsApp contact on a Baileys/Evolution instance. */
+    public function updateBlockStatus(string $instanceName, string $number, bool $blocked): array
+    {
+        return $this->makeRequest('POST', "{$this->baseUrl}/chat/updateBlockStatus/{$instanceName}", [
+            'number' => str_replace('@s.whatsapp.net', '', $number),
+            'status' => $blocked ? 'block' : 'unblock',
+        ]);
+    }
+
+    /** Delete an outbound WhatsApp message for everyone using Evolution API. */
+    public function deleteMessageForEveryone(string $instanceName, array $messageKey): array
+    {
+        return $this->makeRequest('DELETE', "{$this->baseUrl}/chat/deleteMessageForEveryone/{$instanceName}", $messageKey);
     }
 
     /**
@@ -1223,6 +1241,9 @@ class EvolutionApiService
         if (isset($messageContent['documentMessage'])) {
             return 'document';
         }
+        if (isset($messageContent['stickerMessage'])) {
+            return 'sticker';
+        }
         if (isset($messageContent['locationMessage'])) {
             return 'location';
         }
@@ -1238,12 +1259,12 @@ class EvolutionApiService
      */
     protected function extractMedia(array $messageContent): ?array
     {
-        $mediaTypes = ['imageMessage', 'videoMessage', 'audioMessage', 'documentMessage'];
+        $mediaTypes = ['imageMessage', 'videoMessage', 'audioMessage', 'documentMessage', 'stickerMessage'];
 
         foreach ($mediaTypes as $type) {
             if (isset($messageContent[$type])) {
                 return [
-                    'type' => str_replace('Message', '', $type),
+                    'type' => $type === 'stickerMessage' ? 'sticker' : str_replace('Message', '', $type),
                     'url' => $messageContent[$type]['url'] ?? null,
                     'mimetype' => $messageContent[$type]['mimetype'] ?? null,
                     'caption' => $messageContent[$type]['caption'] ?? null,
@@ -1282,7 +1303,7 @@ class EvolutionApiService
 
     protected function getMediaNode(array $messageContent): array
     {
-        foreach (['imageMessage', 'videoMessage', 'audioMessage', 'documentMessage'] as $type) {
+        foreach (['imageMessage', 'videoMessage', 'audioMessage', 'documentMessage', 'stickerMessage'] as $type) {
             if (isset($messageContent[$type])) {
                 return $messageContent[$type];
             }

@@ -60,10 +60,19 @@ class CustomerController extends Controller
         if ($request->boolean('has_email')) $query->whereNotNull('email')->where('email', '!=', '');
         if ($request->boolean('has_phone')) $query->whereNotNull('phone')->where('phone', '!=', '');
 
-        $customers = $query->with('assignee:id,name')->withCount('conversations')
+        $customers = $query->with('assignee:id,name')->with('identities:id,customer_id,platform,external_id')->withCount('conversations')
             ->withMax('conversations', 'last_message_at')
             ->orderBy('created_at', 'desc')
             ->paginate(min(max($request->integer('per_page', 25), 1), 100));
+
+        $customers->getCollection()->each(function (Customer $customer): void {
+            $canDisplayPhone = $this->hasDirectWhatsAppIdentity($customer);
+            $customer->setAttribute('phone_is_displayable', $canDisplayPhone);
+            if (!$canDisplayPhone) {
+                $customer->setAttribute('phone', null);
+            }
+            $customer->makeHidden('identities');
+        });
 
         return response()->json($customers);
     }
@@ -90,6 +99,8 @@ class CustomerController extends Controller
                 'mergeRecordsAsTarget' => fn ($query) => $query->whereNull('reversed_at')->with('source:id,name,email')->orderByDesc('id'),
             ])
             ->findOrFail($id);
+
+        $customer->setAttribute('phone_is_displayable', $this->hasDirectWhatsAppIdentity($customer));
 
         $identifiers = array_values(array_filter(array_unique([
             $customer->email ? mb_strtolower(trim($customer->email)) : null,
@@ -135,12 +146,39 @@ class CustomerController extends Controller
                 ->get(['id', 'channel_id', 'platform', 'post_id', 'comment_id', 'comment_text', 'platform_created_at', 'status', 'public_reply_id']);
         }
 
+        if (!$customer->phone_is_displayable) {
+            $customer->setAttribute('phone', null);
+        }
+        $customer->makeHidden('identities');
+
         return response()->json([
             'customer' => $customer,
             'orders' => $orders,
             'consents' => $consents,
             'comments' => $comments,
         ]);
+    }
+
+    /** A phone is a callable phone only when this contact has a direct WhatsApp identity. */
+    private function hasDirectWhatsAppIdentity(Customer $customer): bool
+    {
+        if (!is_string($customer->phone) || trim($customer->phone) === '') {
+            return false;
+        }
+
+        return $customer->identities->contains(function ($identity): bool {
+            if (strtolower((string) $identity->platform) !== 'whatsapp') {
+                return false;
+            }
+
+            $externalId = trim((string) $identity->external_id);
+            if ($externalId === '' || preg_match('/@(g\.us|broadcast|lid)$/i', $externalId) === 1) {
+                return false;
+            }
+
+            $phoneIdentity = preg_replace('/@s\.whatsapp\.net$/i', '', $externalId);
+            return preg_match('/^\+?[0-9]{7,15}$/', $phoneIdentity) === 1;
+        });
     }
 
     /**
@@ -424,7 +462,7 @@ class CustomerController extends Controller
             $channel = Channel::query()->where('business_id', $business->id)->findOrFail($request->integer('channel_id'));
             $query->whereHas('conversations', fn ($q) => $q->where('channel_id', $channel->id));
         }
-        $rows = $query->limit(10000)->get();
+        $rows = $query->with('identities:id,customer_id,platform,external_id')->limit(10000)->get();
         $filename = 'contacts-' . $business->id . '-' . now()->format('Ymd-His') . '.csv';
         return response()->streamDownload(function () use ($rows) {
             $out = fopen('php://output', 'w');
@@ -435,7 +473,8 @@ class CustomerController extends Controller
             fputcsv($out, ['id', 'name', 'email', 'phone', 'lifecycle_stage', 'language', 'source', 'lead_score', 'tags', 'created_at']);
             foreach ($rows as $customer) {
                 $fields = $customer->custom_fields ?? [];
-                fputcsv($out, array_map($safe, [$customer->id, $customer->name, $customer->email, $customer->phone, $fields['lifecycle_stage'] ?? '', $fields['language'] ?? '', $fields['source'] ?? '', $customer->lead_score, implode('|', $customer->tags ?? []), $customer->created_at?->toIso8601String()]));
+                $phone = $this->hasDirectWhatsAppIdentity($customer) ? $customer->phone : '';
+                fputcsv($out, array_map($safe, [$customer->id, $customer->name, $customer->email, $phone, $fields['lifecycle_stage'] ?? '', $fields['language'] ?? '', $fields['source'] ?? '', $customer->lead_score, implode('|', $customer->tags ?? []), $customer->created_at?->toIso8601String()]));
             }
             fclose($out);
         }, $filename, ['Content-Type' => 'text/csv; charset=UTF-8']);

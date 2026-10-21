@@ -92,6 +92,14 @@ class ProcessAutoReply implements ShouldQueue
             return;
         }
 
+        if ($conversation->is_blocked) {
+            Log::info('ProcessAutoReply: blocked WhatsApp contact; skipped automated reply', [
+                'conversation_id' => $conversation->id,
+                'message_id' => $message->id,
+            ]);
+            return;
+        }
+
         // Default true if column is null (old rows before migration)
         if ($conversation->ai_enabled === false) {
             Log::info('ProcessAutoReply: AI disabled for this conversation (human took over)', [

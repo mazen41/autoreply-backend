@@ -49,6 +49,7 @@ class BillingService
     {
         $user = $subscription->user;
         $package = $subscription->package;
+        $usageLimit = $package->ai_replies_limit ?? 0;
 
         // Check if we already sent an alert recently (avoid spam)
         $lastAlert = $subscription->last_usage_alert_at;
@@ -97,13 +98,26 @@ class BillingService
         // Calculate overage amount (assuming $0.01 per extra message)
         $amount = $extraUsage * 0.01;
 
-        Overage::create([
-            'user_id' => $subscription->user_id,
-            'subscription_id' => $subscription->id,
-            'extra_messages' => $extraUsage,
-            'amount' => $amount,
-            'status' => 'pending',
-        ]);
+        $pending = Overage::query()
+            ->where('subscription_id', $subscription->id)
+            ->where('status', 'pending')
+            ->latest('id')
+            ->first();
+
+        if ($pending) {
+            $pending->update([
+                'extra_messages' => $extraUsage,
+                'amount' => $amount,
+            ]);
+        } else {
+            Overage::create([
+                'user_id' => $subscription->user_id,
+                'subscription_id' => $subscription->id,
+                'extra_messages' => $extraUsage,
+                'amount' => $amount,
+                'status' => 'pending',
+            ]);
+        }
 
         Log::info('Overage tracked', [
             'subscription_id' => $subscription->id,
@@ -193,7 +207,8 @@ class BillingService
 
         foreach ($pendingOverages as $overage) {
             try {
-                // TODO: implement Paymob recurring charge for overage billing
+                // Charging remains intentionally disabled until the product
+                // has an implemented, consented recurring-payment flow.
                 Log::info('Overage billing skipped (Paymob integration pending)', [
                     'overage_id' => $overage->id,
                     'amount'     => $overage->amount,

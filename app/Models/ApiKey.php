@@ -8,6 +8,7 @@ class ApiKey extends Model
 {
     protected $fillable = [
         'user_id',
+        'business_id',
         'key',
         'secret_hash',
         'key_last_four',
@@ -35,6 +36,11 @@ class ApiKey extends Model
     public function user()
     {
         return $this->belongsTo(User::class);
+    }
+
+    public function business()
+    {
+        return $this->belongsTo(BusinessProfile::class, 'business_id');
     }
 
     public function scopeActive($query)

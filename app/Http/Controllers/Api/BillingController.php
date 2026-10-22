@@ -42,7 +42,8 @@ class BillingController extends Controller
         $business = app(ActiveBusiness::class)->resolve($request, permission: 'read');
         $snapshot = app(UsageMeter::class)->snapshot($business);
         $subscription = app(UsageMeter::class)->subscriptionFor($business);
-        $overages = Overage::where('user_id', $business->user_id)
+        $subscriptionIds = Subscription::where('business_id', $business->id)->pluck('id');
+        $overages = Overage::whereIn('subscription_id', $subscriptionIds)
             ->orderBy('created_at', 'desc')
             ->get();
 

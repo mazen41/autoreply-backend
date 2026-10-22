@@ -4,15 +4,18 @@ namespace App\Http\Controllers\Api;
 
 use App\Http\Controllers\Controller;
 use App\Models\ApiKey;
+use App\Services\ActiveBusiness;
+use App\Services\BusinessAccessService;
 use Illuminate\Http\Request;
-use Illuminate\Support\Facades\Auth;
 use Illuminate\Support\Str;
 
 class ApiKeyController extends Controller
 {
-    public function index()
+    public function index(Request $request, ActiveBusiness $activeBusiness, BusinessAccessService $businessAccess)
     {
-        $keys = ApiKey::where('user_id', Auth::id())
+        $businessId = $this->businessId($request, $activeBusiness, $businessAccess);
+        $keys = ApiKey::where('user_id', $request->user()->id)
+            ->where('business_id', $businessId)
             ->latest()
             ->get()
             ->map(fn (ApiKey $key) => $this->publicFields($key));
@@ -20,8 +23,9 @@ class ApiKeyController extends Controller
         return response()->json(['data' => $keys]);
     }
 
-    public function store(Request $request)
+    public function store(Request $request, ActiveBusiness $activeBusiness, BusinessAccessService $businessAccess)
     {
+        $businessId = $this->businessId($request, $activeBusiness, $businessAccess);
         $validated = $request->validate([
             'name' => ['required', 'string', 'max:120'],
             'scopes' => ['required', 'array', 'min:1', 'max:20'],
@@ -32,7 +36,8 @@ class ApiKeyController extends Controller
         $secret = 'naz_live_' . Str::random(48);
         $digest = hash('sha256', $secret);
         $key = ApiKey::create([
-            'user_id' => Auth::id(),
+            'user_id' => $request->user()->id,
+            'business_id' => $businessId,
             'key' => $digest,
             'secret_hash' => $digest,
             'key_last_four' => substr($secret, -4),
@@ -50,9 +55,10 @@ class ApiKeyController extends Controller
         return response()->json($this->publicFields($key, oneTimeSecret: $secret), 201);
     }
 
-    public function destroy(int $id)
+    public function destroy(Request $request, int $id, ActiveBusiness $activeBusiness, BusinessAccessService $businessAccess)
     {
-        $key = ApiKey::where('user_id', Auth::id())->find($id);
+        $businessId = $this->businessId($request, $activeBusiness, $businessAccess);
+        $key = ApiKey::where('user_id', $request->user()->id)->where('business_id', $businessId)->find($id);
         if (!$key) {
             return response()->json(['error' => 'API key not found'], 404);
         }
@@ -61,9 +67,10 @@ class ApiKeyController extends Controller
         return response()->json(['success' => true]);
     }
 
-    public function toggle(int $id)
+    public function toggle(Request $request, int $id, ActiveBusiness $activeBusiness, BusinessAccessService $businessAccess)
     {
-        $key = ApiKey::where('user_id', Auth::id())->find($id);
+        $businessId = $this->businessId($request, $activeBusiness, $businessAccess);
+        $key = ApiKey::where('user_id', $request->user()->id)->where('business_id', $businessId)->find($id);
         if (!$key) {
             return response()->json(['error' => 'API key not found'], 404);
         }
@@ -76,6 +83,7 @@ class ApiKeyController extends Controller
     {
         return [
             'id' => $key->id,
+            'business_id' => $key->business_id,
             'name' => $key->name,
             'key' => $oneTimeSecret ?? '••••••••' . ($key->key_last_four ?: substr($key->key, -4)),
             'scopes' => $key->permissions ?? [],
@@ -84,5 +92,24 @@ class ApiKeyController extends Controller
             'expires_at' => $key->expires_at,
             'created_at' => $key->created_at,
         ];
+    }
+
+    /**
+     * Honor the dashboard's selected workspace. Legacy clients without a
+     * workspace header remain limited to the user's primary business; users
+     * without one can only create/list keys that have no data access.
+     */
+    private function businessId(Request $request, ActiveBusiness $activeBusiness, BusinessAccessService $businessAccess): ?int
+    {
+        if ($request->header('X-Business-Id') || $request->filled('business_id')) {
+            return (int) $activeBusiness->resolve($request, permission: 'write')->id;
+        }
+
+        $primaryBusinessId = $request->user()->business_id;
+        if (!$primaryBusinessId) {
+            return null;
+        }
+
+        return (int) $businessAccess->authorize($request->user(), $primaryBusinessId, 'write')->id;
     }
 }

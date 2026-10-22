@@ -96,6 +96,11 @@ class MyFatoorahWebhookController extends Controller
                 return response()->json(['message' => 'Payment amount or currency did not match the invoice.'], 200);
             }
 
+            $businessId = $intent->business_id ?: $intent->user?->business_id;
+            if ($businessId && \App\Models\BusinessProfile::whereKey($businessId)->exists()) {
+                app(\App\Services\SubscriptionLifecycleService::class)->retireActiveForBusiness((int) $businessId);
+            }
+
             DB::transaction(function () use ($intent, $apiData, $invoiceId) {
                 $lockedIntent = PaymentIntent::query()->lockForUpdate()->find($intent->id);
                 if (!$lockedIntent || $lockedIntent->status === 'completed') {
@@ -119,11 +124,6 @@ class MyFatoorahWebhookController extends Controller
                     'myfatoorah_payment_id' => $txn['TransactionId'] ?? null,
                     'gateway_response'      => $apiData,
                 ]);
-
-                Subscription::query()
-                    ->where('business_id', $businessId)
-                    ->whereIn('status', ['active', 'trial'])
-                    ->update(['status' => 'cancelled', 'cancelled_at' => now()]);
 
                 Subscription::create([
                         'business_id'           => $businessId,
@@ -197,7 +197,7 @@ class MyFatoorahWebhookController extends Controller
 
             DB::transaction(function () use ($subscription, $invoiceId, $transaction, $amount): void {
                 $locked = Subscription::query()->lockForUpdate()->find($subscription->id);
-                if (!$locked || !$locked->auto_renew_enabled || DB::table('subscription_renewal_invoices')
+                if (!$locked || $locked->status !== 'active' || !$locked->auto_renew_enabled || DB::table('subscription_renewal_invoices')
                     ->where('gateway', 'myfatoorah')->where('external_invoice_id', $invoiceId)->exists()) {
                     return;
                 }
@@ -215,7 +215,9 @@ class MyFatoorahWebhookController extends Controller
 
                 $termEnd = $locked->ends_at && $locked->ends_at->isFuture() ? $locked->ends_at->copy() : now();
                 $locked->update([
-                    'ends_at' => $termEnd->addMonth(),
+                    'ends_at' => $locked->billing_cycle === 'yearly'
+                        ? $termEnd->addYear()
+                        : $termEnd->addMonth(),
                     'amount_paid' => $amount,
                     'grace_period_ends_at' => null,
                 ]);

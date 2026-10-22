@@ -8,6 +8,7 @@ use App\Models\Conversation;
 use App\Models\Message;
 use App\Services\ChannelMessageService;
 use App\Services\ConsentGate;
+use App\Services\BusinessAccessService;
 use Illuminate\Http\Request;
 
 class PublicApiController extends Controller
@@ -36,9 +37,16 @@ class PublicApiController extends Controller
             return response()->json(['error' => 'Permission denied'], 403);
         }
 
+        if (!$apiKey->business_id) {
+            return response()->json(['error' => 'API key is not scoped to a business.'], 403);
+        }
+        app(BusinessAccessService::class)->authorize($apiKey->user, $apiKey->business_id, 'write');
+
         // Verify conversation belongs to user
-        $conversation = Conversation::with('channel')->whereHas('channel', function ($q) use ($apiKey) {
-                $q->where('user_id', $apiKey->user_id)
+        $conversation = Conversation::with('channel')
+            ->where('business_id', $apiKey->business_id)
+            ->whereHas('channel', function ($q) use ($apiKey) {
+                $q->where('channels.business_id', $apiKey->business_id)
                     ->whereColumn('channels.business_id', 'conversations.business_id');
             })
             ->find($request->conversation_id);
@@ -119,9 +127,19 @@ class PublicApiController extends Controller
             return response()->json(['error' => 'Permission denied'], 403);
         }
 
-        $conversations = Conversation::whereHas('channel', function ($q) use ($apiKey) {
-                $q->where('user_id', $apiKey->user_id);
-            })
+        if ($apiKey->business_id) {
+            app(BusinessAccessService::class)->authorize($apiKey->user, $apiKey->business_id, 'read');
+        }
+
+        $conversations = Conversation::query();
+        if ($apiKey->business_id) {
+            $conversations->where('business_id', $apiKey->business_id)->whereHas('channel', function ($q) use ($apiKey) {
+                $q->where('business_id', $apiKey->business_id);
+            });
+        } else {
+            $conversations->whereRaw('1 = 0');
+        }
+        $conversations = $conversations
             ->with(['channel', 'latestMessage'])
             ->orderBy('last_message_at', 'desc')
             ->paginate(50);
@@ -149,8 +167,14 @@ class PublicApiController extends Controller
             return response()->json(['error' => 'Permission denied'], 403);
         }
 
-        $conversation = Conversation::whereHas('channel', function ($q) use ($apiKey) {
-                $q->where('user_id', $apiKey->user_id);
+        if (!$apiKey->business_id) {
+            return response()->json(['error' => 'API key is not scoped to a business.'], 403);
+        }
+        app(BusinessAccessService::class)->authorize($apiKey->user, $apiKey->business_id, 'read');
+
+        $conversation = Conversation::where('business_id', $apiKey->business_id)
+            ->whereHas('channel', function ($q) use ($apiKey) {
+                $q->where('business_id', $apiKey->business_id);
             })
             ->find($conversationId);
 

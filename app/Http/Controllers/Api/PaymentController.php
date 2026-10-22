@@ -295,19 +295,7 @@ class PaymentController extends Controller
             return false;
         }
 
-        $activeSubscription = Subscription::query()
-            ->where('business_id', $businessId)
-            ->whereIn('status', ['active', 'trial'])
-            ->where(fn ($query) => $query->whereNull('starts_at')->orWhere('starts_at', '<=', now()))
-            ->where(fn ($query) => $query->whereNull('ends_at')->orWhere('ends_at', '>', now()))
-            ->latest('id')
-            ->first();
-        if ($activeSubscription) {
-            $activeSubscription->update([
-                'status'       => 'cancelled',
-                'cancelled_at' => now(),
-            ]);
-        }
+        app(\App\Services\SubscriptionLifecycleService::class)->retireActiveForBusiness((int) $businessId);
 
         $startDate = now();
         $endDate   = $intent->billing_cycle === 'yearly'

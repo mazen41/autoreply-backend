@@ -3,12 +3,17 @@
 namespace App\Http\Middleware;
 
 use App\Models\FeatureFlag;
+use App\Services\ActiveBusiness;
 use Closure;
 use Illuminate\Http\Request;
 use Symfony\Component\HttpFoundation\Response;
 
 class CheckFeatureFlag
 {
+    public function __construct(private readonly ActiveBusiness $activeBusiness)
+    {
+    }
+
     /**
      * Handle an incoming request.
      *
@@ -16,8 +21,7 @@ class CheckFeatureFlag
      */
     public function handle(Request $request, Closure $next, string $flagKey): Response
     {
-        $user = $request->user();
-        $businessId = $user?->business_id;
+        $businessId = $this->activeBusiness->resolve($request, permission: 'automation_write')->id;
 
         // Check if the feature flag exists and is enabled
         $flag = FeatureFlag::forKey($flagKey)->first();

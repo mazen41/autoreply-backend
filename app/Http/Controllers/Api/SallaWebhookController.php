@@ -101,16 +101,17 @@ class SallaWebhookController extends Controller
             $verified = true;
             $verificationMode = 'token';
         } else {
-            // Fail-open (an unconfigured secret must not silently drop ALL
-            // intake — mirrors the Meta webhook controller's posture), but the
-            // acceptance is now EXPLICITLY marked unverified in both the log
-            // stream and the response body.
-            $warning = 'Payload accepted UNVERIFIED: no signature header and no security strategy token. '
-                . 'Configure SALLA_WEBHOOK_SECRET and the Salla webhook signing secret to enforce verification.';
-            Log::warning('Salla webhook accepted WITHOUT verification (secret not configured / no signature header)', [
+            Log::warning('Salla webhook rejected because no verification credential was supplied', [
                 'event' => $request->input('event') ?? $request->input('type'),
                 'has_signature_header' => false,
+                'has_token' => (bool) $authToken,
             ]);
+            return response()->json([
+                'status' => 'rejected',
+                'verified' => false,
+                'verification_mode' => 'none',
+                'error' => empty($webhookSecret) ? 'webhook_secret_not_configured' : 'verification_credential_missing',
+            ], empty($webhookSecret) ? 503 : 401);
         }
 
         // Get event data - Salla might send different formats

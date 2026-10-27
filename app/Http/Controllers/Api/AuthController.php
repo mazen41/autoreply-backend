@@ -89,7 +89,9 @@ class AuthController extends Controller
             return response()->json(['message' => 'Verification code has expired. Please request a new one.'], 422);
         }
 
-        $user->update(['email_verified_at' => now()]);
+        // email_verified_at is intentionally not mass-assignable on User;
+        // persist this security-sensitive field explicitly after OTP validation.
+        $user->forceFill(['email_verified_at' => now()])->save();
         \DB::table('email_verification_otps')->where('email', $request->email)->delete();
 
         return response()->json(['message' => 'Email verified successfully.']);

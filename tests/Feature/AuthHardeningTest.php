@@ -47,6 +47,28 @@ class AuthHardeningTest extends TestCase
         $this->assertSame(0, $user->tokens()->count());
     }
 
+    public function test_email_verification_is_persisted_and_allows_subsequent_login(): void
+    {
+        $user = User::factory()->create(['email_verified_at' => null]);
+        DB::table('email_verification_otps')->insert([
+            'email' => $user->email,
+            'otp' => Hash::make('123456'),
+            'created_at' => now(),
+        ]);
+
+        $this->postJson('/api/auth/verify-email', [
+            'email' => $user->email,
+            'otp' => '123456',
+        ])->assertOk();
+
+        $this->assertNotNull($user->fresh()->email_verified_at);
+
+        $this->postJson('/api/auth/login', [
+            'email' => $user->email,
+            'password' => 'password',
+        ])->assertOk()->assertJsonStructure(['token', 'user']);
+    }
+
     public function test_verified_user_can_log_in_and_receive_a_token(): void
     {
         $user = User::factory()->create(['email_verified_at' => now()]);

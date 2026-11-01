@@ -2762,21 +2762,26 @@ $aiResponse = $intro
         // ── CHECKOUT STATE PERSISTENCE ─────────────────────────────────────
         // Never let an AI success claim escape when a customer confirms before
         // Salla's required receiver/shipping details have been collected.
+        $aiAskedToConfirmIncompleteOrder = (bool) preg_match(
+            '/\b(?:confirm|confirmation|place (?:the )?order|complete (?:the )?purchase|go ahead)\b/i',
+            (string) $aiResponse
+        );
         if (
-            $intent === 'place_order'
-            && $containsConfirmPhrase
-            && $sallaChannel
+            $sallaChannel
             && !empty($updatedCheckoutState['salla_product_id'])
             && empty($fieldStatus['is_complete'])
+            && !$isProductBrowseMessage
+            && ($containsConfirmPhrase || $intent === 'place_order' || $aiAskedToConfirmIncompleteOrder)
         ) {
             $missingLabels = [
                 'full_name' => 'full name',
                 'phone' => 'phone number',
-                'address' => 'complete delivery address',
-                'email' => 'email address',
-                'postal_code' => 'postal / ZIP code',
-                'geo_coordinates' => 'complete written delivery address with street, building number, district, and postal code',
-                'building_number' => 'building or house number',
+                'address' => 'delivery address',
+                'postal_code' => 'postal code',
+                'geo_coordinates' => 'a clear delivery city so its location can be looked up automatically',
+                'building_number' => 'building number',
+                'block' => 'block number/name',
+                'district' => 'district/neighborhood',
                 'short_address' => 'short / national address code',
                 'additional_number' => 'additional address number',
             ];

@@ -6,8 +6,8 @@ namespace App\Helpers;
  * Stateless helper for normalizing and validating phone numbers
  * for the Salla order-creation API.
  *
- * Salla Technical Support confirmed:
- * - receiver.phone: full country code WITHOUT leading '+' (e.g. 9665XXXXXXXX)
+ * Salla Technical Support confirmed for this store (overriding the current docs example):
+ * - receiver.phone: full international number WITH leading '+' (e.g. +9665XXXXXXXX)
  * - receiver.country_code: ISO 2-letter code (e.g. SA)
  * - customer.mobile: separate field, MAY include leading '+'
  * - Saudi mobile: 966 + 5XXXXXXXX (9 national digits starting with 5)
@@ -155,7 +155,8 @@ class SallaPhoneHelper
 
     /**
      * Format phone for Salla's `receiver.phone` field.
-     * Returns the full number WITHOUT leading '+': e.g. '966512345678'
+     * Salla Support reproduced rejection without '+' and acceptance with it.
+     * Returns the full international number WITH leading '+': e.g. '+966512345678'.
      *
      * @throws \InvalidArgumentException if the phone is invalid or unrecognizable
      */
@@ -168,8 +169,7 @@ class SallaPhoneHelper
             );
         }
 
-        // Full number without +
-        return ltrim($normalized['calling_code'], '+') . $normalized['national'];
+        return $normalized['calling_code'] . $normalized['national'];
     }
 
     /**

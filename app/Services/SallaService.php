@@ -896,6 +896,23 @@ class SallaService
             return null;
         }
 
+        // Validate before customer creation so a malformed checkout phone never
+        // creates an orphan customer with a null/incorrect calling code.
+        $phoneNormalized = SallaPhoneHelper::normalize($phone);
+        if ($phoneNormalized === null) {
+            Log::info('SallaService: phone country could not be determined for customer', [
+                'channel_id' => $channel->id,
+            ]);
+            return null;
+        }
+
+        if (!SallaPhoneHelper::isValidFormat($phone)) {
+            Log::warning('SallaService: phone number has invalid format for order creation', [
+                'channel_id' => $channel->id,
+            ]);
+            return null;
+        }
+
         $customerId = $this->resolveOrCreateCustomerForChannel($channel, $phone, $fullName, $email);
         if (!$customerId) {
             Log::warning('SallaService: unable to resolve or create customer_id for order creation', [
@@ -1002,23 +1019,8 @@ class SallaService
             return null;
         }
 
-        $phoneNormalized = SallaPhoneHelper::normalize($phone);
-        if ($phoneNormalized === null) {
-            Log::info('SallaService: phone country could not be determined for customer', [
-                'channel_id' => $channel->id,
-            ]);
-            return null;
-        }
-
-        // Validate format before sending to Salla
-        if (!SallaPhoneHelper::isValidFormat($phone)) {
-            Log::warning('SallaService: phone number has invalid format for order creation', [
-                'channel_id' => $channel->id,
-            ]);
-            return null;
-        }
-
-        // receiver.phone: full number WITHOUT leading '+' (per Salla Tech Support)
+        // Current docs example omits '+', but Salla Support reproduced rejection
+        // without it and acceptance with it for this store. Preserve their confirmed rule.
         $receiverPhone = SallaPhoneHelper::formatForReceiver($phone);
         // customer.mobile: full number WITH leading '+' (separate Salla field)
         $customerMobile = SallaPhoneHelper::formatForCustomerMobile($phone);

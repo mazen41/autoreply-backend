@@ -155,7 +155,7 @@ Using strictly synthetic customer data and verified demo-store metadata:
 | `customer.mobile` | `"+966500000000"` | Salla documentation standard test phone. |
 | `customer.email` | `"sandbox-order-test@salla.dev"` | Synthetic test email on Salla test domain. |
 | `receiver.country_code` | `"SA"` | Verified country code matching receiver phone. |
-| `receiver.phone` | `"966500000000"` | Salla schema requirement (national without `+`). |
+| `receiver.phone` | `"+966500000000"` | Store-specific Salla Support confirmation: their test store rejects the same number without `+`; this overrides the current docs example for this integration. |
 | `receiver.notify` | `false` | Official schema toggle to suppress customer notifications. |
 | `delivery_method` | `"shipping"` | Official Salla delivery method. |
 | `courier_id` | `326899803` | Returned by `GET /shipping/companies/estimate-rate`. |
@@ -199,6 +199,15 @@ Using strictly synthetic customer data and verified demo-store metadata:
 ---
 
 ## 8. Readiness Assessment & Next Step
+
+### Support-confirmed receiver phone compatibility
+
+Salla Technical Support reproduced a validation failure when `receiver.phone`
+was sent as digits only and success when the same international number included
+the leading `+`, with `receiver.country_code` set to the ISO country code (for
+example, `+966501105068` and `SA`). The current Create Order documentation
+example still shows digits only. The application follows the support-confirmed
+behavior for this store; retain this note until Salla updates the API docs.
 
 - **Safety Checklist:**
   - Demo store verified: **YES** (`918791227`, `type: demo`).

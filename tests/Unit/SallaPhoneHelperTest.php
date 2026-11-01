@@ -19,7 +19,7 @@ class SallaPhoneHelperTest extends TestCase
         $this->assertSame('+966', $norm1['calling_code']);
         $this->assertSame('558912437', $norm1['national']);
         $this->assertSame('SA', $norm1['iso']);
-        $this->assertSame('966558912437', SallaPhoneHelper::formatForReceiver('0558912437'));
+        $this->assertSame('+966558912437', SallaPhoneHelper::formatForReceiver('0558912437'));
         $this->assertSame('+966558912437', SallaPhoneHelper::formatForCustomerMobile('0558912437'));
         $this->assertTrue(SallaPhoneHelper::isValidSaudiMobile('0558912437'));
 
@@ -29,23 +29,23 @@ class SallaPhoneHelperTest extends TestCase
         $this->assertSame('+966', $norm2['calling_code']);
         $this->assertSame('558912437', $norm2['national']);
         $this->assertSame('SA', $norm2['iso']);
-        $this->assertSame('966558912437', SallaPhoneHelper::formatForReceiver('558912437'));
+        $this->assertSame('+966558912437', SallaPhoneHelper::formatForReceiver('558912437'));
         $this->assertSame('+966558912437', SallaPhoneHelper::formatForCustomerMobile('558912437'));
         $this->assertTrue(SallaPhoneHelper::isValidSaudiMobile('558912437'));
     }
 
     /**
      * Requirement 2: A valid international number beginning with +966
-     * produces receiver.phone without +.
+     * produces receiver.phone with +, per Salla support's store-specific confirmation.
      */
-    public function test_valid_international_number_produces_receiver_phone_without_plus(): void
+    public function test_valid_international_number_produces_receiver_phone_with_plus(): void
     {
         $phone = '+966558912437';
         $receiverPhone = SallaPhoneHelper::formatForReceiver($phone);
 
-        $this->assertSame('966558912437', $receiverPhone);
-        $this->assertStringStartsNotWith('+', $receiverPhone);
-        $this->assertSame(12, strlen($receiverPhone));
+        $this->assertSame('+966558912437', $receiverPhone);
+        $this->assertStringStartsWith('+', $receiverPhone);
+        $this->assertSame(13, strlen($receiverPhone));
     }
 
     /**
@@ -57,9 +57,9 @@ class SallaPhoneHelperTest extends TestCase
         $alreadyNormalized = '966558912437';
         $receiverPhone = SallaPhoneHelper::formatForReceiver($alreadyNormalized);
 
-        $this->assertSame('966558912437', $receiverPhone);
+        $this->assertSame('+966558912437', $receiverPhone);
         $this->assertStringNotContainsString('966966', $receiverPhone);
-        $this->assertSame(12, strlen($receiverPhone));
+        $this->assertSame(13, strlen($receiverPhone));
     }
 
     /**
@@ -192,7 +192,7 @@ class SallaPhoneHelperTest extends TestCase
 
         foreach ($variations as $var) {
             $this->assertSame(
-                '966558912437',
+                '+966558912437',
                 SallaPhoneHelper::formatForReceiver($var),
                 "Failed formatting receiver phone for variation: {$var}"
             );
@@ -215,11 +215,11 @@ class SallaPhoneHelperTest extends TestCase
     public function test_accidental_trunk_zero_after_country_code_is_stripped(): void
     {
         $withTrunk = '+966 0558912437';
-        $this->assertSame('966558912437', SallaPhoneHelper::formatForReceiver($withTrunk));
+        $this->assertSame('+966558912437', SallaPhoneHelper::formatForReceiver($withTrunk));
         $this->assertSame('+966558912437', SallaPhoneHelper::formatForCustomerMobile($withTrunk));
 
         $unprefixedWithTrunk = '9660558912437';
-        $this->assertSame('966558912437', SallaPhoneHelper::formatForReceiver($unprefixedWithTrunk));
+        $this->assertSame('+966558912437', SallaPhoneHelper::formatForReceiver($unprefixedWithTrunk));
         $this->assertSame('+966558912437', SallaPhoneHelper::formatForCustomerMobile($unprefixedWithTrunk));
     }
 }

@@ -320,8 +320,8 @@ class SallaServiceTest extends TestCase
 
         $this->assertNotNull($payload);
 
-        // receiver.phone: full country code WITHOUT leading '+' (Salla confirmed spec)
-        $this->assertSame('966558912437', $payload['receiver']['phone']);
+        // Salla Support confirmed this store rejects receiver.phone without '+'.
+        $this->assertSame('+966558912437', $payload['receiver']['phone']);
         $this->assertSame('SA', $payload['receiver']['country_code']);
         $this->assertFalse($payload['receiver']['notify']);
         $this->assertSame('Test Customer', $payload['receiver']['name']);
@@ -337,6 +337,7 @@ class SallaServiceTest extends TestCase
         $this->assertSame('shipping', $payload['delivery_method']);
         $this->assertSame(326899803, $payload['courier_id']);
         $this->assertSame(1242785692, $payload['products'][0]['identifier']);
+        $this->assertSame('id', $payload['products'][0]['identifier_type']);
         $this->assertSame(1, $payload['products'][0]['quantity']);
         $this->assertSame('cod', $payload['payment']['method']);
         $this->assertSame('pending_payment', $payload['payment']['status']);
@@ -406,6 +407,10 @@ class SallaServiceTest extends TestCase
 
         // Must reject placeholder phone before creating an invalid order in Salla
         $this->assertNull($payload);
+        Http::assertNotSent(fn ($request) =>
+            $request->method() === 'POST'
+            && str_contains($request->url(), '/admin/v2/customers')
+        );
     }
 
     public function test_build_canonical_order_payload_preserves_non_saudi_market_country_code(): void
@@ -466,7 +471,7 @@ class SallaServiceTest extends TestCase
 
         $this->assertNotNull($payload);
         $this->assertSame('EG', $payload['receiver']['country_code']);
-        $this->assertSame('201001234567', $payload['receiver']['phone']);
+        $this->assertSame('+201001234567', $payload['receiver']['phone']);
         $this->assertSame('+201001234567', $payload['customer']['mobile']);
     }
 }

@@ -109,8 +109,22 @@ class SallaOrderPayloadPhoneTest extends TestCase
         return $body;
     }
 
+    private function sentCustomerCreationBody(): array
+    {
+        $body = null;
+        Http::assertSent(function ($request) use (&$body) {
+            if ($request->method() === 'POST' && str_contains($request->url(), '/admin/v2/customers')) {
+                $body = $request->data();
+                return true;
+            }
+            return false;
+        });
+        $this->assertNotNull($body, 'A new Salla customer should be created when no matching customer exists');
+        return $body;
+    }
+
     /** @test */
-    public function saudi_number_is_sent_as_documented_in_receiver_and_customer_fields(): void
+    public function saudi_number_is_sent_in_support_confirmed_receiver_and_customer_formats(): void
     {
         $channel = $this->channel();
         $this->fakeSalla();
@@ -118,9 +132,15 @@ class SallaOrderPayloadPhoneTest extends TestCase
         app(SallaService::class)->createOrderForChannel($channel, $this->state('+966505308084'));
 
         $body = $this->sentOrderBody();
-        $this->assertSame('966505308084', $body['receiver']['phone']);
+        $this->assertSame('+966505308084', $body['receiver']['phone']);
         $this->assertSame('SA', $body['receiver']['country_code']);
         $this->assertSame('+966505308084', $body['customer']['mobile']);
+        $this->assertSame('shipping', $body['delivery_method']);
+        $this->assertSame('cod', $body['payment']['method']);
+        $this->assertSame('pending_payment', $body['payment']['status']);
+        $this->assertSame('id', $body['products'][0]['identifier_type']);
+        $this->assertSame(44563344, $body['products'][0]['identifier']);
+        $this->assertArrayHasKey('cash_on_delivery', $body['payment']);
 
         // ship_to must never contain an invented block — Salla rejects unlabelled text here.
         $this->assertArrayNotHasKey('block', $body['ship_to'] ?? [],
@@ -139,9 +159,16 @@ class SallaOrderPayloadPhoneTest extends TestCase
         app(SallaService::class)->createOrderForChannel($channel, $this->state('01152879755'));
 
         $body = $this->sentOrderBody();
-        $this->assertSame('201152879755', $body['receiver']['phone']);
+        $this->assertSame('+201152879755', $body['receiver']['phone']);
         $this->assertSame('EG', $body['receiver']['country_code']);
         $this->assertSame('+201152879755', $body['customer']['mobile']);
+
+        $customerBody = $this->sentCustomerCreationBody();
+        $this->assertSame('Test', $customerBody['first_name']);
+        $this->assertSame('Customer', $customerBody['last_name']);
+        $this->assertSame('1152879755', $customerBody['mobile']);
+        $this->assertSame('+20', $customerBody['mobile_code_country']);
+        $this->assertSame('customer@example.test', $customerBody['email']);
 
         // ship_to must never contain an invented block — Salla rejects unlabelled text here.
         $this->assertArrayNotHasKey('block', $body['ship_to'] ?? [],

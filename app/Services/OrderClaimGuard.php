@@ -166,8 +166,11 @@ class OrderClaimGuard
             'postal_code' => 'postal code',
             'geo_coordinates' => 'delivery address details',
             'building_number' => 'building number',
+            'block' => 'block number/name',
+            'district' => 'district/neighborhood',
             'short_address' => 'short address code',
             'additional_number' => 'additional address number',
+            'po_box' => 'P.O. Box number',
         ];
 
         if ($missingFields !== []) {
@@ -177,7 +180,9 @@ class OrderClaimGuard
                     'full_name' => 'الاسم الكامل', 'phone' => 'رقم الهاتف', 'address' => 'عنوان التوصيل',
                     'email' => 'البريد الإلكتروني', 'postal_code' => 'الرمز البريدي',
                     'geo_coordinates' => 'تفاصيل عنوان التوصيل', 'building_number' => 'رقم المبنى',
+                    'block' => 'رقم/اسم البلوك', 'district' => 'الحي',
                     'short_address' => 'العنوان المختصر', 'additional_number' => 'الرقم الإضافي',
+                    'po_box' => 'رقم صندوق البريد',
                 ];
                 $missing = array_map(fn ($field) => $arabic[$field] ?? $field, $missingFields);
                 return 'لم يتم إرسال الطلب بعد. من فضلك أرسل: ' . implode('، ', $missing) . '.';

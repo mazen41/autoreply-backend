@@ -838,6 +838,7 @@ class ProcessAutoReply implements ShouldQueue
                 'channel_type' => $channel->type,
                 'referenced_platform_message_id_present' => !empty($quotedMessageId),
                 'match_method' => $referenceResolution['match_method'],
+                'platform_id_normalized' => $referenceResolution['platform_id_normalized'] ?? false,
                 'resolution' => $referenceResolution['resolution'],
                 'product_external_id' => $referencedProduct['commerce_external_id'] ?? null,
                 'store_id' => $commerceChannel?->id,

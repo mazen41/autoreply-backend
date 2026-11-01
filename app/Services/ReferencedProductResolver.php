@@ -39,6 +39,7 @@ class ReferencedProductResolver
             'product' => null,
             'candidates' => [],
             'is_pointer' => $pointer,
+            'platform_id_normalized' => false,
         ];
 
         if (!$eligibleConnection) {
@@ -128,6 +129,44 @@ if ($referenceId !== null && $referenceId !== '') {
                 $mapQuery->where('platform_message_id', (string) $referenceId);
             }
             $map = $mapQuery->latest('id')->first();
+            if (!$map && $channelType === 'instagram') {
+                // Instagram's reply webhook uses a `new_ig_dm_item` ID while
+                // the send API returns `ig_dm_item` for the same message. The
+                // opaque wrappers differ, but the decoded Meta payload has a
+                // stable binary body. Compare that body only when the raw
+                // exact lookup misses, and only accept one authorized map in
+                // this conversation/channel.
+                $referenceFingerprint = $this->metaMessageIdFingerprint((string) $referenceId);
+                if ($referenceFingerprint !== null) {
+                    $normalizedMatches = (clone $query)
+                        ->whereNotNull('platform_message_id')
+                        ->get()
+                        ->filter(function (ProductMessageMap $candidate) use ($referenceFingerprint): bool {
+                            $candidateFingerprint = $this->metaMessageIdFingerprint((string) $candidate->platform_message_id);
+                            return $candidateFingerprint !== null
+                                && hash_equals($referenceFingerprint, $candidateFingerprint);
+                        })
+                        ->values();
+
+                    if ($normalizedMatches->count() === 1) {
+                        $map = $normalizedMatches->first();
+                        $base['platform_id_normalized'] = true;
+                        Log::info('Referenced Instagram product image matched after Meta ID normalization', [
+                            'message_id' => $message->id,
+                            'conversation_id' => $conversation->id,
+                            'map_id' => $map->id,
+                            'commerce_connection_id' => $map->commerce_channel_id,
+                        ]);
+                    } elseif ($normalizedMatches->count() > 1) {
+                        Log::warning('Referenced Instagram product image ID normalization was ambiguous', [
+                            'message_id' => $message->id,
+                            'conversation_id' => $conversation->id,
+                            'candidate_count' => $normalizedMatches->count(),
+                        ]);
+                    }
+                }
+            }
+
             if ($map) {
                 if ($this->mapIsResolvable($map)) {
                     $base['resolution'] = 'resolved';
@@ -279,6 +318,39 @@ if ($referenceId !== null && $referenceId !== '') {
     private function mapIsResolvable(ProductMessageMap $map): bool
     {
         return !empty($map->commerce_channel_id) && !empty($map->commerce_external_id);
+    }
+
+    /**
+     * Stable payload key for the two Instagram MID wrappers seen in production:
+     * webhook `new_ig_dm_item` and send response `ig_dm_item`.
+     */
+    private function metaMessageIdFingerprint(string $messageId): ?string
+    {
+        if (str_starts_with($messageId, 'bmV3X2lnX2RtX2l0')) {
+            $trailingBytes = 2;
+        } elseif (str_starts_with($messageId, 'aWdfZAG1faXRlbT')) {
+            $trailingBytes = 4;
+        } else {
+            return null;
+        }
+
+        $decoded = base64_decode($messageId, true);
+        if (!is_string($decoded)) {
+            return null;
+        }
+
+        $payloadMarker = hex2bin('9443a313');
+        $payloadOffset = strpos($decoded, $payloadMarker);
+        if ($payloadOffset === false) {
+            return null;
+        }
+
+        $payloadLength = strlen($decoded) - $payloadOffset - $trailingBytes;
+        if ($payloadLength < 80) {
+            return null;
+        }
+
+        return hash('sha256', substr($decoded, $payloadOffset, $payloadLength));
     }
 
     private function toProduct(ProductMessageMap $map): array

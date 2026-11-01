@@ -9,7 +9,7 @@ return new class extends Migration
 {
     /**
      * Enforces "at most one ACTIVE enrollment per (sequence_id, conversation_id)"
-     * at the database level using a stored generated column + unique index.
+     * at the database level using a virtual generated column + unique index.
      *
      * Rewritten to be fully idempotent and to avoid the FK-drop/re-add
      * dance that failed in production (sequence_enrollments has no FK on
@@ -18,7 +18,7 @@ return new class extends Migration
     public function up(): void
     {
         // Skip this on SQLite since information_schema.STATISTICS doesn't exist
-        // and generated columns with STORED may not be supported
+        // and generated columns with VIRTUAL may not be supported
         if (DB::getDriverName() === 'sqlite') {
             return;
         }
@@ -32,7 +32,7 @@ return new class extends Migration
                 ADD COLUMN conversation_id_if_active BIGINT UNSIGNED
                 GENERATED ALWAYS AS (
                     CASE WHEN status = 'active' THEN conversation_id ELSE NULL END
-                ) STORED
+                ) VIRTUAL
             ");
         }
 

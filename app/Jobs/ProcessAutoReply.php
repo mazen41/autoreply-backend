@@ -4114,11 +4114,24 @@ $aiResponse = $intro
                     // A provider HTTP response confirms rejection. Network
                     // failures stay pending because the provider may have
                     // accepted the request before the connection dropped.
-                    if (preg_match('/^API call failed: (?:HTTP\s*)?(\d{3})\b/', $e->getMessage(), $statusMatch)
+                    $sallaPreflightRejected = str_contains(
+                        $e->getMessage(),
+                        'Canonical Salla order payload could not be constructed'
+                    );
+                    if ($sallaPreflightRejected
+                        || preg_match('/^API call failed: (?:HTTP\s*)?(\d{3})\b/', $e->getMessage(), $statusMatch)
                         || str_contains(strtolower($e->getMessage()), 'token expired')
                         || str_contains(strtolower($e->getMessage()), 'scope missing')
                         || str_contains(strtolower($e->getMessage()), 'rate limited')) {
                         $attempt->update(['status' => 'failed']);
+                    }
+                    if ($sallaPreflightRejected) {
+                        Log::warning('ProcessAutoReply: Salla order rejected before provider request; attempt is safe to retry after checkout data is corrected', [
+                            'conversation_id' => $conversation->id,
+                            'connection_id' => $sallaChannel->id,
+                            'attempt_id' => $attempt->id,
+                            'provider_request_sent' => false,
+                        ]);
                     }
                     Log::error('SALLA_ORDER_CREATION_FAILED', [
                         'conversation_id' => $conversation->id,

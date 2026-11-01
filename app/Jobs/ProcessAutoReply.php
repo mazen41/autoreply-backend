@@ -2368,20 +2368,7 @@ if (!$isProductBrowseMessage && $commerceChannel && !$summaryConfirmTurn) {
             && !$shopifyVariantSelectionRequired
             && ($checkoutState['confirmation_state'] ?? null) === 'confirmation_pending';
         if ($isOrderSummaryMessage) {
-            $productName = trim((string) ($checkoutState['product_name'] ?? 'Selected product'));
-            $price = $checkoutState['product_price'] ?? $checkoutState['price'] ?? null;
-            $currency = trim((string) ($checkoutState['product_currency'] ?? $checkoutState['currency'] ?? ''));
-            $priceText = $price !== null && $price !== '' ? trim((string) $price . ' ' . $currency) : 'Not available';
-            $storeName = trim((string) ($commerceChannel?->page_name ?? '')) ?: 'our store';
-            $aiResponse = "Please review your order summary:\n"
-                . "Product: {$productName}\n"
-                . (!empty($checkoutState['commerce_variant_title']) ? 'Variant: ' . trim((string) $checkoutState['commerce_variant_title']) . "\n" : '')
-                . "Price: {$priceText}\n"
-                . "Store: {$storeName}\n"
-                . 'Name: ' . trim((string) ($checkoutState['full_name'] ?? '')) . "\n"
-                . 'Phone: ' . (\App\Services\OrderCheckoutService::isValidPhone($checkoutState['phone'] ?? $checkoutState['customer_phone'] ?? null) ? trim((string) ($checkoutState['phone'] ?? $checkoutState['customer_phone'])) : 'not provided yet') . "\n"
-                . 'Delivery address: ' . trim((string) ($checkoutState['address'] ?? $checkoutState['customer_address'] ?? '')) . "\n\n"
-                . 'Reply “confirm order” to place it, or “cancel” to stop.';
+            $aiResponse = $this->buildOrderConfirmationSummary($checkoutState, $commerceChannel);
         }
 
         // Ask for the product option first when the customer wants to order, so the option is
@@ -2885,6 +2872,39 @@ $aiResponse = $intro
             $fieldStatus['missing_fields'] ?? [],
             $detectedLanguage
         );
+        if (
+            !$claimGuard['allowed']
+            && !empty($claimGuard['should_send_order_summary'])
+            && !empty($fieldStatus['is_complete'])
+            && !$shopifyVariantSelectionRequired
+            && !empty($guardCheckoutState['product_name'])
+            && !empty($guardCheckoutState['commerce_external_id'] ?? $guardCheckoutState['salla_product_id'] ?? null)
+        ) {
+            // Recover a complete checkout deterministically if the model asks
+            // for a field that is already present. This message itself becomes
+            // the required current summary; it still requires the customer to
+            // confirm on a later turn before any provider API is called.
+            $updatedCheckoutState = $guardCheckoutState;
+            $updatedCheckoutState['confirmation_state'] = 'confirmation_pending';
+            unset(
+                $updatedCheckoutState['confirmation_summary_message_id'],
+                $updatedCheckoutState['confirmation_summary_fingerprint'],
+                $updatedCheckoutState['confirmation_summary_sent_at']
+            );
+            $conversation->update(['checkout_state' => $updatedCheckoutState]);
+            $checkoutState = $updatedCheckoutState;
+            $aiResponse = $this->buildOrderConfirmationSummary($updatedCheckoutState, $commerceChannel);
+            $isOrderSummaryMessage = true;
+            $knownFieldReason = $claimGuard['reason'];
+            $claimGuard['decision'] = 'replaced';
+            $claimGuard['reason'] = 'known_checkout_field_recovered_with_summary';
+            $claimGuard['replacement'] = $aiResponse;
+            Log::warning('ProcessAutoReply: replaced repeated known-field question with a fresh order summary', [
+                'conversation_id' => $conversation->id,
+                'message_id' => $message->id,
+                'field_reason' => $knownFieldReason,
+            ]);
+        }
         if (!$claimGuard['allowed']) {
             $aiResponse = $claimGuard['replacement'];
             $messageMetadata = is_array($replyMessage->metadata) ? $replyMessage->metadata : [];
@@ -4477,6 +4497,27 @@ $aiResponse = $intro
             preg_replace('/\D+/', '', (string) ($state['phone'] ?? $state['customer_phone'] ?? '')),
             mb_strtolower(trim((string) ($state['address'] ?? $state['customer_address'] ?? ''))),
         ]));
+    }
+
+    /** Build the exact summary required before an explicit order confirmation. */
+    private function buildOrderConfirmationSummary(array $checkoutState, ?Channel $commerceChannel): string
+    {
+        $productName = trim((string) ($checkoutState['product_name'] ?? 'Selected product'));
+        $price = $checkoutState['product_price'] ?? $checkoutState['price'] ?? null;
+        $currency = trim((string) ($checkoutState['product_currency'] ?? $checkoutState['currency'] ?? ''));
+        $priceText = $price !== null && $price !== '' ? trim((string) $price . ' ' . $currency) : 'Not available';
+        $storeName = trim((string) ($commerceChannel?->page_name ?? '')) ?: 'our store';
+        $phone = $checkoutState['phone'] ?? $checkoutState['customer_phone'] ?? null;
+
+        return "Please review your order summary:\n"
+            . "Product: {$productName}\n"
+            . (!empty($checkoutState['commerce_variant_title']) ? 'Variant: ' . trim((string) $checkoutState['commerce_variant_title']) . "\n" : '')
+            . "Price: {$priceText}\n"
+            . "Store: {$storeName}\n"
+            . 'Name: ' . trim((string) ($checkoutState['full_name'] ?? '')) . "\n"
+            . 'Phone: ' . (\App\Services\OrderCheckoutService::isValidPhone($phone) ? trim((string) $phone) : 'not provided yet') . "\n"
+            . 'Delivery address: ' . trim((string) ($checkoutState['address'] ?? $checkoutState['customer_address'] ?? '')) . "\n\n"
+            . 'Reply “confirm order” to place it, or “cancel” to stop.';
     }
 
     /** Keep Shopify's useful validation details in logs without exposing checkout PII. */

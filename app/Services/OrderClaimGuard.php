@@ -42,6 +42,10 @@ class OrderClaimGuard
                 'claims_completion' => false,
                 'order_record_present' => $orderPresent,
                 'reason' => 'asks_known_' . $askedKnownField,
+                // With no missing checkout fields, the right recovery is to
+                // show the deterministic summary again, not claim that an
+                // order submission failed before it was attempted.
+                'should_send_order_summary' => $missingFields === [],
                 'replacement' => $this->replacement($missingFields, $language),
             ];
         }

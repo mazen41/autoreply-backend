@@ -120,6 +120,7 @@ class OrderClaimGuardTest extends TestCase
 
         $this->assertFalse($result['allowed']);
         $this->assertSame('asks_known_full_name', $result['reason']);
+        $this->assertFalse($result['should_send_order_summary']);
         $this->assertStringContainsString('phone number', strtolower($result['replacement']));
         $this->assertStringNotContainsString('full name', strtolower($result['replacement']));
     }
@@ -151,6 +152,7 @@ class OrderClaimGuardTest extends TestCase
 
         $this->assertFalse($result['allowed']);
         $this->assertSame('asks_known_full_name', $result['reason']);
+        $this->assertTrue($result['should_send_order_summary']);
     }
 
     private function makeConversation(): array

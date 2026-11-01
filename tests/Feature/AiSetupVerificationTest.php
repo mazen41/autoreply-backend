@@ -37,6 +37,23 @@ class AiSetupVerificationTest extends TestCase
             ->assertJsonPath('checks.handoff_recipient_configured.passed', false);
     }
 
+    public function test_provider_check_accepts_the_connected_agents_configured_provider(): void
+    {
+        [$user, $business, , $bot] = $this->readyBusiness();
+        $bot->update(['ai_provider' => 'groq']);
+        config([
+            'services.ai.provider' => 'groq',
+            'services.groq.api_key' => 'test-groq-key',
+            'services.gemini.api_key' => null,
+        ]);
+        Sanctum::actingAs($user);
+
+        $this->getJson('/api/ai/setup-verification', ['X-Business-Id' => (string) $business->id])
+            ->assertOk()
+            ->assertJsonPath('checks.provider_configured.passed', true)
+            ->assertJsonPath('checks.active_agent.passed', true);
+    }
+
     public function test_channel_ai_cannot_be_enabled_until_readiness_checks_and_test_reply_pass(): void
     {
         [$user, $business, $channel] = $this->readyBusiness();

@@ -15,11 +15,18 @@ class AiSetupVerificationService
         $connectedChannelIds = (clone $connectedChannelQuery)->pluck('id');
 
         $provider = strtolower((string) ($business->ai_provider ?: config('services.ai.provider')));
-        $providerKey = $this->providerKey($provider);
-        $activeConnectedAgent = $business->bots()->where('status', 'active')
+        $activeConnectedBots = $business->bots()->where('status', 'active')
             ->whereHas('channels', fn ($query) => $query->whereIn('channels.id', $connectedChannelIds))
-            ->get(['id', 'ai_provider'])
+            ->get(['id', 'ai_provider']);
+        $activeConnectedAgent = $activeConnectedBots
             ->contains(fn (Bot $bot) => filled($this->providerKey(strtolower((string) ($bot->ai_provider ?: $provider)))));
+        $configuredProvider = collect([
+            $provider,
+            strtolower((string) config('services.ai.provider')),
+        ])->merge($activeConnectedBots->pluck('ai_provider')->filter())
+            ->map(fn ($candidate) => strtolower((string) $candidate))
+            ->unique()
+            ->contains(fn (string $candidate) => filled($this->providerKey($candidate)));
 
         $hasInstructions = filled($business->ai_instructions)
             || filled($business->knowledge_base)
@@ -37,7 +44,7 @@ class AiSetupVerificationService
                 'label' => 'Create an active agent with a supported provider and assign a connected channel',
             ],
             'provider_configured' => [
-                'passed' => $providerKey !== null && trim((string) $providerKey) !== '',
+                'passed' => $configuredProvider,
                 'label' => 'Configure a supported AI provider',
             ],
             'knowledge_or_instructions' => [

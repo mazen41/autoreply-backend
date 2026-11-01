@@ -82,6 +82,32 @@ class ReferencedProductResolver
             }
         }
 
+        // A bare "1" / "2" reply right after we showed a numbered "which product
+        // do you mean?" list must map to THAT exact list, never to a freshly
+        // re-queried "recent products" set and never to a free-text AI guess.
+        // This is checked before quote/thread resolution: a plain digit has no
+        // reply-to reference of its own, and if the customer DID genuinely quote
+        // a specific message, that still resolves correctly below since this
+        // block only fires when the content is nothing but a bare number.
+        $pendingChoices = data_get($pendingConfirmationMessage?->metadata, 'pending_product_choices');
+        if (is_array($pendingChoices) && $pendingChoices !== [] && ($digit = $this->extractBareDigit($content)) !== null) {
+            $index = $digit - 1;
+            if (isset($pendingChoices[$index]) && is_array($pendingChoices[$index])) {
+                $base['resolution'] = 'resolved';
+                $base['match_method'] = 'choice_number';
+                $base['product'] = $pendingChoices[$index];
+                $base['is_pointer'] = true;
+                return $base;
+            }
+
+            // Out-of-range digit (e.g. "6" against a 5-item list): re-show the
+            // SAME list rather than falling through to an AI free-text guess.
+            $base['resolution'] = 'ambiguous';
+            $base['match_method'] = 'choice_number';
+            $base['candidates'] = $pendingChoices;
+            return $base;
+        }
+
         // Quoting our own pending order summary is a confirmation reference, not a product reference.
 $checkoutForRef = is_array($conversation->checkout_state) ? $conversation->checkout_state : [];
 $summaryRow = !empty($checkoutForRef['confirmation_summary_message_id'])
@@ -116,6 +142,23 @@ if ($referenceId !== null && $referenceId !== '') {
                     'store_id' => $map->commerce_channel_id,
                 ]);
                 $base['resolution'] = 'ambiguous';
+            } else {
+                // Exact lookup missed entirely: the id the platform sent back in
+                // its reply event doesn't match anything we stored when we sent
+                // the product image. Log both sides so a real occurrence shows
+                // the actual format mismatch instead of forcing a guess later.
+                Log::warning('Referenced product exact lookup missed — no stored map has this platform_message_id', [
+                    'message_id' => $message->id,
+                    'conversation_id' => $conversation->id,
+                    'channel_type' => $channelType,
+                    'incoming_reference_id' => $referenceId,
+                    'recent_stored_platform_message_ids' => (clone $query)
+                        ->where('created_at', '>=', now()->subMinutes(10))
+                        ->orderByDesc('created_at')
+                        ->limit(10)
+                        ->pluck('platform_message_id')
+                        ->all(),
+                ]);
             }
         }
 
@@ -169,7 +212,16 @@ if ($referenceId !== null && $referenceId !== '') {
             return 'place_order';
         }
 
-        $hasDirectReference = in_array($resolution['match_method'] ?? 'none', ['quote', 'thread'], true);
+        // The ambiguous-clarify list is only ever shown within an order-oriented
+        // flow (never plain product browsing — see the caller's isProductBrowseMessage
+        // guard), so picking a number from it always means "I want this one," the
+        // same as confirming a pointer reference. The reply text itself ("1") has
+        // no ordering words of its own, so this can't fall through to hasOrderingLanguage().
+        if (($resolution['match_method'] ?? null) === 'choice_number' && ($resolution['resolution'] ?? null) === 'resolved') {
+            return 'place_order';
+        }
+
+        $hasDirectReference = in_array($resolution['match_method'] ?? 'none', ['quote', 'thread', 'choice_number'], true);
         if (empty($resolution['is_pointer']) && !$hasDirectReference) {
             return null;
         }
@@ -183,6 +235,19 @@ if ($referenceId !== null && $referenceId !== '') {
     public function hasPointer(string $text): bool
     {
         return $this->matchesPhrase($text, config('referenced_products.pointers', []));
+    }
+
+    /** "1", "2.", "٣" (Arabic-Indic), optionally with trailing punctuation — nothing else. */
+    private function extractBareDigit(string $text): ?int
+    {
+        $translit = strtr(trim($text), [
+            '٠' => '0', '١' => '1', '٢' => '2', '٣' => '3', '٤' => '4',
+            '٥' => '5', '٦' => '6', '٧' => '7', '٨' => '8', '٩' => '9',
+        ]);
+        if (preg_match('/^(\d{1,2})[\.\)\-]?$/u', $translit, $m)) {
+            return (int) $m[1];
+        }
+        return null;
     }
 
     public function hasOrderingLanguage(string $text): bool

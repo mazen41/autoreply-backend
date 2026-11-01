@@ -183,4 +183,61 @@ class ReferencedProductResolverTest extends TestCase
         $this->assertCount(2, $ambiguous['candidates']);
         $this->assertSame('none', $none['resolution']);
     }
+
+    public function test_bare_digit_reply_resolves_against_the_exact_list_just_shown(): void
+    {
+        // Regression test: a customer who replies with a bare "1" to a numbered
+        // "which product do you mean?" clarify list must get the item that was
+        // ACTUALLY at position 1 in that exact list — not a freshly re-queried
+        // "recent products" set, and never a free-text AI guess at a product
+        // that was never even shown (the real production bug this closes).
+        $f = $this->setupCommerce();
+        // Decoy: a product in product_message_map that is NOT in the clarify
+        // list below. Before the fix, "recent" re-querying could surface this.
+        $this->addMap($f['conversation'], $f['store'], 'decoy-image', 'decoy-sku', 'Decoy Snowboard');
+
+        Message::create([
+            'conversation_id' => $f['conversation']->id,
+            'content' => "Which product do you mean? Please choose one:\n1. Liquid\n2. Hydrogen",
+            'direction' => 'outbound',
+            'status' => 'sent',
+            'is_ai' => true,
+            'metadata' => ['pending_product_choices' => [
+                ['commerce_external_id' => 'liquid-sku', 'commerce_channel_id' => $f['store']->id, 'name' => 'Liquid', 'price' => '749.95', 'currency' => 'SAR'],
+                ['commerce_external_id' => 'hydrogen-sku', 'commerce_channel_id' => $f['store']->id, 'name' => 'Hydrogen', 'price' => '600', 'currency' => 'SAR'],
+            ]],
+        ]);
+
+        $resolver = app(ReferencedProductResolver::class);
+        $result = $resolver->resolve($this->inbound($f['conversation'], '1'), $f['conversation'], $f['store']);
+
+        $this->assertSame('resolved', $result['resolution']);
+        $this->assertSame('choice_number', $result['match_method']);
+        $this->assertSame('liquid-sku', $result['product']['commerce_external_id']);
+        $this->assertNotSame('decoy-sku', $result['product']['commerce_external_id']);
+        $this->assertSame('place_order', $resolver->intentFor('1', $result));
+    }
+
+    public function test_out_of_range_digit_reclarifies_instead_of_guessing(): void
+    {
+        $f = $this->setupCommerce();
+        Message::create([
+            'conversation_id' => $f['conversation']->id,
+            'content' => "Which product do you mean? Please choose one:\n1. Liquid\n2. Hydrogen",
+            'direction' => 'outbound',
+            'status' => 'sent',
+            'is_ai' => true,
+            'metadata' => ['pending_product_choices' => [
+                ['commerce_external_id' => 'liquid-sku', 'commerce_channel_id' => $f['store']->id, 'name' => 'Liquid', 'price' => '749.95', 'currency' => 'SAR'],
+                ['commerce_external_id' => 'hydrogen-sku', 'commerce_channel_id' => $f['store']->id, 'name' => 'Hydrogen', 'price' => '600', 'currency' => 'SAR'],
+            ]],
+        ]);
+
+        $resolver = app(ReferencedProductResolver::class);
+        $result = $resolver->resolve($this->inbound($f['conversation'], '6'), $f['conversation'], $f['store']);
+
+        $this->assertSame('ambiguous', $result['resolution']);
+        $this->assertNull($result['product']);
+        $this->assertCount(2, $result['candidates']);
+    }
 }

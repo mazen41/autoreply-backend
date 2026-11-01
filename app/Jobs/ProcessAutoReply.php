@@ -2558,7 +2558,12 @@ $aiResponse = $intro
                         'commerce_channel_id' => $referencedProduct['commerce_channel_id'] ?? null,
                         'commerce_external_id' => $referencedProduct['commerce_external_id'] ?? null,
                     ]]
-                    : null),
+                    : (($referenceResolution['resolution'] === 'ambiguous' && !empty($referenceResolution['candidates']))
+                        // Pin the exact numbered list shown to the customer, in order, so a bare
+                        // "1" reply next turn maps deterministically to THIS list — never a
+                        // freshly re-queried "recent products" set and never an AI guess.
+                        ? ['pending_product_choices' => array_values($referenceResolution['candidates'])]
+                        : null)),
             'confidence_score' => self::normalizeConfidenceScore($aiResult['confidence'] ?? null),
             'detected_dialect' => in_array($detectedDialect, ['egyptian', 'gulf', 'msa', 'mixed']) ? $detectedDialect : null,
             'intent' => $intent,

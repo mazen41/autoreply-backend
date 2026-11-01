@@ -1036,12 +1036,15 @@ class SallaService
         if ($countryCode === 'SA' && $districtName !== '') {
             $districtId = $this->resolveDistrictIdForChannel($channel, (int) $shippingAddress['city_id'], $districtName);
         }
-        if ($countryCode === 'SA' && !$districtId) {
-            Log::info('SallaService: Saudi district could not be matched to Salla district catalog', [
+        if ($countryCode === 'SA' && $districtName !== '' && !$districtId) {
+            // A free-form address segment may not be a Salla district name
+            // (for example, a street or neighborhood alias). District is
+            // optional unless this store's own order endpoint rejects the
+            // payload; never prevent an otherwise valid order locally here.
+            Log::warning('SallaService: unmatched optional Saudi district omitted; Salla will validate whether one is required', [
                 'channel_id' => $channel->id,
                 'city_id' => (int) $shippingAddress['city_id'],
             ]);
-            return null;
         }
 
         // Create/resolve the customer only after the address, product, COD

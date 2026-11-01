@@ -212,6 +212,21 @@ class SallaOrderPayloadPhoneTest extends TestCase
     }
 
     /** @test */
+    public function unknown_optional_saudi_district_is_omitted_instead_of_blocking_order(): void
+    {
+        $channel = $this->channel();
+        $this->fakeSalla();
+        $state = $this->state('+966505308084');
+        $state['district'] = 'Ghaali Mitri';
+
+        app(SallaService::class)->createOrderForChannel($channel, $state);
+
+        $body = $this->sentOrderBody();
+        $this->assertArrayNotHasKey('district', $body['ship_to']);
+        $this->assertSame(1473353380, $body['ship_to']['city']);
+    }
+
+    /** @test */
     public function salla_422_returns_only_fields_reported_by_the_store(): void
     {
         $channel = $this->channel();

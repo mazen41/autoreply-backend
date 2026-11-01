@@ -225,6 +225,10 @@ class ChannelController extends Controller
                 'ai_enabled'           => $channel->ai_enabled,
                 'effective_ai_enabled' => $effectiveAiEnabled,
                 'ai_pause_reason'      => $aiPauseReason,
+                'auto_order_confirmation_enabled' => $channel->auto_order_confirmation_enabled,
+                'effective_auto_order_confirmation_enabled' => $channel->auto_order_confirmation_enabled !== null
+                    ? (bool) $channel->auto_order_confirmation_enabled
+                    : (bool) ($business->auto_order_confirmation_enabled ?? true),
                 // Used by the bot mapping wizard to show a primary-responder
                 // control only when multiple active bots share this account.
                 'bots'                 => $activeBots->map(fn ($bot) => [

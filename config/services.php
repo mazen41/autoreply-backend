@@ -63,8 +63,9 @@ return [
     ],
 
     'nominatim' => [
-        // Configure a private/self-hosted Nominatim endpoint. Do not send
-        // customer delivery addresses to the public Nominatim service.
+        // Only a normalized city and country are sent (never a street address
+        // or customer identifiers). The public endpoint is opt-in; deployments
+        // must keep requests cached and at or below one request per second.
         'endpoint' => env('NOMINATIM_BASE_URL'),
     ],
 

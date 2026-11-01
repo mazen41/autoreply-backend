@@ -1353,7 +1353,8 @@ class ProcessAutoReply implements ShouldQueue
         $checkoutService = app(\App\Services\OrderCheckoutService::class);
         $fieldStatus = $checkoutService->computeFieldStatus(
             is_array($checkoutState) ? $checkoutState : [],
-            (bool) $sallaChannel && !empty($checkoutState['salla_product_id'])
+            (bool) $sallaChannel && !empty($checkoutState['salla_product_id']),
+            is_array($checkoutState) ? (array) ($checkoutState['salla_required_fields'] ?? []) : []
         );
 
         // ── STRUCTURED CONVERSATION STATE ────────────────────────────────────
@@ -1591,7 +1592,11 @@ class ProcessAutoReply implements ShouldQueue
         }
 
         $checkoutState = $updatedCheckoutState;
-        $fieldStatus = $checkoutService->computeFieldStatus($updatedCheckoutState, $sallaCheckoutActive);
+        $fieldStatus = $checkoutService->computeFieldStatus(
+            $updatedCheckoutState,
+            $sallaCheckoutActive,
+            (array) ($updatedCheckoutState['salla_required_fields'] ?? [])
+        );
         $hasValidOrderSummary = $this->hasValidOrderSummaryForConfirmation(
             $conversation,
             $message,
@@ -2708,6 +2713,55 @@ $aiResponse = $intro
                         'conversation_id' => $conversation->id,
                         'order_id'        => $realOrderId,
                     ]);
+                } elseif (($orderData['status'] ?? null) === 'needs_fields') {
+                    // A 422 is a definitive field-validation response, not a
+                    // failed/ambiguous order attempt. Keep checkout active and
+                    // ask only for the fields Salla explicitly rejected.
+                    $freshState = $conversation->fresh()->checkout_state;
+                    $updatedCheckoutState = is_array($freshState) ? $freshState : $updatedCheckoutState;
+                    $updatedCheckoutState['confirmation_state'] = 'collecting_info';
+                    unset(
+                        $updatedCheckoutState['confirmation_summary_message_id'],
+                        $updatedCheckoutState['confirmation_summary_fingerprint'],
+                        $updatedCheckoutState['confirmation_summary_sent_at']
+                    );
+                    $conversation->update(['checkout_state' => $updatedCheckoutState]);
+                    $checkoutState = $updatedCheckoutState;
+                    $fieldStatus = $checkoutService->computeFieldStatus(
+                        $updatedCheckoutState,
+                        $sallaCheckoutActive,
+                        (array) ($updatedCheckoutState['salla_required_fields'] ?? [])
+                    );
+                    $labels = [
+                        'postal_code' => 'postal code',
+                        'building_number' => 'building or house number',
+                        'block' => 'block number/name',
+                        'district' => 'district/neighborhood',
+                        'geo_coordinates' => 'clear delivery city/address details so I can look up its location',
+                        'short_address' => 'Saudi National Address short code',
+                        'additional_number' => 'additional address number',
+                        'address' => 'complete delivery address',
+                    ];
+                    $stillMissing = array_values(array_intersect(
+                        (array) ($orderData['missing_fields'] ?? []),
+                        (array) ($fieldStatus['missing_fields'] ?? [])
+                    ));
+                    $requestedFields = array_values(array_unique(array_map(
+                        fn ($field) => $labels[$field] ?? str_replace('_', ' ', (string) $field),
+                        $stillMissing
+                    )));
+                    if ($requestedFields === []) {
+                        $requestedFields = ['a corrected delivery detail requested by the store'];
+                    }
+                    if ($detectedLanguage === 'arabic') {
+                        $aiResponse = 'لم يتم إرسال الطلب بعد. طلب المتجر هذه البيانات الإضافية فقط: ' . implode('، ', $requestedFields) . '. أرسلها في رسالة واحدة من فضلك.';
+                    } else {
+                        $aiResponse = 'The order has not been submitted yet. The store requires these additional details: ' . implode(', ', $requestedFields) . '. Please send them in one message.';
+                    }
+                    Log::info('ProcessAutoReply: Salla validation requirements collected without escalating checkout', [
+                        'conversation_id' => $conversation->id,
+                        'missing_fields' => (array) ($orderData['missing_fields'] ?? []),
+                    ]);
                 } else {
                     // ❌ FAILURE — Salla API returned no order ID or threw an exception
                     Log::error('ProcessAutoReply: commerce order creation returned no order ID — sending honest failure reply', [
@@ -2718,6 +2772,7 @@ $aiResponse = $intro
 
                     $conversation->update([
                         'requires_human' => true,
+                        'ai_enabled' => false,
                         'status' => 'pending_human',
                         'escalated_at' => now(),
                         'escalation_reason' => $commerceChannel->type . '_order_creation_failed',
@@ -2846,6 +2901,7 @@ $aiResponse = $intro
                 );
                 $conversation->update([
                     'requires_human' => true,
+                    'ai_enabled' => false,
                     'status' => 'pending_human',
                     'escalated_at' => now(),
                     'escalation_reason' => 'ai_claim_blocked',
@@ -3991,7 +4047,34 @@ $aiResponse = $intro
                     ]);
                     $sallaService = new SallaService();
                     $sallaRes = $sallaService->createOrderForChannel($sallaChannel, $checkoutState);
-                    
+
+                    if (($sallaRes['status'] ?? null) === 'needs_fields') {
+                        // Salla's own API validation named the specific
+                        // ship_to fields THIS store requires. Persist them so
+                        // the next turn asks the customer only for those,
+                        // instead of a generic retry/escalation.
+                        $knownRequired = is_array($conversation->fresh()->checkout_state)
+                            ? (array) ($conversation->fresh()->checkout_state['salla_required_fields'] ?? [])
+                            : [];
+                        $mergedRequired = array_values(array_unique(array_merge($knownRequired, (array) $sallaRes['missing_fields'])));
+                        $stateWithRequired = is_array($conversation->fresh()->checkout_state) ? $conversation->fresh()->checkout_state : [];
+                        $stateWithRequired['salla_required_fields'] = $mergedRequired;
+                        $stateWithRequired['confirmation_state'] = 'collecting_info';
+                        $conversation->update(['checkout_state' => $stateWithRequired]);
+                        // Salla returned a definitive 422, so this idempotency
+                        // attempt is safe to retry after the customer supplies
+                        // the newly required fields.
+                        $attempt->update(['status' => 'failed']);
+                        Log::info('ProcessAutoReply: Salla reported additional required ship_to fields; will ask customer for exactly these', [
+                            'conversation_id' => $conversation->id,
+                            'required_fields' => $mergedRequired,
+                        ]);
+                        return [
+                            'status' => 'needs_fields',
+                            'missing_fields' => $mergedRequired,
+                        ];
+                    }
+
                     $externalOrderId = (string)($sallaRes['data']['reference_id'] ?? $sallaRes['data']['id'] ?? $sallaRes['id'] ?? null);
                     if ($externalOrderId) {
                         $externalSource = 'salla';

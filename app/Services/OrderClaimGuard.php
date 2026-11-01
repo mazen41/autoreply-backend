@@ -99,19 +99,57 @@ class OrderClaimGuard
     private function askedForKnownField(string $reply, array $state): ?string
     {
         $patterns = [
-            'full_name' => '/\b(?:what\s+(?:is|\x27s)|could\s+you|can\s+you|please|kindly|provide|share|send|tell\s+me)\b.{0,35}\b(?:full\s+)?name\b|\b(?:full\s+)?name\s*\?|\bwho\s+should\s+(?:i|we)\s+(?:address|put)\b|(?:اسمك|الاسم الكامل)/ui',
+            'full_name' => '/\b(?:what\s+(?:is|\x27s)|could\s+you|can\s+you|please|kindly|provide|share|send|tell\s+me)\b.{0,35}\b(?:your\s+)?(?:full\s+)?name\b\s*[?\x{061F}]?|\bwho\s+should\s+(?:i|we)\s+(?:address|put)\b|(?:اسمك\s*\x{061F}?|الاسم الكامل)/ui',
             'phone' => '/\b(?:what\s+(?:is|\x27s)|could\s+you|can\s+you|please|kindly|provide|share|send|tell\s+me)\b.{0,35}\b(?:phone|mobile|telephone)(?:\s+number)?\b|\bwhat\s+is\s+your\s+(?:phone|mobile)\b|(?:رقم هاتفك|رقم جوالك)/ui',
             'address' => '/\b(?:what\s+(?:is|\x27s)|could\s+you|can\s+you|please|kindly|provide|share|send|tell\s+me)\b.{0,35}\b(?:delivery\s+)?address\b|\bwhere\s+should\s+(?:i|we)\s+(?:deliver|send)\b|(?:عنوانك|عنوان التوصيل)/ui',
         ];
 
         foreach ($patterns as $field => $pattern) {
             $value = $state[$field] ?? ($field === 'phone' ? ($state['customer_phone'] ?? null) : null);
-            if (!empty($value) && preg_match($pattern, $reply)) {
-                return $field;
+            if (empty($value) || !preg_match($pattern, $reply)) {
+                continue;
             }
+
+            // A reply that already restates the known value (for example an
+            // order summary listing "Name: Mazen Hossny" before asking the
+            // customer to confirm) is NOT the AI asking for that field again —
+            // it is confirming/echoing it. Only flag a genuine re-ask.
+            if ($this->replyRestatesValue($reply, $value)) {
+                continue;
+            }
+
+            return $field;
         }
 
         return null;
+    }
+
+    /** Whether the known field value (or its core text) already appears in the reply. */
+    private function replyRestatesValue(string $reply, mixed $value): bool
+    {
+        if (is_array($value)) {
+            return false;
+        }
+
+        $needle = trim((string) $value);
+        if ($needle === '') {
+            return false;
+        }
+
+        // Compare loosely: strip spacing/punctuation differences (phone
+        // formatting, Arabic/English digit variants) so a reformatted but
+        // equivalent value still counts as a restatement.
+        $normalize = static function (string $text): string {
+            $text = mb_strtolower($text);
+            return preg_replace('/[\s\-()+.,\x{060C}]+/u', '', $text) ?? $text;
+        };
+
+        $normalizedNeedle = $normalize($needle);
+        if ($normalizedNeedle === '') {
+            return false;
+        }
+
+        return mb_stripos($normalize($reply), $normalizedNeedle) !== false;
     }
 
     private function replacement(array $missingFields, string $language): string

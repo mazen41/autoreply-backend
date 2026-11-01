@@ -83,7 +83,7 @@ class SallaOrderPayloadPhoneTest extends TestCase
     }
 
     /** Fakes every HTTP call the order path makes, and records the POST /orders body. */
-    private function fakeSalla(): void
+    private function fakeSalla(?array $orderResponse = null, int $orderStatus = 200): void
     {
         Http::fake([
             'api.salla.dev/admin/v2/customers*' => function ($request) {
@@ -101,7 +101,7 @@ class SallaOrderPayloadPhoneTest extends TestCase
                 'name' => 'حي العليا',
                 'name_en' => 'Al Olaya Dist.',
             ]], 'pagination' => ['totalPages' => 1]], 200),
-            'api.salla.dev/admin/v2/orders' => Http::response(['data' => ['id' => 1, 'reference_id' => 'TEST-ONLY']], 200),
+            'api.salla.dev/admin/v2/orders' => Http::response($orderResponse ?? ['data' => ['id' => 1, 'reference_id' => 'TEST-ONLY']], $orderStatus),
             'api.salla.dev/admin/v2/*' => Http::response(['data' => []], 200),
         ]);
     }
@@ -209,5 +209,29 @@ class SallaOrderPayloadPhoneTest extends TestCase
             'Explicitly provided checkout block must be preserved in ship_to.block');
         $this->assertSame('36', $body['ship_to']['building_number'] ?? null);
         $this->assertSame('11511', $body['ship_to']['postal_code'] ?? null);
+    }
+
+    /** @test */
+    public function salla_422_returns_only_fields_reported_by_the_store(): void
+    {
+        $channel = $this->channel();
+        $this->fakeSalla([
+            'errors' => [
+                'ship_to' => [
+                    'district' => ['The district field is required.'],
+                    'short_address' => ['The short address field is required.'],
+                ],
+            ],
+        ], 422);
+
+        $result = app(SallaService::class)->createOrderForChannel(
+            $channel,
+            $this->state('+966505308084')
+        );
+
+        $this->assertSame('needs_fields', $result['status'] ?? null);
+        $this->assertSame(['district', 'short_address'], $result['missing_fields'] ?? []);
+        Http::assertSent(fn ($request) => $request->method() === 'POST'
+            && str_contains($request->url(), '/admin/v2/orders'));
     }
 }

@@ -124,6 +124,35 @@ class OrderClaimGuardTest extends TestCase
         $this->assertStringNotContainsString('full name', strtolower($result['replacement']));
     }
 
+    public function test_order_summary_restating_a_known_name_is_not_treated_as_asking_for_it(): void
+    {
+        [$conversation] = $this->makeConversation();
+
+        $result = app(OrderClaimGuard::class)->inspect(
+            $conversation,
+            "Here's your order summary:\nName: Mazen Hossny\nPhone: +966501234567\nAddress: Ghaali Mitri, Hofuf\nProduct: Dress (100 SAR)\n\nShall I confirm this order?",
+            ['full_name' => 'Mazen Hossny', 'phone' => '+966501234567', 'address' => 'Ghaali Mitri, Hofuf'],
+            []
+        );
+
+        $this->assertTrue($result['allowed'], 'A confirmation summary restating known fields must not be replaced.');
+    }
+
+    public function test_reply_genuinely_re_asking_for_a_known_name_is_still_caught(): void
+    {
+        [$conversation] = $this->makeConversation();
+
+        $result = app(OrderClaimGuard::class)->inspect(
+            $conversation,
+            'Could you please share your full name again?',
+            ['full_name' => 'Mazen Hossny Ahmed'],
+            []
+        );
+
+        $this->assertFalse($result['allowed']);
+        $this->assertSame('asks_known_full_name', $result['reason']);
+    }
+
     private function makeConversation(): array
     {
         $user = User::factory()->create();

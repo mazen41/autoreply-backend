@@ -574,12 +574,15 @@ class CheckoutOrderFlowTest extends TestCase
             'additional_number' => '5678',
         ];
 
-        $missingGeo = $checkout->computeFieldStatus($state, true);
+        $completeWithoutOptionalGeo = $checkout->computeFieldStatus($state, true);
+        $this->assertTrue($completeWithoutOptionalGeo['is_complete']);
+        $this->assertNotContains('email', $completeWithoutOptionalGeo['missing_fields']);
+
+        $missingGeo = $checkout->computeFieldStatus($state, true, ['geo_coordinates']);
         $this->assertContains('geo_coordinates', $missingGeo['missing_fields']);
-        $this->assertNotContains('email', $missingGeo['missing_fields']);
 
         $state['geo_coordinates'] = ['lat' => 24.7136, 'lng' => 46.6753];
-        $this->assertTrue($checkout->computeFieldStatus($state, true)['is_complete']);
+        $this->assertTrue($checkout->computeFieldStatus($state, true, ['geo_coordinates'])['is_complete']);
     }
 
     public function test_selecting_a_different_product_clears_completed_order_identity(): void
@@ -1119,6 +1122,14 @@ class CheckoutOrderFlowTest extends TestCase
         ]);
         $this->assertNotEquals('completed', $conversation->checkout_state['status'] ?? null);
         $this->assertEmpty($conversation->checkout_state['order_id'] ?? null);
+
+        // A provider 5xx is escalated to a human and pauses AI. Simulate the
+        // operator resolving that handoff and re-enabling AI before asserting
+        // that a later explicit confirmation can retry the order.
+        $conversation->update(['ai_enabled' => true, 'requires_human' => false, 'status' => 'active']);
+        \App\Models\HandoffTask::where('conversation_id', $conversation->id)
+            ->where('status', 'open')
+            ->update(['status' => 'resolved', 'resolved_at' => now()]);
 
         $msg2 = Message::create([
             'conversation_id' => $conversation->id,

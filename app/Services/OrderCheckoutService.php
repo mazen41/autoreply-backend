@@ -24,7 +24,7 @@ class OrderCheckoutService
             return ['status' => 'unavailable', 'coordinates' => null];
         }
         if ($endpoint === '') {
-            Log::warning('Nominatim address lookup skipped because no private endpoint is configured');
+            Log::warning('Nominatim address lookup skipped because no endpoint is configured');
             return ['status' => 'unavailable', 'coordinates' => null];
         }
 
@@ -391,6 +391,7 @@ class OrderCheckoutService
         }
 
         $extractedBuildingNumber = self::extractBuildingNumber((string) $incomingText);
+        $extractedPoBox = self::extractPoBox((string) $incomingText);
 
         $extractedShortAddress = null;
         if (preg_match('/(?:short address|national address|العنوان المختصر)\s*(?:(?:is|equals?)\s+|[:#-]\s*)?([A-Z0-9]{4,12})/iu', $incomingText, $shortAddressMatch)) {
@@ -455,7 +456,7 @@ class OrderCheckoutService
         // 3. Extract address heuristics — ONLY from explicit address statements
         $extractedAddress = null;
         $addressPatterns = [
-            '/(?:my address is|address is|delivery address|live in|located at|العنوان|عنواني|حي|شارع|مدينة|محافظة|الرياض|جدة|مكة|الدمام|القاهرة|الإسكندرية)\s*[:\-]?\s*(.+)/ui',
+            '/(?:my\s+address\s+is|delivery\s+address(?:\s+is)?|address(?:\s+is)?|live\s+in|located\s+at|العنوان|عنواني|حي|شارع|مدينة|محافظة|الرياض|جدة|مكة|الدمام|القاهرة|الإسكندرية)\s*[:\-]?\s*(.+)/ui',
         ];
         foreach ($addressPatterns as $pattern) {
             if (preg_match($pattern, $incomingText, $am)) {
@@ -510,6 +511,7 @@ class OrderCheckoutService
             'postal_code'      => $extractedPostalCode               ?? ($existingState['postal_code']       ?? null),
             'geo_coordinates'  => $extractedCoordinates              ?? ($existingState['geo_coordinates']   ?? null),
             'building_number'  => $extractedBuildingNumber           ?? ($existingState['building_number']   ?? null),
+            'po_box'           => $extractedPoBox                    ?? ($existingState['po_box']            ?? null),
             'short_address'    => $extractedShortAddress             ?? ($existingState['short_address']     ?? null),
             'additional_number'=> $extractedAdditionalNumber         ?? ($existingState['additional_number'] ?? null),
             'updated_at'       => now()->toISOString(),
@@ -626,7 +628,7 @@ class OrderCheckoutService
     /**
      * Compute known_fields and missing_fields maps.
      */
-    public function computeFieldStatus(array $state, bool $requireSallaShippingDetails = false): array
+    public function computeFieldStatus(array $state, bool $requireSallaShippingDetails = false, array $sallaRequiredFields = []): array
     {
         // Normalize legacy field aliases
         $phoneValue = $state['phone'] ?? $state['customer_phone'] ?? null;
@@ -638,18 +640,18 @@ class OrderCheckoutService
         ]));
 
         $normalizedState = $requireSallaShippingDetails ? \App\Services\SallaAddressParser::fillMissing($normalizedState) : $normalizedState;
-$requiredFields = self::REQUIRED_FIELDS;
-        if ($requireSallaShippingDetails) {
-            $requiredFields = array_merge($requiredFields, [
-                'postal_code', 'building_number', 'block', 'geo_coordinates',
-            ]);
+        $requiredFields = self::REQUIRED_FIELDS;
 
-            // Saudi National Address codes are not applicable to international
-            // delivery addresses. Require them only for Saudi phone/address flows.
-            $countryCode = SallaPhoneHelper::getCountryCode((string) ($state['phone'] ?? $state['customer_phone'] ?? ''));
-            if ($countryCode === 'SA') {
-                $requiredFields = array_merge($requiredFields, ['district', 'short_address', 'additional_number']);
-            }
+        // National-address extras (postal code, building number, block,
+        // coordinates, district, short address, additional number) are NOT
+        // universally mandatory — Salla's own order/shipping-method validation
+        // decides that per store. We only require them here once a real Salla
+        // order attempt has actually told us they are missing (see
+        // $sallaRequiredFields, populated from the store's own API response by
+        // SallaService). This avoids asking customers for data Salla never
+        // needed, while still honouring genuinely required fields.
+        if ($requireSallaShippingDetails && $sallaRequiredFields !== []) {
+            $requiredFields = array_values(array_unique(array_merge($requiredFields, $sallaRequiredFields)));
         }
 
         $fieldAliases = [
@@ -823,6 +825,25 @@ $requiredFields = self::REQUIRED_FIELDS;
             }
 
             return $number;
+        }
+
+        return null;
+    }
+
+    /**
+     * P.O. Box number from typed address text. Recognised explicitly so a
+     * customer-supplied PO Box is preserved as its own field and is never
+     * mistaken for a street building/house number (see extractBuildingNumber,
+     * which already strips PO Box segments before its own heuristic runs).
+     */
+    public static function extractPoBox(string $text): ?string
+    {
+        if (preg_match(
+            '/(?:p\.?\s*o\.?\s*box|post\s+office\s+box|صندوق\s+البريد|ص\.?\s*ب\.?)\s*[:#-]?\s*(\d{1,10})/iu',
+            $text,
+            $m
+        ) === 1) {
+            return $m[1];
         }
 
         return null;

@@ -7,6 +7,7 @@ use Illuminate\Support\Facades\Log;
 use Illuminate\Support\Facades\DB;
 use App\Models\Channel;
 use App\Helpers\SallaPhoneHelper;
+use App\Exceptions\SallaOrderValidationException;
 
 class SallaService
 {
@@ -168,6 +169,22 @@ class SallaService
                 }
 
                 throw new \Exception('Access token expired');
+            }
+
+            if ($response->status() === 422) {
+                // Salla's field-validation errors are authoritative on what a
+                // given store/shipping method actually requires. Surface them
+                // as structured data instead of a generic failure so a missing
+                // ship_to field can be requested from the customer precisely.
+                $validationFields = $response->json('fields')
+                    ?? $response->json('error.fields')
+                    ?? $response->json('errors')
+                    ?? $response->json('data.errors')
+                    ?? [];
+                throw new SallaOrderValidationException(
+                    "API call failed: 422",
+                    is_array($validationFields) ? $validationFields : []
+                );
             }
 
             throw new \Exception("API call failed: {$response->status()}");
@@ -928,40 +945,16 @@ class SallaService
         $streetNumber = $shippingAddress['street_number'] ?? $buildingNumber;
         $block = $checkoutState['block'] ?? $shippingAddress['block'] ?? null;
 
-        // These are required by Salla's current ship_to/National Address contract.
-        // Coordinates are resolved from the city by Nominatim; customers are never
-        // asked to provide coordinates or a map pin.
-        $missingShipToFields = [];
-        foreach ([
-            'postal_code' => $postalCode,
-            'building_number' => $buildingNumber,
-            'street_number' => $streetNumber,
-            'block' => $block,
-            'geo_coordinates' => isset($coordinates['lat'], $coordinates['lng']) ? $coordinates : null,
-        ] as $field => $value) {
-            if (empty($value)) {
-                $missingShipToFields[] = $field;
-            }
-        }
-        if ($missingShipToFields !== []) {
-            Log::info('SallaService: order is waiting for required National Address fields', [
-                'channel_id' => $channel->id,
-                'missing_fields' => $missingShipToFields,
-            ]);
-            return null;
-        }
-
-        if (($countryCode = SallaPhoneHelper::getCountryCode($phone) ?? 'SA') === 'SA') {
-            foreach (['short_address', 'additional_number', 'district'] as $field) {
-                if (empty($checkoutState[$field])) {
-                    Log::info('SallaService: Saudi order is waiting for National Address data', [
-                        'channel_id' => $channel->id,
-                        'missing_field' => $field,
-                    ]);
-                    return null;
-                }
-            }
-        }
+        // Postal code, building number, block, coordinates, short address,
+        // additional number and district are NOT pre-emptively required here.
+        // They are optional National-Address metadata: Salla's own
+        // POST /orders validation is authoritative on whether a given store /
+        // shipping method actually needs them (see createOrderForChannel,
+        // which surfaces any Salla-reported missing ship_to fields back to the
+        // caller so the customer is asked only for what Salla truly requires).
+        // Coordinates specifically are resolved from the city via geocoding
+        // when available; customers are never asked to provide them directly.
+        $countryCode = SallaPhoneHelper::getCountryCode($phone) ?? 'SA';
 
         $productId = (int)($checkoutState['salla_product_id'] ?? null);
         if (!$productId && !empty($checkoutState['product_name'])) {
@@ -1220,6 +1213,57 @@ class SallaService
             }
 
             return $res;
+        } catch (SallaOrderValidationException $e) {
+            // Map Salla's own field names to our checkout_state field names so
+            // the customer is asked only for what THIS store genuinely needs.
+            $fieldMap = [
+                'ship_to.postal_code' => 'postal_code', 'postal_code' => 'postal_code',
+                'ship_to.building_number' => 'building_number', 'building_number' => 'building_number',
+                'ship_to.street_number' => 'building_number',
+                'ship_to.block' => 'block', 'block' => 'block',
+                'ship_to.district' => 'district', 'district' => 'district',
+                'ship_to.geo_coordinates' => 'geo_coordinates', 'geo_coordinates' => 'geo_coordinates',
+                'ship_to.short_address' => 'short_address', 'short_address' => 'short_address',
+                'ship_to.additional_number' => 'additional_number', 'additional_number' => 'additional_number',
+                'ship_to.address' => 'address', 'ship_to.address_line' => 'address',
+            ];
+            $missingFields = [];
+            $flattenFieldNames = function (array $fields, string $prefix = '') use (&$flattenFieldNames): array {
+                $names = [];
+                foreach ($fields as $field => $details) {
+                    $path = $prefix === '' ? (string) $field : $prefix . '.' . (string) $field;
+                    if (is_array($details)) {
+                        if ($details === [] || array_is_list($details)) {
+                            $names[] = $path;
+                        } else {
+                            $names = array_merge($names, $flattenFieldNames($details, $path));
+                        }
+                    } elseif ($prefix !== '' || !is_numeric($field)) {
+                        $names[] = $path;
+                    }
+                }
+
+                return $names;
+            };
+            foreach ($flattenFieldNames($e->fields) as $sallaField) {
+                $normalized = strtolower((string) $sallaField);
+                if (isset($fieldMap[$normalized])) {
+                    $missingFields[] = $fieldMap[$normalized];
+                }
+            }
+            $missingFields = array_values(array_unique($missingFields));
+
+            Log::warning('SALLA_ORDER_CREATE_VALIDATION_FAILED', [
+                'channel_id' => $channel->id,
+                'salla_fields' => array_keys($e->fields),
+                'mapped_missing_fields' => $missingFields,
+            ]);
+
+            if ($missingFields !== []) {
+                return ['status' => 'needs_fields', 'missing_fields' => $missingFields];
+            }
+
+            throw $e;
         } catch (\Exception $e) {
             Log::error('SALLA_ORDER_CREATE_FAILED', [
                 'channel_id' => $channel->id,

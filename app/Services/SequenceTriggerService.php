@@ -41,6 +41,23 @@ class SequenceTriggerService
             return;
         }
 
+        // A customer actively mid-checkout (already started giving order
+        // details, not yet complete) is expected to keep replying within the
+        // conversation itself. Scheduling a no-reply follow-up here would be
+        // an inappropriate interruption, and every AI turn would otherwise
+        // keep re-scheduling/incrementing the cycle for no behavioural reason.
+        // Once checkout is complete (confirmation_pending/confirmed/order_placed)
+        // or there is no checkout in progress at all, timers schedule as normal.
+        $checkoutState = is_array($conversation->checkout_state) ? $conversation->checkout_state : [];
+        $checkoutActivelyCollecting = !empty($checkoutState['salla_product_id'] ?? $checkoutState['commerce_external_id'] ?? null)
+            && ($checkoutState['confirmation_state'] ?? 'collecting_info') === 'collecting_info';
+        if ($checkoutActivelyCollecting) {
+            Log::info('SequenceTriggerService: skipped no-reply timer scheduling, checkout actively collecting info', [
+                'conversation_id' => $conversation->id,
+            ]);
+            return;
+        }
+
         // Bot scope: global sequences plus the conversation's bot's sequences.
         $noReplySequences = Sequence::forBusiness($businessId)
             ->active()

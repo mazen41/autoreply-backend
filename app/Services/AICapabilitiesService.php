@@ -494,6 +494,7 @@ ROLE;
             $p .= "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n";
             $p .= "CHECKOUT FIELD COLLECTION STATE\n";
             $p .= "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n";
+            $p .= "CURRENT MESSAGE TAKES PRIORITY OVER SAVED CHECKOUT STATE. An active checkout is context, not an instruction to continue checkout on every turn. If the customer's latest message is only a greeting, a product/catalog question, or another unrelated question, answer that message naturally and do not ask for checkout fields or repeat an order-status warning. Continue collecting fields only when the latest message expresses purchase intent, confirms the order, or provides checkout details. Never infer place_order intent from a saved product or missing-field list alone.\n\n";
             $requiredLabels = [
                 'full_name' => 'Full Name',
                 'phone' => 'Phone Number',
@@ -551,7 +552,7 @@ ROLE;
                 $p .= "⚠️ DO NOT claim the order has been placed because required fields are still missing!\n\n";
             }
 
-            $p .= "intent = place_order\n\n";
+            $p .= "Determine intent from the customer's latest message; do not force it to place_order because checkout state exists.\n\n";
         } else {
             $p .= "⚠️ Product catalogue not available right now.\n";
             $p .= "Reply: \"I'm sorry, I'm having a brief issue loading our product catalogue. Could you let me know which product you'd like to order and I'll get it sorted for you right away? 😊\"\n";

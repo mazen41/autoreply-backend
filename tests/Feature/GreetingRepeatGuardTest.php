@@ -54,6 +54,21 @@ class GreetingRepeatGuardTest extends TestCase
         $this->assertSame(self::WELCOME, $result['reply']);
     }
 
+    public function test_first_greeting_does_not_get_a_stale_checkout_prompt(): void
+    {
+        $c = $this->conversation();
+        $message = $this->inbound($c, 'hi');
+
+        $result = app(GreetingRepeatGuard::class)->apply(
+            $message,
+            'I have not submitted the order yet. Please send: block, postal code, delivery address details.'
+        );
+
+        $this->assertTrue($result['replaced']);
+        $this->assertStringNotContainsString('order', mb_strtolower($result['reply']));
+        $this->assertStringNotContainsString('postal', mb_strtolower($result['reply']));
+    }
+
     public function test_repeated_greeting_does_not_receive_the_welcome_again(): void
     {
         $c = $this->conversation();

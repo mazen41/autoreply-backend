@@ -84,6 +84,25 @@ class OrderCheckoutFieldStatusTest extends TestCase
         $this->assertStringContainsString('Hofuf', $state['address']);
     }
 
+    public function test_multiline_salla_address_keeps_city_and_postal_code_without_name_or_phone(): void
+    {
+        $service = new OrderCheckoutService();
+        $conversation = new Conversation(['checkout_state' => null]);
+
+        $state = $service->extractAndMergeState(
+            $conversation,
+            "that's the full address mazen hossny and phone is 966 50 530 8084 and the address Ghaali Mitri\nP.O. Box 122\nHofuf\n36361\nSaudi Arabia",
+            ['salla_product_id' => 'prod-1', 'name' => 'Dress', 'price' => 100, 'currency' => 'SAR']
+        );
+
+        $this->assertSame('966 50 530 8084', $state['phone']);
+        $this->assertSame('122', $state['po_box']);
+        $this->assertSame('36361', $state['postal_code']);
+        $this->assertStringContainsString('Hofuf', $state['address']);
+        $this->assertStringNotContainsString('mazen hossny', mb_strtolower($state['address']));
+        $this->assertStringNotContainsString('966 50 530 8084', $state['address']);
+    }
+
     public function test_fields_accumulate_across_separate_messages_without_losing_prior_data(): void
     {
         $service = new OrderCheckoutService();

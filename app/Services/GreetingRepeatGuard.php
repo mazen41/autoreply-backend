@@ -44,10 +44,6 @@ class GreetingRepeatGuard
             ->filter(fn ($content) => preg_match(self::GREETING, trim((string) $content)) === 1)
             ->count();
 
-        if ($previous === 0) {
-            return ['reply' => $reply, 'replaced' => false, 'previous_greetings' => 0];
-        }
-
         $lastAi = Message::query()
             ->where('conversation_id', $inbound->conversation_id)
             ->where('direction', 'outbound')
@@ -58,15 +54,27 @@ class GreetingRepeatGuard
 
         $repeatsWelcome = preg_match(self::WELCOME, $reply) === 1;
         $repeatsLast = $lastAi !== null && $this->normalize((string) $lastAi) === $this->normalize($reply);
+        $repeatsCheckoutPrompt = preg_match(
+            '/(?:order\s+(?:has\s+)?not\s+(?:been\s+)?submitted|have\s+not\s+submitted\s+the\s+order|haven.t\s+submitted\s+the\s+order|please\s+send\s*:|to\s+complete\s+(?:the\s+)?order|لم\s+يتم\s+إرسال\s+الطلب)/iu',
+            $reply
+        ) === 1;
 
-        if (!$repeatsWelcome && !$repeatsLast) {
+        if ($previous === 0 && !$repeatsCheckoutPrompt) {
+            return ['reply' => $reply, 'replaced' => false, 'previous_greetings' => 0];
+        }
+
+        // A bare greeting during checkout is still a greeting. Some providers
+        // over-prioritize saved checkout instructions and answer "hi" by
+        // repeating the missing-fields prompt. Replace that detour even on the
+        // first greeting; keep the checkout state intact for the next turn.
+        if (!$repeatsWelcome && !$repeatsLast && !$repeatsCheckoutPrompt) {
             return ['reply' => $reply, 'replaced' => false, 'previous_greetings' => $previous];
         }
 
         $pool = preg_match('/\p{Arabic}/u', $text) === 1 ? self::AR : self::EN;
 
         return [
-            'reply' => $pool[($previous - 1) % count($pool)],
+            'reply' => $pool[max(0, $previous - 1) % count($pool)],
             'replaced' => true,
             'previous_greetings' => $previous,
         ];

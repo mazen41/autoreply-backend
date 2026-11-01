@@ -459,7 +459,7 @@ class OrderCheckoutService
         // matched that first occurrence and swallowed the customer's name,
         // phone, and the later actual address into one geocoding query.
         $extractedAddress = null;
-        $addressPattern = '/(?:\bmy\s+address\s+is\b|\bdelivery\s+address(?:\s+is)?\b|\baddress\s+is\b|(?:^|[,;\n]\s*|\band\s+(?:the\s+)?)(?:address|العنوان|عنواني)\b|\b(?:live\s+in|located\s+at)\b|\b(?:حي|شارع|مدينة|محافظة|الرياض|جدة|مكة|الدمام|القاهرة|الإسكندرية)\b)\s*[:\-]?\s*(.+)$/iu';
+        $addressPattern = '/(?:\bmy\s+address\s+is\b|\bdelivery\s+address(?:\s+is)?\b|\baddress\s+is\b|(?:^|[,;\n]\s*|\band\s+(?:the\s+)?)(?:address|العنوان|عنواني)\b|\b(?:live\s+in|located\s+at)\b|\b(?:حي|شارع|مدينة|محافظة|الرياض|جدة|مكة|الدمام|القاهرة|الإسكندرية)\b)\s*[:\-]?\s*(.+)$/isu';
         if (preg_match_all($addressPattern, $incomingText, $addressMatches, PREG_SET_ORDER)) {
             // If several address-like phrases occur, the last explicit one is
             // the actual delivery location (for example, "full address ... and

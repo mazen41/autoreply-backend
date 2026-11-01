@@ -453,20 +453,21 @@ class OrderCheckoutService
             }
         }
 
-        // 3. Extract address heuristics — ONLY from explicit address statements
+        // 3. Extract address heuristics — ONLY from explicit address statements.
+        // Prefer a real address declaration over generic wording such as
+        // "that's the full address ...". The old broad `address` alternative
+        // matched that first occurrence and swallowed the customer's name,
+        // phone, and the later actual address into one geocoding query.
         $extractedAddress = null;
-        $addressPatterns = [
-            '/(?:my\s+address\s+is|delivery\s+address(?:\s+is)?|address(?:\s+is)?|live\s+in|located\s+at|العنوان|عنواني|حي|شارع|مدينة|محافظة|الرياض|جدة|مكة|الدمام|القاهرة|الإسكندرية)\s*[:\-]?\s*(.+)/ui',
-        ];
-        foreach ($addressPatterns as $pattern) {
-            if (preg_match($pattern, $incomingText, $am)) {
-                $candidate = trim($am[1]);
-                // Validate: address must be meaningful (at least 4 chars, not just a product name or greeting)
-                if (strlen($candidate) >= 4
-                    && !preg_match('/^(?:hi|hello|hey|yes|no|ok|sure|thanks|the dress|this one|that one|مرحبا|سلام|نعم|لا|حسنا|شكرا|الفستان|هذا|هذه)$/ui', $candidate)) {
-                    $extractedAddress = $candidate;
-                    break;
-                }
+        $addressPattern = '/(?:\bmy\s+address\s+is\b|\bdelivery\s+address(?:\s+is)?\b|\baddress\s+is\b|(?:^|[,;\n]\s*|\band\s+(?:the\s+)?)(?:address|العنوان|عنواني)\b|\b(?:live\s+in|located\s+at)\b|\b(?:حي|شارع|مدينة|محافظة|الرياض|جدة|مكة|الدمام|القاهرة|الإسكندرية)\b)\s*[:\-]?\s*(.+)$/iu';
+        if (preg_match_all($addressPattern, $incomingText, $addressMatches, PREG_SET_ORDER)) {
+            // If several address-like phrases occur, the last explicit one is
+            // the actual delivery location (for example, "full address ... and
+            // the address Ghaali Mitri ...").
+            $candidate = trim((string) (end($addressMatches)[1] ?? ''));
+            if (strlen($candidate) >= 4
+                && !preg_match('/^(?:hi|hello|hey|yes|no|ok|sure|thanks|the dress|this one|that one|مرحبا|سلام|نعم|لا|حسنا|شكرا|الفستان|هذا|هذه)$/ui', $candidate)) {
+                $extractedAddress = $candidate;
             }
         }
 
@@ -516,6 +517,16 @@ class OrderCheckoutService
             'additional_number'=> $extractedAdditionalNumber         ?? ($existingState['additional_number'] ?? null),
             'updated_at'       => now()->toISOString(),
         ], fn($v) => !is_null($v) && $v !== ''));
+
+        // Persist address facts parsed from the address itself. Computing
+        // field status used to fill these values only in a temporary copy, so
+        // the postal code appeared "missing" again on the next turn and never
+        // reached the Salla order payload. The parser only fills explicit
+        // values (including a five-digit postal code) and does not invent a
+        // block or other address component.
+        if (!empty($mergedState['salla_product_id'])) {
+            $mergedState = SallaAddressParser::fillMissing($mergedState);
+        }
 
         // A plain greeting ("Hi") or catalogue request ("Can i see the images")
         // must NOT create a phantom order context. checkout_state only becomes

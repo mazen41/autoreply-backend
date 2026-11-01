@@ -13,8 +13,6 @@ class GreetingRepeatGuard
 {
     private const GREETING = '/^\s*(hi+|hello|hey|hiya|good\s+(morning|evening|afternoon)|مرحبا|مرحباً|اهلا|أهلا|اهلاً|أهلاً|هلا|هاي|ازيك|ازيكم|السلام\s+عليكم|صباح\s+الخير|مساء\s+الخير)[\s!.,?؟]*$/iu';
 
-    private const WELCOME = '/welcome to naz autoreply|اهلا بيك في|مرحبا بك في|أهلاً بك في/iu';
-
     private const EN = [
         'Hi again! What can I help you with today?',
         'Hello! Happy to help. What are you looking for?',
@@ -44,18 +42,8 @@ class GreetingRepeatGuard
             ->filter(fn ($content) => preg_match(self::GREETING, trim((string) $content)) === 1)
             ->count();
 
-        $lastAi = Message::query()
-            ->where('conversation_id', $inbound->conversation_id)
-            ->where('direction', 'outbound')
-            ->where('is_ai', true)
-            ->where('id', '<', $inbound->id)
-            ->latest('id')
-            ->value('content');
-
-        $repeatsWelcome = preg_match(self::WELCOME, $reply) === 1;
-        $repeatsLast = $lastAi !== null && $this->normalize((string) $lastAi) === $this->normalize($reply);
         $repeatsCheckoutPrompt = preg_match(
-            '/(?:order\s+(?:has\s+)?not\s+(?:been\s+)?submitted|have\s+not\s+submitted\s+the\s+order|haven.t\s+submitted\s+the\s+order|please\s+send\s*:|to\s+complete\s+(?:the\s+)?order|لم\s+يتم\s+إرسال\s+الطلب)/iu',
+            '/(?:order\s+(?:has\s+)?not\s+(?:been\s+)?submitted|have\s+not\s+submitted\s+the\s+order|haven.t\s+submitted\s+the\s+order|please\s+send\b|to\s+complete\s+(?:the\s+)?order|couldn.t\s+identify\s+the\s+delivery\s+city|لم\s+يتم\s+إرسال\s+الطلب)/iu',
             $reply
         ) === 1;
 
@@ -67,10 +55,10 @@ class GreetingRepeatGuard
         // over-prioritize saved checkout instructions and answer "hi" by
         // repeating the missing-fields prompt. Replace that detour even on the
         // first greeting; keep the checkout state intact for the next turn.
-        if (!$repeatsWelcome && !$repeatsLast && !$repeatsCheckoutPrompt) {
-            return ['reply' => $reply, 'replaced' => false, 'previous_greetings' => $previous];
-        }
-
+        // Once a customer has greeted before, treat a new bare greeting as a
+        // greeting even when the model produces a different checkout-related
+        // reply. That reply can otherwise slip past repeat-text detection and
+        // then be rewritten back into the same missing-fields prompt later.
         $pool = preg_match('/\p{Arabic}/u', $text) === 1 ? self::AR : self::EN;
 
         return [
@@ -78,10 +66,5 @@ class GreetingRepeatGuard
             'replaced' => true,
             'previous_greetings' => $previous,
         ];
-    }
-
-    private function normalize(string $value): string
-    {
-        return mb_strtolower(preg_replace('/\s+/u', ' ', trim($value)) ?? '');
     }
 }

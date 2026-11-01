@@ -1464,6 +1464,46 @@ class ProcessAutoReply implements ShouldQueue
 
         // ── ORDER CHECKOUT STATE & FIELD EXTRACTION ─────────────────────────
         $checkoutService = app(\App\Services\OrderCheckoutService::class);
+        $hasActiveSallaCheckout = (bool) $sallaChannel && !empty($checkoutState['salla_product_id']);
+        if (!$isProductBrowseMessage
+            && $hasActiveSallaCheckout
+            && (empty($checkoutState['postal_code']) || empty($checkoutState['geo_coordinates']))) {
+            // Older parser versions stored only the first line of multiline
+            // customer addresses. Recover the latest explicit address message
+            // from conversation history so a later greeting or field reply
+            // doesn't leave the checkout permanently missing its city/ZIP.
+            $priorAddressMessage = Message::query()
+                ->where('conversation_id', $conversation->id)
+                ->where('direction', 'inbound')
+                ->where('id', '<', $message->id)
+                ->where(function ($query) {
+                    $query->where('content', 'like', '%address%')
+                        ->orWhere('content', 'like', '%العنوان%')
+                        ->orWhere('content', 'like', '%عنوان%');
+                })
+                ->latest('id')
+                ->first();
+
+            if ($priorAddressMessage && is_string($priorAddressMessage->content)) {
+                $recoveredCheckoutState = $checkoutService->extractAndMergeState(
+                    $conversation,
+                    $priorAddressMessage->content,
+                    null
+                );
+                if (!empty($recoveredCheckoutState)) {
+                    $conversation->checkout_state = $recoveredCheckoutState;
+                    Log::info('ProcessAutoReply: recovered checkout address from earlier inbound message', [
+                        'conversation_id' => $conversation->id,
+                        'source_message_id' => $priorAddressMessage->id,
+                        'postal_code_recovered' => !empty($recoveredCheckoutState['postal_code']),
+                        'city_in_address' => app(OrderCheckoutService::class)->resolveDeliveryLocation(
+                            (string) ($recoveredCheckoutState['address'] ?? ''),
+                            (string) ($recoveredCheckoutState['phone'] ?? '')
+                        )['city'] !== null,
+                    ]);
+                }
+            }
+        }
         $updatedCheckoutState = $isProductBrowseMessage
             ? []
             : $checkoutService->extractAndMergeState($conversation, $message->content, $referencedProduct);

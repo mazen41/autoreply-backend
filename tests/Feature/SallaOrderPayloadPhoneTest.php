@@ -236,6 +236,9 @@ class SallaOrderPayloadPhoneTest extends TestCase
                     'district' => ['The district field is required.'],
                     'short_address' => ['The short address field is required.'],
                 ],
+                'receiver' => [
+                    'email' => ['The receiver email field is required.'],
+                ],
             ],
         ], 422);
 
@@ -245,7 +248,7 @@ class SallaOrderPayloadPhoneTest extends TestCase
         );
 
         $this->assertSame('needs_fields', $result['status'] ?? null);
-        $this->assertSame(['district', 'short_address'], $result['missing_fields'] ?? []);
+        $this->assertSame(['district', 'short_address', 'email'], $result['missing_fields'] ?? []);
         Http::assertSent(fn ($request) => $request->method() === 'POST'
             && str_contains($request->url(), '/admin/v2/orders'));
     }

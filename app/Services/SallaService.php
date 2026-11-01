@@ -1220,6 +1220,9 @@ class SallaService
             // Map Salla's own field names to our checkout_state field names so
             // the customer is asked only for what THIS store genuinely needs.
             $fieldMap = [
+                'receiver.email' => 'email', 'customer.email' => 'email', 'email' => 'email',
+                'receiver.name' => 'full_name', 'customer.name' => 'full_name',
+                'receiver.phone' => 'phone', 'customer.mobile' => 'phone',
                 'ship_to.postal_code' => 'postal_code', 'postal_code' => 'postal_code',
                 'ship_to.building_number' => 'building_number', 'building_number' => 'building_number',
                 'ship_to.street_number' => 'building_number',

@@ -2720,6 +2720,7 @@ $aiResponse = $intro
                         (array) ($updatedCheckoutState['salla_required_fields'] ?? [])
                     );
                     $labels = [
+                        'email' => 'email address',
                         'postal_code' => 'postal code',
                         'building_number' => 'building or house number',
                         'block' => 'block number/name',
@@ -2819,6 +2820,7 @@ $aiResponse = $intro
                 'full_name' => 'full name',
                 'phone' => 'phone number',
                 'address' => 'delivery address',
+                'email' => 'email address',
                 'postal_code' => 'postal code',
                 'geo_coordinates' => 'a clear delivery city so its location can be looked up automatically',
                 'building_number' => 'building number',

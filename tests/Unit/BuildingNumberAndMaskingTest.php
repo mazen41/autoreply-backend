@@ -30,6 +30,8 @@ class BuildingNumberAndMaskingTest extends TestCase
     {
         $this->assertNull(OrderCheckoutService::extractBuildingNumber('postal code is 11511 giza'));
         $this->assertNull(OrderCheckoutService::extractBuildingNumber('my number 01001234567 mazen'));
+        $this->assertNull(OrderCheckoutService::extractBuildingNumber('Ghaali Mitri, P.O. Box 122, Hofuf 36361, Saudi Arabia'));
+        $this->assertNull(OrderCheckoutService::extractBuildingNumber('P.O. Box 122 Hofuf'));
         $this->assertNull(OrderCheckoutService::extractBuildingNumber(''));
     }
 

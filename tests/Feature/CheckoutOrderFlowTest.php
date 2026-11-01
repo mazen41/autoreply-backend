@@ -221,6 +221,7 @@ class CheckoutOrderFlowTest extends TestCase
             'business_id' => $business->id,
             'type' => 'instagram',
             'ai_enabled' => true,
+            'auto_order_confirmation_enabled' => true,
         ]);
         $conversation = Conversation::factory()->create([
             'channel_id' => $channel->id,
@@ -539,6 +540,48 @@ class CheckoutOrderFlowTest extends TestCase
         Http::assertNothingSent();
     }
 
+    public function test_hofuf_city_can_be_geocoded_for_salla_without_a_map_pin(): void
+    {
+        config(['services.nominatim.endpoint' => 'https://nominatim.test']);
+        Http::fake(['nominatim.test/search*' => Http::response([
+            ['lat' => '25.3833', 'lon' => '49.5833'],
+        ], 200)]);
+
+        $result = app(\App\Services\OrderCheckoutService::class)->geocodeDeliveryAddress(
+            'Ghaali Mitri, P.O. Box 122, Hofuf 36361, Saudi Arabia',
+            '966 50 530 8084'
+        );
+
+        $this->assertSame('found', $result['status']);
+        $this->assertSame(['lat' => 25.3833, 'lng' => 49.5833], $result['coordinates']);
+        Http::assertSent(fn ($request) => str_contains($request->url(), 'nominatim.test/search')
+            && ($request['city'] ?? null) === 'Al Hofuf'
+            && ($request['country'] ?? null) === 'Saudi Arabia');
+    }
+
+    public function test_salla_checkout_does_not_require_email_and_requires_city_geocoding_and_saudi_address_fields(): void
+    {
+        $checkout = app(\App\Services\OrderCheckoutService::class);
+        $state = [
+            'full_name' => 'Mazen Hossny',
+            'phone' => '966 50 530 8084',
+            'address' => '36 Al Olaya Street, Riyadh',
+            'postal_code' => '12211',
+            'building_number' => '36',
+            'block' => 'Block 12',
+            'district' => 'Al Olaya',
+            'short_address' => 'RRRR1234',
+            'additional_number' => '5678',
+        ];
+
+        $missingGeo = $checkout->computeFieldStatus($state, true);
+        $this->assertContains('geo_coordinates', $missingGeo['missing_fields']);
+        $this->assertNotContains('email', $missingGeo['missing_fields']);
+
+        $state['geo_coordinates'] = ['lat' => 24.7136, 'lng' => 46.6753];
+        $this->assertTrue($checkout->computeFieldStatus($state, true)['is_complete']);
+    }
+
     public function test_selecting_a_different_product_clears_completed_order_identity(): void
     {
         $user = User::factory()->create();
@@ -604,6 +647,7 @@ class CheckoutOrderFlowTest extends TestCase
             'business_id' => $business->id,
             'type' => 'instagram',
             'ai_enabled' => true,
+            'auto_order_confirmation_enabled' => true,
         ]);
         $bot = Bot::create([
             'business_profile_id' => $business->id,
@@ -634,6 +678,7 @@ class CheckoutOrderFlowTest extends TestCase
                 'postal_code' => '12345', 'block' => '5', 'district' => 'Nasr City',
                 'geo_coordinates' => ['lat' => 24.7136, 'lng' => 46.6753],
                 'building_number' => '36',
+                'street_number' => '36',
                 'short_address' => 'RRAA1234',
                 'additional_number' => '1234',
             ],
@@ -683,6 +728,9 @@ class CheckoutOrderFlowTest extends TestCase
                 'total' => ['amount' => 20, 'currency' => 'SAR'],
                 'services' => [['name' => 'cod', 'amount' => ['amount' => 0]]],
             ]]], 200),
+                'api.salla.dev/admin/v2/cities/*/districts*' => Http::response(['data' => [[
+                    'id' => 77, 'name' => 'حي النصر', 'name_en' => 'Nasr City',
+                ]], 'pagination' => ['totalPages' => 1]], 200),
             'api.salla.dev/admin/v2/orders' => Http::response([
                 'status' => 200,
                 'data' => ['id' => 889900, 'reference_id' => 'SAL-889900']
@@ -830,6 +878,9 @@ class CheckoutOrderFlowTest extends TestCase
                 'total' => ['amount' => 20, 'currency' => 'SAR'],
                 'services' => [['name' => 'cod', 'amount' => ['amount' => 0]]],
             ]]], 200),
+                'api.salla.dev/admin/v2/cities/*/districts*' => Http::response(['data' => [[
+                    'id' => 77, 'name' => 'حي النصر', 'name_en' => 'Nasr City',
+                ]], 'pagination' => ['totalPages' => 1]], 200),
             'api.salla.dev/admin/v2/orders' => Http::response([
                 'status' => 422,
                 'error' => [
@@ -967,6 +1018,7 @@ class CheckoutOrderFlowTest extends TestCase
             'business_id' => $business->id,
             'type' => 'instagram',
             'ai_enabled' => true,
+            'auto_order_confirmation_enabled' => true,
         ]);
         $bot = Bot::create([
             'business_profile_id' => $business->id,
@@ -997,6 +1049,7 @@ class CheckoutOrderFlowTest extends TestCase
                 'postal_code' => '23456', 'block' => '5', 'district' => 'Nasr City',
                 'geo_coordinates' => ['lat' => 21.5433, 'lng' => 39.1728],
                 'building_number' => '7',
+                'street_number' => '7',
                 'short_address' => 'JEDA1234',
                 'additional_number' => '5678',
                 'confirmation_state' => 'confirmation_pending',
@@ -1046,6 +1099,9 @@ class CheckoutOrderFlowTest extends TestCase
                 'total' => ['amount' => 20, 'currency' => 'SAR'],
                 'services' => [['name' => 'cod', 'amount' => ['amount' => 0]]],
             ]]], 200),
+            'api.salla.dev/admin/v2/cities/*/districts*' => Http::response(['data' => [[
+                'id' => 77, 'name' => 'حي النصر', 'name_en' => 'Nasr City',
+            ]], 'pagination' => ['totalPages' => 1]], 200),
             'api.salla.dev/admin/v2/orders' => Http::sequence()
                 ->push('Server Error', 500)
                 ->push(['status' => 200, 'data' => ['id' => 991122, 'reference_id' => 'SAL-991122']], 200),

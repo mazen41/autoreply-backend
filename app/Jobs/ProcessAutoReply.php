@@ -2642,6 +2642,9 @@ $aiResponse = $intro
                     'postal_code'      => $checkoutState['postal_code']         ?? null,
                     'geo_coordinates'  => $checkoutState['geo_coordinates']     ?? null,
                     'building_number'  => $checkoutState['building_number']     ?? null,
+                    'street_number'    => $checkoutState['street_number']       ?? null,
+                    'block'            => $checkoutState['block']               ?? null,
+                    'district'         => $checkoutState['district']            ?? null,
                     'short_address'    => $checkoutState['short_address']       ?? null,
                     'additional_number'=> $checkoutState['additional_number']   ?? null,
                 ];

@@ -69,6 +69,12 @@ class SallaOrderPayloadPhoneTest extends TestCase
             'address' => $phone === '+966505308084' ? '36 olaya street riyadh' : '36 sayed abdelrahman aladwey giza fisal',
             'postal_code' => '11511',
             'building_number' => '36',
+            'street_number' => '36',
+            'block' => 'Block 12',
+            'district' => 'Al Olaya',
+            'short_address' => 'RRRR1234',
+            'additional_number' => '5678',
+            'geo_coordinates' => ['lat' => 25.3833, 'lng' => 49.5833],
             'salla_product_id' => '44563344',
             'product_name' => 'Test Product',
             'product_price' => 94,
@@ -90,6 +96,11 @@ class SallaOrderPayloadPhoneTest extends TestCase
                 'total' => ['amount' => 20, 'currency' => 'SAR'],
                 'services' => [['name' => 'cod', 'amount' => ['amount' => 0]]],
             ]]], 200),
+            'api.salla.dev/admin/v2/cities/*/districts*' => Http::response(['data' => [[
+                'id' => 555,
+                'name' => 'حي العليا',
+                'name_en' => 'Al Olaya Dist.',
+            ]], 'pagination' => ['totalPages' => 1]], 200),
             'api.salla.dev/admin/v2/orders' => Http::response(['data' => ['id' => 1, 'reference_id' => 'TEST-ONLY']], 200),
             'api.salla.dev/admin/v2/*' => Http::response(['data' => []], 200),
         ]);
@@ -129,7 +140,9 @@ class SallaOrderPayloadPhoneTest extends TestCase
         $channel = $this->channel();
         $this->fakeSalla();
 
-        app(SallaService::class)->createOrderForChannel($channel, $this->state('+966505308084'));
+        $state = $this->state('+966505308084');
+        unset($state['email']);
+        app(SallaService::class)->createOrderForChannel($channel, $state);
 
         $body = $this->sentOrderBody();
         $this->assertSame('+966505308084', $body['receiver']['phone']);
@@ -142,9 +155,13 @@ class SallaOrderPayloadPhoneTest extends TestCase
         $this->assertSame(44563344, $body['products'][0]['identifier']);
         $this->assertArrayHasKey('cash_on_delivery', $body['payment']);
 
-        // ship_to must never contain an invented block — Salla rejects unlabelled text here.
-        $this->assertArrayNotHasKey('block', $body['ship_to'] ?? [],
-            'ship_to.block must be absent when the address has no labelled district/block keyword');
+        $this->assertSame('Block 12', $body['ship_to']['block']);
+        $this->assertSame(555, $body['ship_to']['district']);
+        $this->assertSame(['lat' => 25.3833, 'lng' => 49.5833], $body['ship_to']['geo_coordinates']);
+        $this->assertArrayNotHasKey('email', $body['customer']);
+        $this->assertArrayNotHasKey('email', $body['receiver']);
+        $customerBody = $this->sentCustomerCreationBody();
+        $this->assertArrayNotHasKey('email', $customerBody);
         $this->assertArrayHasKey('country', $body['ship_to']);
         $this->assertArrayHasKey('city', $body['ship_to']);
         $this->assertArrayHasKey('address', $body['ship_to']);
@@ -170,9 +187,7 @@ class SallaOrderPayloadPhoneTest extends TestCase
         $this->assertSame('+20', $customerBody['mobile_code_country']);
         $this->assertSame('customer@example.test', $customerBody['email']);
 
-        // ship_to must never contain an invented block — Salla rejects unlabelled text here.
-        $this->assertArrayNotHasKey('block', $body['ship_to'] ?? [],
-            'ship_to.block must be absent when the address has no labelled district/block keyword');
+        $this->assertSame('Block 12', $body['ship_to']['block']);
         $this->assertArrayHasKey('country', $body['ship_to']);
         $this->assertArrayHasKey('city', $body['ship_to']);
         $this->assertArrayHasKey('address', $body['ship_to']);
@@ -185,12 +200,12 @@ class SallaOrderPayloadPhoneTest extends TestCase
         $this->fakeSalla();
 
         $state = $this->state('+966505308084');
-        $state['block'] = 'Block 12';
+        $state['block'] = 'Block 21';
 
         app(SallaService::class)->createOrderForChannel($channel, $state);
 
         $body = $this->sentOrderBody();
-        $this->assertSame('Block 12', $body['ship_to']['block'] ?? null,
+        $this->assertSame('Block 21', $body['ship_to']['block'] ?? null,
             'Explicitly provided checkout block must be preserved in ship_to.block');
         $this->assertSame('36', $body['ship_to']['building_number'] ?? null);
         $this->assertSame('11511', $body['ship_to']['postal_code'] ?? null);

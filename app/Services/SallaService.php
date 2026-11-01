@@ -838,17 +838,15 @@ class SallaService
             return null;
         }
 
-        // 2. Parse street number (extracted if present)
-        $streetNumber = null;
-        if (preg_match('/\b(\d{1,5})\b/', $freeformAddress, $sm)) {
-            $streetNumber = $sm[1];
-        }
+        // Only accept a real street/building number. In particular, never treat
+        // a PO Box number as the street number sent to Salla.
+        $streetNumber = OrderCheckoutService::extractBuildingNumber($freeformAddress);
 
         // 3. Parse block/district — only set when an explicit label is present.
         // Do NOT fall back to first-N-words: Salla rejects invented block values and the
         // validation failure cascades into a misleading receiver.phone error.
         $block = null;
-        if (preg_match('/(?:district|block|neighborhood|حي|منطقة|بلوك|قطعة)\s*[:\-]?\s*([A-Za-z\x{0600}-\x{06FF}\s]{2,30})/ui', $freeformAddress, $bm)) {
+        if (preg_match('/(?:block|blk|بلوك|قطعة)\s*[:\-]?\s*([A-Za-z\x{0600}-\x{06FF}\s]{2,30})/ui', $freeformAddress, $bm)) {
             $block = trim($bm[1]);
         }
 
@@ -879,21 +877,21 @@ class SallaService
      */
     public function buildCanonicalOrderPayload(Channel $channel, array $checkoutState): ?array
     {
+        $checkoutState = SallaAddressParser::fillMissing($checkoutState);
         $phone    = $checkoutState['phone'] ?? $checkoutState['customer_phone'] ?? '';
         $fullName = $checkoutState['full_name'] ?? null;
         $email    = $checkoutState['email'] ?? $checkoutState['customer_email'] ?? null;
 
-        $existingCustomer = $this->findCustomerForChannel($channel, $phone);
+        $existingCustomer = empty($email) ? $this->findCustomerForChannel($channel, $phone) : null;
         if (empty($email) && !empty($existingCustomer['email'])) {
             $email = $existingCustomer['email'];
         }
 
-        if (empty($email) || !filter_var($email, FILTER_VALIDATE_EMAIL)) {
-            Log::info('SallaService: order is waiting for a valid receiver email', [
+        if (!empty($email) && !filter_var($email, FILTER_VALIDATE_EMAIL)) {
+            Log::info('SallaService: ignoring invalid optional customer email', [
                 'channel_id' => $channel->id,
-                'customer_found' => (bool) $existingCustomer,
             ]);
-            return null;
+            $email = null;
         }
 
         // Validate before customer creation so a malformed checkout phone never
@@ -913,15 +911,6 @@ class SallaService
             return null;
         }
 
-        $customerId = $this->resolveOrCreateCustomerForChannel($channel, $phone, $fullName, $email);
-        if (!$customerId) {
-            Log::warning('SallaService: unable to resolve or create customer_id for order creation', [
-                'channel_id' => $channel->id,
-                'phone_present' => $phone !== '',
-            ]);
-            return null;
-        }
-
         $freeformAddress = $checkoutState['address'] ?? '';
         $shippingAddress = $this->resolveShippingAddressForChannel($channel, $freeformAddress, $phone);
 
@@ -935,13 +924,43 @@ class SallaService
 
         $postalCode = $checkoutState['postal_code'] ?? $shippingAddress['postal_code'] ?? null;
         $coordinates = $checkoutState['geo_coordinates'] ?? null;
-        // Salla requires a postal code; delivery coordinates are optional and are sent only when known.
-        if (empty($postalCode)) {
-            Log::info('SallaService: order is waiting for postal code', [
+        $buildingNumber = $checkoutState['building_number'] ?? $shippingAddress['street_number'] ?? null;
+        $streetNumber = $shippingAddress['street_number'] ?? $buildingNumber;
+        $block = $checkoutState['block'] ?? $shippingAddress['block'] ?? null;
+
+        // These are required by Salla's current ship_to/National Address contract.
+        // Coordinates are resolved from the city by Nominatim; customers are never
+        // asked to provide coordinates or a map pin.
+        $missingShipToFields = [];
+        foreach ([
+            'postal_code' => $postalCode,
+            'building_number' => $buildingNumber,
+            'street_number' => $streetNumber,
+            'block' => $block,
+            'geo_coordinates' => isset($coordinates['lat'], $coordinates['lng']) ? $coordinates : null,
+        ] as $field => $value) {
+            if (empty($value)) {
+                $missingShipToFields[] = $field;
+            }
+        }
+        if ($missingShipToFields !== []) {
+            Log::info('SallaService: order is waiting for required National Address fields', [
                 'channel_id' => $channel->id,
-                'has_postal_code' => false,
+                'missing_fields' => $missingShipToFields,
             ]);
             return null;
+        }
+
+        if (($countryCode = SallaPhoneHelper::getCountryCode($phone) ?? 'SA') === 'SA') {
+            foreach (['short_address', 'additional_number', 'district'] as $field) {
+                if (empty($checkoutState[$field])) {
+                    Log::info('SallaService: Saudi order is waiting for National Address data', [
+                        'channel_id' => $channel->id,
+                        'missing_field' => $field,
+                    ]);
+                    return null;
+                }
+            }
         }
 
         $productId = (int)($checkoutState['salla_product_id'] ?? null);
@@ -1019,13 +1038,36 @@ class SallaService
             return null;
         }
 
+        $districtId = null;
+        $districtName = trim((string) ($checkoutState['district'] ?? ''));
+        if ($countryCode === 'SA' && $districtName !== '') {
+            $districtId = $this->resolveDistrictIdForChannel($channel, (int) $shippingAddress['city_id'], $districtName);
+        }
+        if ($countryCode === 'SA' && !$districtId) {
+            Log::info('SallaService: Saudi district could not be matched to Salla district catalog', [
+                'channel_id' => $channel->id,
+                'city_id' => (int) $shippingAddress['city_id'],
+            ]);
+            return null;
+        }
+
+        // Create/resolve the customer only after the address, product, COD
+        // shipping rate, and provider-required fields are all ready.
+        $customerId = $this->resolveOrCreateCustomerForChannel($channel, $phone, $fullName, $email);
+        if (!$customerId) {
+            Log::warning('SallaService: unable to resolve or create customer_id for order creation', [
+                'channel_id' => $channel->id,
+                'phone_present' => $phone !== '',
+            ]);
+            return null;
+        }
+
         // Current docs example omits '+', but Salla Support reproduced rejection
         // without it and acceptance with it for this store. Preserve their confirmed rule.
         $receiverPhone = SallaPhoneHelper::formatForReceiver($phone);
         // customer.mobile: full number WITH leading '+' (separate Salla field)
         $customerMobile = SallaPhoneHelper::formatForCustomerMobile($phone);
         // ISO country code from phone, fallback to SA for Salla-based stores
-        $countryCode = SallaPhoneHelper::getCountryCode($phone) ?? 'SA';
 
         $products = [[
             'identifier_type' => 'id',
@@ -1072,19 +1114,69 @@ class SallaService
             'ship_to' => array_filter([
                 'country'       => $shippingAddress['country_id'] ?? null,
                 'city'          => $shippingAddress['city_id'] ?? null,
-                'street_number' => $shippingAddress['street_number'] ?? ($checkoutState['building_number'] ?? null),
-                'block'         => $checkoutState['block'] ?? $shippingAddress['block'] ?? null,
+                'district'      => $districtId,
+                'street_number' => $streetNumber,
+                'block'         => $block,
                 'address'       => $shippingAddress['address'] ?? $freeformAddress,
                 'address_line'  => $shippingAddress['address'] ?? $freeformAddress,
                 'postal_code'   => $postalCode,
                 'geo_coordinates' => isset($coordinates['lat'], $coordinates['lng']) ? ['lat' => (float) $coordinates['lat'], 'lng' => (float) $coordinates['lng']] : null,
-                'building_number' => $checkoutState['building_number'] ?? null,
+                'building_number' => $buildingNumber,
                 'short_address' => $checkoutState['short_address'] ?? null,
                 'additional_number' => $checkoutState['additional_number'] ?? null,
             ], fn ($value) => !is_null($value) && $value !== ''),
             'products' => $products,
             'payment'  => $payment,
         ];
+    }
+
+    /** Resolve a customer-provided district name to Salla's numeric district ID. */
+    protected function resolveDistrictIdForChannel(Channel $channel, int $cityId, string $districtName): ?int
+    {
+        $endpoint = "/cities/{$cityId}/districts";
+        $cacheKey = "salla_districts_channel_{$channel->id}_city_{$cityId}";
+        $catalog = $this->cachedSallaResponse($cacheKey, $endpoint, function () use ($channel, $endpoint) {
+            $districts = [];
+            $page = 1;
+            $totalPages = 1;
+
+            do {
+                $response = $this->apiCallForChannel($channel, 'GET', $endpoint, [
+                    'page' => $page,
+                    'per_page' => 60,
+                ]);
+                $districts = array_merge($districts, $response['data'] ?? []);
+                $pagination = $response['pagination'] ?? [];
+                $totalPages = max($totalPages, (int) ($pagination['totalPages'] ?? $pagination['total_pages'] ?? 1));
+                $hasNext = $page < $totalPages || !empty($pagination['links']['next']);
+                $page++;
+
+                if ($page > 200) {
+                    Log::warning('SallaService: district pagination exceeded the safety limit', [
+                        'channel_id' => $channel->id,
+                        'city_id' => $cityId,
+                    ]);
+                    break;
+                }
+            } while ($hasNext);
+
+            return ['data' => $districts];
+        });
+
+        $requestedName = $this->normalizeCitySearchText(preg_replace('/^(?:district|neighborhood|حي)\s+/iu', '', $districtName) ?? $districtName);
+        foreach ($catalog['data'] ?? [] as $district) {
+            if (empty($district['id'])) {
+                continue;
+            }
+            foreach ([$district['name'] ?? '', $district['name_en'] ?? ''] as $candidate) {
+                $candidateName = $this->normalizeCitySearchText(preg_replace('/\s+dist\.?$/iu', '', (string) $candidate) ?? (string) $candidate);
+                if ($requestedName !== '' && $requestedName === $candidateName) {
+                    return (int) $district['id'];
+                }
+            }
+        }
+
+        return null;
     }
 
     /**

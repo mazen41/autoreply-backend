@@ -2,6 +2,7 @@
 
 namespace App\Services;
 
+use App\Helpers\SallaPhoneHelper;
 use App\Models\Conversation;
 use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\Http;
@@ -148,6 +149,7 @@ class OrderCheckoutService
             'Medina' => ['medina', 'madinah', 'المدينة المنورة'],
             'Dammam' => ['dammam', 'الدمام'],
             'Al Khobar' => ['al khobar', 'khobar', 'الخبر'],
+            'Al Hofuf' => ['al hofuf', 'hofuf', 'al-hofuf', 'الهفوف'],
             'Taif' => ['taif', 'الطائف'],
             'Tabuk' => ['tabuk', 'تبوك'],
             'Abha' => ['abha', 'أبها'],
@@ -639,16 +641,14 @@ class OrderCheckoutService
 $requiredFields = self::REQUIRED_FIELDS;
         if ($requireSallaShippingDetails) {
             $requiredFields = array_merge($requiredFields, [
-                'email', 'postal_code', 'building_number', 'block', 'district',
+                'postal_code', 'building_number', 'block', 'geo_coordinates',
             ]);
 
             // Saudi National Address codes are not applicable to international
             // delivery addresses. Require them only for Saudi phone/address flows.
-            $phoneDigits = preg_replace('/[^0-9]/', '', (string) ($state['phone'] ?? $state['customer_phone'] ?? ''));
-            $isSaudiNumber = str_starts_with($phoneDigits, '9665')
-                || (strlen($phoneDigits) === 10 && str_starts_with($phoneDigits, '05'));
-            if ($isSaudiNumber) {
-                $requiredFields = array_merge($requiredFields, ['short_address', 'additional_number']);
+            $countryCode = SallaPhoneHelper::getCountryCode((string) ($state['phone'] ?? $state['customer_phone'] ?? ''));
+            if ($countryCode === 'SA') {
+                $requiredFields = array_merge($requiredFields, ['district', 'short_address', 'additional_number']);
             }
         }
 
@@ -660,9 +660,6 @@ $requiredFields = self::REQUIRED_FIELDS;
             $value = $normalizedState[$field] ?? null;
             foreach ($fieldAliases[$field] ?? [] as $alias) {
                 $value = $value ?: ($normalizedState[$alias] ?? null);
-            }
-            if ($field === 'email' && $value && !filter_var($value, FILTER_VALIDATE_EMAIL)) {
-                $value = null;
             }
             if ($field === 'geo_coordinates' && is_array($value)) {
                 $validCoordinates = isset($value['lat'], $value['lng'])
@@ -808,7 +805,15 @@ $requiredFields = self::REQUIRED_FIELDS;
             return $m[1];
         }
 
-        if (preg_match('/(?:^|[\s,،])(\d{1,5}[A-Za-z]?)\s+(?=\p{L})/u', $text, $m, PREG_OFFSET_CAPTURE) === 1) {
+        // A PO Box number is not a delivery building/street number. Remove
+        // labeled PO Box segments before applying the conservative leading-number heuristic.
+        $streetAddress = preg_replace(
+            '/(?:p\.?\s*o\.?\s*box|post\s+office\s+box|صندوق\s+البريد|ص\.?\s*ب\.?)\s*[:#-]?\s*\d{1,10}/iu',
+            ' ',
+            $text
+        ) ?? $text;
+
+        if (preg_match('/(?:^|[\s,،])(\d{1,5}[A-Za-z]?)\s+(?=\p{L})/u', $streetAddress, $m, PREG_OFFSET_CAPTURE) === 1) {
             $number = $m[1][0];
             $offset = (int) $m[1][1];
             $before = strtolower(substr($text, max(0, $offset - 25), min(25, $offset)));

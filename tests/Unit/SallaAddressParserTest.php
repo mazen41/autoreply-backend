@@ -35,6 +35,14 @@ class SallaAddressParserTest extends TestCase
         $this->assertNull($p['district']);
     }
 
+    public function test_po_box_is_not_parsed_as_a_building_number(): void
+    {
+        $p = SallaAddressParser::parse('Ghaali Mitri, P.O. Box 122, Hofuf 36361, Saudi Arabia');
+
+        $this->assertNull($p['building_number']);
+        $this->assertSame('36361', $p['postal_code']);
+    }
+
     public function test_fill_missing_keeps_values_already_saved(): void
     {
         $state = SallaAddressParser::fillMissing([

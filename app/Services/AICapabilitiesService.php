@@ -507,7 +507,7 @@ ROLE;
             ];
             $p .= "Required Fields: [Full Name, Phone Number, Complete Delivery Address]";
             if (!empty($context['salla_exclusive_mode'])) {
-                $p .= "; for Salla, also collect only the email and delivery-address fields listed as missing below";
+                $p .= "; for Salla, collect the additional delivery-address fields listed as missing below";
             }
             $p .= "\n\n";
 

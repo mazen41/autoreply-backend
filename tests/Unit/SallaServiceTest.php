@@ -304,6 +304,10 @@ class SallaServiceTest extends TestCase
                     ],
                 ],
             ], 200),
+            'https://api.salla.dev/admin/v2/cities/4/districts*' => Http::response([
+                'data' => [['id' => 99, 'name' => 'حي العليا', 'name_en' => 'Al Olaya Dist.']],
+                'pagination' => ['totalPages' => 1],
+            ], 200),
         ]);
 
         $checkoutState = [
@@ -312,6 +316,13 @@ class SallaServiceTest extends TestCase
             'email' => 'receiver@example.com',
             'address' => 'King Fahd Road, Riyadh',
             'postal_code' => '12211',
+            'building_number' => '8230',
+            'street_number' => '8230',
+            'block' => 'Second floor',
+            'district' => 'Al Olaya',
+            'short_address' => 'RRRR1234',
+            'additional_number' => '5678',
+            'geo_coordinates' => ['lat' => 24.7136, 'lng' => 46.6753],
             'salla_product_id' => 1242785692,
             'product_price' => 200,
         ];
@@ -346,6 +357,7 @@ class SallaServiceTest extends TestCase
         $this->assertSame(4, $payload['ship_to']['city']);
         $this->assertSame(1473353380, $payload['ship_to']['country']);
         $this->assertSame('12211', $payload['ship_to']['postal_code']);
+        $this->assertSame(99, $payload['ship_to']['district']);
     }
 
     public function test_build_canonical_order_payload_rejects_repeated_digit_placeholder_phone(): void
@@ -463,6 +475,9 @@ class SallaServiceTest extends TestCase
             'email' => 'eg-customer@example.com',
             'address' => 'Faisal Street, Giza, Egypt',
             'postal_code' => '12511',
+            'building_number' => '15',
+            'block' => 'Faisal',
+            'geo_coordinates' => ['lat' => 30.0131, 'lng' => 31.2089],
             'salla_product_id' => 1242785692,
             'product_price' => 150,
         ];

@@ -95,6 +95,35 @@ class AiSetupVerificationTest extends TestCase
         $this->assertFalse((bool) $channel->fresh()->ai_enabled);
     }
 
+    public function test_test_reply_uses_the_configured_groq_provider_and_skips_empty_knowledge_search(): void
+    {
+        [$user, $business] = $this->business();
+        $this->enableSetupVerification($business->id);
+        config([
+            'services.ai.provider' => 'groq',
+            'services.ai.fallback_provider' => 'gemini',
+            'services.groq.api_key' => 'test-groq-key',
+            'services.groq.model' => 'test-groq-model',
+            'services.gemini.api_key' => null,
+        ]);
+        Http::fake([
+            'api.groq.com/openai/v1/chat/completions' => Http::response([
+                'choices' => [['message' => ['content' => 'Groq test reply.']]],
+            ], 200),
+            'generativelanguage.googleapis.com/*' => Http::response([], 403),
+        ]);
+        Sanctum::actingAs($user);
+
+        $this->postJson('/api/knowledge/test', ['test_question' => 'Say hello'], ['X-Business-Id' => (string) $business->id])
+            ->assertOk()
+            ->assertJsonPath('test_response', 'Groq test reply.');
+
+        Http::assertSent(fn ($request) => str_contains($request->url(), 'api.groq.com/openai/v1/chat/completions')
+            && $request->hasHeader('Authorization', 'Bearer test-groq-key')
+            && data_get($request->data(), 'model') === 'test-groq-model');
+        Http::assertNotSent(fn ($request) => str_contains($request->url(), 'generativelanguage.googleapis.com'));
+    }
+
     public function test_test_reply_is_invalidated_when_agent_instructions_change(): void
     {
         [$user, $business, $channel, $bot] = $this->readyBusiness();

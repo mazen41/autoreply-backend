@@ -28,7 +28,7 @@ class EmbeddingsService
         $this->model   = 'gemini-embedding-001';
 
         if (empty($this->apiKey)) {
-            Log::error('EmbeddingsService: GEMINI_API_KEY is not configured — all embedding calls will fail');
+            Log::warning('EmbeddingsService: Gemini embedding key is not configured; semantic knowledge search is unavailable');
         }
     }
 
@@ -55,6 +55,10 @@ class EmbeddingsService
     {
         // An empty input (for example an attachment with no text) is rejected by the API with 400.
         if (trim($text) === '') {
+            return null;
+        }
+
+        if (empty($this->apiKey)) {
             return null;
         }
 
@@ -102,6 +106,10 @@ class EmbeddingsService
     public function embedBatch(array $chunks): array
     {
         if (empty($chunks)) {
+            return [];
+        }
+
+        if (empty($this->apiKey)) {
             return [];
         }
 

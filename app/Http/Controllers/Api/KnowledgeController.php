@@ -354,7 +354,12 @@ class KnowledgeController extends Controller
 
         // Build knowledge base using RAG
         $knowledgeText = '';
-        if (!empty($query)) {
+        $hasIndexedKnowledge = \App\Models\BusinessKnowledgeChunk::query()
+            ->where('business_profile_id', $business->id)
+            ->whereNotNull('embedding')
+            ->exists();
+
+        if (!empty($query) && $hasIndexedKnowledge) {
             $embeddingsService = app(\App\Services\EmbeddingsService::class);
             $vectorSearch = app(\App\Services\VectorSearchService::class);
 
@@ -415,23 +420,78 @@ class KnowledgeController extends Controller
 
     private function callConfiguredAI(string $systemPrompt, array $contextMessages): ?string
     {
-        $primary = config('services.ai.provider', 'gemini');
+        $primary = strtolower((string) config('services.ai.provider', 'groq'));
         $fallback = config('services.ai.fallback_provider', $primary === 'gemini' ? 'claude' : 'gemini');
-        $providers = array_values(array_unique(array_filter([$primary, $fallback])));
+        $providers = array_values(array_unique(array_filter([$primary, strtolower((string) $fallback)])));
 
         foreach ($providers as $provider) {
+            $model = match ($provider) {
+                'groq' => config('services.groq.model'),
+                'claude' => config('services.claude.model'),
+                'gemini' => config('services.gemini.model'),
+                default => null,
+            };
+            Log::info('Knowledge test reply calling configured AI provider', [
+                'provider' => $provider,
+                'model' => $model,
+            ]);
+
             $reply = match ($provider) {
+                'groq' => $this->callGroqAPI($systemPrompt, $contextMessages),
                 'claude' => $this->callClaudeAPI($systemPrompt, $contextMessages),
                 'gemini' => $this->callGeminiAPI($systemPrompt, $contextMessages),
                 default => null,
             };
 
             if ($reply) {
+                Log::info('Knowledge test reply generated', [
+                    'provider' => $provider,
+                    'model' => $model,
+                ]);
                 return $reply;
             }
         }
 
         return null;
+    }
+
+    private function callGroqAPI(string $systemPrompt, array $contextMessages): ?string
+    {
+        $apiKey = config('services.groq.api_key');
+        if (!$apiKey) {
+            Log::warning('Knowledge test reply skipped Groq because its API key is not configured');
+            return null;
+        }
+
+        try {
+            $response = \Illuminate\Support\Facades\Http::timeout(30)
+                ->connectTimeout(10)
+                ->withToken($apiKey)
+                ->acceptJson()
+                ->post('https://api.groq.com/openai/v1/chat/completions', [
+                    'model' => config('services.groq.model', 'openai/gpt-oss-120b'),
+                    'messages' => array_merge(
+                        [['role' => 'system', 'content' => $systemPrompt]],
+                        $contextMessages,
+                    ),
+                    'temperature' => (float) config('services.ai.temperature', 0.7),
+                    'max_tokens' => (int) config('services.ai.max_tokens', 2048),
+                ]);
+
+            if (!$response->successful()) {
+                Log::error('Groq knowledge test reply request failed', [
+                    'status' => $response->status(),
+                ]);
+                return null;
+            }
+
+            return $response->json('choices.0.message.content');
+        } catch (\Throwable $exception) {
+            Log::error('Groq knowledge test reply request threw an exception', [
+                'exception_type' => get_class($exception),
+            ]);
+            return null;
+        }
     }
 
     private function callClaudeAPI(string $systemPrompt, array $contextMessages): ?string

@@ -437,11 +437,17 @@ class OrderCheckoutService
         if (!$extractedName && empty($existingState['full_name'])
             && preg_match('/\b(?:phone|mobile|telephone|tel|address|delivery\s+address|email)\b/i', $incomingText)) {
             $leadingSegment = preg_split(
-                '/\s+(?:and\s+)?(?:the\s+)?(?:phone|mobile|telephone|tel|address|delivery\s+address|email)\b/i',
+                '/\s+(?:and\s+)?(?:the\s+)?(?:phone|mobile|telephone|tel|email)\b/i',
                 trim($incomingText),
                 2
             )[0] ?? '';
+            $leadingSegment = preg_replace(
+                '/^(?:(?:that\x{2019}s|that\x{27}s|that is|this is|here is)\s+)?(?:the\s+)?(?:full\s+)?address(?:\s+is)?\s*[:,-]?\s*/iu',
+                '',
+                $leadingSegment
+            ) ?? $leadingSegment;
             $candidate = trim(preg_replace('/^(?:my name is|name is)\s+/i', '', $leadingSegment), " \t\n\r\0\x0B,;:-");
+            $candidate = preg_replace('/\s+(?:and|و)\s*$/iu', '', $candidate) ?? $candidate;
             if (preg_match('/^(?:[\p{L}][\p{L}\x{2019}\x{27}-]*\s+){1,3}[\p{L}][\p{L}\x{2019}\x{27}-]*$/u', $candidate)
                 && !preg_match('/(?:order|buy|help|phone|address|price|product|dress|the|this|that|طلب|شراء|عنوان|هاتف|جوال|الفستان)/ui', $candidate)) {
                 $extractedName = $candidate;

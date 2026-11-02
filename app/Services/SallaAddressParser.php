@@ -11,6 +11,42 @@ class SallaAddressParser
     /** Fills empty fields from the stored address text; never overwrites a value already saved. */
     public static function fillMissing(array $state): array
     {
+        $address = (string) ($state['address'] ?? '');
+        $poBox = $state['po_box'] ?? OrderCheckoutService::extractPoBox($address);
+        if (!empty($poBox)) {
+            $state['po_box'] = (string) $poBox;
+        }
+
+        // Older checkout turns could persist "is 122" as the block and 122 as
+        // the building number from "P.O. Box 122". Repair those values before
+        // calculating missing fields; a postal box is never a street number or
+        // a Saudi block/floor.
+        if (!empty($state['block'])) {
+            $block = trim((string) $state['block']);
+            $block = preg_replace('/^(?:is|equals?)\s+/iu', '', $block) ?? $block;
+            $block = trim($block, " ,.-");
+            if ($block === '' || (!empty($poBox) && preg_match('/^\d+$/', $block) && (string) $block === (string) $poBox)) {
+                unset($state['block']);
+            } else {
+                $state['block'] = $block;
+            }
+        }
+
+        foreach (['building_number', 'street_number'] as $numberField) {
+            if (!empty($state[$numberField]) && !empty($poBox)
+                && (string) $state[$numberField] === (string) $poBox) {
+                unset($state[$numberField]);
+            }
+        }
+
+        // A one-word city copied into full_name is a common false match when
+        // the customer sends the address separately (e.g. "Hofuf").
+        $name = trim((string) ($state['full_name'] ?? ''));
+        if ($name !== '' && !preg_match('/\s/u', $name) && $address !== ''
+            && preg_match('/(?<![\p{L}])' . preg_quote($name, '/') . '(?![\p{L}])/iu', $address)) {
+            unset($state['full_name']);
+        }
+
         foreach (self::parse((string) ($state['address'] ?? '')) as $key => $value) {
             if ($value !== null && empty($state[$key])) {
                 $state[$key] = $value;
@@ -28,10 +64,23 @@ class SallaAddressParser
         return [
             'building_number' => OrderCheckoutService::extractBuildingNumber($text),
             'postal_code' => self::postalCode($text),
-            'block' => self::labelled($text, '/(?:block|blk|bl\.?|بلوك|قطعة)\s*(?:no\.?|number|#)?\s*[:#-]?\s*([\p{L}\d][\p{L}\d\s\-\/]{0,20}?)(?=\s*(?:,|$|\b(?:street|st|district|area|postal|zip|and)\b))/iu'),
+            'block' => self::block($text),
             'district' => self::labelled($text, '/(?:district|neighborhood|area|حي|منطقة)\s*[:#-]?\s*(\p{L}[\p{L}\s\-]{1,30}?)(?=\s*(?:,|$|\b(?:street|st|block|postal|zip|and)\b))/iu'),
             'address_line' => self::streetLine($text),
         ];
+    }
+
+    private static function block(string $text): ?string
+    {
+        // Salla's `block` field is also used for floor details (their API
+        // example is "الدور الثاني"). Accept explicit labels only; never
+        // guess a block from a P.O. Box, city, street, or postal code.
+        $labelledBlock = self::labelled($text, '/(?:block|blk|bl\.?|بلوك|قطعة)\s*(?:no\.?|number|#)?\s*(?:(?:is|equals?)\s+|[:=\-#]\s*)?([\p{L}\d][\p{L}\d\s\-\/]{0,30}?)(?=\s*(?:,|$|\b(?:street|st|district|area|postal|zip|and)\b))/iu');
+        if ($labelledBlock !== null) {
+            return $labelledBlock;
+        }
+
+        return self::labelled($text, '/(?:floor|level|apartment|apt\.?|unit|الدور|الطابق|الطابقه|شقة|وحدة)\s*(?:(?:is|number|no\.?|رقم)\s+|[:=#\-]\s*)?([\p{L}\d][\p{L}\d\s\-\/]{0,25}?)(?=\s*(?:,|$|\b(?:street|st|district|area|postal|zip|and)\b))/iu');
     }
 
     private static function postalCode(string $text): ?string

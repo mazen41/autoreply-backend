@@ -448,14 +448,19 @@ class OrderCheckoutService
             }
         }
 
-        // Fallback: If customer is answering a direct name query and message is short (1-4 words, no numbers/keywords)
+        // Fallback for short name replies. A one-word reply is too ambiguous:
+        // it is often a city (for example, "Hofuf") when the customer was
+        // sending an address. One-word names are still accepted through the
+        // explicit "my name is X" pattern above.
         if (!$extractedName && empty($existingState['full_name'])) {
             $words = array_filter(explode(' ', trim($incomingText)));
             if (
-                count($words) >= 1
+                count($words) >= 2
                 && count($words) <= 4
+                && !preg_match('/[\r\n]/u', $incomingText)
                 && !preg_match('/[0-9@]/', $incomingText)
                 && !preg_match('/https?:\/\/|maps\.app|maps\.google/i', $incomingText)
+                && !preg_match('/\b(?:p\.?\s*o\.?\s*box|post(?:al)?\s*code|street|road|district|neighborhood|city|saudi\s+arabia|hofuf|riyadh|jeddah|mecca|dammam|address)\b|صندوق\s+البريد|الرمز\s+البريدي|شارع|حي|مدينة/iu', $incomingText)
             ) {
                 $textLower = mb_strtolower(trim($incomingText));
                 if (!preg_match('/(?:hi|hello|hey|yes|no|ok|sure|thanks?|great|good|perfect|nice|cool|awesome|excellent|wonderful|fine|please|order|buy|address|confirm|products?|items?|images?|pictures?|photos?|the dress|this one|that one|dress|see|view|show|list|help|catalogue|catalog|مرحبا|سلام|نعم|شكرا|اريد|طلب|تأكيد|تم|اكد|الفستان|هذا|هذه)/ui', $textLower)) {

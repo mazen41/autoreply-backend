@@ -1070,6 +1070,20 @@ class SallaService
             'identifier'      => $productId,
             'quantity'        => 1,
         ]];
+        $selectedOptions = $checkoutState['salla_options'] ?? [];
+        if (is_array($selectedOptions) && $selectedOptions !== []) {
+            $products[0]['options'] = array_values(array_filter(array_map(
+                static function ($optionId, $valueIds): ?array {
+                    $values = array_values(array_filter(array_map('strval', (array) $valueIds), fn ($value) => $value !== ''));
+                    return $values === [] ? null : ['id' => (int) $optionId, 'value' => $values];
+                },
+                array_keys($selectedOptions),
+                array_values($selectedOptions)
+            )));
+            if ($products[0]['options'] === []) {
+                unset($products[0]['options']);
+            }
+        }
 
         $currency = $checkoutState['product_currency'] ?? $selectedRate['total']['currency'] ?? 'SAR';
         $productAmount = (float) ($checkoutState['product_price'] ?? 0);
@@ -1287,6 +1301,40 @@ class SallaService
     public function getProductsForChannel(Channel $channel, array $params = []): array
     {
         return $this->apiCallForChannel($channel, 'GET', '/products', $params);
+    }
+
+    /** Return normalized variant/required options for one product in this Salla store. */
+    public function getProductOptionsForChannel(Channel $channel, string $productId): array
+    {
+        $product = $this->apiCallForChannel($channel, 'GET', '/products/' . rawurlencode($productId));
+        $options = $product['data']['options'] ?? [];
+        if (!is_array($options)) {
+            return [];
+        }
+
+        return collect($options)
+            ->filter(fn ($option) => is_array($option)
+                && (($option['purpose'] ?? null) === 'variants' || !empty($option['required'])))
+            ->map(function (array $option): array {
+                $values = collect($option['values'] ?? [])
+                    ->filter(fn ($value) => is_array($value) && empty($value['is_out_of_stock']))
+                    ->map(fn ($value) => [
+                        'id' => (string) ($value['id'] ?? ''),
+                        'name' => trim((string) ($value['name'] ?? '')),
+                    ])
+                    ->filter(fn ($value) => $value['id'] !== '' && $value['name'] !== '')
+                    ->values()
+                    ->all();
+
+                return [
+                    'id' => (string) ($option['id'] ?? ''),
+                    'name' => trim((string) ($option['name'] ?? 'Product option')),
+                    'values' => $values,
+                ];
+            })
+            ->filter(fn ($option) => $option['id'] !== '' && $option['values'] !== [])
+            ->values()
+            ->all();
     }
 
     /**

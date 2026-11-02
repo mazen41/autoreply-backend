@@ -1593,6 +1593,10 @@ class ProcessAutoReply implements ShouldQueue
         $shopifyVariantSelectionRequired = false;
         $shopifyVariantChosenThisMessage = false;
         $shopifyVariantDataUnavailable = false;
+        $sallaProductOptions = [];
+        $sallaOptionSelectionRequired = false;
+        $sallaOptionChosenThisMessage = false;
+        $sallaOptionPrompt = null;
         if ($commerceChannel?->type === 'shopify' && !empty($updatedCheckoutState['commerce_external_id'])) {
             $commerceProduct = \App\Models\Product::query()
                 ->where('business_id', $conversation->business_id)
@@ -1631,6 +1635,81 @@ class ProcessAutoReply implements ShouldQueue
             }
         }
 
+        // Salla products can require explicit variants/options (for example,
+        // clothing size). Resolve them against this store's live product data;
+        // never send an order with an arbitrary size. If exactly one value is
+        // in stock it is safe to carry it into the visible confirmation summary.
+        $shouldInspectSallaOptions = $isPlaceOrder
+            || \App\Services\ShopifyOrderIntent::wantsToOrder((string) $message->content)
+            || \App\Services\OrderCheckoutService::isExplicitOrderConfirmation((string) $message->content)
+            || ($updatedCheckoutState['confirmation_state'] ?? null) === 'selecting_salla_option';
+        if ($commerceChannel?->type === 'salla'
+            && $shouldInspectSallaOptions
+            && !empty($updatedCheckoutState['salla_product_id'])) {
+            try {
+                $sallaProductOptions = (new SallaService())->getProductOptionsForChannel(
+                    $commerceChannel,
+                    (string) $updatedCheckoutState['salla_product_id']
+                );
+                $savedSelections = (array) ($updatedCheckoutState['salla_options'] ?? []);
+                $savedTitles = (array) ($updatedCheckoutState['salla_option_titles'] ?? []);
+                $selectingSallaOption = ($updatedCheckoutState['confirmation_state'] ?? null) === 'selecting_salla_option';
+
+                foreach ($sallaProductOptions as $option) {
+                    $optionId = (string) $option['id'];
+                    $values = $option['values'];
+                    $selectedIds = array_values(array_intersect(
+                        array_map('strval', (array) ($savedSelections[$optionId] ?? [])),
+                        array_column($values, 'id')
+                    ));
+
+                    if ($selectedIds === [] && count($values) === 1) {
+                        $selectedIds = [(string) $values[0]['id']];
+                        $sallaOptionChosenThisMessage = true;
+                    } elseif ($selectedIds === [] && $selectingSallaOption) {
+                        $selectionText = mb_strtolower(trim((string) $message->content));
+                        $index = preg_match('/^\s*(\d{1,2})\s*\.?\s*$/u', $selectionText, $numberMatch)
+                            ? ((int) $numberMatch[1] - 1)
+                            : null;
+                        if ($index !== null && isset($values[$index])) {
+                            $selectedIds = [(string) $values[$index]['id']];
+                        } else {
+                            foreach ($values as $value) {
+                                if (mb_strtolower(trim($value['name'])) === $selectionText) {
+                                    $selectedIds = [(string) $value['id']];
+                                    break;
+                                }
+                            }
+                        }
+                        $sallaOptionChosenThisMessage = $selectedIds !== [];
+                    }
+
+                    if ($selectedIds === []) {
+                        $sallaOptionSelectionRequired = true;
+                        $sallaOptionPrompt ??= $option;
+                        continue;
+                    }
+
+                    $savedSelections[$optionId] = $selectedIds;
+                    $selectedValue = collect($values)->firstWhere('id', $selectedIds[0]);
+                    if ($selectedValue) {
+                        $savedTitles[$optionId] = trim($option['name'] . ': ' . $selectedValue['name']);
+                    }
+                }
+
+                if ($savedSelections !== []) {
+                    $updatedCheckoutState['salla_options'] = $savedSelections;
+                    $updatedCheckoutState['salla_option_titles'] = array_values($savedTitles);
+                }
+            } catch (\Throwable $e) {
+                Log::warning('ProcessAutoReply: could not inspect Salla product options', [
+                    'conversation_id' => $conversation->id,
+                    'connection_id' => $commerceChannel->id,
+                    'exception_type' => get_class($e),
+                ]);
+            }
+        }
+
         $checkoutState = $updatedCheckoutState;
         $fieldStatus = $checkoutService->computeFieldStatus(
             $updatedCheckoutState,
@@ -1656,6 +1735,16 @@ class ProcessAutoReply implements ShouldQueue
                 $updatedCheckoutState['confirmation_summary_fingerprint'],
                 $updatedCheckoutState['confirmation_summary_sent_at']
             );
+        }
+        if ($sallaOptionSelectionRequired) {
+            $updatedCheckoutState['confirmation_state'] = 'selecting_salla_option';
+            unset(
+                $updatedCheckoutState['confirmation_summary_message_id'],
+                $updatedCheckoutState['confirmation_summary_fingerprint'],
+                $updatedCheckoutState['confirmation_summary_sent_at']
+            );
+        } elseif ($sallaOptionChosenThisMessage && !empty($fieldStatus['is_complete'])) {
+            $updatedCheckoutState['confirmation_state'] = 'confirmation_pending';
         }
         $checkoutState = $updatedCheckoutState;
         if (!empty($updatedCheckoutState)) {
@@ -2406,7 +2495,11 @@ if (!$isProductBrowseMessage && $commerceChannel && !$summaryConfirmTurn) {
         $isOrderSummaryMessage = $intent === 'place_order'
             && !empty($fieldStatus['is_complete'])
             && !$shopifyVariantSelectionRequired
+            && !$sallaOptionSelectionRequired
             && ($checkoutState['confirmation_state'] ?? null) === 'confirmation_pending';
+        if ($sallaOptionChosenThisMessage && !empty($fieldStatus['is_complete']) && !$sallaOptionSelectionRequired) {
+            $isOrderSummaryMessage = true;
+        }
         if ($isOrderSummaryMessage) {
             $aiResponse = $this->buildOrderConfirmationSummary($checkoutState, $commerceChannel);
         }
@@ -2445,6 +2538,21 @@ $intro = !empty($fieldStatus['is_complete'])
     : "Which product option would you like? Reply with its number or exact name, then I'll ask for your name, phone and address:\n";
 $aiResponse = $intro
                     . implode("\n", $options);
+            }
+        }
+
+        if ($sallaOptionSelectionRequired
+            && ($variantOrderIntent || ($checkoutState['confirmation_state'] ?? null) === 'selecting_salla_option')
+            && !$isProductBrowseMessage) {
+            $option = $sallaOptionPrompt;
+            $values = $option['values'] ?? [];
+            if ($option && $values !== []) {
+                $choices = [];
+                foreach ($values as $index => $value) {
+                    $choices[] = ($index + 1) . '. ' . $value['name'];
+                }
+                $aiResponse = 'Which ' . mb_strtolower($option['name']) . ' would you like? Reply with its number or exact name:\n'
+                    . implode("\n", $choices);
             }
         }
 
@@ -2667,6 +2775,8 @@ $aiResponse = $intro
                     'product_price'    => $checkoutState['product_price']    ?? 0,
                     'commerce_variant_id' => $checkoutState['commerce_variant_id'] ?? null,
                     'commerce_variant_title' => $checkoutState['commerce_variant_title'] ?? null,
+                    'salla_options' => $checkoutState['salla_options'] ?? [],
+                    'salla_option_titles' => $checkoutState['salla_option_titles'] ?? [],
                     'full_name'        => $checkoutState['full_name']         ?? $checkoutState['customer_name']    ?? null,
                     'phone'            => $checkoutState['customer_phone']    ?? $checkoutState['phone']             ?? '',
                     'address'          => $checkoutState['address']           ?? $checkoutState['customer_address'] ?? '',
@@ -2763,7 +2873,7 @@ $aiResponse = $intro
                         'email' => 'email address',
                         'postal_code' => 'postal code',
                         'building_number' => 'building or house number',
-                        'block' => 'block number/name',
+                        'block' => 'block or floor (for example, a block name or floor number)',
                         'district' => 'district/neighborhood',
                         'geo_coordinates' => 'clear delivery city/address details so I can look up its location',
                         'short_address' => 'Saudi National Address short code',
@@ -2845,16 +2955,14 @@ $aiResponse = $intro
         // ── CHECKOUT STATE PERSISTENCE ─────────────────────────────────────
         // Never let an AI success claim escape when a customer confirms before
         // Salla's required receiver/shipping details have been collected.
-        $aiAskedToConfirmIncompleteOrder = (bool) preg_match(
-            '/\b(?:confirm|confirmation|place (?:the )?order|complete (?:the )?purchase|go ahead)\b/i',
-            (string) $aiResponse
-        );
         if (
             $sallaChannel
             && !empty($updatedCheckoutState['salla_product_id'])
             && empty($fieldStatus['is_complete'])
             && !$isProductBrowseMessage
-            && ($containsConfirmPhrase || $intent === 'place_order' || $aiAskedToConfirmIncompleteOrder)
+            && ($containsConfirmPhrase
+                || $intent === 'place_order'
+                || \App\Services\ShopifyOrderIntent::wantsToOrder((string) $message->content))
         ) {
             $missingLabels = [
                 'full_name' => 'full name',
@@ -2864,7 +2972,7 @@ $aiResponse = $intro
                 'postal_code' => 'postal code',
                 'geo_coordinates' => 'a clear delivery city so its location can be looked up automatically',
                 'building_number' => 'building number',
-                'block' => 'block number/name',
+                'block' => 'block or floor (for example, a block name or floor number)',
                 'district' => 'district/neighborhood',
                 'short_address' => 'short / national address code',
                 'additional_number' => 'additional address number',
@@ -2873,14 +2981,57 @@ $aiResponse = $intro
                 fn ($field) => $missingLabels[$field] ?? str_replace('_', ' ', $field),
                 $fieldStatus['missing_fields']
             );
-            if ($detectedLanguage === 'arabic') {
-                $aiResponse = "لم يتم إرسال الطلب بعد. لإتمامه، أحتاج إلى: " . implode('، ', $missingDetails) . ". من فضلك أرسل البيانات الناقصة.";
+
+            // A customer whose own address genuinely has no Saudi National
+            // Address component (block/district/short address/etc.) cannot
+            // ever answer the same question, and the AI would otherwise ask
+            // for it forever. Track how many times in a row the exact same
+            // set of fields has stayed unresolved across a customer reply; on
+            // the second repeat, hand off to a human instead of looping.
+            $missingFieldsKey = implode(',', $fieldStatus['missing_fields']);
+            $previousAskKey = $updatedCheckoutState['missing_fields_last_asked'] ?? null;
+            $repeatCount = ($previousAskKey === $missingFieldsKey)
+                ? (int) ($updatedCheckoutState['missing_fields_repeat_count'] ?? 0) + 1
+                : 1;
+            $updatedCheckoutState['missing_fields_last_asked'] = $missingFieldsKey;
+            $updatedCheckoutState['missing_fields_repeat_count'] = $repeatCount;
+
+            if ($repeatCount >= 3) {
+                if ($detectedLanguage === 'arabic') {
+                    $aiResponse = "أعتذر، لم أتمكن من إكمال طلبك تلقائياً لأن بيانات العنوان المطلوبة (" . implode('، ', $missingDetails) . ") لم تصل بعد. سيتواصل معك أحد أعضاء فريقنا لإتمام الطلب يدوياً.";
+                } else {
+                    $aiResponse = "Sorry, I haven't been able to get " . implode(', ', $missingDetails) . " from you automatically. I'm connecting you with a team member to finish this order with you directly.";
+                }
+                app(\App\Services\HandoffTaskService::class)->openForConversation(
+                    $conversation,
+                    'checkout_stuck_missing_field',
+                    'normal'
+                );
+                $conversation->update([
+                    'requires_human' => true,
+                    'ai_enabled' => false,
+                    'status' => 'pending_human',
+                    'escalated_at' => now(),
+                    'escalation_reason' => 'checkout_stuck_missing_field',
+                ]);
+                Log::info('ProcessAutoReply: escalated to human after repeated unresolved checkout fields', [
+                    'conversation_id' => $conversation->id,
+                    'missing_fields' => $fieldStatus['missing_fields'],
+                    'repeat_count' => $repeatCount,
+                ]);
             } else {
-                $aiResponse = "I haven't submitted the order yet. To complete it, please send: " . implode(', ', $missingDetails) . ".";
+                if ($detectedLanguage === 'arabic') {
+                    $aiResponse = "لم يتم إرسال الطلب بعد. لإتمامه، أحتاج إلى: " . implode('، ', $missingDetails) . ". من فضلك أرسل البيانات الناقصة.";
+                } else {
+                    $aiResponse = "I haven't submitted the order yet. To complete it, please send: " . implode(', ', $missingDetails) . ".";
+                }
             }
+
+            $conversation->update(['checkout_state' => $updatedCheckoutState]);
             Log::info('ProcessAutoReply: blocked Salla order confirmation while required details are missing', [
                 'conversation_id' => $conversation->id,
                 'missing_fields' => $fieldStatus['missing_fields'],
+                'repeat_count' => $repeatCount,
             ]);
         }
 
@@ -4549,6 +4700,7 @@ $aiResponse = $intro
             (string) ($state['commerce_channel_id'] ?? ''),
             (string) ($state['commerce_external_id'] ?? $state['salla_product_id'] ?? ''),
             (string) ($state['commerce_variant_id'] ?? ''),
+            json_encode($state['salla_options'] ?? [], JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE) ?: '',
             preg_replace('/\D+/', '', (string) ($state['phone'] ?? $state['customer_phone'] ?? '')),
             mb_strtolower(trim((string) ($state['address'] ?? $state['customer_address'] ?? ''))),
         ]));
@@ -4567,6 +4719,7 @@ $aiResponse = $intro
         return "Please review your order summary:\n"
             . "Product: {$productName}\n"
             . (!empty($checkoutState['commerce_variant_title']) ? 'Variant: ' . trim((string) $checkoutState['commerce_variant_title']) . "\n" : '')
+            . (!empty($checkoutState['salla_option_titles']) ? 'Options: ' . implode(', ', array_map('strval', (array) $checkoutState['salla_option_titles'])) . "\n" : '')
             . "Price: {$priceText}\n"
             . "Store: {$storeName}\n"
             . 'Name: ' . trim((string) ($checkoutState['full_name'] ?? '')) . "\n"

@@ -502,7 +502,7 @@ ROLE;
                 'email' => 'Email Address',
                 'postal_code' => 'Postal / ZIP Code',
                 'geo_coordinates' => 'delivery coordinates resolved by the application; do not request a map pin or coordinates from the customer',
-                'building_number' => 'Building or house number', 'block' => 'block number or name', 'district' => 'district or area name',
+                'building_number' => 'Building or house number', 'block' => 'block or floor (for example, block name or floor number)', 'district' => 'district or area name',
                 'short_address' => 'Short / national address code',
                 'additional_number' => 'Additional address number',
             ];
@@ -529,7 +529,7 @@ ROLE;
                 $p .= "\n⚠️ CRITICAL RULE: ASK FOR ALL CURRENTLY MISSING REQUIRED FIELDS TOGETHER IN ONE SINGLE MESSAGE!\n";
                 $p .= "Do NOT ask for fields one-by-one in separate turns. Do NOT re-ask for any field listed under ALREADY KNOWN FIELDS.\n\n";
                 if (!empty($context['salla_exclusive_mode'])) {
-                    $p .= "Use any delivery details already present in the customer's message or saved Salla profile before asking follow-up questions. Do not ask the customer to send a Google Maps pin/link or latitude and longitude; ask for a complete written delivery address (street, district, building number, and postal code) instead. Never invent coordinates, postal codes, email addresses, or address values. The customer does not need to provide a courier ID; the application selects from the store's Salla shipping options.\n\n";
+                    $p .= "Use and extract all delivery facts already present in the customer's full message or saved Salla profile before asking follow-up questions. Parse a P.O. Box separately; never reuse its number as a building number or block. A Saudi Salla block may be written as a block name/number or floor (for example, 'second floor' / 'الدور الثاني'); extract it only when explicit. Ask only for fields the checkout system marks missing, and do not ask again for address, city, or postal code already present. Never invent a block, district, coordinates, postal code, email, or any address value. Do not ask for a map link or coordinates; the application looks up coordinates from the city. The application selects the store's shipping option.\n\n";
                 }
             }
 

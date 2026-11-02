@@ -2551,7 +2551,7 @@ $aiResponse = $intro
                 foreach ($values as $index => $value) {
                     $choices[] = ($index + 1) . '. ' . $value['name'];
                 }
-                $aiResponse = 'Which ' . mb_strtolower($option['name']) . ' would you like? Reply with its number or exact name:\n'
+                $aiResponse = 'Which ' . mb_strtolower($option['name']) . ' would you like? Reply with its number or exact name:' . "\n"
                     . implode("\n", $choices);
             }
         }

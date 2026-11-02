@@ -393,6 +393,17 @@ class OrderCheckoutService
         $extractedBuildingNumber = self::extractBuildingNumber((string) $incomingText);
         $extractedPoBox = self::extractPoBox((string) $incomingText);
 
+        // Block and district (Saudi National Address components) were being
+        // parsed only ephemerally inside computeFieldStatus() for the
+        // missing-field check, and never actually written into persisted
+        // checkout_state. That made them IMPOSSIBLE for a customer to ever
+        // satisfy once Salla required them — a guaranteed infinite loop.
+        // Extract them here, the same way every other field is, so a reply
+        // like "block 5" or "district An Nuzha" is actually saved.
+        $parsedAddressExtras = \App\Services\SallaAddressParser::parse((string) $incomingText);
+        $extractedBlock = $parsedAddressExtras['block'] ?? null;
+        $extractedDistrict = $parsedAddressExtras['district'] ?? null;
+
         $extractedShortAddress = null;
         if (preg_match('/(?:short address|national address|العنوان المختصر)\s*(?:(?:is|equals?)\s+|[:#-]\s*)?([A-Z0-9]{4,12})/iu', $incomingText, $shortAddressMatch)) {
             $extractedShortAddress = strtoupper($shortAddressMatch[1]);
@@ -513,6 +524,8 @@ class OrderCheckoutService
             'geo_coordinates'  => $extractedCoordinates              ?? ($existingState['geo_coordinates']   ?? null),
             'building_number'  => $extractedBuildingNumber           ?? ($existingState['building_number']   ?? null),
             'po_box'           => $extractedPoBox                    ?? ($existingState['po_box']            ?? null),
+            'block'            => $extractedBlock                    ?? ($existingState['block']             ?? null),
+            'district'         => $extractedDistrict                 ?? ($existingState['district']          ?? null),
             'short_address'    => $extractedShortAddress             ?? ($existingState['short_address']     ?? null),
             'additional_number'=> $extractedAdditionalNumber         ?? ($existingState['additional_number'] ?? null),
             'updated_at'       => now()->toISOString(),

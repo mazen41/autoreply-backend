@@ -67,6 +67,11 @@ class OrderClaimGuard
         $connectionId = (int) ($state['commerce_channel_id'] ?? $state['order_connection_id'] ?? 0);
         $productId = (string) ($state['commerce_external_id'] ?? $state['salla_product_id'] ?? '');
         $variantId = (string) ($state['commerce_variant_id'] ?? '');
+        $sallaOptions = $state['salla_options'] ?? [];
+        $optionsFingerprint = json_encode(
+            is_array($sallaOptions) ? $sallaOptions : [],
+            JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE
+        ) ?: '[]';
         $phone = preg_replace('/\D+/', '', (string) ($state['phone'] ?? $state['customer_phone'] ?? ''));
         $address = mb_strtolower(trim((string) ($state['address'] ?? $state['customer_address'] ?? '')));
         $summarySentAt = $state['confirmation_summary_sent_at'] ?? null;
@@ -81,10 +86,23 @@ class OrderClaimGuard
             return null;
         }
 
-        $fingerprints = [hash('sha256', implode('|', [$connectionId, $productId, $variantId, $phone, $address]))];
-        // Keep completed orders created before variant-aware idempotency readable.
-        if ($variantId === '') {
-            $fingerprints[] = hash('sha256', implode('|', [$connectionId, $productId, $phone, $address]));
+        $fingerprints = [hash('sha256', implode('|', [
+            $connectionId,
+            $productId,
+            $variantId,
+            $optionsFingerprint,
+            $phone,
+            $address,
+        ]))];
+
+        // Keep orders created before option-aware fingerprints readable. Do
+        // not use these fallbacks when this checkout selected options: doing
+        // so could match a different product size/variant order.
+        if ($sallaOptions === [] || $sallaOptions === null) {
+            $fingerprints[] = hash('sha256', implode('|', [$connectionId, $productId, $variantId, $phone, $address]));
+            if ($variantId === '') {
+                $fingerprints[] = hash('sha256', implode('|', [$connectionId, $productId, $phone, $address]));
+            }
         }
 
         return CommerceOrderAttempt::query()

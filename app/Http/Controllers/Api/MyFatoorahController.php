@@ -67,12 +67,22 @@ class MyFatoorahController extends Controller
         ]);
 
         try {
-            // Step 1 – discover payment methods
-            $this->mf->initiatePayment($amount, $currency);
+            // Step 1 – discover payment methods enabled on this merchant account.
+            $paymentMethods = $this->mf->initiatePayment($amount, $currency);
+            $availableMethods = collect($paymentMethods['PaymentMethods'] ?? [])
+                ->filter(fn ($method) => isset($method['PaymentMethodId']) && (int) $method['PaymentMethodId'] > 0);
 
-            // Step 2 – execute to get redirect URL (PaymentMethodId=0 shows all methods)
+            if ($availableMethods->isEmpty()) {
+                throw new \RuntimeException('MyFatoorah returned no enabled payment methods for this account.');
+            }
+
+            // ExecutePayment requires a real enabled method ID for this account;
+            // PaymentMethodId=0 is rejected by the live Saudi API.
+            $paymentMethodId = (int) $availableMethods->first()['PaymentMethodId'];
+
+            // Step 2 – create a hosted payment request using an enabled method.
             $executeData = $this->mf->executePayment([
-                'PaymentMethodId'    => 0,
+                'PaymentMethodId'    => $paymentMethodId,
                 'InvoiceValue'       => $amount,
                 'CustomerName'       => $user->name,
                 'CustomerEmail'      => $user->email,
@@ -90,6 +100,11 @@ class MyFatoorahController extends Controller
                 ]] : []),
             ]);
 
+            $paymentUrl = $executeData['PaymentURL'] ?? $executeData['InvoiceURL'] ?? null;
+            if (!is_string($paymentUrl) || !filter_var($paymentUrl, FILTER_VALIDATE_URL)) {
+                throw new \RuntimeException('MyFatoorah did not return a valid payment URL.');
+            }
+
             $intent->update([
                 'myfatoorah_invoice_id' => (string) $executeData['InvoiceId'],
                 'myfatoorah_recurring_id' => $executeData['RecurringId'] ?? null,
@@ -98,9 +113,7 @@ class MyFatoorahController extends Controller
 
             return response()->json([
                 'invoice_id'  => $executeData['InvoiceId'],
-                'payment_url' => $executeData['IsDirectPayment']
-                    ? $executeData['PaymentURL']
-                    : $executeData['InvoiceURL'],
+                'payment_url' => $paymentUrl,
                 'intent_id'   => $intent->id,
             ]);
 

@@ -132,11 +132,13 @@ class MyFatoorahService
             . ',Recurring.Status=' . $recurring['Status']
             . ',Recurring.InitialInvoiceId=' . $recurring['InitialInvoiceId'];
 
-        return hash_equals(hash_hmac('sha256', $signedData, $secret), $signature);
+        $expected = base64_encode(hash_hmac('sha256', $signedData, $secret, true));
+
+        return hash_equals($expected, trim($signature));
     }
 
     // ─── Webhook Signature Verification ───────────────────────────────────────
-    public function verifyWebhookSignature(string $rawBody, string $signature): bool
+    public function verifyWebhookSignature(array $payload, string $signature): bool
     {
         $secret = config('services.myfatoorah.webhook_secret');
 
@@ -145,7 +147,17 @@ class MyFatoorahService
             return false;
         }
 
-        $expected = hash_hmac('sha256', $rawBody, $secret);
-        return hash_equals($expected, $signature);
+        $data = $payload['Data'] ?? [];
+        $invoice = $data['Invoice'] ?? [];
+        $transaction = $data['Transaction'] ?? [];
+        $signedData = 'Invoice.Id=' . ($invoice['Id'] ?? '')
+            . ',Invoice.Status=' . ($invoice['Status'] ?? '')
+            . ',Transaction.Status=' . ($transaction['Status'] ?? '')
+            . ',Transaction.PaymentId=' . ($transaction['PaymentId'] ?? '')
+            . ',Invoice.ExternalIdentifier=' . ($invoice['ExternalIdentifier'] ?? '');
+
+        $expected = base64_encode(hash_hmac('sha256', $signedData, $secret, true));
+
+        return hash_equals($expected, trim($signature));
     }
 }

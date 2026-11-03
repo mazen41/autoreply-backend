@@ -20,8 +20,6 @@ class MyFatoorahWebhookController extends Controller
      */
     public function handle(Request $request)
     {
-        // Read raw body before any Laravel parsing so HMAC is correct
-        $rawBody   = $request->getContent();
         $signature = $request->header('MyFatoorah-Signature', '');
         $payload = $request->json()->all();
         $event = $payload['Event'] ?? $payload['event'] ?? null;
@@ -31,7 +29,7 @@ class MyFatoorahWebhookController extends Controller
             return $this->handleRecurringUpdate($payload, $signature);
         }
 
-        if (! $this->mf->verifyWebhookSignature($rawBody, $signature)) {
+        if (! $this->mf->verifyWebhookSignature($payload, $signature)) {
             app(\App\Support\OperationalMetricCounter::class)->increment('webhook_signature_failures');
             Log::warning('[MyFatoorah Webhook] Invalid signature');
             return response()->json(['message' => 'Invalid signature.'], 401);
@@ -39,7 +37,7 @@ class MyFatoorahWebhookController extends Controller
 
         Log::info('[MyFatoorah Webhook] Received', ['event' => $event]);
 
-        if (in_array($eventName, ['PAYMENT_STATUS_CHANGED', 'payment_status_changed'])) {
+        if (in_array(strtoupper((string) $eventName), ['PAYMENT_STATUS_CHANGED', 'TRANSACTIONSSTATUSCHANGED'], true)) {
             return $this->handlePaymentStatusChanged($payload);
         }
 
@@ -49,8 +47,14 @@ class MyFatoorahWebhookController extends Controller
 
     private function handlePaymentStatusChanged(array $payload)
     {
-        $invoiceId = (string) ($payload['Data']['InvoiceId'] ?? $payload['InvoiceId'] ?? '');
-        $status    = $payload['Data']['InvoiceStatus'] ?? $payload['InvoiceStatus'] ?? '';
+        $invoiceId = (string) ($payload['Data']['Invoice']['Id']
+            ?? $payload['Data']['InvoiceId']
+            ?? $payload['InvoiceId']
+            ?? '');
+        $status = (string) ($payload['Data']['Invoice']['Status']
+            ?? $payload['Data']['InvoiceStatus']
+            ?? $payload['InvoiceStatus']
+            ?? '');
 
         if (! $invoiceId) {
             Log::error('[MyFatoorah Webhook] Missing InvoiceId in payload');
@@ -66,7 +70,7 @@ class MyFatoorahWebhookController extends Controller
         $apiData = [];
         try {
             $apiData = $this->mf->getPaymentStatus($invoiceId, 'InvoiceId');
-            $status  = $apiData['InvoiceStatus'] ?? $status;
+            $status  = (string) ($apiData['InvoiceStatus'] ?? $status);
         } catch (\Exception $e) {
             Log::error('[MyFatoorah Webhook] GetPaymentStatus failed', ['exception_type' => get_class($e)]);
             // Fall back to webhook payload status
@@ -81,7 +85,7 @@ class MyFatoorahWebhookController extends Controller
             return response()->json(['message' => 'Invoice not tracked.'], 200);
         }
 
-        if ($status === 'Paid' && $intent->status === 'pending') {
+        if (strtoupper($status) === 'PAID' && $intent->status === 'pending') {
             $transaction = collect($apiData['InvoiceTransactions'] ?? [])->first();
             $actualCurrency = $apiData['CurrencyIso']
                 ?? $apiData['DisplayCurrencyIso']
@@ -147,7 +151,7 @@ class MyFatoorahWebhookController extends Controller
 
             Log::info("[MyFatoorah Webhook] Subscription activated for user {$intent->user_id}");
 
-        } elseif (in_array($status, ['Failed', 'Expired', 'Cancelled'])) {
+        } elseif (in_array(strtoupper($status), ['FAILED', 'EXPIRED', 'CANCELLED', 'CANCELED'], true)) {
             $intent->update(['status' => 'failed']);
             Log::info("[MyFatoorah Webhook] Payment marked failed. Status={$status}");
         }

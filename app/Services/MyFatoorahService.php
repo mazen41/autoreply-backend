@@ -73,12 +73,34 @@ class MyFatoorahService
         ]);
 
         if ($response->failed()) {
+            $body = $response->json() ?? [];
+            Log::error('[MyFatoorah] ExecutePayment rejected request', [
+                'status' => $response->status(),
+                'provider_message' => $body['Message'] ?? null,
+                'validation_errors' => collect($body['ValidationErrors'] ?? [])
+                    ->map(fn ($error) => [
+                        'field' => $error['Name'] ?? null,
+                        'message' => $error['Error'] ?? null,
+                    ])
+                    ->values()
+                    ->all(),
+            ]);
             throw new Exception('MyFatoorah ExecutePayment failed with HTTP status ' . $response->status());
         }
 
         $data = $response->json();
 
         if (! ($data['IsSuccess'] ?? false)) {
+            Log::error('[MyFatoorah] ExecutePayment provider validation failed', [
+                'provider_message' => $data['Message'] ?? null,
+                'validation_errors' => collect($data['ValidationErrors'] ?? [])
+                    ->map(fn ($error) => [
+                        'field' => $error['Name'] ?? null,
+                        'message' => $error['Error'] ?? null,
+                    ])
+                    ->values()
+                    ->all(),
+            ]);
             throw new Exception('MyFatoorah ExecutePayment error: ' . ($data['Message'] ?? 'Unknown error'));
         }
 

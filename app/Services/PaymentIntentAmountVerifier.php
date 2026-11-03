@@ -13,6 +13,12 @@ class PaymentIntentAmountVerifier
         $expectedCurrency = strtoupper(trim((string) $intent->expected_currency));
         $actualCurrency = $actualCurrency !== null ? strtoupper(trim($actualCurrency)) : '';
 
+        // MyFatoorah's Saudi V2 status response reports Saudi Riyal as "SR"
+        // in InvoiceTransactions, while checkout intents use ISO code "SAR".
+        if ($provider === 'myfatoorah' && $actualCurrency === 'SR') {
+            $actualCurrency = 'SAR';
+        }
+
         $reason = null;
         if ($expectedMinor === null || $actualMinor === null || $actualMinor !== (int) $expectedMinor) {
             $reason = 'amount_mismatch';

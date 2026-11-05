@@ -12,6 +12,7 @@ class AICapabilitiesService
 {
     private static ?string $lastRequestProvider = null;
     private static ?string $lastRequestModel = null;
+    private static array $lastRequestUsage = [];
 
     private static function getAIProvider(array $context = []): string
     {
@@ -30,6 +31,7 @@ class AICapabilitiesService
         return match ($provider) {
             'groq' => config('services.groq.model', env('GROQ_MODEL', 'openai/gpt-oss-120b')),
             'claude' => config('services.claude.model', env('CLAUDE_MODEL', 'claude-haiku-4-5-20251001')),
+            'openai' => config('services.openai.model', env('OPENAI_MODEL', 'gpt-4o')),
             default => config('services.gemini.model', env('GEMINI_MODEL', 'gemini-2.5-flash')),
         };
     }
@@ -37,11 +39,7 @@ class AICapabilitiesService
     private static function getAIAPIKey(array $context = []): string
     {
         $provider = self::getAIProvider($context);
-        return match ($provider) {
-            'groq' => (string) config('services.groq.api_key', env('GROQ_API_KEY', '')),
-            'claude' => (string) config('services.claude.api_key', env('ANTHROPIC_API_KEY', '')),
-            default => (string) config('services.gemini.api_key', env('GEMINI_API_KEY', '')),
-        };
+        return app(AiProviderConfiguration::class)->key($provider);
     }
 
     /**
@@ -847,6 +845,7 @@ JSON;
         try {
             self::$lastRequestProvider = null;
             self::$lastRequestModel = null;
+            self::$lastRequestUsage = [];
             $systemPrompt = self::getUltimateSystemPrompt($context);
 
             $messages = [
@@ -854,11 +853,45 @@ JSON;
                 ['role' => 'user',   'content' => $message],
             ];
 
-            $response = self::callAIChatWithRetry(
-                $messages,
-                $context,
-                max(1, (int) config('services.ai.retries', 3))
-            );
+            $generate = function () use ($messages, &$context) {
+                return self::callAIChatWithRetry($messages, $context, max(1, (int) config('services.ai.retries', 3)));
+            };
+            if (!empty($context['business_id'])) {
+                $business = BusinessProfile::query()->find((int) $context['business_id']);
+                if (!$business) {
+                    throw new \RuntimeException('AI request has no valid business scope.');
+                }
+                $route = app(AiRouter::class)->resolve($business, (string) ($context['ai_task'] ?? 'customer_reply'), self::getAIProvider($context), self::getAIModel($context), ['text', 'json']);
+                $provider = $route['provider'];
+                $model = $route['model'];
+                $context['ai_provider'] = $provider;
+                $context['ai_model'] = $model;
+                $context['ai_fallback_models'] = $route['fallback_models'] ?? [];
+                $context['ai_max_latency_ms'] = $route['max_latency_ms'] ?? null;
+                Log::info('AI credit gateway routing selected', ['business_id' => $business->id, 'conversation_id' => $context['conversation_id'] ?? null, 'task_type' => $context['ai_task'] ?? 'customer_reply', 'provider' => $provider, 'model' => $model, 'mode' => $route['mode'], 'resolution_source' => $route['source'], 'routing_rule_id' => $route['rule_id']]);
+                $estimatedInputTokens = max(1, (int) ceil(collect($messages)->sum(fn ($item) => mb_strlen((string) ($item['content'] ?? '')) / 4)));
+                $gatewayResult = app(AiGateway::class)->execute(
+                    $business,
+                    (string) ($context['ai_task'] ?? 'customer_reply'),
+                    $provider,
+                    $model,
+                    $estimatedInputTokens,
+                    (int) config('services.ai.max_tokens', 2048),
+                    fn () => [
+                        'content' => $generate(),
+                        'provider' => self::$lastRequestProvider ?: $provider,
+                        'model' => self::$lastRequestModel ?: $model,
+                        'usage' => self::$lastRequestUsage,
+                    ],
+                    ['conversation_id' => $context['conversation_id'] ?? null, 'assistant_id' => $context['assistant_id'] ?? null, 'message_id' => $context['message_id'] ?? null, 'routing_source' => $route['source'], 'routing_rule_id' => $route['rule_id'], 'operating_mode' => $route['mode'], 'fallback_model_ids' => $route['fallback_model_ids'] ?? []],
+                    $context['ai_operation_id'] ?? null,
+                );
+                $response = (string) ($gatewayResult['content'] ?? '');
+                self::$lastRequestProvider = $gatewayResult['provider'] ?? self::$lastRequestProvider;
+                self::$lastRequestModel = $gatewayResult['model'] ?? self::$lastRequestModel;
+            } else {
+                throw new \RuntimeException('AI request has no authorized business scope for credit billing.');
+            }
 
             // ── Robust JSON extraction ────────────────────────────────────────
             // Gemini sometimes wraps the JSON in markdown fences, adds a preamble
@@ -1154,17 +1187,8 @@ JSON;
             } catch (\Exception $e) {
                 $lastError = $e;
 
-                if (str_contains($e->getMessage(), '429') || str_contains($e->getMessage(), '500')) {
-                    if ($attempt < $maxRetries) {
-                        $delay = $baseDelay * pow(2, $attempt - 1);
-                        usleep($delay * 1000);
-                        continue;
-                    }
-                }
-
-                if ($attempt < $maxRetries) {
-                    usleep($baseDelay * 1000);
-                }
+                if (!$e instanceof \App\Exceptions\AiProviderRequestException || !$e->isRetryableUnbilled() || $attempt >= $maxRetries) break;
+                usleep($baseDelay * (2 ** ($attempt - 1)) * 1000);
             }
         }
 
@@ -1180,21 +1204,27 @@ JSON;
         try {
             return self::callProviderChat($provider, $messages, $context);
         } catch (\Throwable $exception) {
-            $fallbackProvider = (string) config('services.ai.fallback_provider', 'gemini');
-            if (!in_array($fallbackProvider, ['groq', 'gemini', 'claude'], true) || $fallbackProvider === $provider) {
+            if (!$exception instanceof \App\Exceptions\AiProviderRequestException || !$exception->isRetryableUnbilled()) {
                 throw $exception;
             }
-
-            Log::warning('Primary AI provider failed; trying configured fallback.', [
-                'provider' => $provider,
-                'fallback_provider' => $fallbackProvider,
-                'exception_type' => get_class($exception),
-            ]);
-            $fallbackContext = $context;
-            $fallbackContext['ai_provider'] = $fallbackProvider;
-            unset($fallbackContext['ai_model']);
-
-            return self::callProviderChat($fallbackProvider, $messages, $fallbackContext);
+            app(AiGateway::class)->reportProviderFailure(self::$lastRequestProvider ?: $provider, self::$lastRequestModel ?: self::getAIModel($context), $exception);
+            $fallbacks = $context['ai_fallback_models'] ?? [];
+            $lastException = $exception;
+            foreach ($fallbacks as $fallback) {
+                $fallbackProvider = (string) ($fallback['provider'] ?? '');
+                $fallbackModel = (string) ($fallback['model_key'] ?? '');
+                if (!in_array($fallbackProvider, ['groq', 'gemini', 'claude', 'openai'], true) || $fallbackProvider === $provider || $fallbackModel === '') continue;
+                Log::warning('AI routing primary model failed; trying configured fallback.', ['provider' => $provider, 'fallback_provider' => $fallbackProvider, 'fallback_model' => $fallbackModel, 'exception_type' => get_class($lastException)]);
+                $fallbackContext = $context;
+                $fallbackContext['ai_provider'] = $fallbackProvider;
+                $fallbackContext['ai_model'] = $fallbackModel;
+                try { return self::callProviderChat($fallbackProvider, $messages, $fallbackContext); }
+                catch (\Throwable $fallbackException) {
+                    if ($fallbackException instanceof \App\Exceptions\AiProviderRequestException) app(AiGateway::class)->reportProviderFailure($fallbackProvider, $fallbackModel, $fallbackException);
+                    $lastException = $fallbackException;
+                }
+            }
+            throw $lastException;
         }
     }
 
@@ -1203,8 +1233,39 @@ JSON;
         return match ($provider) {
             'groq' => self::callGroqChat($messages, $context),
             'claude' => self::callClaudeChat($messages, $context),
+            'openai' => self::callOpenAIChat($messages, $context),
             default => self::callGeminiChat($messages, $context),
         };
+    }
+
+    private static function providerTimeout(array $context, string $provider): int
+    {
+        $timeout = app(\App\Services\AiProviderConfiguration::class)->timeoutSeconds($provider);
+        $latencyLimit = (int) ($context['ai_max_latency_ms'] ?? 0);
+        return $latencyLimit > 0 ? min($timeout, max(1, (int) ceil($latencyLimit / 1000))) : $timeout;
+    }
+
+    private static function callOpenAIChat(array $messages, array $context = []): string
+    {
+        $apiKey = self::getAIAPIKey($context);
+        $model = self::getAIModel($context);
+        if ($apiKey === '') throw new \App\Exceptions\AiProviderRequestException('OpenAI', 401, 'OpenAI API key is not configured.');
+        self::$lastRequestProvider = 'openai';
+        self::$lastRequestModel = $model;
+        $response = Http::timeout(self::providerTimeout($context, 'openai'))->connectTimeout(10)->withToken($apiKey)->post('https://api.openai.com/v1/chat/completions', [
+            'model' => $model,
+            'messages' => $messages,
+            'temperature' => (float) config('services.ai.temperature', 0.7),
+            'max_tokens' => (int) config('services.ai.max_tokens', 2048),
+            'response_format' => ['type' => 'json_object'],
+        ]);
+        if (!$response->successful()) throw new \App\Exceptions\AiProviderRequestException('OpenAI', $response->status());
+        self::$lastRequestUsage = [
+            'input_tokens' => (int) $response->json('usage.prompt_tokens', 0),
+            'output_tokens' => (int) $response->json('usage.completion_tokens', 0),
+            'cached_tokens' => (int) $response->json('usage.prompt_tokens_details.cached_tokens', 0),
+        ];
+        return (string) $response->json('choices.0.message.content', '');
     }
 
     /** Call Anthropic Messages API for text replies. */
@@ -1213,7 +1274,7 @@ JSON;
         $apiKey = self::getAIAPIKey($context);
         $model = self::getAIModel($context);
         if ($apiKey === '') {
-            throw new \Exception('Anthropic API key is not configured (ANTHROPIC_API_KEY).');
+            throw new \App\Exceptions\AiProviderRequestException('Anthropic', 401, 'Anthropic API key is not configured.');
         }
 
         $system = '';
@@ -1238,7 +1299,7 @@ JSON;
             $payload['system'] = trim($system);
         }
 
-        $response = Http::timeout((int) config('services.ai.timeout', 30))
+        $response = Http::timeout(self::providerTimeout($context, 'claude'))
             ->connectTimeout(10)
             ->withHeaders([
                 'x-api-key' => $apiKey,
@@ -1249,10 +1310,16 @@ JSON;
 
         if (!$response->successful()) {
             Log::error('Claude API error', ['status' => $response->status()]);
-            throw new \Exception('Claude API error (HTTP ' . $response->status() . ')');
+            throw new \App\Exceptions\AiProviderRequestException('Claude', $response->status());
         }
 
-        return (string) ($response->json('content.0.text') ?? '');
+        $data = $response->json();
+        self::$lastRequestUsage = [
+            'input_tokens' => (int) data_get($data, 'usage.input_tokens', 0),
+            'output_tokens' => (int) data_get($data, 'usage.output_tokens', 0),
+            'cached_tokens' => (int) data_get($data, 'usage.cache_read_input_tokens', 0),
+        ];
+        return (string) data_get($data, 'content.0.text', '');
     }
 
     /**
@@ -1260,11 +1327,11 @@ JSON;
      */
     private static function callGroqChat(array $messages, array $context = []): string
     {
-        $apiKey = env('GROQ_API_KEY', config('services.groq.api_key', self::getAIAPIKey($context)));
-        $model  = env('GROQ_MODEL', config('services.groq.model', self::getAIModel($context)));
+        $apiKey = self::getAIAPIKey($context);
+        $model  = self::getAIModel($context);
 
         if (empty($apiKey)) {
-            throw new \Exception('Groq API Key is not configured (GROQ_API_KEY).');
+            throw new \App\Exceptions\AiProviderRequestException('Groq', 401, 'Groq API key is not configured.');
         }
 
         self::$lastRequestProvider = 'groq';
@@ -1278,7 +1345,7 @@ JSON;
             'response_format' => ['type' => 'json_object'],
         ];
 
-        $response = Http::timeout(25)->connectTimeout(10)->withHeaders([
+        $response = Http::timeout(self::providerTimeout($context, 'groq'))->connectTimeout(10)->withHeaders([
             'Authorization' => 'Bearer ' . $apiKey,
             'Content-Type'  => 'application/json',
         ])->post('https://api.groq.com/openai/v1/chat/completions', $payload);
@@ -1287,10 +1354,15 @@ JSON;
             Log::error('Groq API error', [
                 'status' => $response->status(),
             ]);
-            throw new \Exception('Groq API error (HTTP ' . $response->status() . ')');
+            throw new \App\Exceptions\AiProviderRequestException('Groq', $response->status());
         }
 
         $data = $response->json();
+        self::$lastRequestUsage = [
+            'input_tokens' => (int) data_get($data, 'usage.prompt_tokens', 0),
+            'output_tokens' => (int) data_get($data, 'usage.completion_tokens', 0),
+            'cached_tokens' => (int) data_get($data, 'usage.prompt_tokens_details.cached_tokens', 0),
+        ];
         return $data['choices'][0]['message']['content'] ?? '';
     }
 
@@ -1350,7 +1422,7 @@ JSON;
         // lets this fail fast with a real exception, which the existing
         // callAIChatWithRetry() retry-with-backoff logic already handles
         // correctly — that logic never even triggers on a plain hang.
-        $response = Http::timeout(25)->connectTimeout(10)->withHeaders([
+        $response = Http::timeout(self::providerTimeout($context, 'gemini'))->connectTimeout(10)->withHeaders([
             'Content-Type' => 'application/json',
         ])->post(
             "https://generativelanguage.googleapis.com/v1beta/models/{$model}:generateContent?key={$apiKey}",
@@ -1358,10 +1430,15 @@ JSON;
         );
 
         if (!$response->successful()) {
-            throw new \Exception('Gemini API error (HTTP ' . $response->status() . ')');
+            throw new \App\Exceptions\AiProviderRequestException('Gemini', $response->status());
         }
 
         $data = $response->json();
+        self::$lastRequestUsage = [
+            'input_tokens' => (int) data_get($data, 'usageMetadata.promptTokenCount', 0),
+            'output_tokens' => (int) data_get($data, 'usageMetadata.candidatesTokenCount', 0),
+            'cached_tokens' => (int) data_get($data, 'usageMetadata.cachedContentTokenCount', 0),
+        ];
         return $data['candidates'][0]['content']['parts'][0]['text'] ?? '';
     }
 

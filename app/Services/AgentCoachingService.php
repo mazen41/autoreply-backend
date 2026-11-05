@@ -4,7 +4,7 @@ namespace App\Services;
 
 use App\Models\Conversation;
 use App\Models\AgentCoachingLog;
-use Illuminate\Support\Facades\Http;
+use App\Models\BusinessProfile;
 use Illuminate\Support\Facades\Log;
 
 class AgentCoachingService
@@ -42,7 +42,9 @@ class AgentCoachingService
         $agentName = $agent?->name ?? 'Unknown Agent';
 
         // Run LLM analysis
-        $analysis = self::runLlmAnalysis($transcript, $agentName);
+        $business = $conversation->business;
+        if (!$business) return ['error' => 'Business scope is unavailable for AI credit billing'];
+        $analysis = self::runLlmAnalysis($transcript, $agentName, $business, (int) $conversation->id);
 
         // Save coaching log
         $coachingLog = AgentCoachingLog::create([
@@ -76,14 +78,8 @@ class AgentCoachingService
     /**
      * Run LLM analysis on conversation transcript.
      */
-    private static function runLlmAnalysis(string $transcript, string $agentName): array
+    private static function runLlmAnalysis(string $transcript, string $agentName, BusinessProfile $business, int $conversationId): array
     {
-        $apiKey = env('OPENAI_API_KEY') ?: env('GEMINI_API_KEY');
-
-        if (!$apiKey) {
-            return self::getDefaultScores('AI provider not configured');
-        }
-
         $prompt = <<<PROMPT
 You are an expert customer service coach. Analyze the following conversation between a customer and agent "{$agentName}".
 
@@ -108,34 +104,8 @@ Respond in JSON format:
 PROMPT;
 
         try {
-            $provider = env('OPENAI_API_KEY') ? 'openai' : 'gemini';
-
-            if ($provider === 'openai') {
-                $response = Http::timeout(60)
-                    ->withHeaders(['Authorization' => 'Bearer ' . $apiKey])
-                    ->post('https://api.openai.com/v1/chat/completions', [
-                        'model' => 'gpt-4o-mini',
-                        'messages' => [['role' => 'user', 'content' => $prompt]],
-                        'response_format' => ['type' => 'json_object'],
-                        'max_tokens' => 500,
-                    ]);
-            } else {
-                $response = Http::timeout(60)
-                    ->post("https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key={$apiKey}", [
-                        'contents' => [['parts' => [['text' => $prompt]]]],
-                        'generationConfig' => ['responseMimeType' => 'application/json'],
-                    ]);
-            }
-
-            if (!$response->successful()) {
-                return self::getDefaultScores('LLM analysis failed');
-            }
-
-            $result = $response->json();
-            $content = $provider === 'openai'
-                ? ($result['choices'][0]['message']['content'] ?? '{}')
-                : ($result['candidates'][0]['content']['parts'][0]['text'] ?? '{}');
-
+            $result = app(AiGateway::class)->chat($business, 'summarization', 'Return only a JSON object matching the requested coaching schema.', [['role' => 'user', 'content' => $prompt]], 500, 'agent-coaching:' . $conversationId, ['conversation_id' => $conversationId]);
+            $content = $result['content'] ?? '{}';
             $parsed = json_decode($content, true) ?? [];
 
             return [
@@ -146,9 +116,9 @@ PROMPT;
                 'constructive_feedback' => $parsed['constructive_feedback'] ?? 'No feedback available',
             ];
 
-        } catch (\Exception $e) {
-            Log::error('Agent coaching LLM analysis error', ['exception_type' => get_class($e)]);
-            return self::getDefaultScores($e->getMessage());
+        } catch (\Throwable $e) {
+            Log::error('Agent coaching LLM analysis error', ['exception_type' => get_class($e), 'conversation_id' => $conversationId]);
+            return self::getDefaultScores($e instanceof \App\Exceptions\InsufficientAiCreditsException ? 'Insufficient AI credits' : 'AI analysis unavailable');
         }
     }
 

@@ -42,6 +42,16 @@ class UsageMeter
             ];
         }
 
+        $creditBalance = app(AiCreditManager::class)->balance($business);
+        $metrics[self::AI_REPLIES] = array_merge($metrics[self::AI_REPLIES], [
+            'used' => (int) $creditBalance['cycle_usage']['credits_consumed'],
+            'limit' => (int) $creditBalance['cycle_usage']['allowance'],
+            'remaining' => (int) $creditBalance['wallet']['available_balance'],
+            'unlimited' => false,
+            'percentage' => $creditBalance['cycle_usage']['percentage'],
+            'allowed' => (int) $creditBalance['wallet']['available_balance'] > 0,
+        ]);
+
         return [
             'business_id' => $business->id,
             'period' => [
@@ -55,6 +65,7 @@ class UsageMeter
                 'subscription_status' => $subscription?->status,
             ],
             'usage' => $metrics,
+            'ai_credits' => $creditBalance,
         ];
     }
 
@@ -71,6 +82,12 @@ class UsageMeter
     {
         if (!in_array($metric, [self::AI_REPLIES, self::OUTBOUND_MESSAGES, self::CHANNELS], true)) {
             throw new \InvalidArgumentException('Unknown usage metric.');
+        }
+
+        if ($metric === self::AI_REPLIES) {
+            $creditBalance = app(AiCreditManager::class)->balance($business);
+            $available = (int) $creditBalance['wallet']['available_balance'];
+            return ['allowed' => $available > 0, 'metric' => 'ai_credits', 'used' => (int) $creditBalance['cycle_usage']['credits_consumed'], 'limit' => (int) $creditBalance['cycle_usage']['allowance'], 'unlimited' => false, 'available' => $available];
         }
 
         $package = $this->subscriptionFor($business)?->package ?? Package::query()->where('name', 'Free')->first();
@@ -90,14 +107,6 @@ class UsageMeter
     /** Mark an already-created outbound attempt blocked before a provider call. */
     public function blockMessageIfOverLimit(BusinessProfile $business, Message $message): bool
     {
-        if ($message->is_ai) {
-            $ai = $this->canUse($business, self::AI_REPLIES, (int) $message->id);
-            if (!$ai['allowed']) {
-                $this->markBlocked($message, 'The business plan limit for monthly AI replies has been reached.');
-                return true;
-            }
-        }
-
         $outbound = $this->canUse($business, self::OUTBOUND_MESSAGES, (int) $message->id);
         if (!$outbound['allowed']) {
             $this->markBlocked($message, 'The business plan limit for monthly outbound messages has been reached.');
@@ -144,7 +153,7 @@ class UsageMeter
     private function limitFor(?Package $package, string $metric): int
     {
         $attribute = match ($metric) {
-            self::AI_REPLIES => 'ai_replies_limit',
+            self::AI_REPLIES => 'ai_credits_monthly',
             self::OUTBOUND_MESSAGES => 'outbound_messages_limit',
             self::CHANNELS => 'channels_limit',
         };
@@ -170,13 +179,15 @@ class UsageMeter
                 ->count();
         }
 
-        $messageCount = $this->billableOutboundMessages($business, $periodStart, $excludeMessageId)
-            ->when($metric === self::AI_REPLIES, fn (Builder $query) => $query->where('messages.is_ai', true))
-            ->count();
-
         if ($metric === self::AI_REPLIES) {
-            return $messageCount;
+            return (int) \App\Models\AiUsageLog::query()
+                ->where('business_id', $business->id)
+                ->where('status', 'succeeded')
+                ->where('created_at', '>=', $periodStart)
+                ->sum('credits_consumed');
         }
+
+        $messageCount = $this->billableOutboundMessages($business, $periodStart, $excludeMessageId)->count();
 
         // Email campaigns do not create inbox Message rows, so their accepted
         // and currently claimed recipients are included from their own ledger.

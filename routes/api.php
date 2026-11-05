@@ -24,6 +24,7 @@ use App\Http\Controllers\Api\NotificationController;
 use App\Http\Controllers\Api\WebChatController;
 use App\Http\Controllers\Api\AiActionsController;
 use App\Http\Controllers\Api\AiReplyAuditController;
+use App\Http\Controllers\Api\AiCreditsController;
 use App\Http\Controllers\Api\WhatsAppController;
 use App\Http\Controllers\Api\WhatsAppCloudController;
 use App\Http\Controllers\Api\MediaProcessingDisclosureController;
@@ -435,6 +436,12 @@ Route::middleware('auth:sanctum')->group(function () {
 
     // Billing
     Route::middleware('business.access:read')->group(function () {
+        Route::get('/ai/settings', [AiCreditsController::class, 'settings']);
+        Route::get('/ai/usage', [AiCreditsController::class, 'usage']);
+        Route::get('/ai/usage/history', [AiCreditsController::class, 'history']);
+        Route::get('/ai/credits', [AiCreditsController::class, 'usage']);
+        Route::get('/ai/credits/transactions', [AiCreditsController::class, 'transactions']);
+        Route::get('/ai/credits/packages', [AiCreditsController::class, 'packages']);
         Route::get('/billing/subscription', [BillingController::class, 'getCurrentSubscription']);
         Route::get('/billing/usage', [BillingController::class, 'getUsageStats']);
         Route::get('/billing/service-status', [BillingController::class, 'checkServiceStatus']);
@@ -442,6 +449,8 @@ Route::middleware('auth:sanctum')->group(function () {
         Route::get('/subscriptions/current', [SubscriptionController::class, 'current']);
     });
     Route::middleware('business.access:manage_billing')->group(function () {
+        Route::put('/ai/settings', [AiCreditsController::class, 'updateSettings']);
+        Route::post('/ai/credits/purchase', [AiCreditsController::class, 'purchase']);
         Route::post('/billing/upgrade', [BillingController::class, 'upgradePlan']);
         Route::post('/subscriptions/create-free', [SubscriptionController::class, 'createFree']);
         Route::delete('/subscriptions', [SubscriptionController::class, 'cancel']);
@@ -584,8 +593,8 @@ Route::get('/packages/{id}', [PackageController::class, 'show']);
 // Payment callback (public - Paymob redirects here after checkout)
 Route::get('/payments/callback', [PaymentController::class, 'callback']);
 
-// Tools API (public with rate limiting)
-Route::post('/tools/ai-call', [ToolsController::class, 'aiCall']);
+// Tools AI calls consume business credits and require authenticated workspace scope.
+Route::middleware(['auth:sanctum', 'throttle:10,1'])->post('/tools/ai-call', [ToolsController::class, 'aiCall']);
 
 // Paymob webhook (public, exclude CSRF)
 Route::post('/payments/webhook', [PaymentController::class, 'webhook'])->withoutMiddleware([\App\Http\Middleware\VerifyCsrfToken::class]);
@@ -613,6 +622,30 @@ Route::post('/whatsapp/webhook', [WhatsAppController::class, 'webhook'])
 
 // Admin routes (protected + admin middleware)
 Route::middleware(['auth:sanctum', 'admin'])->prefix('admin')->group(function () {
+    Route::prefix('ai')->group(function () {
+        Route::get('/overview', [AiCreditsController::class, 'adminOverview']);
+        Route::get('/providers', [AiCreditsController::class, 'adminProviders']);
+        Route::post('/providers', [AiCreditsController::class, 'saveAdminProvider']);
+        Route::put('/providers/{id}', [AiCreditsController::class, 'saveAdminProvider']);
+        Route::post('/providers/{id}/test', [AiCreditsController::class, 'testAdminProvider']);
+        Route::delete('/providers/{id}', [AiCreditsController::class, 'deleteAdminProvider']);
+        Route::get('/models', [AiCreditsController::class, 'adminModels']);
+        Route::post('/models', [AiCreditsController::class, 'createAdminModel']);
+        Route::put('/models/{id}', [AiCreditsController::class, 'updateAdminModel']);
+        Route::delete('/models/{id}', [AiCreditsController::class, 'deleteAdminModel']);
+        Route::get('/routing-rules', [AiCreditsController::class, 'adminRouting']);
+        Route::post('/routing-rules', [AiCreditsController::class, 'saveAdminRouting']);
+        Route::get('/credit-settings', [AiCreditsController::class, 'adminCreditSettings']);
+        Route::put('/credit-settings', [AiCreditsController::class, 'updateAdminCreditSettings']);
+        Route::get('/credit-packages', [AiCreditsController::class, 'adminCreditPackages']);
+        Route::post('/credit-packages', [AiCreditsController::class, 'saveAdminCreditPackage']);
+        Route::put('/credit-packages/{id}', [AiCreditsController::class, 'saveAdminCreditPackage']);
+        Route::delete('/credit-packages/{id}', [AiCreditsController::class, 'deleteAdminCreditPackage']);
+        Route::get('/usage', [AiCreditsController::class, 'adminUsage']);
+        Route::post('/usage/{id}/reconcile', [AiCreditsController::class, 'reconcileUsage']);
+        Route::get('/businesses/{id}/usage', [AiCreditsController::class, 'adminBusinessUsage']);
+        Route::post('/businesses/{id}/credits/adjust', [AiCreditsController::class, 'adjustBusinessCredits']);
+    });
     // Dashboard
     Route::get('/dashboard', [AdminController::class, 'dashboard']);
 

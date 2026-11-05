@@ -33,7 +33,7 @@ class MultimodalController extends Controller
         }
 
         try {
-            $result = ImageUnderstandingService::analyzeImage($imagePath);
+            $result = ImageUnderstandingService::analyzeImage($imagePath, 'Describe this image and identify any products or receipts', null, $business, \App\Services\AiGateway::stableOperationId('image-test:' . $business->id . ':' . sha1_file($imagePath)));
         } finally {
             \Illuminate\Support\Facades\Storage::disk(app(\App\Services\IncomingMediaStorage::class)->diskName())
                 ->delete($relativePath);

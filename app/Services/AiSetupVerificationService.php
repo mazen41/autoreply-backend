@@ -102,10 +102,7 @@ class AiSetupVerificationService
 
     private function providerKey(string $provider): ?string
     {
-        return match ($provider) {
-            'gemini' => config('services.gemini.api_key'),
-            'groq' => config('services.groq.api_key'),
-            default => null,
-        };
+        $key = app(AiProviderConfiguration::class)->key($provider);
+        return $key !== '' ? $key : null;
     }
 }

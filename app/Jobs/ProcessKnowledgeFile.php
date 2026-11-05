@@ -4,6 +4,7 @@ namespace App\Jobs;
 
 use App\Models\BusinessKnowledgeFile;
 use App\Models\BusinessKnowledgeChunk;
+use App\Models\BusinessProfile;
 use App\Services\KnowledgeChunker;
 use App\Services\EmbeddingsService;
 use Illuminate\Bus\Queueable;
@@ -82,7 +83,8 @@ class ProcessKnowledgeFile implements ShouldQueue, ShouldBeUnique
             }
 
             // 2. Generate embeddings for chunks
-            $embeddings = $embeddingsService->embedBatch($chunks);
+            $business = BusinessProfile::query()->findOrFail($file->business_profile_id);
+            $embeddings = $embeddingsService->embedBatch($chunks, $business, \App\Services\AiGateway::stableOperationId('knowledge-file:' . $file->id . ':' . sha1($fullText)));
             
             if (empty($embeddings) || count($embeddings) !== count($chunks)) {
                 throw new \Exception("Failed to generate embeddings for all chunks");

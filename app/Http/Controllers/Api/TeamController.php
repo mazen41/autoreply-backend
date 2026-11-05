@@ -7,9 +7,11 @@ use App\Models\TeamMember;
 use App\Models\User;
 use App\Models\BusinessProfile;
 use App\Models\TeamInvitation;
+use App\Models\Package;
 use App\Models\Notification;
 use App\Services\AuditLoggerService;
 use App\Services\BusinessAccessService;
+use App\Services\UsageMeter;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Hash;
@@ -75,10 +77,42 @@ class TeamController extends Controller
                 return ['error' => 'A pending invitation already exists'];
             }
 
+            $package = app(UsageMeter::class)->subscriptionFor($lockedBusiness)?->package
+                ?? Package::query()->where('name', 'Free')->first();
+            $memberLimit = (int) ($package?->max_team_members ?? -1);
+            if ($memberLimit >= 0) {
+                $activeMembers = TeamMember::query()
+                    ->where('business_id', $lockedBusiness->id)
+                    ->where('user_id', '!=', $lockedBusiness->user_id)
+                    ->where('is_active', true)
+                    ->count();
+                $pendingInvitations = TeamInvitation::query()
+                    ->where('business_id', $lockedBusiness->id)
+                    ->where('status', 'pending')
+                    ->where('expires_at', '>', now())
+                    ->count();
+
+                // The business owner uses a seat too, even though they are
+                // represented by BusinessProfile rather than a TeamMember row.
+                $ownerSeat = $lockedBusiness->user_id ? 1 : 0;
+                if ($ownerSeat + $activeMembers + $pendingInvitations >= $memberLimit) {
+                    return [
+                        'error' => 'Your plan has reached its team member limit. Upgrade your plan to invite more members.',
+                        'status' => 403,
+                        'error_code' => 'PLAN_LIMIT_EXCEEDED',
+                        'max_allowed' => $memberLimit,
+                    ];
+                }
+            }
+
             return ['invitation' => $this->createInvitation($request, $lockedBusiness, $email, $request->role)];
         });
         if (isset($result['error'])) {
-            return response()->json(['error' => $result['error']], 409);
+            return response()->json([
+                'error' => $result['error'],
+                'error_code' => $result['error_code'] ?? null,
+                'max_allowed' => $result['max_allowed'] ?? null,
+            ], $result['status'] ?? 409);
         }
         $business = BusinessProfile::findOrFail($business->id);
         $invitation = $result['invitation'];
@@ -198,6 +232,28 @@ class TeamController extends Controller
                 return ['error' => 'Invitation is invalid or expired. Ask the owner to resend it.'];
             }
 
+            $business = BusinessProfile::query()->whereKey($invitation->business_id)->lockForUpdate()->firstOrFail();
+            $package = app(UsageMeter::class)->subscriptionFor($business)?->package
+                ?? Package::query()->where('name', 'Free')->first();
+            $memberLimit = (int) ($package?->max_team_members ?? -1);
+            if ($memberLimit >= 0) {
+                $activeMembers = TeamMember::query()
+                    ->where('business_id', $business->id)
+                    ->where('user_id', '!=', $business->user_id)
+                    ->where('is_active', true)
+                    ->count();
+                $pendingInvitations = TeamInvitation::query()
+                    ->where('business_id', $business->id)
+                    ->where('status', 'pending')
+                    ->where('expires_at', '>', now())
+                    ->count();
+
+                $ownerSeat = $business->user_id ? 1 : 0;
+                if ($ownerSeat + $activeMembers + $pendingInvitations > $memberLimit) {
+                    return ['error' => 'This workspace has exceeded the team member limit for its current plan.', 'status' => 403];
+                }
+            }
+
             $email = mb_strtolower(trim($invitation->email));
             $user = User::whereRaw('LOWER(email) = ?', [$email])->lockForUpdate()->first();
             if ($user) {
@@ -236,7 +292,7 @@ class TeamController extends Controller
         });
 
         if (isset($result['error'])) {
-            return response()->json(['message' => $result['error']], 410);
+            return response()->json(['message' => $result['error']], $result['status'] ?? 410);
         }
 
         /** @var User $user */

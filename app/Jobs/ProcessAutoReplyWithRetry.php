@@ -15,8 +15,9 @@ use Illuminate\Contracts\Queue\ShouldQueue;
 use Illuminate\Foundation\Bus\Dispatchable;
 use Illuminate\Queue\InteractsWithQueue;
 use Illuminate\Queue\SerializesModels;
-use Illuminate\Support\Facades\Http;
 use Illuminate\Support\Facades\Log;
+use App\Models\BusinessProfile;
+use App\Exceptions\InsufficientAiCreditsException;
 
 class ProcessAutoReplyWithRetry implements ShouldQueue
 {
@@ -109,7 +110,7 @@ class ProcessAutoReplyWithRetry implements ShouldQueue
                 ])
                 ->toArray();
 
-            $aiResponse = $this->callConfiguredAI($systemPrompt, $contextMessages);
+            $aiResponse = $this->callConfiguredAI($systemPrompt, $contextMessages, $business, (int) $conversation->id);
 
             if (!$aiResponse) {
                 Log::error('ProcessAutoReplyWithRetry: configured AI providers returned no response', ['message_id' => $this->messageId]);
@@ -156,6 +157,11 @@ class ProcessAutoReplyWithRetry implements ShouldQueue
                 'attempt' => $this->attempts(),
                 'exception_type' => get_class($e),
             ]);
+
+            if ($e instanceof InsufficientAiCreditsException) {
+                Log::info('ProcessAutoReplyWithRetry: skipped AI generation because the business has insufficient AI credits', ['business_id' => $business->id, 'conversation_id' => $conversation->id, 'message_id' => $this->messageId]);
+                return;
+            }
 
             // Mark message as failed if this is the last attempt
             if ($this->attempts() >= $this->tries) {
@@ -257,45 +263,22 @@ class ProcessAutoReplyWithRetry implements ShouldQueue
         return $prompt;
     }
 
-    private function callConfiguredAI(string $systemPrompt, array $contextMessages): ?string
+    private function callConfiguredAI(string $systemPrompt, array $contextMessages, BusinessProfile $business, int $conversationId): ?string
     {
         $this->lastAIProvider = null;
         $this->lastAIModel = null;
-
-        // Try OpenAI first
-        $openaiKey = config('services.openai.api_key');
-        if ($openaiKey) {
-            try {
-                $response = Http::timeout(30)
-                    ->withHeaders([
-                        'Authorization' => 'Bearer ' . $openaiKey,
-                        'Content-Type' => 'application/json',
-                    ])
-                    ->post('https://api.openai.com/v1/chat/completions', [
-                        'model' => config('services.openai.model', 'gpt-3.5-turbo'),
-                        'messages' => [
-                            ['role' => 'system', 'content' => $systemPrompt],
-                            ...$contextMessages,
-                        ],
-                        'max_tokens' => 500,
-                        'temperature' => 0.7,
-                    ]);
-
-                if ($response->successful()) {
-                    $data = $response->json();
-                    $this->lastAIProvider = 'openai';
-                    $this->lastAIModel = config('services.openai.model', 'gpt-3.5-turbo');
-                    return $data['choices'][0]['message']['content'] ?? null;
-                }
-            } catch (\Exception $e) {
-                Log::warning('OpenAI API call failed', ['exception_type' => get_class($e)]);
-            }
-        }
-
-        // Fallback to a simple rule-based response
-        $this->lastAIProvider = 'rule_fallback';
-        $this->lastAIModel = 'keyword_rules';
-        return $this->getFallbackResponse($contextMessages);
+        $result = app(\App\Services\AiGateway::class)->chat(
+            $business,
+            'customer_reply',
+            $systemPrompt,
+            $contextMessages,
+            500,
+            'legacy-retry-message:' . $this->messageId,
+            ['conversation_id' => $conversationId, 'source' => 'legacy_retry_processor'],
+        );
+        $this->lastAIProvider = $result['provider'] ?? null;
+        $this->lastAIModel = $result['model'] ?? null;
+        return isset($result['content']) ? trim((string) $result['content']) : null;
     }
 
     private function getFallbackResponse(array $contextMessages): ?string

@@ -157,6 +157,8 @@ class MyFatoorahController extends Controller
                     PaymentIntent::where('myfatoorah_invoice_id', $invoiceId)
                         ->where('status', 'pending')
                         ->update(['status' => 'failed']);
+                    \App\Models\AiCreditPurchase::query()->where('invoice_id', $invoiceId)
+                        ->where('status', 'pending')->update(['status' => 'failed']);
                 }
             } catch (\Exception $e) {
                 Log::warning('[MyFatoorah] Could not fetch status on error URL', ['exception_type' => get_class($e)]);
@@ -177,6 +179,9 @@ class MyFatoorahController extends Controller
             ->first();
 
         if (! $intent) {
+            if (app(\App\Http\Controllers\Api\AiCreditsController::class)->fulfillVerifiedPurchase($data)) {
+                return response()->json(['message' => 'Credit purchase was received and verified.']);
+            }
             Log::warning("[MyFatoorah] No PaymentIntent found for InvoiceId={$invoiceId}");
             return response()->json(['message' => 'Invoice not recognised.'], 404);
         }

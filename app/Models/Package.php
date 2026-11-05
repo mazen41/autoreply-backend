@@ -14,7 +14,9 @@ class Package extends Model
         'price_monthly',
         'price_yearly',
         'ai_replies_limit',
+        'ai_credits_monthly',
         'channels_limit',
+        'max_team_members',
         'outbound_messages_limit',
         'tools_limit',
         'blog_posts_limit',
@@ -30,6 +32,7 @@ class Package extends Model
         'features_ar' => 'array',
         'is_popular' => 'boolean',
         'is_active' => 'boolean',
+        'ai_credits_monthly' => 'integer',
     ];
 
     public function subscriptions()

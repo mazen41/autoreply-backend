@@ -925,36 +925,6 @@ Customer message: {$messageText}
 Reply:";
     }
 
-    private function getGeminiReply(string $messageText, Channel $channel): ?string
-    {
-        $apiKey = env('GEMINI_API_KEY');
-        $model  = env('GEMINI_MODEL', 'gemini-2.5-flash');
-        $prompt = $this->buildPrompt($messageText, $channel);
-
-        try {
-            $response = Http::timeout(20)
-                ->post(
-                    "https://generativelanguage.googleapis.com/v1beta/models/{$model}:generateContent?key={$apiKey}",
-                    [
-                        'contents'         => [['parts' => [['text' => $prompt]]]],
-                        'generationConfig' => ['maxOutputTokens' => 300, 'temperature' => 0.7],
-                    ]
-                );
-
-            if (!$response->successful()) {
-                Log::error('Gemini API error', ['http_status' => $response->status()]);
-                return null;
-            }
-
-            $reply = $response->json()['candidates'][0]['content']['parts'][0]['text'] ?? null;
-            return $reply ? trim($reply) : null;
-
-        } catch (\Exception $e) {
-            Log::error('Gemini exception', ['exception_type' => get_class($e)]);
-            return null;
-        }
-    }
-
     public function handleGmail(Request $request)
     {
         try {

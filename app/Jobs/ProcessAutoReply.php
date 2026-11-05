@@ -253,6 +253,9 @@ class ProcessAutoReply implements ShouldQueue
                 'conversation_id' => $conversation->id,
                 'metric' => !$aiUsage['allowed'] ? 'ai_replies' : 'outbound_messages',
             ]);
+            if (!$aiUsage['allowed']) {
+                $this->notifyInsufficientAiCredits($business, $conversation, $message);
+            }
             return;
         }
         $this->aiRepliesCount = max(0, $aiUsage['used']) + 1;
@@ -329,7 +332,12 @@ class ProcessAutoReply implements ShouldQueue
                     throw new \RuntimeException('Inbound audio is unavailable in private storage.');
                 }
 
-                $voiceTranscription = $voiceService->transcribeAudio($audioPath);
+                $voiceTranscription = $voiceService->transcribeAudio(
+                    $audioPath,
+                    $business,
+                    \App\Services\AiGateway::stableOperationId('voice-transcription:' . $message->id),
+                    is_numeric(data_get($message->metadata, 'media.duration')) ? (int) data_get($message->metadata, 'media.duration') : null,
+                );
                 if (trim($voiceTranscription) === '') {
                     throw new \RuntimeException('Audio transcription returned no text.');
                 }
@@ -367,7 +375,9 @@ class ProcessAutoReply implements ShouldQueue
                 $imageAnalysis = $imageService->analyzeImage(
                     $imagePath,
                     'Describe this image and identify any products or receipts',
-                    data_get($message->metadata, 'media.storage_disk')
+                    data_get($message->metadata, 'media.storage_disk'),
+                    $business,
+                    \App\Services\AiGateway::stableOperationId('image-understanding:' . $message->id)
                 );
 
                 if (!empty($imageAnalysis['raw_analysis'])) {
@@ -430,7 +440,7 @@ class ProcessAutoReply implements ShouldQueue
             // Count previous greetings in this conversation
             $previousGreetings = Message::where('conversation_id', $message->conversation_id)
                 ->where('direction', 'inbound')
-                ->whereRaw('LOWER(TRIM(content)) REGEXP ?', ['^(hi|hello|hey|مرحبا|السلام عليكم|صباح الخير|مساء الخير|اهلا|هلا)[\\s\\!\\.\\,]*$'])
+                ->whereRaw('LOWER(TRIM(content)) REGEXP ?', ['^(hi|hello|hey|مرحبا|السلام عليكم|صباح الخير|مساء الخير|اهلا|هلا)[\s\!\.\,]*$'])
                 ->count();
 
             if ($previousGreetings > 0) {
@@ -1849,6 +1859,11 @@ class ProcessAutoReply implements ShouldQueue
         $knowledgeChunkIds = [];
 
         $context = [
+            'business_id' => $business?->id,
+            'conversation_id' => $conversation->id,
+            'message_id' => $message->id,
+            'ai_operation_id' => \App\Services\AiGateway::stableOperationId('process-auto-reply:' . $message->id),
+            'ai_task' => 'customer_reply',
             'business_name'  => $channel->business?->business_name ?? 'our business',
             'platform'       => $channel->type,
             'language'       => $detectedLanguage,
@@ -1877,7 +1892,7 @@ class ProcessAutoReply implements ShouldQueue
                 $vectorSearch = app(\App\Services\VectorSearchService::class);
 
                 // 1. Get embedding for the user's message
-                $queryEmbedding = $embeddingsService->embedChunk($message->content);
+                $queryEmbedding = $embeddingsService->embedChunk($message->content, $business, \App\Services\AiGateway::stableOperationId('knowledge-query:' . $message->id));
                 
                 if (empty($queryEmbedding)) {
                     return ''; // Fallback if embedding fails
@@ -2006,7 +2021,19 @@ class ProcessAutoReply implements ShouldQueue
         ];
 
         // Step 4: Single AI Call with JSON Output
-        $aiResult = AICapabilitiesService::callAIWithJSON($message->content, $context);
+        try {
+            $aiResult = AICapabilitiesService::callAIWithJSON($message->content, $context);
+        } catch (\App\Exceptions\InsufficientAiCreditsException $exception) {
+            Log::info('ProcessAutoReply: AI generation skipped because estimated reservation exceeds available credits', [
+                'business_id' => $business->id,
+                'conversation_id' => $conversation->id,
+                'message_id' => $message->id,
+                'available_credits' => $exception->balance['available'] ?? null,
+                'required_credits' => $exception->balance['required'] ?? null,
+            ]);
+            $this->notifyInsufficientAiCredits($business, $conversation, $message);
+            return;
+        }
         $auditProvider = $aiResult['provider'] ?? ($context['ai_provider'] ?: config('services.ai.provider', 'gemini'));
         $auditModel = $aiResult['model'] ?? ($context['ai_model'] ?: ($auditProvider === 'groq'
             ? config('services.groq.model', 'openai/gpt-oss-120b')
@@ -4931,6 +4958,41 @@ $aiResponse = $intro
                 . '|^(?:أريد|اريد|عايز|عاوز|أبغى|ابغى)\s+(?:إلغاء|الغاء|ألغي|الغي)\s+(?:الطلب|طلبي)[.!؟\s]*$/u',
             $message
         );
+    }
+
+    /** Notify the business once for each inbound message skipped for lack of AI credits. */
+    private function notifyInsufficientAiCredits(
+        \App\Models\BusinessProfile $business,
+        \App\Models\Conversation $conversation,
+        Message $message,
+    ): void {
+        if (!$business->user_id) {
+            return;
+        }
+
+        $alreadyNotified = \App\Models\Notification::query()
+            ->where('user_id', $business->user_id)
+            ->where('type', 'ai_credits')
+            ->where('data->message_id', (int) $message->id)
+            ->exists();
+        if ($alreadyNotified) {
+            return;
+        }
+
+        \App\Models\Notification::query()->create([
+            'user_id' => $business->user_id,
+            'type' => 'ai_credits',
+            'title' => 'AI reply skipped: insufficient credits',
+            'message' => 'A customer message was saved, but the AI could not reply because this business has insufficient AI credits. Buy credits or wait for the allowance to renew.',
+            'data' => [
+                'business_id' => (int) $business->id,
+                'conversation_id' => (int) $conversation->id,
+                'message_id' => (int) $message->id,
+                'reason' => 'insufficient_credits',
+            ],
+            'action_url' => '/dashboard/billing',
+            'is_read' => false,
+        ]);
     }
 
     /** Digits of the sender ID, only when the channel's sender ID is itself a phone number (WhatsApp). */

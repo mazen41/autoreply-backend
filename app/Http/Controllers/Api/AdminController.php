@@ -397,33 +397,37 @@ class AdminController extends Controller
 
     public function createPackage(Request $request)
     {
-        $request->validate([
+        $values = $request->validate([
             'name' => 'required|string|max:255', 'name_ar' => 'required|string|max:255',
             'description' => 'nullable|string', 'description_ar' => 'nullable|string',
             'price_monthly' => 'required|numeric|min:0', 'price_yearly' => 'required|numeric|min:0',
             'ai_replies_limit' => 'required|integer', 'channels_limit' => 'required|integer',
+            'ai_credits_monthly' => 'required|integer|min:0|max:1000000000',
+            'max_team_members' => 'required|integer|min:-1',
             'outbound_messages_limit' => 'sometimes|integer|min:-1',
             'tools_limit' => 'required|integer', 'blog_posts_limit' => 'required|integer',
             'features' => 'nullable|array', 'features_ar' => 'nullable|array',
             'is_popular' => 'sometimes|boolean', 'is_active' => 'sometimes|boolean', 'sort_order' => 'sometimes|integer',
         ]);
-        return response()->json(Package::create($request->all()), 201);
+        return response()->json(Package::create($values), 201);
     }
 
     public function updatePackage(Request $request, $id)
     {
         $package = Package::findOrFail($id);
-        $request->validate([
+        $values = $request->validate([
             'name' => 'sometimes|string|max:255', 'name_ar' => 'sometimes|string|max:255',
             'description' => 'nullable|string', 'description_ar' => 'nullable|string',
             'price_monthly' => 'sometimes|numeric|min:0', 'price_yearly' => 'sometimes|numeric|min:0',
             'ai_replies_limit' => 'sometimes|integer', 'channels_limit' => 'sometimes|integer',
+            'ai_credits_monthly' => 'sometimes|integer|min:0|max:1000000000',
+            'max_team_members' => 'sometimes|integer|min:-1',
             'outbound_messages_limit' => 'sometimes|integer|min:-1',
             'tools_limit' => 'sometimes|integer', 'blog_posts_limit' => 'sometimes|integer',
             'features' => 'nullable|array', 'features_ar' => 'nullable|array',
             'is_popular' => 'sometimes|boolean', 'is_active' => 'sometimes|boolean', 'sort_order' => 'sometimes|integer',
         ]);
-        $package->update($request->all());
+        $package->update($values);
         return response()->json($package);
     }
 
@@ -474,17 +478,18 @@ class AdminController extends Controller
             'ai_timeout' => (int) config('services.ai.timeout', 30),
             'ai_retries' => (int) config('services.ai.retries', 3),
             'ai_streaming' => (bool) config('services.ai.streaming', false),
-            'gemini_api_key' => config('services.gemini.api_key') ? '***' : null,
+            'gemini_api_key' => app(\App\Services\AiProviderConfiguration::class)->isAvailable('gemini') ? '***' : null,
             'gemini_model' => config('services.gemini.model', 'gemini-2.5-flash'),
-            'gemini_configured' => (bool) config('services.gemini.api_key'),
-            'groq_api_key' => config('services.groq.api_key') ? '***' : null,
+            'gemini_configured' => app(\App\Services\AiProviderConfiguration::class)->isAvailable('gemini'),
+            'groq_api_key' => app(\App\Services\AiProviderConfiguration::class)->isAvailable('groq') ? '***' : null,
             'groq_model' => config('services.groq.model', 'openai/gpt-oss-120b'),
-            'groq_configured' => (bool) config('services.groq.api_key'),
-            'openai_api_key' => config('services.openai.api_key') ? '***' : null,
-            'openai_configured' => (bool) config('services.openai.api_key'),
-            'claude_api_key' => config('services.claude.api_key') ? '***' : null,
+            'groq_configured' => app(\App\Services\AiProviderConfiguration::class)->isAvailable('groq'),
+            'openai_api_key' => app(\App\Services\AiProviderConfiguration::class)->isAvailable('openai') ? '***' : null,
+            'openai_model' => config('services.openai.model', 'gpt-4o'),
+            'openai_configured' => app(\App\Services\AiProviderConfiguration::class)->isAvailable('openai'),
+            'claude_api_key' => app(\App\Services\AiProviderConfiguration::class)->isAvailable('claude') ? '***' : null,
             'claude_model' => config('services.claude.model', 'claude-haiku-4-5-20251001'),
-            'claude_configured' => (bool) config('services.claude.api_key'),
+            'claude_configured' => app(\App\Services\AiProviderConfiguration::class)->isAvailable('claude'),
             'vision_provider' => config('services.vision.provider', 'openai'),
             'vision_openai_model' => config('services.vision.openai_model', 'gpt-4o'),
             'vision_gemini_model' => config('services.vision.gemini_model', 'gemini-3.8-flash'),
@@ -513,8 +518,8 @@ class AdminController extends Controller
     {
         $request->validate([
             'app_name' => 'sometimes|string|max:255',
-            'ai_provider' => 'sometimes|in:gemini,groq,claude',
-            'ai_fallback_provider' => 'sometimes|in:gemini,groq,claude',
+            'ai_provider' => 'sometimes|in:gemini,groq,claude,openai',
+            'ai_fallback_provider' => 'sometimes|in:gemini,groq,claude,openai',
             'ai_temperature' => 'sometimes|numeric|min:0|max:2',
             'ai_max_tokens' => 'sometimes|integer|min:50|max:8000',
             'ai_timeout' => 'sometimes|integer|min:5|max:120',
@@ -523,6 +528,7 @@ class AdminController extends Controller
             'gemini_api_key' => 'nullable|string', 'gemini_model' => 'sometimes|string|max:120',
             'groq_api_key' => 'nullable|string', 'groq_model' => 'sometimes|string|max:120',
             'openai_api_key' => 'nullable|string',
+            'openai_model' => 'sometimes|string|max:120',
             'claude_api_key' => 'nullable|string', 'claude_model' => 'sometimes|string|max:120',
             'vision_provider' => 'sometimes|in:openai,gemini',
             'vision_openai_model' => 'sometimes|string|max:120',
@@ -546,6 +552,7 @@ class AdminController extends Controller
             'gemini_api_key' => 'GEMINI_API_KEY', 'gemini_model' => 'GEMINI_MODEL',
             'groq_api_key' => 'GROQ_API_KEY', 'groq_model' => 'GROQ_MODEL',
             'openai_api_key' => 'OPENAI_API_KEY',
+            'openai_model' => 'OPENAI_MODEL',
             'claude_api_key' => 'ANTHROPIC_API_KEY', 'claude_model' => 'CLAUDE_MODEL',
             'vision_provider' => 'VISION_PROVIDER',
             'vision_openai_model' => 'VISION_OPENAI_MODEL',

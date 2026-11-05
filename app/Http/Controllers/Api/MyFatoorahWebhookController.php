@@ -81,6 +81,10 @@ class MyFatoorahWebhookController extends Controller
             ->first();
 
         if (! $intent) {
+            if (app(\App\Http\Controllers\Api\AiCreditsController::class)->fulfillVerifiedPurchase($apiData)) {
+                Log::info('[MyFatoorah Webhook] Verified AI credit purchase processed', ['invoice_id' => $invoiceId]);
+                return response()->json(['message' => 'AI credit purchase processed.'], 200);
+            }
             Log::warning("[MyFatoorah Webhook] No PaymentIntent found for InvoiceId={$invoiceId}");
             return response()->json(['message' => 'Invoice not tracked.'], 200);
         }

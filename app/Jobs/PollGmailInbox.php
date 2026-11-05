@@ -11,7 +11,6 @@ use Illuminate\Contracts\Queue\ShouldQueue;
 use Illuminate\Foundation\Bus\Dispatchable;
 use Illuminate\Queue\InteractsWithQueue;
 use Illuminate\Queue\SerializesModels;
-use Illuminate\Support\Facades\Http;
 use Illuminate\Support\Facades\Log;
 use Illuminate\Support\Facades\Cache;
 use Google\Service\Gmail;
@@ -249,30 +248,4 @@ class PollGmailInbox implements ShouldQueue
         $gmail->users_messages->send('me', $message);
     }
 
-    private function getGeminiReply(string $messageText, string $subject, Channel $channel): ?string
-    {
-        $apiKey   = env('GEMINI_API_KEY');
-        $model    = env('GEMINI_MODEL', 'gemini-2.5-flash');
-        $business = $channel->business;
-
-        $prompt = $business
-            ? "You are a customer service assistant for {$business->business_name}. Reply to this email professionally and concisely.\n\nSubject: {$subject}\n\nEmail:\n{$messageText}\n\nReply:"
-            : "You are a helpful customer service assistant. Reply to this email politely in the same language used. Keep it short.\n\nSubject: {$subject}\n\nEmail:\n{$messageText}\n\nReply:";
-
-        try {
-            $response = Http::timeout(20)
-                ->post(
-                    "https://generativelanguage.googleapis.com/v1beta/models/{$model}:generateContent?key={$apiKey}",
-                    [
-                        'contents'         => [['parts' => [['text' => $prompt]]]],
-                        'generationConfig' => ['maxOutputTokens' => 400, 'temperature' => 0.7],
-                    ]
-                );
-
-            return $response->json()['candidates'][0]['content']['parts'][0]['text'] ?? null;
-        } catch (\Exception $e) {
-            Log::error('Gemini Gmail exception', ['exception_type' => get_class($e)]);
-            return null;
-        }
-    }
 }

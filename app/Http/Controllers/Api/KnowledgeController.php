@@ -196,12 +196,12 @@ class KnowledgeController extends Controller
         $profile = $this->profile($request, 'write');
 
         // Build system prompt using the same logic as ProcessAutoReply
-        $systemPrompt = $this->buildTestSystemPrompt($profile, $request->test_question);
+        $systemPrompt = $this->buildTestSystemPrompt($profile, $request->test_question, $request->header('Idempotency-Key'));
 
         // Call AI for test response
-        $testResponse = $this->callConfiguredAI($systemPrompt, [
+        $testResponse = $this->callConfiguredAI($profile, $systemPrompt, [
             ['role' => 'user', 'content' => $request->test_question]
-        ]);
+        ], $request->header('Idempotency-Key') ? \App\Services\AiGateway::stableOperationId('knowledge-test:' . $profile->id . ':' . $request->header('Idempotency-Key')) : (string) \Illuminate\Support\Str::uuid());
 
         if (!$testResponse) {
             return response()->json(['error' => 'Failed to generate test response'], 500);
@@ -251,7 +251,7 @@ class KnowledgeController extends Controller
         $embeddingsService = app(\App\Services\EmbeddingsService::class);
         $vectorSearch = app(\App\Services\VectorSearchService::class);
 
-        $queryEmbedding = $embeddingsService->embedChunk($queryStr);
+        $queryEmbedding = $embeddingsService->embedChunk($queryStr, $profile, $request->header('Idempotency-Key') ? \App\Services\AiGateway::stableOperationId('knowledge-search:' . $profile->id . ':' . $request->header('Idempotency-Key')) : (string) \Illuminate\Support\Str::uuid());
         if (!empty($queryEmbedding)) {
             $relevantChunks = $vectorSearch->search($queryEmbedding, $profile->id, $limit);
             foreach ($relevantChunks as $chunk) {
@@ -331,7 +331,7 @@ class KnowledgeController extends Controller
         return $text;
     }
 
-    private function buildTestSystemPrompt(BusinessProfile $business, string $query = ''): string
+    private function buildTestSystemPrompt(BusinessProfile $business, string $query = '', ?string $idempotencyKey = null): string
     {
         if (!$business) {
             return "You are an AI customer support assistant. Answer questions truthfully. If you do not know the answer, politely state that you don't know and offer to connect them with a human agent.";
@@ -363,7 +363,7 @@ class KnowledgeController extends Controller
             $embeddingsService = app(\App\Services\EmbeddingsService::class);
             $vectorSearch = app(\App\Services\VectorSearchService::class);
 
-            $queryEmbedding = $embeddingsService->embedChunk($query);
+            $queryEmbedding = $embeddingsService->embedChunk($query, $business, $idempotencyKey ? \App\Services\AiGateway::stableOperationId('knowledge-answer:' . $business->id . ':' . $idempotencyKey) : (string) \Illuminate\Support\Str::uuid());
             if (!empty($queryEmbedding)) {
                 $relevantChunks = $vectorSearch->search($queryEmbedding, $business->id, 5);
                 foreach ($relevantChunks as $index => $chunk) {
@@ -418,150 +418,43 @@ class KnowledgeController extends Controller
         return $prompt;
     }
 
-    private function callConfiguredAI(string $systemPrompt, array $contextMessages): ?string
+    private function callConfiguredAI(BusinessProfile $business, string $systemPrompt, array $contextMessages, string $operationId): ?string
     {
-        $primary = strtolower((string) config('services.ai.provider', 'groq'));
-        $fallback = config('services.ai.fallback_provider', $primary === 'gemini' ? 'claude' : 'gemini');
-        $providers = array_values(array_unique(array_filter([$primary, strtolower((string) $fallback)])));
-
-        foreach ($providers as $provider) {
-            $model = match ($provider) {
-                'groq' => config('services.groq.model'),
-                'claude' => config('services.claude.model'),
-                'gemini' => config('services.gemini.model'),
-                default => null,
-            };
-            Log::info('Knowledge test reply calling configured AI provider', [
-                'provider' => $provider,
-                'model' => $model,
-            ]);
-
-            $reply = match ($provider) {
-                'groq' => $this->callGroqAPI($systemPrompt, $contextMessages),
-                'claude' => $this->callClaudeAPI($systemPrompt, $contextMessages),
-                'gemini' => $this->callGeminiAPI($systemPrompt, $contextMessages),
-                default => null,
-            };
-
-            if ($reply) {
-                Log::info('Knowledge test reply generated', [
-                    'provider' => $provider,
-                    'model' => $model,
-                ]);
-                return $reply;
-            }
-        }
-
-        return null;
+        $router = app(\App\Services\AiRouter::class);
+        $route = $router->resolve($business, 'knowledge_generation', (string) config('services.ai.provider'), (string) config('services.ai.model', config('services.groq.model')));
+        Log::info('Knowledge test reply routed through AI credit gateway', ['business_id' => $business->id, 'provider' => $route['provider'], 'model' => $route['model'], 'mode' => $route['mode']]);
+        $tokens = max(1, (int) ceil((mb_strlen($systemPrompt) + collect($contextMessages)->sum(fn ($message) => mb_strlen((string) ($message['content'] ?? '')))) / 4));
+        $result = app(\App\Services\AiGateway::class)->execute(
+            $business, 'knowledge_generation', $route['provider'], $route['model'], $tokens, 1000,
+            fn () => $this->requestKnowledgeProvider($route['provider'], $route['model'], $systemPrompt, $contextMessages),
+            ['routing_source' => $route['source'], 'routing_rule_id' => $route['rule_id']], $operationId,
+        );
+        return (string) ($result['content'] ?? '');
     }
 
-    private function callGroqAPI(string $systemPrompt, array $contextMessages): ?string
+    private function requestKnowledgeProvider(string $provider, string $model, string $systemPrompt, array $messages): array
     {
-        $apiKey = config('services.groq.api_key');
-        if (!$apiKey) {
-            Log::warning('Knowledge test reply skipped Groq because its API key is not configured');
-            return null;
+        $maxTokens = 1000;
+        if ($provider === 'claude') {
+            $apiKey = app(\App\Services\AiProviderConfiguration::class)->key('claude');
+            $response = \Illuminate\Support\Facades\Http::timeout(30)->connectTimeout(10)->withHeaders(['x-api-key' => $apiKey, 'anthropic-version' => '2023-06-01'])->post('https://api.anthropic.com/v1/messages', ['model' => $model, 'max_tokens' => $maxTokens, 'system' => $systemPrompt, 'messages' => $messages]);
+            if (!$response->successful()) throw new \App\Exceptions\AiProviderRequestException('Anthropic', $response->status());
+            return ['content' => (string) $response->json('content.0.text', ''), 'provider' => $provider, 'model' => $model, 'usage' => ['input_tokens' => (int) $response->json('usage.input_tokens', 0), 'output_tokens' => (int) $response->json('usage.output_tokens', 0), 'cached_tokens' => (int) $response->json('usage.cache_read_input_tokens', 0)]];
         }
-
-        try {
-            $response = \Illuminate\Support\Facades\Http::timeout(30)
-                ->connectTimeout(10)
-                ->withToken($apiKey)
-                ->acceptJson()
-                ->post('https://api.groq.com/openai/v1/chat/completions', [
-                    'model' => config('services.groq.model', 'openai/gpt-oss-120b'),
-                    'messages' => array_merge(
-                        [['role' => 'system', 'content' => $systemPrompt]],
-                        $contextMessages,
-                    ),
-                    'temperature' => (float) config('services.ai.temperature', 0.7),
-                    'max_tokens' => (int) config('services.ai.max_tokens', 2048),
-                ]);
-
-            if (!$response->successful()) {
-                Log::error('Groq knowledge test reply request failed', [
-                    'status' => $response->status(),
-                ]);
-                return null;
-            }
-
-            return $response->json('choices.0.message.content');
-        } catch (\Throwable $exception) {
-            Log::error('Groq knowledge test reply request threw an exception', [
-                'exception_type' => get_class($exception),
-            ]);
-            return null;
+        if ($provider === 'gemini') {
+            $contents = array_map(fn ($message) => ['role' => ($message['role'] ?? 'user') === 'assistant' ? 'model' : 'user', 'parts' => [['text' => (string) ($message['content'] ?? '')]]], $messages);
+            $apiKey = app(\App\Services\AiProviderConfiguration::class)->key('gemini');
+            $response = \Illuminate\Support\Facades\Http::timeout(30)->connectTimeout(10)->post("https://generativelanguage.googleapis.com/v1beta/models/{$model}:generateContent?key=" . urlencode($apiKey), ['contents' => $contents, 'systemInstruction' => ['parts' => [['text' => $systemPrompt]]], 'generationConfig' => ['maxOutputTokens' => $maxTokens, 'temperature' => (float) config('services.ai.temperature', 0.7)]]);
+            if (!$response->successful()) throw new \App\Exceptions\AiProviderRequestException('Gemini', $response->status());
+            return ['content' => (string) $response->json('candidates.0.content.parts.0.text', ''), 'provider' => $provider, 'model' => $model, 'usage' => ['input_tokens' => (int) $response->json('usageMetadata.promptTokenCount', 0), 'output_tokens' => (int) $response->json('usageMetadata.candidatesTokenCount', 0), 'cached_tokens' => (int) $response->json('usageMetadata.cachedContentTokenCount', 0)]];
         }
+        if ($provider === 'groq') {
+            $apiKey = app(\App\Services\AiProviderConfiguration::class)->key('groq');
+            $response = \Illuminate\Support\Facades\Http::timeout(30)->connectTimeout(10)->withToken($apiKey)->post('https://api.groq.com/openai/v1/chat/completions', ['model' => $model, 'messages' => array_merge([['role' => 'system', 'content' => $systemPrompt]], $messages), 'temperature' => (float) config('services.ai.temperature', 0.7), 'max_tokens' => $maxTokens]);
+            if (!$response->successful()) throw new \App\Exceptions\AiProviderRequestException('Groq', $response->status());
+            return ['content' => (string) $response->json('choices.0.message.content', ''), 'provider' => $provider, 'model' => $model, 'usage' => ['input_tokens' => (int) $response->json('usage.prompt_tokens', 0), 'output_tokens' => (int) $response->json('usage.completion_tokens', 0), 'cached_tokens' => (int) $response->json('usage.prompt_tokens_details.cached_tokens', 0)]];
+        }
+        throw new \RuntimeException('The configured AI provider is not supported for knowledge generation.');
     }
 
-    private function callClaudeAPI(string $systemPrompt, array $contextMessages): ?string
-    {
-        $apiKey = config('services.claude.api_key');
-        if (!$apiKey) {
-            return null;
-        }
-
-        try {
-            $response = \Illuminate\Support\Facades\Http::withHeaders([
-                'x-api-key' => $apiKey,
-                'anthropic-version' => '2023-06-01',
-                'content-type' => 'application/json',
-            ])->post('https://api.anthropic.com/v1/messages', [
-                'model' => config('services.claude.model', 'claude-3-5-sonnet-20241022'),
-                'max_tokens' => 1000,
-                'system' => $systemPrompt,
-                'messages' => $contextMessages,
-            ]);
-
-            if ($response->successful()) {
-                return $response->json('content.0.text');
-            }
-        } catch (\Exception $e) {
-            Log::error('Claude API call failed', ['exception_type' => get_class($e)]);
-        }
-
-        return null;
-    }
-
-    private function callGeminiAPI(string $systemPrompt, array $contextMessages): ?string
-    {
-        $apiKey = config('services.gemini.api_key');
-        if (!$apiKey) {
-            return null;
-        }
-
-        try {
-            $contents = [];
-            foreach ($contextMessages as $msg) {
-                $contents[] = [
-                    'role' => $msg['role'],
-                    'parts' => [['text' => $msg['content']]]
-                ];
-            }
-
-            $response = \Illuminate\Support\Facades\Http::post(
-                "https://generativelanguage.googleapis.com/v1beta/models/" . 
-                config('services.gemini.model', 'gemini-1.5-flash') . 
-                ":generateContent?key={$apiKey}",
-                [
-                    'contents' => $contents,
-                    'systemInstruction' => [
-                        'parts' => [['text' => $systemPrompt]]
-                    ],
-                    'generationConfig' => [
-                        'maxOutputTokens' => 1000,
-                        'temperature' => 0.4,
-                    ]
-                ]
-            );
-
-            if ($response->successful()) {
-                return $response->json('candidates.0.content.parts.0.text');
-            }
-        } catch (\Exception $e) {
-            Log::error('Gemini API call failed', ['exception_type' => get_class($e)]);
-        }
-
-        return null;
-    }
 }

@@ -96,6 +96,10 @@ class N8nIntegrationController extends Controller
 
             // Build context for AI
             $context = [
+                'business_id' => $business?->id,
+                'conversation_id' => $conversationId,
+                'ai_operation_id' => \App\Services\AiGateway::stableOperationId('n8n:' . $business?->id . ':' . ($request->input('idempotency_key') ?: $request->input('message_id', (string) \Illuminate\Support\Str::uuid()))),
+                'ai_task' => 'ai_assistant',
                 'business_name' => $business?->business_name ?? 'our business',
                 'platform' => $platform,
                 'language' => $language,

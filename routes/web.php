@@ -16,3 +16,6 @@ Route::get('/', function () {
 Route::get('/login', function () {
     return response()->json(['message' => 'Unauthenticated.'], 401);
 })->name('login');
+
+// Universal JS tracker served at root
+Route::get('/tracker.js', [\App\Http\Controllers\Api\VisitorTrackingController::class, 'serveTracker']);

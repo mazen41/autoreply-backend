@@ -25,6 +25,8 @@ use App\Http\Controllers\Api\WebChatController;
 use App\Http\Controllers\Api\AiActionsController;
 use App\Http\Controllers\Api\AiReplyAuditController;
 use App\Http\Controllers\Api\AiCreditsController;
+use App\Http\Controllers\Api\VisitorTrackingController;
+use App\Http\Controllers\Api\AdminVisitorAnalyticsController;
 use App\Http\Controllers\Api\WhatsAppController;
 use App\Http\Controllers\Api\WhatsAppCloudController;
 use App\Http\Controllers\Api\MediaProcessingDisclosureController;
@@ -680,4 +682,19 @@ Route::middleware(['auth:sanctum', 'admin'])->prefix('admin')->group(function ()
     // Settings
     Route::get('/settings', [AdminController::class, 'settings']);
     Route::patch('/settings', [AdminController::class, 'updateSettings']);
+
+    // Visitor Analytics & Behavior Tracking
+    Route::prefix('visitor-analytics')->group(function () {
+        Route::get('/properties', [AdminVisitorAnalyticsController::class, 'getProperties']);
+        Route::post('/properties', [AdminVisitorAnalyticsController::class, 'createProperty']);
+        Route::get('/dashboard', [AdminVisitorAnalyticsController::class, 'getDashboard']);
+        Route::get('/live', [AdminVisitorAnalyticsController::class, 'getLive']);
+        Route::post('/verify', [AdminVisitorAnalyticsController::class, 'verify']);
+    });
 });
+
+// Universal Visitor Analytics Tracker & Public Ingestion Endpoints
+Route::get('/tracker.js', [VisitorTrackingController::class, 'serveTracker']);
+Route::get('/v1/analytics/tracker.js', [VisitorTrackingController::class, 'serveTracker']);
+Route::post('/v1/analytics/collect', [VisitorTrackingController::class, 'collect']);
+Route::post('/v1/analytics/verify', [VisitorTrackingController::class, 'verify']);

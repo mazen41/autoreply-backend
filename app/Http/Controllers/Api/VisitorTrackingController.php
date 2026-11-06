@@ -5,6 +5,7 @@ namespace App\Http\Controllers\Api;
 use App\Http\Controllers\Controller;
 use App\Services\Analytics\VisitorTrackingService;
 use App\Models\VisitorProperty;
+use App\Models\VisitorEvent;
 use Illuminate\Http\Request;
 use Illuminate\Http\Response;
 
@@ -30,7 +31,26 @@ class VisitorTrackingController extends Controller
             }
         }
 
-        $result = $this->trackingService->ingest($payload, $request);
+        $validated = validator($payload, [
+            'property_id' => 'required|string|max:64',
+            'property_uid' => 'sometimes|string|max:64',
+            'anonymous_id' => 'sometimes|string|max:96',
+            'visitor_id' => 'sometimes|string|max:96',
+            'session_id' => 'sometimes|string|max:96',
+            'type' => 'sometimes|string|in:pageview,custom,conversion,ecommerce,identify',
+            'event' => 'sometimes|string|max:100',
+            'category' => 'sometimes|string|max:64',
+            'url' => 'sometimes|string|max:2048',
+            'path' => 'sometimes|string|max:190',
+            'title' => 'sometimes|string|max:255',
+            'properties' => 'sometimes|array',
+            'revenue' => 'sometimes|numeric|min:0|max:9999999999',
+            'value' => 'sometimes|numeric|min:0|max:9999999999',
+            'currency' => 'sometimes|string|size:3',
+            'order_id' => 'sometimes|nullable|string|max:100',
+        ])->validate();
+
+        $result = $this->trackingService->ingest($validated, $request);
 
         return response()->json($result, $result['success'] ? 200 : 422)
             ->header('Access-Control-Allow-Origin', '*')
@@ -69,7 +89,11 @@ class VisitorTrackingController extends Controller
   };
 
   var sessionIdKey = '_naz_sid';
+  var sessionActivityKey = '_naz_last_activity';
   var anonIdKey = '_naz_aid';
+  var memorySessionId = null;
+  var memorySessionActivityAt = 0;
+  var memoryAnonymousId = null;
 
   function getStorage(key) {
     try { return localStorage.getItem(key); } catch(e) { return null; }
@@ -89,18 +113,31 @@ class VisitorTrackingController extends Controller
   function getAnonymousId() {
     var id = getStorage(anonIdKey);
     if (!id) {
-      id = 'aid_' + uuid().replace(/-/g, '').substring(0, 16);
+      id = memoryAnonymousId || ('aid_' + uuid().replace(/-/g, '').substring(0, 16));
+      memoryAnonymousId = id;
       setStorage(anonIdKey, id);
     }
     return id;
   }
 
   function getSessionId() {
-    var sid = sessionStorage.getItem(sessionIdKey);
-    if (!sid) {
+    var sid = null;
+    var lastActivityAt = 0;
+    try { sid = sessionStorage.getItem(sessionIdKey); } catch(e) {}
+    try { lastActivityAt = Number(sessionStorage.getItem(sessionActivityKey)) || 0; } catch(e) {}
+    var nowMs = Date.now();
+    if (!sid) sid = memorySessionId;
+    if (!lastActivityAt) lastActivityAt = memorySessionActivityAt;
+    if (!sid || !lastActivityAt || nowMs - lastActivityAt >= 30 * 60 * 1000) {
       sid = 'sid_' + uuid().replace(/-/g, '').substring(0, 16);
-      try { sessionStorage.setItem(sessionIdKey, sid); } catch(e) {}
+      memorySessionId = sid;
     }
+    memorySessionId = sid;
+    memorySessionActivityAt = nowMs;
+    try {
+      sessionStorage.setItem(sessionIdKey, sid);
+      sessionStorage.setItem(sessionActivityKey, String(nowMs));
+    } catch(e) {}
     return sid;
   }
 
@@ -116,17 +153,24 @@ class VisitorTrackingController extends Controller
   }
 
   function send(data) {
-    if (config.respectDnt && (navigator.doNotTrack === '1' || window.doNotTrack === '1')) {
+    if (config.respectDnt && (navigator.doNotTrack === '1' || window.doNotTrack === '1' || navigator.globalPrivacyControl === true)) {
       return;
     }
 
     data.property_id = config.propertyId;
     data.anonymous_id = getAnonymousId();
     data.session_id = getSessionId();
-    data.url = window.location.href;
+    data.url = window.location.origin + window.location.pathname;
     data.path = window.location.pathname;
     data.title = document.title;
-    data.referrer = document.referrer || null;
+    if (document.referrer) {
+      try {
+        var referrerUrl = new URL(document.referrer);
+        data.referrer = referrerUrl.origin + referrerUrl.pathname;
+      } catch(e) { data.referrer = null; }
+    } else {
+      data.referrer = null;
+    }
     data.screen_res = window.screen.width + 'x' + window.screen.height;
     data.language = navigator.language || navigator.userLanguage;
 
@@ -136,9 +180,11 @@ class VisitorTrackingController extends Controller
     }
 
     var payload = JSON.stringify(data);
+    var sent = false;
     if (navigator.sendBeacon) {
-      navigator.sendBeacon(config.endpoint, payload);
-    } else {
+      sent = navigator.sendBeacon(config.endpoint, payload);
+    }
+    if (!sent) {
       var xhr = new XMLHttpRequest();
       xhr.open('POST', config.endpoint, true);
       xhr.setRequestHeader('Content-Type', 'application/json');
@@ -180,26 +226,43 @@ class VisitorTrackingController extends Controller
   };
 
   NazAnalytics.conversion = function(goalName, value, currency, orderId) {
-    send({
+    var conversionData = {
       type: 'conversion',
       conversion_goal: goalName,
       revenue: value || 0,
-      currency: currency || 'SAR',
       order_id: orderId || null
-    });
+    };
+    if (currency) conversionData.currency = String(currency).toUpperCase();
+    send(conversionData);
   };
 
   // Process queued commands
   var queue = NazAnalytics.q || [];
+  var methods = {
+    init: NazAnalytics.init,
+    page: NazAnalytics.page,
+    track: NazAnalytics.track,
+    identify: NazAnalytics.identify,
+    conversion: NazAnalytics.conversion
+  };
   NazAnalytics.q = [];
   for (var i = 0; i < queue.length; i++) {
     var args = Array.prototype.slice.call(queue[i]);
     var method = args.shift();
-    if (typeof NazAnalytics[method] === 'function') {
-      NazAnalytics[method].apply(NazAnalytics, args);
+    if (typeof methods[method] === 'function') {
+      methods[method].apply(NazAnalytics, args);
     }
   }
 
+  NazAnalytics = function() {
+    var args = Array.prototype.slice.call(arguments);
+    var method = args.shift();
+    if (typeof methods[method] === 'function') {
+      return methods[method].apply(NazAnalytics, args);
+    }
+  };
+  for (var methodName in methods) { NazAnalytics[methodName] = methods[methodName]; }
+  NazAnalytics.version = '2.4.0';
   window.NazAnalytics = NazAnalytics;
 })(window, document);
 JAVASCRIPT;
@@ -216,15 +279,27 @@ JAVASCRIPT;
      */
     public function verify(Request $request)
     {
-        $propertyUid = $request->input('property_id');
-        $property = VisitorProperty::where('property_uid', $propertyUid)->first();
+        $validated = $request->validate(['property_id' => 'required|string|max:190']);
+        $propertyUid = $validated['property_id'];
+        $property = VisitorProperty::where('property_uid', $propertyUid)->where('is_active', true)->first();
 
         if ($property) {
+            $latestEvent = VisitorEvent::where('property_id', $property->id)
+                ->where('created_at', '>=', now()->subMinutes(10))
+                ->latest('created_at')->first();
+            if (!$latestEvent) {
+                return response()->json([
+                    'verified' => false,
+                    'error' => 'No tracking event received in the last 10 minutes.',
+                ], 422);
+            }
+
             $property->update(['verified_at' => now()]);
             return response()->json([
                 'verified' => true,
                 'property_id' => $propertyUid,
                 'verified_at' => $property->verified_at->toIso8601String(),
+                'last_event_at' => $latestEvent->created_at?->toIso8601String(),
             ]);
         }
 

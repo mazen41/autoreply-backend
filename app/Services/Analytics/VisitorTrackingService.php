@@ -26,30 +26,43 @@ class VisitorTrackingService
 
         $property = VisitorProperty::where('property_uid', $propertyUid)->first();
         if (!$property) {
-            // Auto-provision if it's the internal property or customer store
-            $property = $this->autoProvisionProperty($propertyUid, $data, $request);
+            return ['success' => false, 'error' => 'Unknown property_id'];
         }
 
         if (!$property->is_active) {
             return ['success' => false, 'error' => 'Property is inactive'];
         }
 
-        // Domain validation if configured
+        // Browser Origin is not an authentication mechanism, but it prevents
+        // accidental cross-domain collection and catches a misconfigured tag.
         $origin = $request->header('Origin') ?: $request->header('Referer');
         if ($origin && !empty($property->allowed_domains)) {
-            $parsedHost = parse_url($origin, PHP_URL_HOST);
-            if ($parsedHost && !in_array($parsedHost, $property->allowed_domains, true)) {
+            $parsedHost = strtolower((string) parse_url($origin, PHP_URL_HOST));
+            $allowed = array_map(static function ($domain) {
+                $domain = trim((string) $domain);
+                $host = parse_url(str_contains($domain, '://') ? $domain : '//' . $domain, PHP_URL_HOST);
+                return is_string($host) ? strtolower(rtrim($host, '.')) : '';
+            }, $property->allowed_domains);
+            if (!$parsedHost || !in_array($parsedHost, $allowed, true)) {
                 Log::warning('Analytics domain mismatch rejected', [
                     'property' => $property->property_uid,
                     'host' => $parsedHost,
-                    'allowed' => $property->allowed_domains,
+                    'allowed_domains' => $allowed,
                 ]);
+                return ['success' => false, 'error' => 'Origin is not allowed for this property'];
             }
+        }
+
+        $settings = $property->settings ?? [];
+        if (($settings['respect_dnt'] ?? true) && ($request->header('DNT') === '1' || $request->header('Sec-GPC') === '1')) {
+            return ['success' => true, 'ignored' => true, 'reason' => 'privacy_signal'];
         }
 
         $anonymousId = $data['anonymous_id'] ?? $data['visitor_id'] ?? Str::uuid()->toString();
         $sessionId = $data['session_id'] ?? Str::uuid()->toString();
-        $userId = $data['user_id'] ?? null;
+        // Public browser payloads are untrusted. Only authenticated server-side
+        // linkIdentity() may associate anonymous activity with a customer user.
+        $userId = null;
 
         // Anonymize IP
         $rawIp = $request->ip() ?: '127.0.0.1';
@@ -60,7 +73,7 @@ class VisitorTrackingService
         $clientInfo = $this->parseUserAgent($ua);
 
         // Geolocation (Coarse country / city)
-        $geo = $this->resolveGeo($request, $data);
+        $geo = $this->resolveGeo($request, []);
 
         // 1. Resolve or create Identity
         $identity = VisitorIdentity::firstOrCreate(
@@ -69,7 +82,7 @@ class VisitorTrackingService
                 'user_id' => $userId,
                 'first_seen_at' => now(),
                 'last_seen_at' => now(),
-                'traits' => $data['traits'] ?? null,
+                'traits' => null,
             ]
         );
 
@@ -83,10 +96,42 @@ class VisitorTrackingService
             ->where('session_id', $sessionId)
             ->first();
 
-        $referrer = $data['referrer'] ?? null;
-        $referrerDomain = $referrer ? (parse_url($referrer, PHP_URL_HOST) ?: null) : null;
-        $url = $data['url'] ?? $request->fullUrl();
-        $path = $data['path'] ?? (parse_url($url, PHP_URL_PATH) ?: '/');
+        // Store canonical page/referrer URLs without query strings or fragments:
+        // those often contain reset tokens, email addresses, and other secrets.
+        $allowedHosts = array_map(static function ($domain) {
+            $host = parse_url(str_contains((string) $domain, '://') ? (string) $domain : '//' . (string) $domain, PHP_URL_HOST);
+            return is_string($host) ? strtolower(rtrim($host, '.')) : '';
+        }, $property->allowed_domains ?: [$property->domain]);
+        $rawUrl = (string) ($data['url'] ?? '');
+        $urlParts = $rawUrl !== '' ? parse_url($rawUrl) : false;
+        $pageHost = is_array($urlParts) && !empty($urlParts['host'])
+            ? strtolower(rtrim($urlParts['host'], '.'))
+            : (string) (parse_url(str_contains((string) $property->domain, '://') ? (string) $property->domain : '//' . (string) $property->domain, PHP_URL_HOST) ?: $property->domain);
+        if ($allowedHosts && !in_array($pageHost, $allowedHosts, true)) {
+            return ['success' => false, 'error' => 'Page URL domain is not allowed for this property'];
+        }
+        $rawPath = (string) ($data['path'] ?? (is_array($urlParts) ? ($urlParts['path'] ?? '/') : '/'));
+        $path = parse_url($rawPath, PHP_URL_PATH) ?: '/';
+        if (!str_starts_with($path, '/') || str_starts_with($path, '//')) {
+            $path = '/';
+        }
+        $scheme = is_array($urlParts) && in_array($urlParts['scheme'] ?? '', ['http', 'https'], true)
+            ? $urlParts['scheme']
+            : 'https';
+        $port = is_array($urlParts) && isset($urlParts['port']) ? ':' . (int) $urlParts['port'] : '';
+        $url = $scheme . '://' . $pageHost . $port . $path;
+
+        $rawReferrer = $data['referrer'] ?? null;
+        $referrerParts = is_string($rawReferrer) && $rawReferrer !== '' ? parse_url($rawReferrer) : false;
+        $referrerDomain = is_array($referrerParts) && !empty($referrerParts['host'])
+            ? strtolower(rtrim($referrerParts['host'], '.'))
+            : null;
+        $referrerScheme = is_array($referrerParts) && in_array($referrerParts['scheme'] ?? '', ['http', 'https'], true)
+            ? $referrerParts['scheme']
+            : 'https';
+        $referrer = $referrerDomain
+            ? ($referrerScheme . '://' . $referrerDomain)
+            : null;
 
         if (!$session) {
             $session = VisitorSession::create([
@@ -98,9 +143,9 @@ class VisitorTrackingService
                 'country' => $geo['country'],
                 'country_code' => $geo['country_code'],
                 'city' => $geo['city'],
-                'device_type' => $data['device_type'] ?? $clientInfo['device'],
-                'browser' => $data['browser'] ?? $clientInfo['browser'],
-                'os' => $data['os'] ?? $clientInfo['os'],
+                'device_type' => $clientInfo['device'],
+                'browser' => $clientInfo['browser'],
+                'os' => $clientInfo['os'],
                 'referrer' => $referrer,
                 'referrer_domain' => $referrerDomain,
                 'entry_url' => $url,
@@ -113,7 +158,6 @@ class VisitorTrackingService
                 'pageviews_count' => ($data['type'] ?? 'pageview') === 'pageview' ? 1 : 0,
                 'events_count' => 1,
                 'duration_seconds' => 0,
-                'is_bounce' => true,
                 'started_at' => now(),
                 'last_activity_at' => now(),
             ]);
@@ -130,7 +174,6 @@ class VisitorTrackingService
                 'exit_url' => $url,
                 'last_activity_at' => now(),
                 'duration_seconds' => $duration,
-                'is_bounce' => ($session->pageviews_count <= 1 && $session->events_count <= 2),
                 'user_id' => $userId ?: $session->user_id,
             ]);
         }
@@ -145,7 +188,7 @@ class VisitorTrackingService
             'session_id' => $sessionId,
             'visitor_identity_id' => $identity->id,
             'user_id' => $userId,
-            'event_type' => $eventType,
+            'event_type' => $eventType === 'identify' ? 'custom' : $eventType,
             'event_name' => $eventName,
             'category' => $eventCategory,
             'url' => $url,
@@ -158,8 +201,8 @@ class VisitorTrackingService
         // 4. Record Conversion if applicable
         if ($eventType === 'conversion' || !empty($data['conversion_goal'])) {
             $goalName = $data['conversion_goal'] ?? $eventName;
-            $revenue = (float) ($data['revenue'] ?? $data['value'] ?? 0);
-            $currency = $data['currency'] ?? 'SAR';
+            $revenue = is_numeric($data['revenue'] ?? $data['value'] ?? null) ? max(0, (float) ($data['revenue'] ?? $data['value'])) : 0;
+            $currency = strtoupper((string) ($data['currency'] ?? 'UNKNOWN'));
 
             VisitorConversion::create([
                 'property_id' => $property->id,
@@ -279,9 +322,12 @@ class VisitorTrackingService
      */
     private function resolveGeo(Request $request, array $data): array
     {
-        $country = $data['country'] ?? $request->header('CF-IPCountry') ?? $request->header('X-Country-Code') ?? 'Saudi Arabia';
-        $countryCode = $data['country_code'] ?? ($country === 'Saudi Arabia' ? 'SA' : ($country === 'UAE' ? 'AE' : 'SA'));
-        $city = $data['city'] ?? $request->header('CF-IPCity') ?? ($countryCode === 'SA' ? 'Riyadh' : 'Dubai');
+        // Use only trusted edge headers. Never accept client-supplied geo values
+        // or invent a default country/city when location is unavailable.
+        $countryCode = strtoupper((string) ($request->header('CF-IPCountry') ?: $request->header('X-Country-Code') ?: ''));
+        $countryNames = ['SA' => 'Saudi Arabia', 'AE' => 'United Arab Emirates', 'EG' => 'Egypt', 'KW' => 'Kuwait', 'QA' => 'Qatar', 'BH' => 'Bahrain', 'OM' => 'Oman', 'US' => 'United States', 'GB' => 'United Kingdom'];
+        $country = $countryNames[$countryCode] ?? null;
+        $city = $request->header('CF-IPCity') ?: null;
 
         return [
             'country' => $country,
@@ -290,21 +336,4 @@ class VisitorTrackingService
         ];
     }
 
-    private function autoProvisionProperty(string $propertyUid, array $data, Request $request): VisitorProperty
-    {
-        $host = $request->header('Origin') ?: $request->header('Referer') ?: 'nazbiz.io';
-        $domain = parse_url($host, PHP_URL_HOST) ?: 'nazbiz.io';
-
-        return VisitorProperty::create([
-            'property_uid' => $propertyUid,
-            'name' => $data['property_name'] ?? ($domain === 'nazbiz.io' ? 'Nazeer Business (Internal)' : $domain),
-            'domain' => $domain,
-            'allowed_domains' => [$domain],
-            'type' => $domain === 'nazbiz.io' ? 'internal' : 'customer_store',
-            'platform' => $data['platform'] ?? ($domain === 'nazbiz.io' ? 'nextjs' : 'custom'),
-            'settings' => ['anonymize_ip' => true, 'respect_dnt' => true],
-            'is_active' => true,
-            'verified_at' => now(),
-        ]);
-    }
 }

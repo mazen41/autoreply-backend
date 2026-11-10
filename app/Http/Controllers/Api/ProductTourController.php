@@ -3,6 +3,7 @@
 namespace App\Http\Controllers\Api;
 
 use App\Http\Controllers\Controller;
+use App\Models\FeatureFlag;
 use App\Services\ActiveBusiness;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\DB;
@@ -21,6 +22,9 @@ class ProductTourController extends Controller
             'status' => $state->status ?? 'not_started',
             'current_step' => (int) ($state->current_step ?? 0),
             'updated_at' => $state?->updated_at,
+            'enabled_features' => FeatureFlag::query()->get()
+                ->filter(fn (FeatureFlag $flag) => $flag->isEnabledForBusiness((int) $business->id))
+                ->pluck('key')->values(),
         ]);
     }
 

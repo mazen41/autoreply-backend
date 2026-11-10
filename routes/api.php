@@ -471,6 +471,8 @@ Route::middleware('auth:sanctum')->group(function () {
 
     // Onboarding
     Route::get('/onboarding/status', [OnboardingController::class, 'getStatus']);
+    Route::get('/onboarding/product-tour', [\App\Http\Controllers\Api\ProductTourController::class, 'show']);
+    Route::put('/onboarding/product-tour', [\App\Http\Controllers\Api\ProductTourController::class, 'update']);
     Route::post('/onboarding/progress', [OnboardingController::class, 'updateProgress']);
     Route::post('/onboarding/complete-step', [OnboardingController::class, 'completeStep']);
     Route::post('/onboarding/skip', [OnboardingController::class, 'skip']);

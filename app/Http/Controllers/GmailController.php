@@ -34,6 +34,7 @@ class GmailController extends Controller
         $client = $this->makeClient();
         $client->setState(app(OAuthStateService::class)->issue('gmail', (int) $request->user()->id, [
             'business_id' => $business->id,
+            'return_to_onboarding' => $request->query('return_to') === 'onboarding',
         ]));
         $url = $client->createAuthUrl();
         return response()->json(['url' => $url]);
@@ -135,7 +136,10 @@ class GmailController extends Controller
             \App\Jobs\SyncGmailHistory::dispatch($channel->id);
 
             Log::info('Gmail channel connected', ['user_id' => $userId, 'email_present' => $email !== '']);
-            return redirect(env('FRONTEND_URL') . '/dashboard/channels?success=gmail');
+            $returnPath = ($stateData['context']['return_to_onboarding'] ?? false)
+                ? '/onboarding?success=gmail_connected&channel=gmail'
+                : '/dashboard/channels?success=gmail';
+            return redirect(env('FRONTEND_URL') . $returnPath);
 
         } catch (\Exception $e) {
             Log::error('Gmail callback exception', ['exception_type' => get_class($e)]);

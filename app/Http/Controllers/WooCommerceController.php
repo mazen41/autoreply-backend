@@ -28,11 +28,13 @@ class WooCommerceController extends Controller
         $state = app(OAuthStateService::class)->issue('woocommerce', (int) $request->user()->id, [
             'store_url' => $storeUrl,
             'business_id' => $business->id,
+            'return_to_onboarding' => $request->input('return_to') === 'onboarding',
         ]);
         $this->saveConnectionResult($state, (int) $request->user()->id, 'pending');
 
+        $returnPath = ($state['context']['return_to_onboarding'] ?? false) ? '/onboarding?' : '/dashboard/channels?';
         $returnUrl = rtrim((string) config('app.frontend_url', env('FRONTEND_URL', '')), '/')
-            . '/dashboard/channels?' . http_build_query([
+            . $returnPath . http_build_query([
                 'connection' => 'woocommerce',
                 'connection_state' => $state,
             ]);

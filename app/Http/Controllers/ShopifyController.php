@@ -37,6 +37,7 @@ class ShopifyController extends Controller
         $state = app(OAuthStateService::class)->issue('shopify', (int) $request->user()->id, [
             'shop' => $shop,
             'business_id' => $business->id,
+            'return_to_onboarding' => $request->input('return_to') === 'onboarding',
         ]);
 
         $params = [
@@ -136,7 +137,10 @@ class ShopifyController extends Controller
             $this->registerWebhooks($channel);
             SyncCommerceStore::dispatch($channel->id);
 
-            return redirect($this->frontendUrl() . '/dashboard/channels?success=shopify_connected');
+            $returnPath = ($stateData['context']['return_to_onboarding'] ?? false)
+                ? '/onboarding?success=shopify_connected&channel=shopify'
+                : '/dashboard/channels?success=shopify_connected';
+            return redirect($this->frontendUrl() . $returnPath);
         } catch (\Throwable $e) {
             Log::error('Shopify connection failed', ['shop' => $shop, 'exception_type' => get_class($e)]);
             return redirect($this->frontendUrl() . '/dashboard/channels?error=shopify_connection_failed');

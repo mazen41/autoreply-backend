@@ -269,7 +269,7 @@ class ChannelController extends Controller
         abort_unless($user, 401);
         $business = app(\App\Services\ActiveBusiness::class)->resolve($request, permission: 'write');
         $state = app(OAuthStateService::class)->issue('facebook', (int) $user->id, [
-            'redirect' => 'dashboard', 'business_id' => $business->id,
+            'redirect' => $request->input('return_to') === 'onboarding' ? 'onboarding' : 'dashboard', 'business_id' => $business->id,
         ]);
 
         $appId       = env('META_APP_ID');
@@ -588,7 +588,8 @@ class ChannelController extends Controller
 
         \Log::info('=== FACEBOOK CALLBACK SUCCESS ===');
 
-        return redirect(env('FRONTEND_URL') . '/dashboard/channels?success=facebook_connected');
+        $returnPath = ($stateData['context']['redirect'] ?? null) === 'onboarding' ? '/onboarding?success=facebook_connected&channel=facebook' : '/dashboard/channels?success=facebook_connected';
+        return redirect(env('FRONTEND_URL') . $returnPath);
     }
 
     public function disconnect(Request $request, $id)
@@ -665,7 +666,7 @@ class ChannelController extends Controller
         abort_unless($user, 401);
         $business = app(\App\Services\ActiveBusiness::class)->resolve($request, permission: 'write');
         $state = app(OAuthStateService::class)->issue('salla', (int) $user->id, [
-            'redirect' => 'dashboard', 'business_id' => $business->id,
+            'redirect' => $request->input('return_to') === 'onboarding' ? 'onboarding' : 'dashboard', 'business_id' => $business->id,
         ]);
 
         $sallaService = new SallaService();
@@ -822,7 +823,8 @@ class ChannelController extends Controller
 
             $this->subscribeSallaWebhooks($channel, $accessToken);
 
-            return redirect(env('FRONTEND_URL') . '/dashboard/channels?success=salla_connected');
+            $returnPath = ($stateData['context']['redirect'] ?? null) === 'onboarding' ? '/onboarding?success=salla_connected&channel=salla' : '/dashboard/channels?success=salla_connected';
+            return redirect(env('FRONTEND_URL') . $returnPath);
 
         } catch (\Exception $e) {
             Log::error('Salla OAuth callback error', [

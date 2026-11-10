@@ -7,7 +7,6 @@ use App\Models\TeamMember;
 use App\Models\User;
 use App\Models\BusinessProfile;
 use App\Models\TeamInvitation;
-use App\Models\Package;
 use App\Models\Notification;
 use App\Services\AuditLoggerService;
 use App\Services\BusinessAccessService;
@@ -77,9 +76,11 @@ class TeamController extends Controller
                 return ['error' => 'A pending invitation already exists'];
             }
 
-            $package = app(UsageMeter::class)->subscriptionFor($lockedBusiness)?->package
-                ?? Package::query()->where('name', 'Free')->first();
-            $memberLimit = (int) ($package?->max_team_members ?? -1);
+            $package = app(UsageMeter::class)->subscriptionFor($lockedBusiness)?->package;
+            if (!$package) {
+                return ['error' => 'Choose a paid plan to invite team members.', 'status' => 402, 'error_code' => 'PLAN_REQUIRED'];
+            }
+            $memberLimit = (int) ($package->max_team_members ?? 0);
             if ($memberLimit >= 0) {
                 $activeMembers = TeamMember::query()
                     ->where('business_id', $lockedBusiness->id)
@@ -233,9 +234,11 @@ class TeamController extends Controller
             }
 
             $business = BusinessProfile::query()->whereKey($invitation->business_id)->lockForUpdate()->firstOrFail();
-            $package = app(UsageMeter::class)->subscriptionFor($business)?->package
-                ?? Package::query()->where('name', 'Free')->first();
-            $memberLimit = (int) ($package?->max_team_members ?? -1);
+            $package = app(UsageMeter::class)->subscriptionFor($business)?->package;
+            if (!$package) {
+                return ['error' => 'Choose a paid plan to accept team invitations.', 'status' => 402];
+            }
+            $memberLimit = (int) ($package->max_team_members ?? 0);
             if ($memberLimit >= 0) {
                 $activeMembers = TeamMember::query()
                     ->where('business_id', $business->id)

@@ -23,7 +23,7 @@ class UsageMeter
     public function snapshot(BusinessProfile $business): array
     {
         $subscription = $this->subscriptionFor($business);
-        $package = $subscription?->package ?? Package::query()->where('name', 'Free')->first();
+        $package = $subscription?->package;
         $periodStart = now()->startOfMonth();
         $periodEnd = now()->endOfMonth();
 
@@ -60,7 +60,7 @@ class UsageMeter
             ],
             'plan' => [
                 'id' => $package?->id,
-                'name' => $package?->name ?? 'Unavailable',
+                'name' => $package?->name ?? 'No active plan',
                 'subscription_id' => $subscription?->id,
                 'subscription_status' => $subscription?->status,
             ],
@@ -90,7 +90,7 @@ class UsageMeter
             return ['allowed' => $available > 0, 'metric' => 'ai_credits', 'used' => (int) $creditBalance['cycle_usage']['credits_consumed'], 'limit' => (int) $creditBalance['cycle_usage']['allowance'], 'unlimited' => false, 'available' => $available];
         }
 
-        $package = $this->subscriptionFor($business)?->package ?? Package::query()->where('name', 'Free')->first();
+        $package = $this->subscriptionFor($business)?->package;
         $limit = $this->limitFor($package, $metric);
         $used = $this->usedFor($business, $metric, now()->startOfMonth(), $excludeMessageId, $excludeEmailRecipientId);
         $unlimited = $limit < 0;
@@ -121,6 +121,7 @@ class UsageMeter
         $subscription = Subscription::query()
             ->with('package')
             ->where('business_id', $business->id)
+            ->whereHas('package', fn (Builder $query) => $query->where('name', '!=', 'Free'))
             ->whereIn('status', ['active', 'trial'])
             ->where(fn (Builder $query) => $query->whereNull('starts_at')->orWhere('starts_at', '<=', now()))
             ->where(fn (Builder $query) => $query->whereNull('ends_at')->orWhere('ends_at', '>', now()))
@@ -142,6 +143,7 @@ class UsageMeter
             ->with('package')
             ->where('user_id', $business->user_id)
             ->whereNull('business_id')
+            ->whereHas('package', fn (Builder $query) => $query->where('name', '!=', 'Free'))
             ->whereIn('status', ['active', 'trial'])
             ->where(fn (Builder $query) => $query->whereNull('starts_at')->orWhere('starts_at', '<=', now()))
             ->where(fn (Builder $query) => $query->whereNull('ends_at')->orWhere('ends_at', '>', now()))
@@ -158,7 +160,7 @@ class UsageMeter
             self::CHANNELS => 'channels_limit',
         };
 
-        return (int) ($package?->{$attribute} ?? -1);
+        return (int) ($package?->{$attribute} ?? 0);
     }
 
     private function usedFor(

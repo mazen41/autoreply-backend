@@ -18,6 +18,7 @@ class SocialAuthController extends Controller
             $redirectTo = $request->query('redirect');
             $packageId = $request->query('package');
             $billingCycle = $request->query('billing');
+            $signupChoice = $request->query('signup_choice');
             $rememberMe = $request->boolean('remember_me');
 
             $driver = Socialite::driver('google')
@@ -30,6 +31,7 @@ class SocialAuthController extends Controller
                 'redirect' => $redirectTo,
                 'package' => $packageId,
                 'billing' => $billingCycle,
+                'signup_choice' => $signupChoice,
                 'remember_me' => $rememberMe,
             ];
             $driver = $driver->with(['state' => base64_encode(json_encode($stateData))]);
@@ -58,6 +60,7 @@ class SocialAuthController extends Controller
             $redirectTo = $stateData['redirect'] ?? null;
             $packageId = $stateData['package'] ?? null;
             $billingCycle = $stateData['billing'] ?? null;
+            $signupChoice = $stateData['signup_choice'] ?? null;
             $rememberMe = (bool) ($stateData['remember_me'] ?? false);
 
             // Build redirect params
@@ -65,6 +68,7 @@ class SocialAuthController extends Controller
             if ($redirectTo) $params[] = 'redirect=' . urlencode($redirectTo);
             if ($packageId) $params[] = 'package=' . urlencode($packageId);
             if ($billingCycle) $params[] = 'billing=' . urlencode($billingCycle);
+            if ($signupChoice) $params[] = 'signup_choice=' . urlencode($signupChoice);
             if ($rememberMe) $params[] = 'remember_me=1';
             $redirectParam = !empty($params) ? '&' . implode('&', $params) : '';
 
@@ -80,15 +84,31 @@ class SocialAuthController extends Controller
 
                 return $this->redirectWithLoginCode($user, 'google', false, $redirectParam);
             } else {
+                if (!in_array($signupChoice, ['trial', 'paid'], true)
+                    || ($signupChoice === 'paid' && (!$packageId || !in_array($billingCycle, ['monthly', 'yearly'], true)))) {
+                    return redirect()->away(config('services.frontend_url', 'http://localhost:3000') . '/register?error=plan_required');
+                }
+
                 // Create new user
-                $user = User::create([
-                    'name' => $googleUser->getName(),
-                    'email' => $googleUser->getEmail(),
-                    'google_id' => $googleUser->getId(),
-                    'avatar' => $googleUser->getAvatar(),
-                    'password' => bcrypt(Str::random(32)),
-                    'email_verified_at' => now(),
-                ]);
+                $user = \Illuminate\Support\Facades\DB::transaction(function () use ($googleUser, $signupChoice, $packageId, $billingCycle): User {
+                    $newUser = User::create([
+                        'name' => $googleUser->getName(),
+                        'email' => $googleUser->getEmail(),
+                        'google_id' => $googleUser->getId(),
+                        'avatar' => $googleUser->getAvatar(),
+                        'password' => bcrypt(Str::random(32)),
+                        'email_verified_at' => now(),
+                    ]);
+
+                    app(\App\Services\SignupPlanService::class)->createWorkspace(
+                        $newUser,
+                        $signupChoice,
+                        $packageId ? (int) $packageId : null,
+                        $billingCycle,
+                    );
+
+                    return $newUser;
+                });
 
                 return $this->redirectWithLoginCode($user, 'google', true, $redirectParam);
             }
@@ -105,6 +125,7 @@ class SocialAuthController extends Controller
             $redirectTo = $request->query('redirect');
             $packageId = $request->query('package');
             $billingCycle = $request->query('billing');
+            $signupChoice = $request->query('signup_choice');
             $rememberMe = $request->boolean('remember_me');
 
             $driver = Socialite::driver('facebook')
@@ -117,6 +138,7 @@ class SocialAuthController extends Controller
                 'redirect' => $redirectTo,
                 'package' => $packageId,
                 'billing' => $billingCycle,
+                'signup_choice' => $signupChoice,
                 'remember_me' => $rememberMe,
             ];
             $driver = $driver->with(['state' => base64_encode(json_encode($stateData))]);
@@ -145,6 +167,7 @@ class SocialAuthController extends Controller
             $redirectTo = $stateData['redirect'] ?? null;
             $packageId = $stateData['package'] ?? null;
             $billingCycle = $stateData['billing'] ?? null;
+            $signupChoice = $stateData['signup_choice'] ?? null;
             $rememberMe = (bool) ($stateData['remember_me'] ?? false);
 
             // Build redirect params
@@ -152,6 +175,7 @@ class SocialAuthController extends Controller
             if ($redirectTo) $params[] = 'redirect=' . urlencode($redirectTo);
             if ($packageId) $params[] = 'package=' . urlencode($packageId);
             if ($billingCycle) $params[] = 'billing=' . urlencode($billingCycle);
+            if ($signupChoice) $params[] = 'signup_choice=' . urlencode($signupChoice);
             if ($rememberMe) $params[] = 'remember_me=1';
             $redirectParam = !empty($params) ? '&' . implode('&', $params) : '';
 
@@ -167,15 +191,31 @@ class SocialAuthController extends Controller
 
                 return $this->redirectWithLoginCode($user, 'facebook', false, $redirectParam);
             } else {
+                if (!in_array($signupChoice, ['trial', 'paid'], true)
+                    || ($signupChoice === 'paid' && (!$packageId || !in_array($billingCycle, ['monthly', 'yearly'], true)))) {
+                    return redirect()->away(config('services.frontend_url', 'http://localhost:3000') . '/register?error=plan_required');
+                }
+
                 // Create new user
-                $user = User::create([
-                    'name' => $facebookUser->getName(),
-                    'email' => $facebookUser->getEmail(),
-                    'facebook_id' => $facebookUser->getId(),
-                    'avatar' => $facebookUser->getAvatar(),
-                    'password' => bcrypt(Str::random(32)),
-                    'email_verified_at' => now(),
-                ]);
+                $user = \Illuminate\Support\Facades\DB::transaction(function () use ($facebookUser, $signupChoice, $packageId, $billingCycle): User {
+                    $newUser = User::create([
+                        'name' => $facebookUser->getName(),
+                        'email' => $facebookUser->getEmail(),
+                        'facebook_id' => $facebookUser->getId(),
+                        'avatar' => $facebookUser->getAvatar(),
+                        'password' => bcrypt(Str::random(32)),
+                        'email_verified_at' => now(),
+                    ]);
+
+                    app(\App\Services\SignupPlanService::class)->createWorkspace(
+                        $newUser,
+                        $signupChoice,
+                        $packageId ? (int) $packageId : null,
+                        $billingCycle,
+                    );
+
+                    return $newUser;
+                });
 
                 return $this->redirectWithLoginCode($user, 'facebook', true, $redirectParam);
             }

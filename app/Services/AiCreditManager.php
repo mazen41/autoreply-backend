@@ -31,7 +31,7 @@ class AiCreditManager
     public function walletFor(BusinessProfile $business): AiCreditWallet
     {
         $subscription = app(UsageMeter::class)->subscriptionFor($business);
-        $package = $subscription?->package ?? Package::query()->where('name', 'Free')->first();
+        $package = $subscription?->package;
         $monthlyAllowance = (int) ($package?->ai_credits_monthly ?? $package?->ai_replies_limit ?? 0);
         [$periodStart, $periodEnd] = $this->billingPeriod($subscription);
         $periodKey = ($subscription?->id ?? 'free') . ':' . $periodStart->format('Y-m');
@@ -64,14 +64,16 @@ class AiCreditManager
     public function balance(BusinessProfile $business): array
     {
         $wallet = $this->walletFor($business);
-        $available = max(0, (int) $wallet->subscription_balance + (int) $wallet->purchased_balance - (int) $wallet->reserved_balance);
         $subscription = app(UsageMeter::class)->subscriptionFor($business);
-        $allowance = (int) ($subscription?->package?->ai_credits_monthly ?? Package::where('name', 'Free')->value('ai_credits_monthly') ?? 0);
+        $available = $subscription
+            ? max(0, (int) $wallet->subscription_balance + (int) $wallet->purchased_balance - (int) $wallet->reserved_balance)
+            : 0;
+        $allowance = (int) ($subscription?->package?->ai_credits_monthly ?? 0);
         $consumedThisCycle = (int) AiUsageLog::query()->where('business_id', $business->id)->where('status', 'succeeded')->where('created_at', '>=', $wallet->billing_period_starts_at ?? now()->startOfMonth())->sum('credits_consumed');
 
         return [
             'business_id' => (int) $business->id,
-            'subscription' => ['plan' => $subscription?->package?->name ?? 'Free', 'allowance' => $allowance, 'renewal_at' => $subscription?->ends_at?->toISOString()],
+            'subscription' => ['plan' => $subscription?->package?->name ?? 'No active plan', 'allowance' => $allowance, 'renewal_at' => $subscription?->ends_at?->toISOString()],
             'wallet' => ['subscription_balance' => (int) $wallet->subscription_balance, 'purchased_balance' => (int) $wallet->purchased_balance, 'reserved_balance' => (int) $wallet->reserved_balance, 'available_balance' => $available, 'total_consumed' => (int) $wallet->total_consumed, 'period_ends_at' => $wallet->billing_period_ends_at?->toISOString()],
             'cycle_usage' => ['credits_consumed' => $consumedThisCycle, 'allowance' => $allowance, 'percentage' => $allowance > 0 ? min(100, round($consumedThisCycle * 100 / $allowance, 2)) : null],
         ];
@@ -82,6 +84,9 @@ class AiCreditManager
         $settings = $this->settings();
         if (!(bool) $settings->system_enabled) {
             throw new \RuntimeException('AI credit billing is temporarily unavailable.');
+        }
+        if (!app(UsageMeter::class)->subscriptionFor($business)) {
+            throw new \RuntimeException('Choose a paid plan to continue using AI features.');
         }
         $expected = $this->calculateCredits($price, $inputTokens, $maxOutputTokens, $settings, 0, $estimatedAudioSeconds, $estimatedImages, $estimatedAudioOutputChars);
         $reservation = max((int) $settings->reservation_minimum, (int) ceil($expected * 1.25));
@@ -271,7 +276,7 @@ class AiCreditManager
     private function notifyThresholds(BusinessProfile $business, AiCreditWallet $wallet, ?string $periodKey): void
     {
         $subscription = app(UsageMeter::class)->subscriptionFor($business);
-        $allowance = (int) ($subscription?->package?->ai_credits_monthly ?? Package::where('name', 'Free')->value('ai_credits_monthly') ?? 0);
+        $allowance = (int) ($subscription?->package?->ai_credits_monthly ?? 0);
         if ($allowance <= 0 || !$business->user_id) return;
         $settings = $this->settings();
         $businessSettings = AiBusinessSetting::query()->where('business_id', $business->id)->first();

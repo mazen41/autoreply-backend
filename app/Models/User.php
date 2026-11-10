@@ -22,6 +22,9 @@ class User extends Authenticatable
         'facebook_id',
         'avatar',
         'business_id',
+        'signup_plan_choice',
+        'signup_package_id',
+        'signup_billing_cycle',
     ];
 
     protected $hidden = [

@@ -18,13 +18,27 @@ class AuthController extends Controller
             'name'                  => 'required|string|max:255',
             'email'                 => 'required|string|email|max:255|unique:users',
             'password'              => 'required|string|min:8|confirmed',
+            'signup_choice'         => 'required|in:trial,paid',
+            'package_id'            => 'required_if:signup_choice,paid|nullable|integer|exists:packages,id',
+            'billing_cycle'         => 'required_if:signup_choice,paid|nullable|in:monthly,yearly',
         ]);
 
-        $user = User::create([
-            'name'     => $validated['name'],
-            'email'    => $validated['email'],
-            'password' => Hash::make($validated['password']),
-        ]);
+        $user = \Illuminate\Support\Facades\DB::transaction(function () use ($validated): User {
+            $user = User::create([
+                'name'     => $validated['name'],
+                'email'    => $validated['email'],
+                'password' => Hash::make($validated['password']),
+            ]);
+
+            app(\App\Services\SignupPlanService::class)->createWorkspace(
+                $user,
+                $validated['signup_choice'],
+                isset($validated['package_id']) ? (int) $validated['package_id'] : null,
+                $validated['billing_cycle'] ?? null,
+            );
+
+            return $user;
+        });
 
         $token = $user->createToken('auth_token')->plainTextToken;
 

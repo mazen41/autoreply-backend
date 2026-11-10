@@ -15,25 +15,6 @@ class PackageSeeder extends Seeder
     public static function definitions(): array
     {
         return [
-            'Free' => [
-                'name_ar' => 'مجاني',
-                'description' => 'Start using Nazeer Business at no cost.',
-                'description_ar' => 'ابدأ رحلتك مع نظير بزنس بدون أي تكلفة.',
-                'price_monthly' => 0,
-                'price_yearly' => 0,
-                'ai_replies_limit' => 1000,
-                'ai_credits_monthly' => 1000,
-                'channels_limit' => -1,
-                'outbound_messages_limit' => -1,
-                'max_team_members' => 1,
-                'tools_limit' => -1,
-                'blog_posts_limit' => -1,
-                'features' => ['Unlimited channel and store connections', 'Unified inbox', 'Unlimited workflows and sequences', 'Basic AI assistant', '1,000 AI credits per month', '1 team member'],
-                'features_ar' => ['ربط غير محدود للقنوات والمتاجر', 'صندوق وارد موحد', 'سير عمل وتسلسلات غير محدودة', 'مساعد ذكاء اصطناعي أساسي', '1,000 رصيد AI شهرياً', 'عضو واحد في الفريق'],
-                'is_popular' => false,
-                'is_active' => true,
-                'sort_order' => 1,
-            ],
             'Starter' => [
                 'name_ar' => 'المبتدئة',
                 'description' => 'Everything you need to start automating customer conversations.',
@@ -99,6 +80,9 @@ class PackageSeeder extends Seeder
      */
     public function run(): void
     {
+        // The old zero-price Free tier is no longer offered to new accounts.
+        Package::where('name', 'Free')->update(['is_active' => false]);
+
         foreach (self::definitions() as $name => $attributes) {
             Package::updateOrCreate(['name' => $name], $attributes + ['name' => $name]);
         }

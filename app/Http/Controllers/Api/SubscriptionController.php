@@ -3,8 +3,6 @@
 namespace App\Http\Controllers\Api;
 
 use App\Http\Controllers\Controller;
-use App\Models\Package;
-use App\Models\Subscription;
 use App\Services\ActiveBusiness;
 use App\Services\UsageMeter;
 use App\Services\MyFatoorahService;
@@ -18,12 +16,18 @@ class SubscriptionController extends Controller
         $subscription = $usageMeter->subscriptionFor($business);
 
         if (!$subscription) {
-            // Return Free package as default
-            $freePackage = Package::where('name', 'Free')->first();
+            $trialExpired = \App\Models\Subscription::query()
+                ->where('business_id', $business->id)
+                ->whereNotNull('trial_ends_at')
+                ->where(function ($query): void {
+                    $query->where('ends_at', '<=', now())->orWhere('trial_ends_at', '<=', now());
+                })->exists();
             return response()->json([
                 'subscription' => null,
-                'package' => $freePackage,
-                'is_free' => true,
+                'package' => null,
+                'is_free' => false,
+                'requires_plan' => true,
+                'trial_expired' => $trialExpired,
                 'business_id' => $business->id,
             ]);
         }
@@ -32,6 +36,8 @@ class SubscriptionController extends Controller
             'subscription' => $subscription->load('package'),
             'package' => $subscription->package,
             'is_free' => false,
+            'requires_plan' => false,
+            'trial_expired' => false,
             'business_id' => $business->id,
         ]);
     }
@@ -92,42 +98,6 @@ class SubscriptionController extends Controller
 
     public function createFree(Request $request, ActiveBusiness $activeBusiness, UsageMeter $usageMeter)
     {
-        $user = auth()->user();
-        $business = $activeBusiness->resolve($request, permission: 'manage_billing');
-        
-        // A business can have only one active plan. Another business owned by
-        // the same user may keep its own independent subscription.
-        if ($usageMeter->subscriptionFor($business)) {
-            return response()->json(['message' => 'This business already has an active subscription'], 400);
-        }
-
-        $validated = $request->validate([
-            'package_id' => 'required|exists:packages,id',
-            'billing_cycle' => 'required|in:monthly,yearly',
-        ]);
-
-        $package = Package::query()->whereKey($validated['package_id'])->where('is_active', true)->firstOrFail();
-
-        // Only allow free packages
-        if ($package->price_monthly > 0 || $package->price_yearly > 0) {
-            return response()->json(['message' => 'This endpoint is only for free plans'], 400);
-        }
-
-        $subscription = Subscription::create([
-            'user_id' => $user->id,
-            'business_id' => $business->id,
-            'package_id' => $package->id,
-            'billing_cycle' => $validated['billing_cycle'],
-            'status' => 'active',
-            'starts_at' => now(),
-            'ends_at' => now()->addMonth(), // Free plans renew monthly
-            'amount_paid' => 0,
-        ]);
-
-        return response()->json([
-            'subscription' => $subscription->load('package'),
-            'package' => $package,
-            'message' => 'Free subscription created successfully'
-        ]);
+        return response()->json(['message' => 'There is no free plan. Choose the 14-day Business trial during signup or purchase a paid plan.'], 410);
     }
 }

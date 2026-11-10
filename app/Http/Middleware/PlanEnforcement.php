@@ -3,7 +3,6 @@
 namespace App\Http\Middleware;
 
 use App\Models\Bot;
-use App\Models\Package;
 use App\Models\TeamMember;
 use App\Services\ActiveBusiness;
 use App\Services\UsageMeter;
@@ -25,7 +24,14 @@ class PlanEnforcement
         $businessId = (int) $business->id;
         $usageMeter = app(UsageMeter::class);
         $subscription = $usageMeter->subscriptionFor($business);
-        $package = $subscription?->package ?? Package::where('name', 'Free')->first();
+        if (!$subscription || !$subscription->package) {
+            return response()->json([
+                'message' => 'Choose a paid plan to continue using this workspace.',
+                'error_code' => 'PLAN_REQUIRED',
+                'upgrade_url' => '/pricing',
+            ], 402);
+        }
+        $package = $subscription->package;
 
         $configuredLimit = match ($limitType) {
             'max_bots' => $package->max_bots ?? PHP_INT_MAX,

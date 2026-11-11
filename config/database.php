@@ -64,6 +64,29 @@ return [
             ]) : [],
         ],
 
+        // Isolated ledger and client registry for the centralized payment
+        // gateway. Production must point this at a dedicated database; it is
+        // intentionally not aliased to the application's primary DB.
+        'central_payments' => [
+            'driver' => env('CENTRAL_PAYMENT_DB_CONNECTION', 'mysql'),
+            'url' => env('CENTRAL_PAYMENT_DB_URL'),
+            'host' => env('CENTRAL_PAYMENT_DB_HOST', '127.0.0.1'),
+            'port' => env('CENTRAL_PAYMENT_DB_PORT', '3306'),
+            'database' => env('CENTRAL_PAYMENT_DB_DATABASE', 'nazbiz_central_payments'),
+            'username' => env('CENTRAL_PAYMENT_DB_USERNAME', 'root'),
+            'password' => env('CENTRAL_PAYMENT_DB_PASSWORD', ''),
+            'unix_socket' => env('CENTRAL_PAYMENT_DB_SOCKET', ''),
+            'charset' => env('CENTRAL_PAYMENT_DB_CHARSET', 'utf8mb4'),
+            'collation' => env('CENTRAL_PAYMENT_DB_COLLATION', 'utf8mb4_unicode_ci'),
+            'prefix' => '',
+            'prefix_indexes' => true,
+            'strict' => true,
+            'engine' => null,
+            'options' => extension_loaded('pdo_mysql') ? array_filter([
+                PDO::MYSQL_ATTR_SSL_CA => env('CENTRAL_PAYMENT_MYSQL_ATTR_SSL_CA'),
+            ]) : [],
+        ],
+
         'mariadb' => [
             'driver' => 'mariadb',
             'url' => env('DB_URL'),

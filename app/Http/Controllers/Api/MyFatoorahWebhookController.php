@@ -5,6 +5,7 @@ namespace App\Http\Controllers\Api;
 use App\Http\Controllers\Controller;
 use App\Models\PaymentIntent;
 use App\Models\Subscription;
+use App\Models\CentralPayment;
 use App\Services\MyFatoorahService;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\DB;
@@ -59,6 +60,25 @@ class MyFatoorahWebhookController extends Controller
         if (! $invoiceId) {
             Log::error('[MyFatoorah Webhook] Missing InvoiceId in payload');
             return response()->json(['message' => 'Missing InvoiceId.'], 200);
+        }
+
+        // Payments created through the shared gateway are tracked in the
+        // isolated central ledger. Keep legacy NazBiz intents on the existing
+        // handler below while new central invoices use strict verification.
+        $centralPayment = config('services.central_payments.enabled')
+            ? CentralPayment::query()->where('myfatoorah_invoice_id', $invoiceId)->first()
+            : null;
+        if ($centralPayment) {
+            try {
+                app(\App\Services\CentralPaymentProcessor::class)->verifyInvoiceId($centralPayment);
+                return response()->json(['message' => 'Central payment event processed.'], 200);
+            } catch (\Throwable $exception) {
+                Log::error('[MyFatoorah Webhook] Central payment verification failed; provider may retry', [
+                    'payment_uuid' => $centralPayment->uuid,
+                    'exception_type' => get_class($exception),
+                ]);
+                return response()->json(['message' => 'Payment verification is temporarily unavailable.'], 503);
+            }
         }
 
         Log::info('[MyFatoorah Webhook] PAYMENT_STATUS_CHANGED', [

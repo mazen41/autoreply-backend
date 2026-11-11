@@ -36,6 +36,8 @@ return Application::configure(basePath: dirname(__DIR__))
             'plan.enforce' => \App\Http\Middleware\PlanEnforcement::class,
             'feature.flag' => \App\Http\Middleware\CheckFeatureFlag::class,
             'business.access' => \App\Http\Middleware\EnsureBusinessAccess::class,
+            'payment.client' => \App\Http\Middleware\AuthenticateCentralPaymentClient::class,
+            'payment.origin' => \App\Http\Middleware\AuthenticatePaymentOriginRequest::class,
         ]);
     })
     ->withExceptions(function (Exceptions $exceptions): void {
@@ -79,4 +81,5 @@ return Application::configure(basePath: dirname(__DIR__))
         $command('salla:sync-customers', 'sync-salla-customers', 45, static fn ($event) => $event->everyThirtyMinutes());
         $command('performance:create-indexes', 'create-performance-indexes', 180, static fn ($event) => $event->dailyAt('03:00'));
         $command('telegram:resync-webhooks', 'resync-telegram-webhooks', 60, static fn ($event) => $event->twiceDaily(0, 12));
+        $command('payments:reconcile-central', 'reconcile-central-payments', 10, static fn ($event) => $event->everyFiveMinutes());
     })->create();

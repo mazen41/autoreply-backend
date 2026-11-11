@@ -34,6 +34,9 @@ class MyFatoorahController extends Controller
         if ($autoRenew && !config('services.myfatoorah.recurring_enabled')) {
             return response()->json(['message' => 'Automatic renewal is not enabled for this payment account yet. Please choose manual renewal or contact support.'], 422);
         }
+        if (config('services.central_payments.enabled') && $autoRenew) {
+            return response()->json(['message' => 'Automatic renewal is not yet available through centralized checkout. Choose manual renewal.'], 422);
+        }
 
         $user    = Auth::user();
         $package = Package::findOrFail($request->package_id);
@@ -59,12 +62,32 @@ class MyFatoorahController extends Controller
             'package_id'            => $package->id,
             'billing_cycle'         => $request->billing_cycle,
             'status'                => 'pending',
-            'payment_gateway'       => 'myfatoorah',
+            'payment_gateway'       => config('services.central_payments.enabled') ? 'central' : 'myfatoorah',
             'expected_amount_minor' => (int) round($amount * 100),
             'expected_currency'    => $currency,
             'auto_renew_requested' => $autoRenew,
             'auto_renew_consented_at' => $autoRenew ? now() : null,
         ]);
+
+        if (config('services.central_payments.enabled')) {
+            try {
+                $centralPayment = app(\App\Services\CentralPaymentClientService::class)
+                    ->createHostedPayment((string) $intent->id, 'nazbiz-subscription-' . $intent->id);
+                $intent->update(['gateway_response' => ['central_payment_id' => $centralPayment['central_payment_id']]]);
+                return response()->json([
+                    'payment_url' => $centralPayment['payment_url'],
+                    'payment_id' => $centralPayment['central_payment_id'],
+                    'intent_id' => $intent->id,
+                ]);
+            } catch (\Throwable $exception) {
+                $intent->update(['status' => 'failed', 'failure_reason' => 'central_checkout_unavailable']);
+                Log::error('[Central Payment] NazBiz checkout request failed', [
+                    'payment_intent_id' => $intent->id,
+                    'exception_type' => get_class($exception),
+                ]);
+                return response()->json(['message' => 'Payment initiation failed. Please try again.'], 502);
+            }
+        }
 
         try {
             // Step 1 – discover payment methods enabled on this merchant account.
@@ -140,6 +163,35 @@ class MyFatoorahController extends Controller
         } catch (\Exception $e) {
             Log::error('[MyFatoorah] Callback error', ['exception_type' => get_class($e)]);
             return response()->json(['message' => 'Could not verify payment. Please contact support.'], 502);
+        }
+    }
+
+    public function centralStatus(Request $request, string $centralPaymentId)
+    {
+        $business = app(ActiveBusiness::class)->resolve($request, permission: 'manage_billing');
+        $intent = PaymentIntent::query()
+            ->where('payment_gateway', 'central')
+            ->where('user_id', Auth::id())
+            ->where('business_id', $business->id)
+            ->where('gateway_response->central_payment_id', $centralPaymentId)
+            ->first();
+
+        if (!$intent) return response()->json(['message' => 'Payment not found.'], 404);
+        if ($intent->status === 'completed') return response()->json(['status' => 'completed']);
+
+        try {
+            $remote = app(\App\Services\CentralPaymentClientService::class)->getPayment($centralPaymentId);
+            if (in_array($remote['status'] ?? '', ['failed', 'expired', 'cancelled', 'canceled'], true)) {
+                $intent->update(['status' => 'failed', 'failure_reason' => 'central_' . $remote['status']]);
+                return response()->json(['status' => 'failed']);
+            }
+            return response()->json(['status' => ($remote['status'] ?? '') === 'paid' ? 'processing' : 'pending']);
+        } catch (\Throwable $exception) {
+            Log::warning('[Central Payment] Could not retrieve checkout status', [
+                'payment_intent_id' => $intent->id,
+                'exception_type' => get_class($exception),
+            ]);
+            return response()->json(['status' => 'pending'], 202);
         }
     }
 

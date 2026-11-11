@@ -135,6 +135,24 @@ Route::post('/salla/webhook', [SallaWebhookController::class, 'handle']);
 Route::post('/webhooks/myfatoorah', [MyFatoorahWebhookController::class, 'handle'])
     ->name('webhooks.myfatoorah');
 
+// Centralized payment API. The existing MyFatoorah portal webhook above is
+// deliberately retained at /api/webhooks/myfatoorah for compatibility.
+Route::prefix('v1/payments')->middleware(['payment.client', 'throttle:60,1'])->group(function () {
+    Route::post('/', [\App\Http\Controllers\Api\CentralPaymentsController::class, 'store'])
+        ->name('central-payments.store');
+    Route::get('/{paymentUuid}', [\App\Http\Controllers\Api\CentralPaymentsController::class, 'show'])
+        ->whereUuid('paymentUuid')
+        ->name('central-payments.show');
+});
+Route::get('/v1/payments/callback', [\App\Http\Controllers\Api\CentralPaymentsController::class, 'callback'])
+    ->name('central-payments.callback');
+
+Route::prefix('internal/payments')->middleware('payment.origin:hmac')->group(function () {
+    Route::post('/verify', [\App\Http\Controllers\Api\CentralPaymentOriginController::class, 'verifyOrder']);
+});
+Route::post('/internal/payments/confirm', [\App\Http\Controllers\Api\CentralPaymentOriginController::class, 'confirmPayment'])
+    ->middleware('payment.origin:notification');
+
 // Email campaign open-tracking pixel — public, hit by recipients' mail clients
 Route::get('/email-campaigns/track/open/{recipientId}', [EmailCampaignController::class, 'trackOpen']);
 Route::get('/email-campaigns/track/click/{recipientId}/{linkToken}', [EmailCampaignController::class, 'trackClick']);
@@ -460,6 +478,9 @@ Route::middleware('auth:sanctum')->group(function () {
         Route::post('/payments/create', [PaymentController::class, 'createPayment']);
         Route::post('/payment/myfatoorah/initiate', [MyFatoorahController::class, 'initiate'])
             ->name('payment.myfatoorah.initiate');
+        Route::get('/payment/central-status/{centralPaymentId}', [MyFatoorahController::class, 'centralStatus'])
+            ->whereUuid('centralPaymentId')
+            ->name('payment.central-status');
     });
 
     // Notifications

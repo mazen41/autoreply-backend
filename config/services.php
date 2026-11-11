@@ -104,6 +104,14 @@ return [
         'recurring_enabled' => env('MYFATOORAH_RECURRING_ENABLED', false),
     ],
 
+    'central_payments' => [
+        'enabled' => env('CENTRAL_PAYMENTS_ENABLED', false),
+        'api_url' => env('CENTRAL_PAYMENT_API_URL', 'https://api.nazbiz.io'),
+        'client_id' => env('CENTRAL_PAYMENT_CLIENT_ID'),
+        'api_key' => env('CENTRAL_PAYMENT_CLIENT_API_KEY'),
+        'hmac_secret' => env('CENTRAL_PAYMENT_CLIENT_HMAC_SECRET'),
+    ],
+
     'paymob' => [
         'secret_key'     => env('PAYMOB_SECRET_KEY'),
         'public_key'     => env('PAYMOB_PUBLIC_KEY'),

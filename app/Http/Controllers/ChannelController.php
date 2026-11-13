@@ -678,8 +678,9 @@ class ChannelController extends Controller
             Log::error('Salla connect error', [
                 'user_id' => $user->id,
                 'exception_type' => get_class($e),
+                'message' => $e->getMessage(),
             ]);
-            return redirect(env('FRONTEND_URL') . '/dashboard/channels?error=salla_config_error');
+            return response()->json(['error' => 'salla_config_error', 'message' => 'Salla is not configured. Please contact support.'], 500);
         }
     }
 

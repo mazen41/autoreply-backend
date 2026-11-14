@@ -3,6 +3,7 @@
 namespace App\Services;
 
 use App\Exceptions\InsufficientAiCreditsException;
+use App\Models\AiBusinessSetting;
 use App\Models\AiCreditPackage;
 use App\Models\AiCreditTransaction;
 use App\Models\AiCreditWallet;

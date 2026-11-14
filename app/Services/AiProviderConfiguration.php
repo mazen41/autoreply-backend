@@ -18,7 +18,19 @@ class AiProviderConfiguration
     {
         if (!array_key_exists($provider, self::KEY_PATHS)) return '';
         $configured = $this->record($provider);
-        if ($configured && !$configured->is_active) return '';
+        if ($configured && !$configured->is_active) {
+            // If custom credentials were intentionally stored in database, honor is_active flag.
+            if ($configured->credentials !== null && !empty($configured->credentials)) {
+                return '';
+            }
+            // If configured via environment key, self-heal and activate provider
+            $envKey = (string) config(self::KEY_PATHS[$provider], '');
+            if ($envKey !== '') {
+                $configured->update(['is_active' => true]);
+                return $envKey;
+            }
+            return '';
+        }
         $key = data_get($configured?->credentials, 'api_key');
         return is_string($key) && $key !== '' ? $key : (string) config(self::KEY_PATHS[$provider], '');
     }

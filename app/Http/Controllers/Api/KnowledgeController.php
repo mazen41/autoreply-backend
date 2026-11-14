@@ -3,6 +3,7 @@
 namespace App\Http\Controllers\Api;
 
 use App\Http\Controllers\Controller;
+use App\Models\BusinessKnowledgeChunk;
 use App\Models\BusinessKnowledgeFile;
 use App\Models\BusinessProfile;
 use Illuminate\Http\Request;
@@ -130,6 +131,37 @@ class KnowledgeController extends Controller
         ]);
 
         return response()->json(['message' => 'Document reindexing queued.', 'file_id' => $file->id], 202);
+    }
+
+    /** Get paginated indexed chunks for a knowledge file */
+    public function chunks(Request $request, $id)
+    {
+        $profile = $this->profile($request, 'read');
+        $file = $profile->knowledgeFiles()->findOrFail($id);
+
+        $perPage = min(max((int) $request->input('per_page', 50), 1), 100);
+
+        $chunks = BusinessKnowledgeChunk::where('business_knowledge_file_id', $file->id)
+            ->orderBy('chunk_index', 'asc')
+            ->select(['id', 'business_knowledge_file_id', 'chunk_index', 'content', 'created_at'])
+            ->paginate($perPage);
+
+        return response()->json([
+            'file' => [
+                'id' => $file->id,
+                'filename' => $file->filename,
+                'file_type' => $file->file_type,
+                'status' => $file->status,
+                'chunks_count' => $chunks->total(),
+            ],
+            'chunks' => $chunks->items(),
+            'pagination' => [
+                'current_page' => $chunks->currentPage(),
+                'last_page' => $chunks->lastPage(),
+                'per_page' => $chunks->perPage(),
+                'total' => $chunks->total(),
+            ],
+        ]);
     }
 
     /** Update AI instructions */

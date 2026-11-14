@@ -41,6 +41,14 @@ return [
         'redirect' => env('GOOGLE_LOGIN_REDIRECT_URI', env('GOOGLE_REDIRECT_URI')),
     ],
 
+    'salla' => [
+        'client_id' => env('SALLA_CLIENT_ID'),
+        'client_secret' => env('SALLA_CLIENT_SECRET'),
+        'redirect_uri' => env('SALLA_REDIRECT_URI'),
+        'webhook_secret' => env('SALLA_WEBHOOK_SECRET'),
+        'api_base_url' => env('SALLA_API_BASE_URL', 'https://api.salla.dev'),
+    ],
+
     'shopify' => [
         'client_id' => env('SHOPIFY_CLIENT_ID', env('SHOPIFY_API_KEY')),
         'client_secret' => env('SHOPIFY_CLIENT_SECRET', env('SHOPIFY_API_SECRET')),

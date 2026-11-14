@@ -84,7 +84,10 @@ class ProcessKnowledgeFile implements ShouldQueue, ShouldBeUnique
 
             // 2. Generate embeddings for chunks
             $business = BusinessProfile::query()->findOrFail($file->business_profile_id);
-            $embeddings = $embeddingsService->embedBatch($chunks, $business, \App\Services\AiGateway::stableOperationId('knowledge-file:' . $file->id . ':' . sha1($fullText)));
+            $operationId = \App\Services\AiGateway::stableOperationId(
+                'knowledge-file:' . $file->id . ':' . sha1($fullText) . ':' . ($file->updated_at?->timestamp ?? time())
+            );
+            $embeddings = $embeddingsService->embedBatch($chunks, $business, $operationId);
             
             if (empty($embeddings) || count($embeddings) !== count($chunks)) {
                 throw new \Exception("Failed to generate embeddings for all chunks");

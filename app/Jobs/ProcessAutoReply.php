@@ -3669,6 +3669,26 @@ $aiResponse = $intro
                         'exception_type' => get_class($e),
                     ]);
                 }
+
+                if ($productImageMessageId !== null && $channel->user_id) {
+                    try {
+                        $productImageMessage = Message::find($productImageMessageId);
+                        if (!$productImageMessage) {
+                            continue;
+                        }
+                        broadcast(new \App\Events\MessageReceived(
+                            $productImageMessage,
+                            $conversation,
+                            (int) $channel->user_id,
+                        ));
+                    } catch (\Throwable $e) {
+                        Log::warning('ProcessAutoReply: sent product image could not be broadcast to inbox', [
+                            'conversation_id' => $conversation->id,
+                            'message_id' => $productImageMessageId,
+                            'exception_type' => get_class($e),
+                        ]);
+                    }
+                }
             }
 
             // Product references are usable only when both the resolved store

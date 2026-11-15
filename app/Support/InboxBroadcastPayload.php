@@ -78,6 +78,7 @@ class InboxBroadcastPayload
             'delivery_status'   => $message->delivery_status,
             'error_details'     => $message->error_details,
             'is_ai'             => (bool) $message->is_ai,
+            'source'            => $message->source,
             'media_url'         => $message->media_url,
             'media_type'        => $message->media_type,
             'mime_type'         => $message->mime_type,

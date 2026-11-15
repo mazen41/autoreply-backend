@@ -40,6 +40,11 @@ class InboxController extends Controller
     {
         $business = app(\App\Services\ActiveBusiness::class)->resolve($request, permission: 'conversation_read');
         $userId = (int) $request->user()->id;
+        $conversationColumns = ['id', 'channel_id', 'business_id', 'bot_id', 'sender_id', 'sender_name', 'sender_email', 'subject', 'status', 'ai_enabled', 'is_blocked', 'requires_human', 'escalated_at', 'escalation_reason', 'last_message_at', 'assigned_agent_id', 'assigned_at', 'checkout_state'];
+        if ($this->hasHumanHandlingSchema()) {
+            $conversationColumns[] = 'human_handling_started_at';
+            $conversationColumns[] = 'human_handled_count';
+        }
         $query = Conversation::where('business_id', $business->id)
             ->with([
                 'channel:id,type,page_name,page_id,metadata',
@@ -50,7 +55,7 @@ class InboxController extends Controller
             ->whereHas('messages', function ($messages): void {
                 $this->applyChatMessageFilter($messages);
             })
-            ->select(['id', 'channel_id', 'business_id', 'bot_id', 'sender_id', 'sender_name', 'sender_email', 'subject', 'status', 'ai_enabled', 'is_blocked', 'requires_human', 'escalated_at', 'escalation_reason', 'last_message_at', 'assigned_agent_id', 'assigned_at', 'checkout_state'])
+            ->select($conversationColumns)
             // Unread count within the 24h unread window — matches the
             // `unread` filter below and the realtime contract's
             // unread_count (InboxBroadcastPayload::unreadCount).
@@ -398,6 +403,7 @@ class InboxController extends Controller
             ]);
 
             $conversation->update(['last_message_at' => now()]);
+            $this->markHumanHandling($conversation);
 
             \App\Models\WhatsAppMessage::create([
                 'whatsapp_instance_id' => \App\Models\WhatsAppInstance::where('instance_name', $instanceName)->first()?->id,
@@ -528,6 +534,7 @@ class InboxController extends Controller
             ]);
 
             $conversation->update(['last_message_at' => now()]);
+            $this->markHumanHandling($conversation);
 
             if ($channel->user_id) {
                 broadcast(new \App\Events\MessageReceived($message, $conversation, $channel->user_id));
@@ -588,6 +595,7 @@ class InboxController extends Controller
         ]);
 
         $conversation->update(['last_message_at' => now()]);
+        $this->markHumanHandling($conversation);
 
         if ($channel->user_id) {
             broadcast(new \App\Events\MessageReceived($message, $conversation, $channel->user_id));
@@ -641,6 +649,7 @@ class InboxController extends Controller
                     ], $statusCode);
                 }
                 $conversation->update(['last_message_at' => now()]);
+                $this->markHumanHandling($conversation);
                 if ($channel->user_id) {
                     broadcast(new \App\Events\MessageReceived($message->fresh(), $conversation, $channel->user_id));
                 }
@@ -692,6 +701,7 @@ class InboxController extends Controller
             ]);
 
             $conversation->update(['last_message_at' => now()]);
+            $this->markHumanHandling($conversation);
 
             // Also save to WhatsApp messages table for legacy compatibility
             $instance = \App\Models\WhatsAppInstance::where('instance_name', $instanceName)->first();
@@ -766,6 +776,7 @@ class InboxController extends Controller
             'metadata' => array_filter(['reply_to_message_id' => $replyTo?->id], fn ($value) => $value !== null),
         ]);
         $conversation->update(['last_message_at' => now()]);
+        $this->markHumanHandling($conversation);
         if ($channel->user_id) {
             broadcast(new \App\Events\MessageReceived($message, $conversation, $channel->user_id));
         }
@@ -777,6 +788,35 @@ class InboxController extends Controller
     {
         $lastInbound = $conversation->messages()->where('direction', 'inbound')->latest('created_at')->first();
         return $lastInbound !== null && $lastInbound->created_at->gt(now()->subHours(24));
+    }
+
+    /** Mark a successfully sent agent reply as taking ownership of an escalation. */
+    private function markHumanHandling(Conversation $conversation): void
+    {
+        if (!$conversation->requires_human) {
+            return;
+        }
+
+        $updates = [];
+        if ($this->hasHumanHandlingSchema()) {
+            $updates['human_handling_started_at'] = $conversation->human_handling_started_at ?? now();
+        }
+
+        $agentId = auth('sanctum')->id() ?? auth()->id();
+        if (!$conversation->assigned_agent_id && $agentId) {
+            $updates['assigned_agent_id'] = $agentId;
+            $updates['assigned_at'] = now();
+        }
+
+        if ($updates) {
+            $conversation->update($updates);
+        }
+    }
+
+    private function hasHumanHandlingSchema(): bool
+    {
+        return \Illuminate\Support\Facades\Schema::hasColumn('conversations', 'human_handling_started_at')
+            && \Illuminate\Support\Facades\Schema::hasColumn('conversations', 'human_handled_count');
     }
 
     private function planUsageBlock(Channel $channel, Conversation $conversation, string $content, string $source)
@@ -1282,6 +1322,12 @@ class InboxController extends Controller
         $conversation = $this->conversationQuery($request, 'conversation_write')
             ->findOrFail($conversationId);
 
+        if ($conversation->requires_human) {
+            return response()->json([
+                'error' => 'This conversation is escalated. Mark it handled after the agent reply to resume auto-reply.',
+            ], 422);
+        }
+
         $newValue = !$conversation->ai_enabled;
 
         $conversation->update([
@@ -1298,6 +1344,55 @@ class InboxController extends Controller
         return response()->json([
             'message'    => 'AI toggled successfully',
             'ai_enabled' => $newValue,
+        ]);
+    }
+
+    /** Complete the current human escalation and resume automated replies. */
+    public function markHandled(Request $request, $conversationId)
+    {
+        if (!$this->hasHumanHandlingSchema()) {
+            return response()->json(['error' => 'Conversation handling migration has not been applied yet.'], 503);
+        }
+
+        $conversation = DB::transaction(function () use ($request, $conversationId) {
+            $locked = $this->conversationQuery($request, 'conversation_write')
+                ->lockForUpdate()
+                ->findOrFail($conversationId);
+
+            if (!$locked->requires_human) {
+                return null;
+            }
+
+            if (!$locked->human_handling_started_at) {
+                return false;
+            }
+
+            $locked->update([
+                'requires_human' => false,
+                'ai_enabled' => true,
+                'status' => 'open',
+                'human_handling_started_at' => null,
+                'human_handled_count' => (int) $locked->human_handled_count + 1,
+            ]);
+
+            return $locked->fresh(['channel:id,type,page_name,page_id', 'bot:id,name']);
+        });
+
+        if ($conversation === null) {
+            return response()->json(['error' => 'This escalation has already been handled.'], 409);
+        }
+
+        if ($conversation === false) {
+            return response()->json(['error' => 'Send a manual reply before marking this escalation handled.'], 422);
+        }
+
+        broadcast(new \App\Events\ConversationUpdated($conversation));
+
+        return response()->json([
+            'message' => 'Conversation marked handled. Auto-reply is active again.',
+            'conversation' => $conversation,
+            'human_handled_count' => $conversation->human_handled_count,
+            'ai_enabled' => $conversation->ai_enabled,
         ]);
     }
 

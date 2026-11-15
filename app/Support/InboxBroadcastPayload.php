@@ -111,6 +111,8 @@ class InboxBroadcastPayload
             'requires_human'    => (bool) $conversation->requires_human,
             'escalated_at'      => $conversation->escalated_at?->toISOString(),
             'escalation_reason' => $conversation->escalation_reason,
+            'human_handling_started_at' => $conversation->human_handling_started_at?->toISOString(),
+            'human_handled_count' => (int) ($conversation->human_handled_count ?? 0),
             'last_message_at'   => $conversation->last_message_at?->toISOString(),
             'bot_id'            => $conversation->bot_id,
             'assigned_agent_id' => $conversation->assigned_agent_id,

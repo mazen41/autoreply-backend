@@ -108,6 +108,17 @@ class ProcessAutoReply implements ShouldQueue
             return;
         }
 
+        // Escalation itself is a hard pause, even if a legacy escalation path
+        // did not also persist ai_enabled=false. Only the explicit handled
+        // action clears requires_human and resumes future customer turns.
+        if ($conversation->requires_human) {
+            Log::info('ProcessAutoReply: conversation is waiting for human handling', [
+                'conversation_id' => $conversation->id,
+                'message_id' => $message->id,
+            ]);
+            return;
+        }
+
         // Global human-only/emergency pause must also cover inbound AI replies
         // and deterministic attachment acknowledgements. Drop this turn while
         // paused so queued messages are never sent late after an operator

@@ -324,6 +324,7 @@ Route::middleware('auth:sanctum')->group(function () {
     Route::post('/inbox/{conversationId}/reply',        [InboxController::class, 'reply']);
     Route::post('/inbox/{conversationId}/media',        [InboxController::class, 'mediaReply']);
     Route::patch('/inbox/{conversationId}/toggle-ai',   [InboxController::class, 'toggleAi']);
+    Route::post('/inbox/{conversationId}/handled', [InboxController::class, 'markHandled']);
     Route::patch('/inbox/{conversationId}/status',      [InboxController::class, 'updateStatus']);
     Route::delete('/inbox/{conversationId}', [InboxController::class, 'deleteConversation']);
     Route::patch('/inbox/{conversationId}/block', [InboxController::class, 'updateBlockStatus']);

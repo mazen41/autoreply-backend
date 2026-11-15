@@ -24,6 +24,8 @@ class Conversation extends Model
         'requires_human',
         'escalated_at',
         'escalation_reason',
+        'human_handling_started_at',
+        'human_handled_count',
         'escalation_notified',
         'last_message_at',
         'assigned_agent_id',
@@ -38,6 +40,8 @@ class Conversation extends Model
     protected $casts = [
         'last_message_at'      => 'datetime',
         'escalated_at'         => 'datetime',
+        'human_handling_started_at' => 'datetime',
+        'human_handled_count' => 'integer',
         'assigned_at'          => 'datetime',
         'ai_enabled'           => 'boolean',
         'is_blocked'            => 'boolean',

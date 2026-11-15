@@ -4,7 +4,6 @@ namespace App\Services;
 
 use App\Models\PaymentClient;
 use Illuminate\Support\Facades\Http;
-use Illuminate\Support\Str;
 use RuntimeException;
 
 class CentralPaymentOrderVerifier
@@ -16,7 +15,8 @@ class CentralPaymentOrderVerifier
         $payload = ['external_order_id' => $externalOrderId];
         $rawBody = json_encode($payload, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE | JSON_THROW_ON_ERROR);
         $timestamp = (string) now()->timestamp;
-        $nonce = Str::random(40);
+        // AuthenticatePaymentOriginRequest only accepts lowercase hex nonces.
+        $nonce = bin2hex(random_bytes(24));
         $canonical = implode("\n", [
             'POST', $path, $timestamp, $nonce, hash('sha256', $rawBody),
         ]);

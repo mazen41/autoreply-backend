@@ -37,7 +37,7 @@ class BotController extends Controller
             ->with([
                 'channels' => fn ($query) => $query
                     ->where('channels.business_id', $business->id)
-                    ->select('channels.id', 'channels.type', 'channels.page_name', 'channels.page_id', 'channels.status', 'channels.ai_enabled'),
+                    ->select('channels.id', 'channels.type', 'channels.page_name', 'channels.page_id', 'channels.status'),
                 'channels.bots:id,status,business_profile_id',
                 'ecommerceChannel:id,type,page_name,page_id',
                 'ecommerceConnections:id,type,page_name,page_id,status',
@@ -58,7 +58,6 @@ class BotController extends Controller
                     ? $activeBots->first()
                     : ($activeBots->count() > 1 ? $primaryBot : null);
                 $channelEffective = $bot->status === 'active'
-                    && (bool) $channel->ai_enabled
                     && $channel->status === 'connected'
                     && $resolvedBot?->id === $bot->id;
                 $channel->setAttribute('agent_ai_enabled', $channelEffective);
@@ -66,11 +65,9 @@ class BotController extends Controller
                     ? null
                     : ($bot->status !== 'active'
                         ? 'agent_inactive'
-                        : (!(bool) $channel->ai_enabled
-                            ? 'channel_ai_paused'
-                            : ($channel->status !== 'connected'
-                                ? 'channel_not_connected'
-                                : ($resolvedBot ? 'another_agent_selected' : 'no_active_agent')))));
+                        : ($channel->status !== 'connected'
+                            ? 'channel_not_connected'
+                            : ($resolvedBot ? 'another_agent_selected' : 'no_active_agent'))));
 
                 if ($channelEffective) {
                     $effectiveChannels++;

@@ -81,8 +81,8 @@ class ProcessAutoReply implements ShouldQueue
             return;
         }
 
-        if (!$channel || !$channel->ai_enabled) {
-            Log::info('ProcessAutoReply: AI not enabled for channel', ['channel_id' => $channel?->id]);
+        if (!$channel) {
+            Log::info('ProcessAutoReply: channel not found for message', ['message_id' => $message->id]);
             return;
         }
 

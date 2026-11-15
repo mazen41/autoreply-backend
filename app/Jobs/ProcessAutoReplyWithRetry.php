@@ -53,8 +53,8 @@ class ProcessAutoReplyWithRetry implements ShouldQueue
         $channel = $message->conversation->channel;
         $conversation = $message->conversation;
 
-        if (!$channel || !$channel->ai_enabled) {
-            Log::info('ProcessAutoReplyWithRetry: AI not enabled for channel', ['channel_id' => $channel?->id]);
+        if (!$channel) {
+            Log::info('ProcessAutoReplyWithRetry: channel not found for message', ['message_id' => $message->id]);
             return;
         }
 

@@ -499,7 +499,7 @@ class EvolutionApiService
                     ->where('created_at', '>=', $alreadyPersisted->created_at)
                     ->exists();
                 $debounceKey = "debounce:conversation:{$alreadyPersisted->conversation_id}";
-                if ($channel->ai_enabled && !$hasReply && !Cache::has($debounceKey)) {
+                if (!$hasReply && !Cache::has($debounceKey)) {
                     ProcessAutoReply::dispatch($alreadyPersisted->id);
                     Cache::put($debounceKey, true, 10);
                     Log::info('Evolution webhook replay recovered missing auto-reply dispatch', [
@@ -733,7 +733,7 @@ class EvolutionApiService
             // fromMe=true means WE sent this message (our own AI/agent reply
             // coming back through the webhook) — never trigger on those or the
             // AI will reply to itself in an infinite loop.
-            if (!$fromMe && $channel->ai_enabled) {
+            if (!$fromMe) {
                 // Implement message debounce for WhatsApp
                 $debounceKey = "debounce:conversation:{$conversation->id}";
                 $debounceWindow = 10; // 10 seconds debounce window

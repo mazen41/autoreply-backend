@@ -182,16 +182,14 @@ class ChannelController extends Controller
             $noAgentFailClosedEnabled = \App\Models\FeatureFlag::isEnabled('phase3_no_agent_fail_closed', (int) $business->id);
             $legacyFallbackAllowed = !$noAgentFailClosedEnabled;
             $routingAvailable = (bool) $resolvedBot || $legacyFallbackAllowed;
-            $effectiveAiEnabled = (bool) $channel->ai_enabled
-                && $channel->status === 'connected'
-                && $routingAvailable;
-            $aiPauseReason = !$channel->ai_enabled
-                ? 'channel_ai_paused'
-                : ($channel->status !== 'connected'
-                    ? 'channel_not_connected'
-                    : (!$routingAvailable
-                        ? ($activeBots->count() > 1 ? 'multiple_active_agents_without_primary' : 'no_active_agent')
-                        : null));
+            // Auto-replies follow bot assignment and channel connectivity. The
+            // legacy per-channel ai_enabled flag is intentionally ignored.
+            $effectiveAiEnabled = $channel->status === 'connected' && $routingAvailable;
+            $aiPauseReason = $channel->status !== 'connected'
+                ? 'channel_not_connected'
+                : (!$routingAvailable
+                    ? ($activeBots->count() > 1 ? 'multiple_active_agents_without_primary' : 'no_active_agent')
+                    : null);
 
             return [
                 'id'                   => $channel->id,
@@ -222,7 +220,7 @@ class ChannelController extends Controller
                             : null))
                         : null,
                 'connected_at'         => $channel->connected_at,
-                'ai_enabled'           => $channel->ai_enabled,
+                'ai_enabled'           => $effectiveAiEnabled,
                 'effective_ai_enabled' => $effectiveAiEnabled,
                 'ai_pause_reason'      => $aiPauseReason,
                 'auto_order_confirmation_enabled' => $channel->auto_order_confirmation_enabled,
@@ -612,32 +610,9 @@ class ChannelController extends Controller
             ->firstOrFail();
 
         $validated = $request->validate([
-            'ai_enabled' => 'boolean',
             'default_ecommerce_connection_id' => 'nullable|integer',
             'auto_order_confirmation_enabled' => 'nullable|boolean',
         ]);
-
-        if ($channel->type === 'tiktok' && ($validated['ai_enabled'] ?? false)) {
-            return response()->json([
-                'message' => 'TikTok messaging is unsupported; automated replies cannot be enabled for this channel.',
-            ], 422);
-        }
-
-        if (
-            array_key_exists('ai_enabled', $validated)
-            && $request->boolean('ai_enabled')
-            && \App\Models\FeatureFlag::isEnabled('phase3_setup_verification_required', (int) $business->id)
-        ) {
-            $readiness = app(\App\Services\AiSetupVerificationService::class)->checklist($business);
-            if (!$readiness['ready']) {
-                return response()->json([
-                    'message' => 'Complete the AI setup checklist before enabling replies.',
-                    'ready' => false,
-                    'checks' => $readiness['checks'],
-                    'missing' => $readiness['missing'],
-                ], 422);
-            }
-        }
 
         if (array_key_exists('default_ecommerce_connection_id', $validated) && $validated['default_ecommerce_connection_id'] !== null) {
             $connection = Channel::query()

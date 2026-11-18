@@ -68,7 +68,7 @@ return Application::configure(basePath: dirname(__DIR__))
         $command('analytics:daily', 'daily-analytics', 240, static fn ($event) => $event->dailyAt('01:00'));
         $command('email-campaigns:send-due', 'send-due-email-campaigns', 5, static fn ($event) => $event->everyMinute());
         $command('campaigns:send-due', 'send-due-campaigns', 5, static fn ($event) => $event->everyMinute());
-        $command('salla:cities:queue-refresh', 'salla-city-catalog-refresh', 60, static fn ($event) => $event->everySixHours());
+        $command('salla:cities:queue-refresh', 'salla-city-catalog-refresh', 120, static fn ($event) => $event->dailyAt('01:10'));
         $command('usage:check', 'check-usage-limits', 120, static fn ($event) => $event->dailyAt('01:30'));
         $command('system:health-check', 'system-health-check', 90, static fn ($event) => $event->hourly());
         $command('workflows:run-time-triggers', 'run-time-workflows', 5, static fn ($event) => $event->everyMinute());

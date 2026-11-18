@@ -57,7 +57,7 @@ class ChannelController extends Controller
             $claimed = Channel::where('type', 'salla')->where('page_id', $storeId)->whereNotNull('user_id')->first();
             if ($claimed) {
                 $claimed->update($fields);
-                $this->queueSallaCityCatalogs($claimed);
+                $this->queueSallaCityCatalogs();
                 Log::info('Salla install: refreshed tokens on existing channel', ['channel_id' => $claimed->id]);
                 return redirect($frontend . '/dashboard/channels?success=salla_connected');
             }
@@ -68,8 +68,6 @@ class ChannelController extends Controller
             } else {
                 $channel = Channel::create($fields + ['type' => 'salla', 'page_id' => $storeId, 'user_id' => null]);
             }
-            $this->queueSallaCityCatalogs($channel);
-
             Log::info('Salla install: unclaimed channel stored, awaiting claim', [
                 'channel_id' => $channel->id,
             ]);
@@ -145,7 +143,7 @@ class ChannelController extends Controller
         }
 
         Log::info('Salla channel claimed', ['channel_id' => $channel->id, 'user_id' => $userId]);
-        $this->queueSallaCityCatalogs($channel);
+        $this->queueSallaCityCatalogs();
 
         return response()->json(['success' => true, 'channel_id' => $channel->id]);
     }
@@ -804,7 +802,7 @@ class ChannelController extends Controller
 
             $this->subscribeSallaWebhooks($channel, $accessToken);
 
-            $this->queueSallaCityCatalogs($channel);
+            $this->queueSallaCityCatalogs();
 
             $returnPath = ($stateData['context']['redirect'] ?? null) === 'onboarding' ? '/onboarding?success=salla_connected&channel=salla' : '/dashboard/channels?success=salla_connected';
             return redirect(env('FRONTEND_URL') . $returnPath);
@@ -817,8 +815,8 @@ class ChannelController extends Controller
         }
     }
 
-    /** Queue first-time and future city catalog synchronization for this store. */
-    protected function queueSallaCityCatalogs(Channel $channel): void
+    /** Queue a country-wide city catalog refresh only when missing or stale. */
+    protected function queueSallaCityCatalogs(): void
     {
         foreach ((array) config('services.salla.city_catalog_countries', ['SA']) as $countryCode) {
             $countryCode = strtoupper(trim((string) $countryCode));
@@ -827,10 +825,9 @@ class ChannelController extends Controller
             }
 
             try {
-                \App\Jobs\SyncSallaCityCatalog::dispatch((int) $channel->id, $countryCode);
+                app(\App\Services\SharedSallaCityCatalogService::class)->queueIfStale($countryCode);
             } catch (\Throwable $exception) {
-                Log::warning('Salla connected but city catalog sync could not be queued', [
-                    'channel_id' => $channel->id,
+                Log::warning('Salla city catalog refresh could not be queued', [
                     'country_code' => $countryCode,
                     'exception_type' => get_class($exception),
                 ]);

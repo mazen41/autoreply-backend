@@ -2,18 +2,16 @@
 
 namespace App\Console\Commands;
 
-use App\Models\Channel;
-use App\Services\SallaService;
+use App\Jobs\SyncSallaSharedCityCatalog;
 use Illuminate\Console\Command;
-use Throwable;
 
 class SyncSallaCities extends Command
 {
-    protected $signature = 'salla:cities:sync {countryCode : ISO country code, for example SA} {channelId? : Connected Salla channel ID; defaults to all connected stores}';
+    protected $signature = 'salla:cities:sync {countryCode : ISO country code, for example SA}';
 
-    protected $description = 'Sync a Salla country city catalog into the local database';
+    protected $description = 'Queue a shared Salla country city catalog sync';
 
-    public function handle(SallaService $sallaService): int
+    public function handle(): int
     {
         $countryCode = strtoupper(trim((string) $this->argument('countryCode')));
         if (!preg_match('/^[A-Z]{2}$/', $countryCode)) {
@@ -21,56 +19,8 @@ class SyncSallaCities extends Command
             return self::FAILURE;
         }
 
-        $channelId = $this->argument('channelId');
-
-        $channels = Channel::query()
-            ->where('type', 'salla')
-            ->where('status', 'connected')
-            ->when($channelId, fn ($query) => $query->whereKey((int) $channelId))
-            ->get();
-
-        if ($channels->isEmpty()) {
-            $this->error($channelId
-                ? "No connected Salla channel found with ID {$channelId}."
-                : 'No connected Salla channels found.');
-            return self::FAILURE;
-        }
-
-        $failed = false;
-        foreach ($channels as $channel) {
-            try {
-                $this->info("Channel {$channel->id}: starting a full {$countryCode} city sync (up to 60 cities per page).");
-                $count = $sallaService->syncCityCatalog($channel, $countryCode, function (array $progress) use ($channel): void {
-                    if ($progress['stage'] === 'countries_request') {
-                        $this->line("Channel {$channel->id}: fetching Salla country catalog...");
-                        return;
-                    }
-
-                    if ($progress['stage'] === 'page_request') {
-                        $this->line("Channel {$channel->id}: requesting {$progress['country_code']} cities page {$progress['page']}...");
-                        return;
-                    }
-
-                    if ($progress['stage'] === 'page_complete') {
-                        $totalPages = max(1, (int) $progress['total_pages']);
-                        $this->info(sprintf(
-                            'Channel %d: page %d/%d complete; received %d cities (API perPage=%d, %d saved so far).',
-                            $channel->id,
-                            $progress['page'],
-                            $totalPages,
-                            $progress['page_count'],
-                            $progress['response_per_page'],
-                            $progress['total_synced']
-                        ));
-                    }
-                });
-                $this->info("Channel {$channel->id}: {$countryCode} catalog now contains {$count} cities.");
-            } catch (Throwable $exception) {
-                $failed = true;
-                $this->error("Channel {$channel->id}: {$exception->getMessage()}");
-            }
-        }
-
-        return $failed ? self::FAILURE : self::SUCCESS;
+        SyncSallaSharedCityCatalog::dispatch($countryCode);
+        $this->info("Queued one shared {$countryCode} Salla city catalog sync; the sync selects a healthy connected store as its metadata source.");
+        return self::SUCCESS;
     }
 }

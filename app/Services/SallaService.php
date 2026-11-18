@@ -145,7 +145,10 @@ class SallaService
     protected function apiCall(string $method, string $endpoint, array $data = [], string $accessToken = ''): array
     {
         $url     = $this->apiBaseUrl . $endpoint;
-        $request = Http::withToken($accessToken)->accept('application/json');
+        $request = Http::withToken($accessToken)
+            ->accept('application/json')
+            ->connectTimeout(10)
+            ->timeout(30);
 
         $response = strtoupper($method) === 'GET'
             ? $request->get($url, $data)
@@ -271,6 +274,22 @@ class SallaService
 
             throw $e;
         }
+    }
+
+    /** Fetch shared Salla country metadata with this store's authenticated token. */
+    public function getCountriesForChannel(Channel $channel): array
+    {
+        return $this->apiCallForChannel($channel, 'GET', '/countries');
+    }
+
+    /** Fetch one page of a Salla country city catalog (the API currently caps at 15). */
+    public function getCitiesPageForChannel(Channel $channel, int $countryId, int $page): array
+    {
+        return $this->apiCallForChannel($channel, 'GET', "/countries/{$countryId}/cities", [
+            'page' => $page,
+            'per_page' => 15,
+            'count' => 15,
+        ]);
     }
 
     /**
@@ -627,246 +646,31 @@ class SallaService
     }
 
     /**
-     * Download one country's Salla city list into the local catalog.
-     * Salla permits at most 60 cities per page; checkout reads this catalog
-     * locally so it never performs a multi-page network scan while placing an order.
+     * Compatibility wrapper: synchronize into the shared country catalog, never
+     * into a store-specific city table.
      */
     public function syncCityCatalog(
         Channel $channel,
         string $countryCode,
         ?callable $onProgress = null,
         int $startPage = 1
-    ): int
-    {
-        $countryCode = strtoupper(trim($countryCode));
+    ): int {
         if ($startPage !== 1) {
-            throw new \InvalidArgumentException('Partial-page sync is disabled because it cannot prove catalog completeness. Start a full sync instead.');
+            throw new \InvalidArgumentException('Shared catalog sync resumes from its saved country cursor.');
         }
-        if (!preg_match('/^[A-Z]{2}$/', $countryCode)) {
-            throw new \InvalidArgumentException('A two-letter ISO country code is required.');
-        }
-
-        $sync = \App\Models\SallaCityCatalogSync::query()->firstOrNew([
-            'channel_id' => $channel->id,
-            'country_code' => $countryCode,
-        ]);
-        $sync->status = 'running';
-        $sync->pages_completed = 0;
-        $sync->attempt_expected_city_count = null;
-        $sync->started_at = now();
-        $sync->last_error_code = null;
-        $sync->last_error_message = null;
-        $sync->save();
-
-        try {
-            $grantedScopes = $channel->metadata['scopes'] ?? null;
-            if (is_string($grantedScopes) && trim($grantedScopes) !== '') {
-                $granted = preg_split('/[\s,]+/', trim($grantedScopes)) ?: [];
-                if (!array_intersect(['metadata.read', 'metadata.read_write'], $granted)) {
-                    throw new \RuntimeException('Salla authorization is missing metadata.read. Reconnect the store with this permission granted.');
-                }
-            }
-
-            if ($onProgress) {
-                $onProgress(['stage' => 'countries_request', 'country_code' => $countryCode]);
-            }
-            $countriesResponse = $this->apiCallForChannel($channel, 'GET', '/countries');
-            $countries = $countriesResponse['data'] ?? null;
-            if (!is_array($countries)) {
-                throw new \UnexpectedValueException('Salla returned an invalid countries response.');
-            }
-            $country = collect($countries)->first(
-                fn ($candidate) => strtoupper((string) ($candidate['code'] ?? '')) === $countryCode
-            );
-            $countryId = filter_var($country['id'] ?? null, FILTER_VALIDATE_INT);
-            if (!$countryId || $countryId < 1) {
-                throw new \RuntimeException("Salla country {$countryCode} was not found or had an invalid ID.");
-            }
-
-            $endpoint = "/countries/{$countryId}/cities";
-            $staged = [];
-            $pagesCompleted = 0;
-            $expectedCount = null;
-            $totalPages = null;
-            $now = now();
-
-            for ($page = 1; $page <= 2000; $page++) {
-                if ($onProgress) {
-                    $onProgress(['stage' => 'page_request', 'country_code' => $countryCode, 'page' => $page]);
-                }
-                $response = $this->apiCallForChannel($channel, 'GET', $endpoint, [
-                    'page' => $page,
-                    'per_page' => 60,
-                    'count' => 60,
-                ]);
-                $cities = $response['data'] ?? null;
-                $pagination = $response['pagination'] ?? null;
-                if (!is_array($cities) || !is_array($pagination)) {
-                    throw new \UnexpectedValueException("Salla returned an invalid cities response on page {$page}.");
-                }
-
-                $pageTotalPages = filter_var($pagination['totalPages'] ?? $pagination['total_pages'] ?? null, FILTER_VALIDATE_INT);
-                $pageExpectedCount = filter_var($pagination['total'] ?? $pagination['totalCount'] ?? $pagination['total_count'] ?? null, FILTER_VALIDATE_INT);
-                if (!$pageTotalPages || $pageTotalPages < 1 || $pageExpectedCount === false || $pageExpectedCount === null || $pageExpectedCount < 1) {
-                    throw new \UnexpectedValueException("Salla omitted valid total city and page counts on page {$page}.");
-                }
-                if ($totalPages !== null && ($totalPages !== $pageTotalPages || $expectedCount !== $pageExpectedCount)) {
-                    throw new \UnexpectedValueException('Salla city pagination totals changed during synchronization.');
-                }
-                $totalPages = $pageTotalPages;
-                $expectedCount = $pageExpectedCount;
-                if ($page > $totalPages || $page > 2000) {
-                    throw new \UnexpectedValueException('Salla city pagination exceeded its validated page range.');
-                }
-
-                foreach ($cities as $city) {
-                    $cityId = filter_var($city['id'] ?? null, FILTER_VALIDATE_INT);
-                    if (!$cityId || $cityId < 1) {
-                        throw new \UnexpectedValueException("Salla returned a city with an invalid ID on page {$page}.");
-                    }
-                    if (isset($city['country_id']) && (int) $city['country_id'] !== (int) $countryId) {
-                        throw new \UnexpectedValueException("Salla returned a city assigned to a different country on page {$page}.");
-                    }
-                    if (isset($staged[$cityId])) {
-                        throw new \UnexpectedValueException("Salla returned duplicate city ID {$cityId} across its pagination.");
-                    }
-                    $name = trim((string) ($city['name'] ?? $city['name_en'] ?? $city['name_ar'] ?? ''));
-                    if ($name === '') {
-                        throw new \UnexpectedValueException("Salla returned city {$cityId} without a usable name.");
-                    }
-                    $staged[$cityId] = [
-                        'channel_id' => $channel->id,
-                        'country_code' => $countryCode,
-                        'country_id' => (int) $countryId,
-                        'salla_city_id' => (int) $cityId,
-                        'name' => $name,
-                        'name_en' => isset($city['name_en']) ? (string) $city['name_en'] : null,
-                        'name_ar' => isset($city['name_ar']) ? (string) $city['name_ar'] : null,
-                        'synced_at' => $now,
-                        'created_at' => $now,
-                        'updated_at' => $now,
-                    ];
-                }
-                $pagesCompleted = $page;
-                // `expected_city_count` remains tied to the last successful
-                // catalog; attempt counters describe this refresh separately.
-                $sync->update([
-                    'pages_completed' => $pagesCompleted,
-                    'attempt_expected_city_count' => $expectedCount,
-                ]);
-
-                if ($onProgress) {
-                    $onProgress([
-                        'stage' => 'page_complete',
-                        'country_code' => $countryCode,
-                        'page' => $page,
-                        'total_pages' => $totalPages,
-                        'response_per_page' => (int) ($pagination['perPage'] ?? $pagination['per_page'] ?? 0),
-                        'page_count' => count($cities),
-                        'total_synced' => count($staged),
-                    ]);
-                }
-                if ($page === $totalPages) {
-                    break;
-                }
-                if ($page === 2000) {
-                    throw new \RuntimeException('Salla city pagination exceeded the 2000-page safety limit.');
-                }
-            }
-
-            if (count($staged) !== $expectedCount || $pagesCompleted !== $totalPages) {
-                throw new \UnexpectedValueException(sprintf(
-                    'Salla city catalog was incomplete: collected %d/%d cities across %d/%d pages.',
-                    count($staged), $expectedCount, $pagesCompleted, $totalPages
-                ));
-            }
-
-            $savedCount = DB::transaction(function () use ($channel, $countryCode, $staged, $expectedCount): int {
-                // MySQL limits the number of bound placeholders in one prepared
-                // statement. A full Salla country catalog can contain tens of
-                // thousands of cities, so write bounded batches inside the same
-                // transaction to keep the refresh atomic without exceeding that
-                // limit.
-                foreach (array_chunk(array_values($staged), 400) as $cityBatch) {
-                    DB::table('salla_cities')->upsert(
-                        $cityBatch,
-                        ['channel_id', 'country_code', 'salla_city_id'],
-                        ['country_id', 'name', 'name_en', 'name_ar', 'synced_at', 'updated_at']
-                    );
-                }
-                DB::table('salla_cities')
-                    ->where('channel_id', $channel->id)
-                    ->where('country_code', $countryCode)
-                    ->whereNotIn('salla_city_id', array_keys($staged))
-                    ->delete();
-                $count = (int) DB::table('salla_cities')
-                    ->where('channel_id', $channel->id)
-                    ->where('country_code', $countryCode)
-                    ->count();
-                if ($count !== $expectedCount) {
-                    throw new \UnexpectedValueException("Saved Salla city count {$count} does not match API total {$expectedCount}.");
-                }
-                return $count;
-            });
-
-            $sync->update([
-                'status' => 'succeeded',
-                'pages_completed' => $pagesCompleted,
-                'attempt_expected_city_count' => $expectedCount,
-                'expected_city_count' => $expectedCount,
-                'saved_city_count' => $savedCount,
-                'last_successful_sync_at' => $now,
-                'last_error_code' => null,
-                'last_error_message' => null,
-            ]);
-
-            Log::info('Salla city catalog sync completed', [
-                'channel_id' => $channel->id,
-                'country_code' => $countryCode,
-                'pages' => $pagesCompleted,
-                'expected_city_count' => $expectedCount,
-                'saved_city_count' => $savedCount,
-            ]);
-
-            return $savedCount;
-        } catch (\Throwable $exception) {
-            $safeMessage = \App\Services\OrderCheckoutService::maskSensitive($exception->getMessage());
-            $sync->update([
-                'status' => 'failed',
-                'last_error_code' => class_basename($exception),
-                'last_error_message' => mb_substr($safeMessage, 0, 2000),
-            ]);
-            Log::error('Salla city catalog sync failed; prior successful catalog preserved', [
-                'channel_id' => $channel->id,
-                'country_code' => $countryCode,
-                'pages_completed' => (int) $sync->pages_completed,
-                'exception_type' => get_class($exception),
-                'message' => $safeMessage,
-            ]);
-            throw $exception;
-        }
+        return app(SharedSallaCityCatalogService::class)->syncAll(
+            $countryCode,
+            (int) $channel->id,
+            $onProgress
+        );
     }
 
-    /** A catalog is usable only after a fully validated sync and exact row-count check. */
+    /** Retained for older callers; health is country-wide, not store-specific. */
     public function hasHealthyCityCatalog(Channel $channel, string $countryCode): bool
     {
-        $countryCode = strtoupper(trim($countryCode));
-        $sync = \App\Models\SallaCityCatalogSync::query()
-            ->where('channel_id', $channel->id)
-            ->where('country_code', $countryCode)
-            ->first();
-        if (!$sync || !$sync->last_successful_sync_at || (int) $sync->saved_city_count < 1
-            || (int) $sync->saved_city_count !== (int) $sync->expected_city_count) {
-            return false;
-        }
-
-        return (int) DB::table('salla_cities')
-            ->where('channel_id', $channel->id)
-            ->where('country_code', $countryCode)
-            ->count() === (int) $sync->saved_city_count;
+        return app(SharedSallaCityCatalogService::class)->isHealthy($countryCode);
     }
-
-    protected function normalizeCitySearchText(string $value): string
+    public function normalizeCitySearchText(string $value): string
     {
         $value = mb_strtolower(trim($value));
         $value = strtr($value, [
@@ -905,6 +709,42 @@ class SallaService
         }
 
         return $normalized === '' ? [] : [$normalized];
+    }
+
+    /**
+     * Use the country/name indexes to find exact and known-alias candidates
+     * before falling back to a full-country fuzzy scan.
+     */
+    protected function findIndexedCityCandidates(int $countryId, string $normalizedAddress)
+    {
+        $tokens = preg_split('/\s+/u', $normalizedAddress, -1, PREG_SPLIT_NO_EMPTY) ?: [];
+        $tokens = array_slice($tokens, 0, 80);
+        $names = [];
+        $tokenCount = count($tokens);
+        for ($start = 0; $start < $tokenCount; $start++) {
+            for ($length = 1; $length <= 8 && $start + $length <= $tokenCount; $length++) {
+                $phrase = implode(' ', array_slice($tokens, $start, $length));
+                foreach ($this->cityNameSearchVariants($phrase) as $variant) {
+                    if ($variant !== '') {
+                        $names[$variant] = true;
+                    }
+                }
+            }
+        }
+
+        if ($names === []) {
+            return collect();
+        }
+
+        $names = array_keys($names);
+        return DB::table('salla_city_reference_cities')
+            ->where('country_id', $countryId)
+            ->where(function ($query) use ($names): void {
+                $query->whereIn('normalized_name', $names)
+                    ->orWhereIn('normalized_en', $names)
+                    ->orWhereIn('normalized_ar', $names);
+            })
+            ->get();
     }
 
     /** Find a unique close Latin spelling when no exact/known alias matched. */
@@ -994,12 +834,13 @@ class SallaService
             return null;
         }
 
-        $catalogHealthy = $this->hasHealthyCityCatalog($channel, $countryCode);
+        $catalogs = app(SharedSallaCityCatalogService::class);
+        $catalogHealthy = $catalogs->isHealthy($countryCode);
         if (!$catalogHealthy) {
             try {
-                \App\Jobs\SyncSallaCityCatalog::dispatch((int) $channel->id, $countryCode);
+                $catalogs->queueIfStale($countryCode);
             } catch (\Throwable $exception) {
-                Log::warning('Salla city catalog recovery could not be queued', [
+                Log::warning('Shared Salla city catalog recovery could not be queued', [
                     'channel_id' => $channel->id,
                     'country_code' => $countryCode,
                     'exception_type' => get_class($exception),
@@ -1007,15 +848,15 @@ class SallaService
             }
         }
 
-        $cities = $catalogHealthy
-            ? DB::table('salla_cities')->where('channel_id', $channel->id)->where('country_code', $countryCode)->get()
-            : collect();
-        $countryId = $cities->first()->country_id ?? null;
+        $catalog = DB::table('salla_city_catalogs')->where('country_code', $countryCode)->first();
+        $countryId = $catalog->country_id ?? null;
         $matchedCityId = null;
         $matchedCityNameLength = 0;
-        $availableCityNames = [];
-
         $normalizedAddress = $this->normalizeCitySearchText($freeformAddress);
+        $cities = $catalogHealthy && $countryId
+            ? $this->findIndexedCityCandidates((int) $countryId, $normalizedAddress)
+            : collect();
+
         foreach ($cities as $city) {
             foreach ([$city->name, $city->name_en, $city->name_ar] as $cityName) {
                 $cityName = trim((string) $cityName);
@@ -1023,7 +864,6 @@ class SallaService
                     continue;
                 }
 
-                $availableCityNames[] = $cityName;
                 foreach ($this->cityNameSearchVariants($cityName) as $normalizedCityName) {
                     $cityNameLength = mb_strlen($normalizedCityName);
                     if (
@@ -1038,6 +878,9 @@ class SallaService
         }
 
         if (!$matchedCityId) {
+            $cities = $catalogHealthy && $countryId
+                ? DB::table('salla_city_reference_cities')->where('country_id', $countryId)->get()
+                : collect();
             $matchedCityId = $this->findFuzzyCityMatch($cities, $normalizedAddress);
         }
 
@@ -1049,8 +892,8 @@ class SallaService
                 'country_code' => $countryCode,
                 'address'    => $freeformAddress,
                 'catalog_synced' => $catalogHealthy,
-                'cities_checked' => count($availableCityNames),
-                'available_city_names_sample' => array_slice($availableCityNames, 0, 30),
+                'cities_checked' => $catalogHealthy ? (int) ($catalog->saved_city_count ?? 0) : 0,
+                'available_city_names_sample' => $cities->take(30)->map(fn ($city) => $city->name)->values()->all(),
             ]);
             return null;
         }

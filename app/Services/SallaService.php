@@ -662,7 +662,7 @@ class SallaService
             $grantedScopes = $channel->metadata['scopes'] ?? null;
             if (is_string($grantedScopes) && trim($grantedScopes) !== '') {
                 $granted = preg_split('/[\s,]+/', trim($grantedScopes)) ?: [];
-                if (!in_array('metadata.read', $granted, true)) {
+                if (!array_intersect(['metadata.read', 'metadata.read_write'], $granted)) {
                     throw new \RuntimeException('Salla authorization is missing metadata.read. Reconnect the store with this permission granted.');
                 }
             }

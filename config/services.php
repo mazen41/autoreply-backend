@@ -47,6 +47,7 @@ return [
         'redirect_uri' => env('SALLA_REDIRECT_URI'),
         'webhook_secret' => env('SALLA_WEBHOOK_SECRET'),
         'api_base_url' => env('SALLA_API_BASE_URL', 'https://api.salla.dev'),
+        'city_catalog_countries' => array_filter(array_map('trim', explode(',', env('SALLA_CITY_CATALOG_COUNTRIES', 'SA')))),
     ],
 
     'shopify' => [

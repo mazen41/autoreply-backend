@@ -57,6 +57,19 @@ class SallaOrderPayloadPhoneTest extends TestCase
             'updated_at' => now(),
         ]);
 
+        foreach (['EG' => 1, 'SA' => 1] as $countryCode => $count) {
+            \App\Models\SallaCityCatalogSync::updateOrCreate(
+                ['channel_id' => $channel->id, 'country_code' => $countryCode],
+                [
+                    'status' => 'succeeded',
+                    'pages_completed' => 1,
+                    'expected_city_count' => $count,
+                    'saved_city_count' => $count,
+                    'last_successful_sync_at' => now(),
+                ]
+            );
+        }
+
         return $channel;
     }
 
@@ -251,5 +264,69 @@ class SallaOrderPayloadPhoneTest extends TestCase
         $this->assertSame(['district', 'short_address', 'email'], $result['missing_fields'] ?? []);
         Http::assertSent(fn ($request) => $request->method() === 'POST'
             && str_contains($request->url(), '/admin/v2/orders'));
+    }
+
+    public function test_missing_saudi_national_address_fields_stop_before_any_order_request(): void
+    {
+        $channel = $this->channel();
+        $this->fakeSalla();
+        $state = $this->state('+966505308084');
+        foreach (['street_number', 'building_number', 'block', 'short_address', 'additional_number', 'postal_code', 'geo_coordinates'] as $field) {
+            unset($state[$field]);
+        }
+
+        $result = app(SallaService::class)->createOrderForChannel($channel, $state);
+
+        $this->assertSame('needs_fields', $result['status'] ?? null);
+        $this->assertContains('street_number', $result['missing_fields'] ?? []);
+        $this->assertContains('short_address', $result['missing_fields'] ?? []);
+        Http::assertNotSent(fn ($request) => $request->method() === 'POST'
+            && str_contains($request->url(), '/admin/v2/orders'));
+    }
+
+    public function test_order_payload_deduplicates_repeated_option_value_ids(): void
+    {
+        $channel = $this->channel();
+        $this->fakeSalla();
+        $state = $this->state('+966505308084');
+        $state['salla_options'] = ['11' => ['22', '22', 22, '23']];
+
+        app(SallaService::class)->createOrderForChannel($channel, $state);
+
+        $body = $this->sentOrderBody();
+        $this->assertSame([
+            ['id' => 11, 'value' => ['22', '23']],
+        ], $body['products'][0]['options']);
+    }
+
+    public function test_multiple_product_lines_keep_their_own_options_and_quantities(): void
+    {
+        $channel = $this->channel();
+        $this->fakeSalla();
+        $state = $this->state('+966505308084');
+        unset($state['salla_product_id'], $state['salla_options']);
+        $state['salla_line_items'] = [
+            [
+                'line_item_id' => 'line-a', 'salla_product_id' => '44563344',
+                'product_name' => 'Dress', 'quantity' => 2, 'price' => 10,
+                'options' => ['11' => ['22', '22']], 'option_titles' => ['Size: M'],
+            ],
+            [
+                'line_item_id' => 'line-b', 'salla_product_id' => '44563345',
+                'product_name' => 'Dress', 'quantity' => 1, 'price' => 15,
+                'options' => ['11' => ['23']], 'option_titles' => ['Size: S'],
+            ],
+        ];
+
+        app(SallaService::class)->createOrderForChannel($channel, $state);
+
+        $body = $this->sentOrderBody();
+        $this->assertCount(2, $body['products']);
+        $this->assertSame(44563344, $body['products'][0]['identifier']);
+        $this->assertSame(2, $body['products'][0]['quantity']);
+        $this->assertSame([['id' => 11, 'value' => ['22']],], $body['products'][0]['options']);
+        $this->assertSame(44563345, $body['products'][1]['identifier']);
+        $this->assertSame([['id' => 11, 'value' => ['23']],], $body['products'][1]['options']);
+        $this->assertSame(55.0, $body['payment']['cash_on_delivery']['amount']);
     }
 }

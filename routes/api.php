@@ -311,6 +311,9 @@ Route::middleware('auth:sanctum')->group(function () {
     Route::patch('/handoff-tasks/{taskId}/assign', [\App\Http\Controllers\Api\HandoffTaskController::class, 'assign']);
     Route::get('/inbox',                                [InboxController::class, 'index']);
     Route::get('/social-comments', [\App\Http\Controllers\Api\SocialCommentController::class, 'index']);
+    Route::post('/social-comments/{eventId}/replies', [\App\Http\Controllers\Api\SocialCommentController::class, 'reply']);
+    Route::patch('/social-comments/{eventId}/replies/{messageId}', [\App\Http\Controllers\Api\SocialCommentController::class, 'editReply']);
+    Route::patch('/social-comments/{eventId}/visibility', [\App\Http\Controllers\Api\SocialCommentController::class, 'setVisibility']);
     Route::post('/social-comments/simulate', [\App\Http\Controllers\Api\SocialCommentController::class, 'simulate']);
     Route::get('/social-comments/scenarios', [\App\Http\Controllers\Api\SocialCommentController::class, 'scenarios']);
     Route::post('/social-comments/scenarios', [\App\Http\Controllers\Api\SocialCommentController::class, 'storeScenario']);

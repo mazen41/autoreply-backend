@@ -4,6 +4,7 @@ namespace App\Jobs;
 
 use App\Models\Channel;
 use App\Models\Conversation;
+use App\Models\SallaWebhookReceipt;
 use App\Services\SallaService;
 use App\Services\SequenceTriggerService;
 use Illuminate\Bus\Queueable;
@@ -12,6 +13,7 @@ use Illuminate\Foundation\Bus\Dispatchable;
 use Illuminate\Queue\InteractsWithQueue;
 use Illuminate\Queue\SerializesModels;
 use Illuminate\Support\Facades\Log;
+use Illuminate\Support\Facades\Cache;
 
 class SallaWebhookJob implements ShouldQueue
 {
@@ -27,6 +29,52 @@ class SallaWebhookJob implements ShouldQueue
     }
 
     public function handle(): void
+    {
+        $eventIdentity = [
+            'event' => $this->event,
+            'merchant' => $this->data['merchant'] ?? $this->data['store_id'] ?? null,
+            'id' => $this->data['id'] ?? null,
+            'created_at' => $this->data['created_at'] ?? $this->data['date']['date'] ?? null,
+            'updated_at' => $this->event === 'order.status.updated' ? ($this->data['updated_at'] ?? null) : null,
+            'status' => $this->event === 'order.status.updated' ? ($this->data['status']['id'] ?? $this->data['status']['name'] ?? null) : null,
+        ];
+        if ($eventIdentity['id'] === null) {
+            $eventIdentity['data_hash'] = hash('sha256', json_encode($this->data, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES) ?: '');
+        }
+        $eventKey = hash('sha256', json_encode($eventIdentity, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES) ?: '');
+        $lock = Cache::lock('salla-webhook:' . $eventKey, 120);
+        if (!$lock->get()) {
+            throw new \RuntimeException('Salla webhook event is already being processed.');
+        }
+
+        $receipt = null;
+        try {
+            $receipt = SallaWebhookReceipt::query()->firstOrCreate(
+                ['event_key' => $eventKey],
+                ['event' => $this->event, 'status' => 'processing', 'attempts' => 1]
+            );
+            if (!$receipt->wasRecentlyCreated && $receipt->status === 'processed') {
+                Log::info('Skipping duplicate Salla webhook delivery', ['event' => $this->event]);
+                return;
+            }
+            $receipt->update([
+                'status' => 'processing',
+                'attempts' => (int) $receipt->attempts + ($receipt->wasRecentlyCreated ? 0 : 1),
+            ]);
+
+            $this->processEvent();
+            $receipt->update(['status' => 'processed', 'processed_at' => now()]);
+        } catch (\Throwable $exception) {
+            if ($receipt) {
+                $receipt->update(['status' => 'failed']);
+            }
+            throw $exception;
+        } finally {
+            $lock->release();
+        }
+    }
+
+    protected function processEvent(): void
     {
         Log::info('Processing Salla webhook event', [
             'event' => $this->event,
@@ -62,6 +110,10 @@ class SallaWebhookJob implements ShouldQueue
         if (!$channel) {
             Log::error('Salla channel not found for merchant', ['merchant_id' => $merchantId]);
             return;
+        }
+
+        if ($this->event === 'order.created') {
+            $this->reconcilePendingOrderAttempt($channel, $this->data);
         }
 
         // Handle different event types
@@ -110,6 +162,114 @@ class SallaWebhookJob implements ShouldQueue
         }
     }
 
+    /**
+     * Match a provider-created order to an ambiguous local submission only when
+     * the merchant, customer phone, product, and checkout state identify one
+     * candidate. Ambiguous events are intentionally left unresolved.
+     */
+    protected function reconcilePendingOrderAttempt(Channel $channel, array $data): void
+    {
+        $orderId = $data['id'] ?? null;
+        if (!$orderId) {
+            return;
+        }
+
+        $customerPhone = $data['customer']['mobile']
+            ?? $data['customer']['phone']
+            ?? $data['receiver']['phone']
+            ?? null;
+        $normalizedPhone = preg_replace('/\\D+/', '', (string) $customerPhone);
+        if ($normalizedPhone === '') {
+            Log::warning('Salla order.created could not reconcile an order attempt: customer phone missing', [
+                'channel_id' => $channel->id,
+                'order_id' => (string) $orderId,
+            ]);
+            return;
+        }
+
+        $productIds = [];
+        foreach (($data['items'] ?? $data['products'] ?? $data['order_products'] ?? []) as $item) {
+            // `items[].id` is often the order-line ID, not the catalog product.
+            $productId = $item['product']['id'] ?? $item['product_id'] ?? null;
+            if ($productId !== null && is_scalar($productId)) {
+                $productIds[] = (string) $productId;
+            }
+        }
+        $productIds = array_values(array_unique($productIds));
+        if ($productIds === []) {
+            Log::warning('Salla order.created could not reconcile an order attempt: product identity missing', [
+                'channel_id' => $channel->id,
+                'order_id' => (string) $orderId,
+            ]);
+            return;
+        }
+
+        $candidates = [];
+        $attempts = \App\Models\CommerceOrderAttempt::query()
+            ->where('connection_id', $channel->id)
+            ->where('provider', 'salla')
+            ->whereIn('status', ['submitting', 'unknown'])
+            ->where('created_at', '>=', now()->subHours(72))
+            ->orderByDesc('id')
+            ->limit(50)
+            ->get();
+
+        foreach ($attempts as $attempt) {
+            $conversation = Conversation::query()->find($attempt->conversation_id);
+            $state = is_array($conversation?->checkout_state) ? $conversation->checkout_state : [];
+            if (!$conversation || ($state['confirmation_state'] ?? null) !== 'confirmed') {
+                continue;
+            }
+
+            $statePhone = preg_replace('/\\D+/', '', (string) ($state['phone'] ?? $state['customer_phone'] ?? ''));
+            $stateProductIds = array_values(array_unique(array_filter(array_map(
+                static fn (array $item): string => (string) ($item['salla_product_id'] ?? $item['product_id'] ?? ''),
+                is_array($state['salla_line_items'] ?? null) ? $state['salla_line_items'] : []
+            ))));
+            if ($stateProductIds === []) {
+                $singleProductId = (string) ($state['salla_product_id'] ?? $state['commerce_external_id'] ?? '');
+                $stateProductIds = $singleProductId !== '' ? [$singleProductId] : [];
+            }
+            $productsMatch = $stateProductIds !== []
+                && array_diff($stateProductIds, $productIds) === []
+                && array_diff($productIds, $stateProductIds) === [];
+            if ($statePhone === $normalizedPhone && $productsMatch) {
+                $candidates[] = [$attempt, $conversation, $state];
+            }
+        }
+
+        if (count($candidates) !== 1) {
+            Log::warning('Salla order.created reconciliation was not unique; attempt remains unresolved', [
+                'channel_id' => $channel->id,
+                'order_id' => (string) $orderId,
+                'candidate_count' => count($candidates),
+            ]);
+            return;
+        }
+
+        [$attempt, $conversation, $state] = $candidates[0];
+        $attempt->update([
+            'status' => 'completed',
+            'external_order_id' => (string) $orderId,
+            'order_number' => (string) ($data['reference_id'] ?? $orderId),
+        ]);
+        $state['status'] = 'completed';
+        $state['order_id'] = (string) $orderId;
+        $state['order_number'] = (string) ($data['reference_id'] ?? $orderId);
+        $state['order_fingerprint'] = $attempt->checkout_fingerprint;
+        $state['order_product_id'] = (string) ($state['salla_product_id'] ?? $state['commerce_external_id'] ?? '');
+        $state['order_connection_id'] = (string) $channel->id;
+        $state['confirmation_state'] = 'completed';
+        $conversation->update(['checkout_state' => $state]);
+
+        Log::info('Reconciled Salla order.created event with an ambiguous submission', [
+            'channel_id' => $channel->id,
+            'conversation_id' => $conversation->id,
+            'attempt_id' => $attempt->id,
+            'order_id' => (string) $orderId,
+        ]);
+    }
+
     protected function handleOrderCreated(Channel $channel, array $data): void
     {
         Log::info('Salla order created', [
@@ -155,7 +315,7 @@ class SallaWebhookJob implements ShouldQueue
             }
 
             // Trigger sequences with order-based triggers
-            $sequenceTriggerService = new SequenceTriggerService();
+            $sequenceTriggerService = app(SequenceTriggerService::class);
             $sequenceTriggerService->checkAndEnrollForOrderCreated($conversation, $data);
         }
 

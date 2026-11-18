@@ -59,7 +59,7 @@ class SocialCommentRuleEvaluator
                 $sawInvalidRule = true;
                 continue;
             }
-            $matchedKeywords = $this->matchingKeywords($keywords, $normalizedComment, $mode);
+            $matchedKeywords = $this->matchingKeywords($keywords, $normalizedComment, $mode, true);
             if ($matchedKeywords === []) {
                 continue;
             }
@@ -132,11 +132,15 @@ class SocialCommentRuleEvaluator
     }
 
     /** @return list<string> */
-    private function matchingKeywords(array $keywords, string $normalizedComment, string $mode): array
+    private function matchingKeywords(array $keywords, string $normalizedComment, string $mode, bool $allowWildcard = false): array
     {
         $matches = [];
         foreach ($keywords as $keyword) {
             if (!is_string($keyword) || trim($keyword) === '') continue;
+            if ($allowWildcard && trim($keyword) === '*') {
+                $matches[] = $keyword;
+                continue;
+            }
             $normalizedKeyword = self::normalize($keyword);
             if ($normalizedKeyword === '') continue;
 

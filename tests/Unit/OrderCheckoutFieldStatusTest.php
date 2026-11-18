@@ -8,18 +8,15 @@ use PHPUnit\Framework\TestCase;
 
 /**
  * Regression tests for the Salla checkout fix:
- *  - National-address extras (postal code, building number, block,
- *    coordinates, district, short address, additional number) must NOT be
- *    universally mandatory; only full_name/phone/address are, unless Salla's
- *    own API has actually told us (via $sallaRequiredFields) that a specific
- *    extra field is required for this store.
+ *  - Saudi Salla checkouts collect the National Address fields before showing
+ *    the final order confirmation; no address detail is fabricated.
  *  - PO Box must be captured as its own field, never as building_number.
  *  - Saudi city ("Hofuf") and postal code must be recognised from a single
  *    free-form message without extra prompting.
  */
 class OrderCheckoutFieldStatusTest extends TestCase
 {
-    public function test_salla_checkout_does_not_require_national_address_extras_by_default(): void
+    public function test_saudi_salla_checkout_requires_national_address_details(): void
     {
         $service = new OrderCheckoutService();
 
@@ -29,11 +26,10 @@ class OrderCheckoutFieldStatusTest extends TestCase
             'address' => 'Ghaali Mitri, Hofuf, Saudi Arabia',
         ], true);
 
-        $this->assertTrue($status['is_complete']);
-        $this->assertSame([], $status['missing_fields']);
-        $this->assertNotContains('geo_coordinates', $status['required_fields']);
-        $this->assertNotContains('short_address', $status['required_fields']);
-        $this->assertNotContains('district', $status['required_fields']);
+        $this->assertFalse($status['is_complete']);
+        $this->assertContains('street_number', $status['missing_fields']);
+        $this->assertContains('short_address', $status['missing_fields']);
+        $this->assertContains('geo_coordinates', $status['missing_fields']);
     }
 
     public function test_salla_reported_required_fields_are_honoured_once_known(): void
@@ -47,7 +43,10 @@ class OrderCheckoutFieldStatusTest extends TestCase
         ], true, ['postal_code', 'district']);
 
         $this->assertFalse($status['is_complete']);
-        $this->assertSame(['postal_code', 'district'], $status['missing_fields']);
+        $this->assertSame([
+            'postal_code', 'district', 'delivery_city', 'street_number', 'building_number',
+            'block', 'short_address', 'additional_number', 'geo_coordinates',
+        ], $status['missing_fields']);
     }
 
     public function test_po_box_is_extracted_as_its_own_field_not_building_number(): void

@@ -12,6 +12,7 @@ use App\Services\ActiveBusiness;
 use App\Services\EcommerceChannelResolver;
 use App\Services\SocialCommentRuleEvaluator;
 use Illuminate\Http\Request;
+use Illuminate\Support\Facades\DB;
 
 class SocialCommentController extends Controller
 {
@@ -308,9 +309,12 @@ class SocialCommentController extends Controller
                 // Expose operational codes, never internal exception paths or raw exception text.
                 $event->setAttribute('failure_reason', $event->failure_code);
                 $event->setAttribute('decision_trace', $trace);
+                $event->setAttribute('is_hidden', (bool) data_get($event->payload, 'moderation.hidden', false));
                 $event->setAttribute('reply', $reply ? [
+                    'id' => $reply->id,
                     'content' => $reply->content,
                     'source' => $reply->source,
+                    'is_ai' => (bool) $reply->is_ai,
                     'created_at' => $reply->created_at,
                 ] : null);
                 return $event;
@@ -335,6 +339,128 @@ class SocialCommentController extends Controller
                     + (int) ($statusCounts['scheduled'] ?? 0) + (int) ($statusCounts['failed'] ?? 0) + (int) ($statusCounts['retryable'] ?? 0),
             ],
         ]);
+    }
+
+    public function reply(Request $request, ActiveBusiness $activeBusiness, int $eventId)
+    {
+        $business = $activeBusiness->resolve($request, permission: 'conversation_write');
+        $input = $request->validate(['message' => ['required', 'string', 'max:500']]);
+        $event = SocialCommentEvent::query()->where('business_id', $business->id)->findOrFail($eventId);
+        $channel = Channel::query()->where('business_id', $business->id)->findOrFail($event->channel_id);
+        $this->assertEventChannel($event, $channel);
+
+        $inbound = Message::query()->where('source', 'social_comment')
+            ->where('metadata->social_comment_event_id', $event->id)->oldest('id')->first();
+        if (!$inbound) {
+            return response()->json(['message' => 'This comment is still being prepared. Refresh and try again shortly.'], 409);
+        }
+
+        $result = app(\App\Services\MetaCommentAutomationService::class)->publishManualPublic($event, $channel, trim($input['message']));
+        if (empty($result['success'])) {
+            return $this->metaActionFailure($result);
+        }
+
+        DB::transaction(function () use ($event, $inbound, $input, $result): void {
+            Message::create([
+                'conversation_id' => $inbound->conversation_id,
+                'channel_id' => $event->channel_id,
+                'platform_message_id' => $result['reply_id'] ?? null,
+                'content' => trim($input['message']),
+                'direction' => 'outbound', 'type' => 'text', 'status' => 'sent',
+                'send_status' => 'sent', 'delivery_status' => 'sent', 'source' => 'comment_public_reply',
+                'is_ai' => false,
+                'metadata' => ['social_comment_event_id' => $event->id, 'public_reply_id' => $result['reply_id'] ?? null, 'manual' => true],
+            ]);
+            $trace = (array) data_get($event->payload, 'decision_trace', []);
+            $manualReplies = (array) data_get($event->payload, 'manual_public_replies', []);
+            $manualReplies[] = ['reply_id' => $result['reply_id'] ?? null, 'sent_at' => now()->toIso8601String()];
+            $event->forceFill([
+                'status' => 'processed', 'failure_code' => null, 'processed_at' => now(),
+                'payload' => array_merge((array) $event->payload, [
+                    'manual_public_replies' => $manualReplies,
+                    'decision_trace' => array_merge($trace, ['manual_reply_sent_at' => now()->toIso8601String(), 'final_status' => 'processed']),
+                ]),
+            ])->save();
+        });
+
+        return response()->json(['success' => true, 'reply_id' => $result['reply_id'] ?? null]);
+    }
+
+    public function editReply(Request $request, ActiveBusiness $activeBusiness, int $eventId, int $messageId)
+    {
+        $business = $activeBusiness->resolve($request, permission: 'conversation_write');
+        $input = $request->validate(['message' => ['required', 'string', 'max:500']]);
+        $event = SocialCommentEvent::query()->where('business_id', $business->id)->findOrFail($eventId);
+        $channel = Channel::query()->where('business_id', $business->id)->findOrFail($event->channel_id);
+        $this->assertEventChannel($event, $channel);
+        if ($event->platform !== 'facebook') {
+            return response()->json(['message' => 'Meta does not expose comment-reply editing for Instagram through this API. You can send a corrected follow-up reply instead.'], 422);
+        }
+
+        $message = Message::query()->where('id', $messageId)->where('source', 'comment_public_reply')
+            ->where('is_ai', true)->where('metadata->social_comment_event_id', $event->id)->firstOrFail();
+        $replyId = data_get($message->metadata, 'public_reply_id') ?: $message->platform_message_id;
+        if (!$replyId) {
+            return response()->json(['message' => 'The platform reply ID is unavailable, so this reply cannot be edited.'], 409);
+        }
+
+        $result = app(\App\Services\MetaCommentAutomationService::class)->editFacebookReply($event, $channel, (string) $replyId, trim($input['message']));
+        if (empty($result['success'])) {
+            return $this->metaActionFailure($result);
+        }
+
+        $message->forceFill(['content' => trim($input['message']), 'metadata' => array_merge((array) $message->metadata, ['edited_at' => now()->toIso8601String()])])->save();
+
+        return response()->json(['success' => true]);
+    }
+
+    public function setVisibility(Request $request, ActiveBusiness $activeBusiness, int $eventId)
+    {
+        $business = $activeBusiness->resolve($request, permission: 'conversation_write');
+        $input = $request->validate(['hidden' => ['required', 'boolean']]);
+        $event = SocialCommentEvent::query()->where('business_id', $business->id)->findOrFail($eventId);
+        $channel = Channel::query()->where('business_id', $business->id)->findOrFail($event->channel_id);
+        $this->assertEventChannel($event, $channel);
+
+        $result = app(\App\Services\MetaCommentAutomationService::class)->setCommentHidden($event, $channel, (bool) $input['hidden']);
+        if (empty($result['success'])) {
+            return $this->metaActionFailure($result);
+        }
+
+        $payload = (array) $event->payload;
+        $moderation = (array) ($payload['moderation'] ?? []);
+        $moderation['hidden'] = (bool) $input['hidden'];
+        $moderation['updated_at'] = now()->toIso8601String();
+        $event->forceFill(['payload' => array_merge($payload, ['moderation' => $moderation])])->save();
+
+        return response()->json(['success' => true, 'hidden' => (bool) $input['hidden']]);
+    }
+
+    private function assertEventChannel(SocialCommentEvent $event, Channel $channel): void
+    {
+        $expectedAccountId = $event->platform === 'facebook' ? $channel->page_id : $channel->instagram_account_id;
+        abort_unless(
+            in_array($event->platform, ['facebook', 'instagram'], true)
+            && $channel->type === $event->platform
+            && $event->account_id === $expectedAccountId,
+            422,
+            'The comment and connected social account do not match.'
+        );
+    }
+
+    private function metaActionFailure(array $result)
+    {
+        if (($result['error_code'] ?? null) === 'platform_edit_unsupported') {
+            return response()->json(['message' => 'This action is not supported for this platform.'], 422);
+        }
+        if (($result['error_code'] ?? null) === 'account_disconnected') {
+            return response()->json(['message' => 'Reconnect this social account, then try again.'], 422);
+        }
+        $code = (string) ($result['error_code'] ?? 'unknown');
+        return response()->json([
+            'message' => 'Meta rejected this comment action. Check that the connected account has comment-management access and that the app has the required permission.',
+            'provider_error_code' => $code,
+        ], !empty($result['retryable']) ? 503 : 422);
     }
 
     private function decodeSettings(mixed $value): array

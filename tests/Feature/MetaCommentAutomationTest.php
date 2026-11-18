@@ -5,10 +5,13 @@ namespace Tests\Feature;
 use App\Models\Bot;
 use App\Models\BusinessProfile;
 use App\Models\Channel;
+use App\Models\Conversation;
+use App\Models\Message;
 use App\Models\SocialCommentEvent;
 use App\Models\User;
 use App\Jobs\ProcessSocialCommentEvent;
 use App\Services\MetaCommentAutomationService;
+use App\Services\SocialCommentRuleEvaluator;
 use Illuminate\Foundation\Testing\RefreshDatabase;
 use Illuminate\Support\Facades\Http;
 use Illuminate\Support\Facades\Queue;
@@ -213,6 +216,83 @@ class MetaCommentAutomationTest extends TestCase
         ])->assertOk()->assertJsonPath('channels.0.enabled', true);
 
         $this->assertDatabaseHas('bot_channels', ['bot_id' => $bot->id, 'channel_id' => $channel->id, 'comment_automation_enabled' => 1]);
+    }
+
+    public function test_wildcard_legacy_trigger_matches_any_comment_but_exclusions_still_apply(): void
+    {
+        $evaluator = app(SocialCommentRuleEvaluator::class);
+        $settings = ['trigger_keywords' => ['*'], 'excluded_keywords' => ['spam']];
+
+        $this->assertTrue($evaluator->evaluate($settings, 'Hi there')['matched']);
+        $blocked = $evaluator->evaluate($settings, 'This is spam');
+        $this->assertFalse($blocked['matched']);
+        $this->assertSame('excluded_keyword', $blocked['reason']);
+    }
+
+    public function test_agent_can_publish_a_manual_public_reply_from_comments_inbox(): void
+    {
+        Http::fake(['graph.facebook.com/*' => Http::response(['id' => 'manual-reply-1'], 200)]);
+        $user = User::factory()->create();
+        $business = BusinessProfile::factory()->create(['user_id' => $user->id]);
+        $user->forceFill(['business_id' => $business->id])->save();
+        $channel = Channel::factory()->create([
+            'user_id' => $user->id, 'business_id' => $business->id, 'type' => 'facebook',
+            'page_id' => 'manual-reply-page', 'access_token' => 'test-token', 'status' => 'connected',
+        ]);
+        $event = $this->commentEvent($channel, $business, 'facebook', 'manual-reply-comment');
+        $conversation = Conversation::create([
+            'business_id' => $business->id, 'channel_id' => $channel->id,
+            'sender_id' => 'manual-commenter', 'status' => 'open', 'last_message_at' => now(),
+        ]);
+        Message::create([
+            'conversation_id' => $conversation->id, 'content' => 'Question?', 'direction' => 'inbound',
+            'type' => 'text', 'status' => 'received', 'source' => 'social_comment',
+            'metadata' => ['social_comment_event_id' => $event->id],
+        ]);
+        Sanctum::actingAs($user);
+
+        $this->withHeader('X-Business-Id', (string) $business->id)
+            ->postJson("/api/social-comments/{$event->id}/replies", ['message' => 'Thanks for asking!'])
+            ->assertOk()->assertJsonPath('reply_id', 'manual-reply-1');
+
+        $this->assertDatabaseHas('messages', [
+            'conversation_id' => $conversation->id, 'content' => 'Thanks for asking!',
+            'source' => 'comment_public_reply', 'is_ai' => 0, 'platform_message_id' => 'manual-reply-1',
+        ]);
+        $this->assertSame('processed', $event->fresh()->status);
+        Http::assertSent(fn ($request) => str_contains($request->url(), '/manual-reply-comment/comments')
+            && $request['message'] === 'Thanks for asking!');
+    }
+
+    public function test_agent_can_edit_an_ai_facebook_public_reply(): void
+    {
+        Http::fake(['graph.facebook.com/*' => Http::response(['success' => true], 200)]);
+        $user = User::factory()->create();
+        $business = BusinessProfile::factory()->create(['user_id' => $user->id]);
+        $user->forceFill(['business_id' => $business->id])->save();
+        $channel = Channel::factory()->create([
+            'user_id' => $user->id, 'business_id' => $business->id, 'type' => 'facebook',
+            'page_id' => 'edit-reply-page', 'access_token' => 'test-token', 'status' => 'connected',
+        ]);
+        $event = $this->commentEvent($channel, $business, 'facebook', 'edit-reply-comment');
+        $conversation = Conversation::create([
+            'business_id' => $business->id, 'channel_id' => $channel->id,
+            'sender_id' => 'edit-commenter', 'status' => 'open', 'last_message_at' => now(),
+        ]);
+        $reply = Message::create([
+            'conversation_id' => $conversation->id, 'content' => 'Old answer', 'direction' => 'outbound',
+            'type' => 'text', 'status' => 'sent', 'send_status' => 'sent', 'source' => 'comment_public_reply',
+            'is_ai' => true, 'metadata' => ['social_comment_event_id' => $event->id, 'public_reply_id' => 'owned-reply-1'],
+        ]);
+        Sanctum::actingAs($user);
+
+        $this->withHeader('X-Business-Id', (string) $business->id)
+            ->patchJson("/api/social-comments/{$event->id}/replies/{$reply->id}", ['message' => 'Corrected answer'])
+            ->assertOk()->assertJsonPath('success', true);
+
+        $this->assertSame('Corrected answer', $reply->fresh()->content);
+        Http::assertSent(fn ($request) => str_ends_with($request->url(), '/owned-reply-1')
+            && $request['message'] === 'Corrected answer');
     }
 
     public function test_structured_comment_rules_round_trip_through_settings_api(): void

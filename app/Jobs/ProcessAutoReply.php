@@ -1673,16 +1673,19 @@ class ProcessAutoReply implements ShouldQueue
                     (string) $updatedCheckoutState['salla_product_id']
                 );
                 $savedSelections = (array) ($updatedCheckoutState['salla_options'] ?? []);
-                $savedTitles = (array) ($updatedCheckoutState['salla_option_titles'] ?? []);
+                // Titles are derived from the canonical option-ID map below.
+                // Carrying a legacy numeric title list forward caused each
+                // extraction pass to append another copy of size/color.
+                $savedTitles = [];
                 $selectingSallaOption = ($updatedCheckoutState['confirmation_state'] ?? null) === 'selecting_salla_option';
 
                 foreach ($sallaProductOptions as $option) {
                     $optionId = (string) $option['id'];
                     $values = $option['values'];
-                    $selectedIds = array_values(array_intersect(
+                    $selectedIds = array_values(array_unique(array_intersect(
                         array_map('strval', (array) ($savedSelections[$optionId] ?? [])),
                         array_column($values, 'id')
-                    ));
+                    )));
 
                     if ($selectedIds === [] && count($values) === 1) {
                         $selectedIds = [(string) $values[0]['id']];
@@ -1731,6 +1734,20 @@ class ProcessAutoReply implements ShouldQueue
             }
         }
 
+        if ($commerceChannel?->type === 'salla'
+            && !empty($updatedCheckoutState['address'])
+            && \App\Helpers\SallaPhoneHelper::getCountryCode((string) ($updatedCheckoutState['phone'] ?? '')) === 'SA') {
+            $resolvedShipping = (new SallaService())->resolveShippingAddressForChannel(
+                $commerceChannel,
+                (string) $updatedCheckoutState['address'],
+                (string) ($updatedCheckoutState['phone'] ?? '')
+            );
+            if ($resolvedShipping && !empty($resolvedShipping['city_id'])) {
+                $updatedCheckoutState['delivery_city'] = (string) $resolvedShipping['city_id'];
+            } else {
+                unset($updatedCheckoutState['delivery_city']);
+            }
+        }
         $checkoutState = $updatedCheckoutState;
         $fieldStatus = $checkoutService->computeFieldStatus(
             $updatedCheckoutState,
@@ -2276,6 +2293,9 @@ if (!$isProductBrowseMessage && $commerceChannel && !$summaryConfirmTurn) {
                 'postal_code' => 'الرمز البريدي',
                 'geo_coordinates' => 'عنوان التوصيل المكتوب كاملًا مع الشارع ورقم المبنى والحي والرمز البريدي',
                 'building_number' => 'رقم المبنى',
+                'street_number' => 'رقم الشارع',
+                'address_line' => 'اسم الشارع وعنوان التوصيل',
+                'delivery_city' => 'مدينة توصيل يدعمها المتجر',
                 'short_address' => 'العنوان الوطني المختصر',
                 'additional_number' => 'الرقم الإضافي',
             ] : [
@@ -2286,6 +2306,9 @@ if (!$isProductBrowseMessage && $commerceChannel && !$summaryConfirmTurn) {
                 'postal_code' => 'postal / ZIP code',
                 'geo_coordinates' => 'complete written delivery address with street, building number, district, and postal code',
                 'building_number' => 'building or house number',
+                'street_number' => 'street number',
+                'address_line' => 'street and delivery address line',
+                'delivery_city' => 'a delivery city supported by the store',
                 'short_address' => 'short / national address code',
                 'additional_number' => 'additional address number',
             ];
@@ -2805,16 +2828,22 @@ $aiResponse = $intro
             ]);
 
                 // Normalise checkout_state keys to what SallaService expects
+                $primaryLineItem = is_array($checkoutState['salla_line_items'][0] ?? null) ? $checkoutState['salla_line_items'][0] : [];
+                $primaryProductId = $checkoutState['salla_product_id']
+                    ?? $primaryLineItem['salla_product_id']
+                    ?? $primaryLineItem['product_id']
+                    ?? null;
                 $orderInput = [
-                    'salla_product_id' => $checkoutState['salla_product_id'],
-                    'commerce_external_id' => $checkoutState['commerce_external_id'] ?? $checkoutState['salla_product_id'],
+                    'salla_product_id' => $primaryProductId,
+                    'commerce_external_id' => $checkoutState['commerce_external_id'] ?? $primaryProductId,
                     'commerce_channel_id' => $commerceChannel->id,
-                    'product_name'     => $checkoutState['product_name']     ?? null,
+                    'product_name'     => $checkoutState['product_name'] ?? $primaryLineItem['product_name'] ?? $primaryLineItem['name'] ?? null,
                     'product_price'    => $checkoutState['product_price']    ?? 0,
                     'commerce_variant_id' => $checkoutState['commerce_variant_id'] ?? null,
                     'commerce_variant_title' => $checkoutState['commerce_variant_title'] ?? null,
                     'salla_options' => $checkoutState['salla_options'] ?? [],
                     'salla_option_titles' => $checkoutState['salla_option_titles'] ?? [],
+                    'salla_line_items' => $checkoutState['salla_line_items'] ?? [],
                     'full_name'        => $checkoutState['full_name']         ?? $checkoutState['customer_name']    ?? null,
                     'phone'            => $checkoutState['customer_phone']    ?? $checkoutState['phone']             ?? '',
                     'address'          => $checkoutState['address']           ?? $checkoutState['customer_address'] ?? '',
@@ -2823,6 +2852,7 @@ $aiResponse = $intro
                     'geo_coordinates'  => $checkoutState['geo_coordinates']     ?? null,
                     'building_number'  => $checkoutState['building_number']     ?? null,
                     'street_number'    => $checkoutState['street_number']       ?? null,
+                    'address_line'     => $checkoutState['address_line']        ?? null,
                     'block'            => $checkoutState['block']               ?? null,
                     'district'         => $checkoutState['district']            ?? null,
                     'short_address'    => $checkoutState['short_address']       ?? null,
@@ -2911,6 +2941,9 @@ $aiResponse = $intro
                         'email' => 'email address',
                         'postal_code' => 'postal code',
                         'building_number' => 'building or house number',
+                        'street_number' => 'street number',
+                        'address_line' => 'street and delivery address line',
+                        'delivery_city' => 'a delivery city supported by the store',
                         'block' => 'block or floor (for example, a block name or floor number)',
                         'district' => 'district/neighborhood',
                         'geo_coordinates' => 'clear delivery city/address details so I can look up its location',
@@ -2940,10 +2973,18 @@ $aiResponse = $intro
                     ]);
                 } else {
                     // ❌ FAILURE — Salla API returned no order ID or threw an exception
+                    $attemptFingerprint = $this->orderFingerprint($orderInput);
+                    $latestAttempt = \App\Models\CommerceOrderAttempt::query()
+                        ->where('conversation_id', $conversation->id)
+                        ->where('connection_id', $commerceChannel?->id)
+                        ->where('checkout_fingerprint', $attemptFingerprint)
+                        ->latest('id')
+                        ->first();
+                    $providerOutcomeUnknown = in_array($latestAttempt?->status, ['submitting', 'unknown'], true);
                     Log::error('ProcessAutoReply: commerce order creation returned no order ID — sending honest failure reply', [
                         'conversation_id' => $conversation->id,
                         'provider' => $commerceChannel?->type,
-                        'order_data'      => $orderData,
+                        'attempt_status' => $latestAttempt?->status,
                     ]);
 
                     $conversation->update([
@@ -2959,7 +3000,11 @@ $aiResponse = $intro
                         'high'
                     );
 
-                    if ($detectedLanguage === 'arabic') {
+                    if ($providerOutcomeUnknown && $detectedLanguage === 'arabic') {
+                        $aiResponse = "تعذر علينا التأكد مما إذا كان المتجر قد قبل الطلب. حفظنا بياناتك ليتحقق منها الفريق، فضلاً لا تعِد إرسال الطلب حتى نؤكد لك النتيجة.";
+                    } elseif ($providerOutcomeUnknown) {
+                        $aiResponse = "I couldn't verify whether the store accepted the order. I've saved your checkout for the team to verify. Please don't submit it again until we confirm the result.";
+                    } elseif ($detectedLanguage === 'arabic') {
                         $aiResponse = "عذراً، واجهنا مشكلة تقنية في إتمام طلبك الآن 😔\n" .
                             "سيتواصل معك أحد فريقنا قريباً لإتمام الطلب يدوياً. نعتذر عن الإزعاج.";
                     } else {
@@ -2968,7 +3013,11 @@ $aiResponse = $intro
                     }
 
                     $failedAttempts = (int) ($updatedCheckoutState['failed_order_attempts'] ?? 0) + 1;
-                    if ($failedAttempts >= 2) {
+                    if ($providerOutcomeUnknown) {
+                        $updatedCheckoutState['confirmation_state'] = 'provider_outcome_unknown';
+                        $updatedCheckoutState['provider_attempt_status'] = $latestAttempt?->status;
+                        $conversation->update(['checkout_state' => $updatedCheckoutState]);
+                    } elseif ($failedAttempts >= 2) {
                         $conversation->update([
                             'checkout_state' => null,
                             'requires_human' => true,
@@ -3010,6 +3059,9 @@ $aiResponse = $intro
                 'postal_code' => 'postal code',
                 'geo_coordinates' => 'a clear delivery city so its location can be looked up automatically',
                 'building_number' => 'building number',
+                'street_number' => 'street number',
+                'address_line' => 'street and delivery address line',
+                'delivery_city' => 'delivery city supported by the store',
                 'block' => 'block or floor (for example, a block name or floor number)',
                 'district' => 'district/neighborhood',
                 'short_address' => 'short / national address code',
@@ -4249,6 +4301,21 @@ $aiResponse = $intro
             // summary message ID distinguishes a later, intentional checkout
             // of the same product/customer from a retry of this checkout.
             $checkoutFingerprint = $this->orderFingerprint($checkoutState);
+            $unresolvedAttempt = \App\Models\CommerceOrderAttempt::query()
+                ->where('conversation_id', $conversation->id)
+                ->where('connection_id', $commerceChannel->id)
+                ->where('checkout_fingerprint', $checkoutFingerprint)
+                ->whereIn('status', ['submitting', 'unknown'])
+                ->latest('id')
+                ->first();
+            if ($unresolvedAttempt) {
+                Log::warning('ProcessAutoReply: suppressing duplicate order because a matching provider attempt is unresolved', [
+                    'conversation_id' => $conversation->id,
+                    'attempt_id' => $unresolvedAttempt->id,
+                    'attempt_status' => $unresolvedAttempt->status,
+                ]);
+                return null;
+            }
             $summaryMessageId = (string) ($checkoutState['confirmation_summary_message_id']
                 ?? $currentState['confirmation_summary_message_id']
                 ?? '');
@@ -4290,17 +4357,9 @@ $aiResponse = $intro
                 ];
             }
 
-            if (!$attempt->wasRecentlyCreated && $attempt->status === 'pending') {
-                Log::warning('ProcessAutoReply: commerce order attempt is unresolved; suppressing duplicate provider request', [
-                    'conversation_id' => $conversation->id,
-                    'connection_id' => $commerceChannel->id,
-                    'attempt_id' => $attempt->id,
-                    'attempt_status' => $attempt->status,
-                    'provider_request_sent' => false,
-                ]);
-                return null;
-            }
-
+            // `pending` means the process recorded intent but had not yet
+            // started the provider request; it is safe to resume under the
+            // per-conversation lock. `submitting`/`unknown` remain fail-closed.
             if ($attempt->status === 'failed') {
                 $attempt->update(['status' => 'pending', 'external_order_id' => null, 'order_number' => null]);
             }
@@ -4311,6 +4370,7 @@ $aiResponse = $intro
 
             if ($sallaChannel) {
                 try {
+                    $attempt->update(['status' => 'submitting']);
                     Log::info('ProcessAutoReply: sending order request to Salla', [
                         'conversation_id' => $conversation->id,
                         'connection_id' => $sallaChannel->id,
@@ -4346,7 +4406,10 @@ $aiResponse = $intro
                         ];
                     }
 
-                    $externalOrderId = (string)($sallaRes['data']['reference_id'] ?? $sallaRes['data']['id'] ?? $sallaRes['id'] ?? null);
+                    // The provider's immutable API ID is the canonical order
+                    // identity. reference_id is the merchant-facing number.
+                    $externalOrderId = (string)($sallaRes['data']['id'] ?? $sallaRes['id'] ?? $sallaRes['data']['reference_id'] ?? null);
+                    $externalOrderNumber = (string) ($sallaRes['data']['reference_id'] ?? $externalOrderId);
                     if ($externalOrderId) {
                         $externalSource = 'salla';
                         Log::info('ProcessAutoReply: Salla order created successfully via API', [
@@ -4354,6 +4417,7 @@ $aiResponse = $intro
                             'salla_order_id'  => $externalOrderId,
                         ]);
                     } else {
+                        $attempt->update(['status' => 'unknown']);
                         Log::error('SALLA_ORDER_CREATION_FAILED', [
                             'conversation_id' => $conversation->id,
                             'channel_id'      => $sallaChannel->id,
@@ -4362,6 +4426,20 @@ $aiResponse = $intro
                         return null;
                     }
                 } catch (\Exception $e) {
+                    // The order.created webhook can arrive while the POST is
+                    // still waiting or after the connection timed out. If it
+                    // already reconciled this attempt, trust the persisted
+                    // provider order ID and continue the normal success path.
+                    $reconciledAttempt = $attempt->fresh();
+                    if ($reconciledAttempt?->status === 'completed' && $reconciledAttempt->external_order_id) {
+                        $externalOrderId = (string) $reconciledAttempt->external_order_id;
+                        $externalOrderNumber = (string) ($reconciledAttempt->order_number ?: $externalOrderId);
+                        $externalSource = 'salla';
+                        Log::info('ProcessAutoReply: Salla webhook reconciled order after submission exception', [
+                            'conversation_id' => $conversation->id,
+                            'attempt_id' => $attempt->id,
+                        ]);
+                    } else {
                     // A provider HTTP response confirms rejection. Network
                     // failures stay pending because the provider may have
                     // accepted the request before the connection dropped.
@@ -4369,12 +4447,15 @@ $aiResponse = $intro
                         $e->getMessage(),
                         'Canonical Salla order payload could not be constructed'
                     );
-                    if ($sallaPreflightRejected
-                        || preg_match('/^API call failed: (?:HTTP\s*)?(\d{3})\b/', $e->getMessage(), $statusMatch)
+                    $definiteSallaRejection = $e instanceof \App\Exceptions\SallaOrderSubmissionException
+                        && $e->isDefinitiveRejection();
+                    if ($sallaPreflightRejected || $definiteSallaRejection
                         || str_contains(strtolower($e->getMessage()), 'token expired')
                         || str_contains(strtolower($e->getMessage()), 'scope missing')
                         || str_contains(strtolower($e->getMessage()), 'rate limited')) {
                         $attempt->update(['status' => 'failed']);
+                    } elseif ($e instanceof \App\Exceptions\SallaOrderSubmissionException) {
+                        $attempt->update(['status' => 'unknown']);
                     }
                     if ($sallaPreflightRejected) {
                         Log::warning('ProcessAutoReply: Salla order rejected before provider request; attempt is safe to retry after checkout data is corrected', [
@@ -4388,11 +4469,15 @@ $aiResponse = $intro
                         'conversation_id' => $conversation->id,
                         'channel_id'      => $sallaChannel->id,
                         'exception_type' => get_class($e),
+                        'provider_http_status' => $e instanceof \App\Exceptions\SallaOrderSubmissionException ? $e->httpStatus : null,
+                        'provider_request_sent' => $e instanceof \App\Exceptions\SallaOrderSubmissionException,
+                        'attempt_status' => $attempt->fresh()->status,
             'message' => \App\Services\OrderCheckoutService::maskSensitive($e->getMessage()),
             'file' => basename($e->getFile()) . ':' . $e->getLine(),
                     ]);
                     // STRICT RULE: DO NOT generate a fake ID or pretend success when Salla fails!
                     return null;
+                    }
                 }
             }
 
@@ -4692,7 +4777,23 @@ $aiResponse = $intro
                 'order_number' => $externalOrderNumber ?: $externalOrderId,
             ]);
 
-            $orderTotal = (float)($checkoutState['product_price'] ?? 0);
+            $checkoutLineItems = is_array($checkoutState['salla_line_items'] ?? null) ? $checkoutState['salla_line_items'] : [];
+            $orderTotal = $checkoutLineItems !== []
+                ? array_sum(array_map(static fn (array $item): float =>
+                    max(0, (float) ($item['price'] ?? 0)) * max(1, (int) ($item['quantity'] ?? 1)), $checkoutLineItems))
+                : (float) ($checkoutState['product_price'] ?? 0);
+            $orderItems = $checkoutLineItems !== []
+                ? array_map(static fn (array $item): array => [
+                    'name' => trim((string) ($item['product_name'] ?? $item['name'] ?? 'Product')),
+                    'price' => (float) ($item['price'] ?? 0),
+                    'quantity' => max(1, (int) ($item['quantity'] ?? 1)),
+                    'options' => $item['option_titles'] ?? $item['salla_option_titles'] ?? [],
+                ], $checkoutLineItems)
+                : [[
+                    'name' => $checkoutState['product_name'] ?? 'Product',
+                    'price' => $orderTotal,
+                    'quantity' => 1,
+                ]];
             $orderData  = [
                 'id'              => $externalOrderId,
                 'order_id'        => $externalOrderId,
@@ -4702,13 +4803,7 @@ $aiResponse = $intro
                 'status'          => 'completed',
                 'currency'        => $checkoutState['product_currency'] ?? 'SAR',
                 'has_order'       => true,
-                'items'           => [
-                    [
-                        'name'     => $checkoutState['product_name'] ?? 'Product',
-                        'price'    => $orderTotal,
-                        'quantity' => 1,
-                    ]
-                ],
+                'items'           => $orderItems,
                 'product_name' => $checkoutState['product_name'] ?? 'Product',
                 'customer'     => [
                     'name'    => $checkoutState['full_name'] ?? $conversation->sender_name,
@@ -4754,30 +4849,58 @@ $aiResponse = $intro
     /** Stable per-checkout identity used to scope order idempotency. */
     private function orderFingerprint(array $state): string
     {
-        return hash('sha256', implode('|', [
+        $identity = [
             (string) ($state['commerce_channel_id'] ?? ''),
             (string) ($state['commerce_external_id'] ?? $state['salla_product_id'] ?? ''),
             (string) ($state['commerce_variant_id'] ?? ''),
             json_encode($state['salla_options'] ?? [], JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE) ?: '',
             preg_replace('/\D+/', '', (string) ($state['phone'] ?? $state['customer_phone'] ?? '')),
             mb_strtolower(trim((string) ($state['address'] ?? $state['customer_address'] ?? ''))),
-        ]));
+        ];
+        // Preserve fingerprints already persisted by the single-item checkout
+        // flow. Add the multi-line identity only when a cart actually exists.
+        if (!empty($state['salla_line_items']) && is_array($state['salla_line_items'])) {
+            $identity[] = json_encode($state['salla_line_items'], JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE) ?: '';
+        }
+
+        return hash('sha256', implode('|', $identity));
     }
 
     /** Build the exact summary required before an explicit order confirmation. */
     private function buildOrderConfirmationSummary(array $checkoutState, ?Channel $commerceChannel): string
     {
-        $productName = trim((string) ($checkoutState['product_name'] ?? 'Selected product'));
-        $price = $checkoutState['product_price'] ?? $checkoutState['price'] ?? null;
+        $lineItems = is_array($checkoutState['salla_line_items'] ?? null) ? $checkoutState['salla_line_items'] : [];
+        if ($lineItems !== []) {
+            $productName = implode('; ', array_map(static function (array $item): string {
+                $name = trim((string) ($item['product_name'] ?? $item['name'] ?? 'Product'));
+                $quantity = max(1, (int) ($item['quantity'] ?? 1));
+                return $quantity > 1 ? "{$name} × {$quantity}" : $name;
+            }, $lineItems));
+            $price = array_sum(array_map(static fn (array $item): float =>
+                max(0, (float) ($item['price'] ?? 0)) * max(1, (int) ($item['quantity'] ?? 1)), $lineItems));
+        } else {
+            $productName = trim((string) ($checkoutState['product_name'] ?? 'Selected product'));
+            $price = $checkoutState['product_price'] ?? $checkoutState['price'] ?? null;
+        }
         $currency = trim((string) ($checkoutState['product_currency'] ?? $checkoutState['currency'] ?? ''));
         $priceText = $price !== null && $price !== '' ? trim((string) $price . ' ' . $currency) : 'Not available';
         $storeName = trim((string) ($commerceChannel?->page_name ?? '')) ?: 'our store';
         $phone = $checkoutState['phone'] ?? $checkoutState['customer_phone'] ?? null;
+        if ($lineItems !== []) {
+            $optionGroups = array_values(array_filter(array_map(static function (array $item): string {
+                $titles = $item['option_titles'] ?? $item['salla_option_titles'] ?? [];
+                return implode(', ', array_values(array_unique(array_map('strval', (array) $titles))));
+            }, $lineItems)));
+            $optionsText = $optionGroups !== [] ? 'Options: ' . implode('; ', $optionGroups) . "\n" : '';
+        } else {
+            $titles = array_values(array_unique(array_map('strval', (array) ($checkoutState['salla_option_titles'] ?? []))));
+            $optionsText = $titles !== [] ? 'Options: ' . implode(', ', $titles) . "\n" : '';
+        }
 
         return "Please review your order summary:\n"
             . "Product: {$productName}\n"
             . (!empty($checkoutState['commerce_variant_title']) ? 'Variant: ' . trim((string) $checkoutState['commerce_variant_title']) . "\n" : '')
-            . (!empty($checkoutState['salla_option_titles']) ? 'Options: ' . implode(', ', array_map('strval', (array) $checkoutState['salla_option_titles'])) . "\n" : '')
+            . $optionsText
             . "Price: {$priceText}\n"
             . "Store: {$storeName}\n"
             . 'Name: ' . trim((string) ($checkoutState['full_name'] ?? '')) . "\n"

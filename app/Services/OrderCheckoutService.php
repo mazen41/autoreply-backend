@@ -405,12 +405,16 @@ class OrderCheckoutService
         $extractedDistrict = $parsedAddressExtras['district'] ?? null;
 
         $extractedShortAddress = null;
-        if (preg_match('/(?:short address|national address|العنوان المختصر)\s*(?:(?:is|equals?)\s+|[:#-]\s*)?([A-Z0-9]{4,12})/iu', $incomingText, $shortAddressMatch)) {
+        if (!empty($parsedAddressExtras['short_address'])) {
+            $extractedShortAddress = strtoupper((string) $parsedAddressExtras['short_address']);
+        } elseif (preg_match('/(?:short address|national address|العنوان المختصر)\s*(?:(?:is|equals?)\s+|[:#-]\s*)?([A-Z0-9]{4,12})/iu', $incomingText, $shortAddressMatch)) {
             $extractedShortAddress = strtoupper($shortAddressMatch[1]);
         }
 
         $extractedAdditionalNumber = null;
-        if (preg_match('/(?:additional number|secondary number|الرقم الإضافي)\s*(?:(?:is|equals?)\s+|[:#-]\s*)?([A-Z0-9-]{2,12})/iu', $incomingText, $additionalNumberMatch)) {
+        if (!empty($parsedAddressExtras['additional_number'])) {
+            $extractedAdditionalNumber = trim((string) $parsedAddressExtras['additional_number']);
+        } elseif (preg_match('/(?:additional number|secondary number|الرقم الإضافي)\s*(?:(?:is|equals?)\s+|[:#-]\s*)?([A-Z0-9-]{2,12})/iu', $incomingText, $additionalNumberMatch)) {
             $extractedAdditionalNumber = trim($additionalNumberMatch[1]);
         }
 
@@ -534,6 +538,8 @@ class OrderCheckoutService
             'postal_code'      => $extractedPostalCode               ?? ($existingState['postal_code']       ?? null),
             'geo_coordinates'  => $extractedCoordinates              ?? ($existingState['geo_coordinates']   ?? null),
             'building_number'  => $extractedBuildingNumber           ?? ($existingState['building_number']   ?? null),
+            'street_number'    => $parsedAddressExtras['street_number'] ?? ($existingState['street_number'] ?? null),
+            'address_line'     => $parsedAddressExtras['address_line'] ?? ($existingState['address_line'] ?? null),
             'po_box'           => $extractedPoBox                    ?? ($existingState['po_box']            ?? null),
             'block'            => $extractedBlock                    ?? ($existingState['block']             ?? null),
             'district'         => $extractedDistrict                 ?? ($existingState['district']          ?? null),
@@ -689,6 +695,17 @@ class OrderCheckoutService
             $requiredFields = array_values(array_unique(array_merge($requiredFields, $sallaRequiredFields)));
         }
 
+        // Salla's current Create Order contract requires the Saudi National
+        // Address fields before the customer confirms. Collect precise values
+        // from the customer; never synthesize coordinates or address numbers.
+        $phoneCountry = SallaPhoneHelper::getCountryCode((string) ($normalizedState['phone'] ?? ''));
+        if ($requireSallaShippingDetails && $phoneCountry === 'SA') {
+            $requiredFields = array_values(array_unique(array_merge($requiredFields, [
+                'delivery_city', 'address_line', 'street_number', 'building_number',
+                'block', 'short_address', 'additional_number', 'postal_code', 'geo_coordinates',
+            ])));
+        }
+
         $fieldAliases = [
             'email' => ['customer_email'],
         ];
@@ -707,6 +724,11 @@ class OrderCheckoutService
                     && (float) $value['lng'] >= -180
                     && (float) $value['lng'] <= 180;
                 $value = $validCoordinates ? $value : null;
+            }
+            if (in_array($field, ['block', 'additional_number', 'postal_code'], true)
+                && is_string($value)
+                && in_array(mb_strtolower(trim($value)), ['n/a', 'na', 'none', 'not applicable', 'لا يوجد', 'غير متوفر'], true)) {
+                $value = '__not_applicable__';
             }
             if (!empty($value)) {
                 $known[$field] = $value;

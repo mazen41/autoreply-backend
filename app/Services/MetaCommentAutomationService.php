@@ -3,6 +3,7 @@
 namespace App\Services;
 
 use App\Jobs\ProcessSocialCommentEvent;
+use App\Events\SocialCommentReceived;
 use App\Models\Channel;
 use App\Models\SocialCommentEvent;
 use Illuminate\Database\QueryException;
@@ -85,6 +86,20 @@ class MetaCommentAutomationService
             if (!$event) throw $exception;
         }
 
+        if ($event->wasRecentlyCreated) {
+            try {
+                event(new SocialCommentReceived((int) $channel->business_id, (int) $event->id));
+            } catch (\Throwable $exception) {
+                // Realtime delivery is best-effort; never fail Meta's webhook
+                // after the comment has already been safely persisted.
+                Log::warning('Meta comment realtime broadcast failed', [
+                    'comment_event_id' => $event->id,
+                    'business_id' => $channel->business_id,
+                    'exception' => $exception::class,
+                ]);
+            }
+        }
+
         if (in_array($event->status, ['received', 'retryable'], true)) {
             ProcessSocialCommentEvent::dispatch($event->id)->afterCommit();
         }
@@ -95,6 +110,61 @@ class MetaCommentAutomationService
     {
         if ($event->public_reply_id) return ['success' => true, 'reply_id' => $event->public_reply_id];
         return $this->publish($event, $channel, $text, false);
+    }
+
+    /** Publish an additional agent-authored public reply, bypassing AI idempotency. */
+    public function publishManualPublic(SocialCommentEvent $event, Channel $channel, string $text): array
+    {
+        return $this->publish($event, $channel, $text, false);
+    }
+
+    /** Update a Page-authored Facebook comment/reply. Instagram comment edit is not exposed by its moderation API. */
+    public function editFacebookReply(SocialCommentEvent $event, Channel $channel, string $replyId, string $text): array
+    {
+        if ($event->platform !== 'facebook') {
+            return ['success' => false, 'error_code' => 'platform_edit_unsupported'];
+        }
+        if ($channel->type !== 'facebook' || $channel->status !== 'connected' || trim((string) $channel->access_token) === '') {
+            return ['success' => false, 'error_code' => 'account_disconnected'];
+        }
+
+        try {
+            $response = Http::timeout(15)->post('https://graph.facebook.com/' . config('services.meta.graph_version', 'v26.0') . '/' . rawurlencode($replyId), [
+                'message' => $text,
+                'access_token' => $channel->access_token,
+            ]);
+        } catch (ConnectionException) {
+            return ['success' => false, 'retryable' => true, 'error_code' => 'transport_error'];
+        }
+
+        if (!$response->successful() || $response->json('success') !== true) {
+            return ['success' => false, 'error_code' => (string) ($response->json('error.code') ?? $response->status())];
+        }
+
+        return ['success' => true];
+    }
+
+    /** Hide or unhide the customer's original comment on a Page or Instagram media. */
+    public function setCommentHidden(SocialCommentEvent $event, Channel $channel, bool $hidden): array
+    {
+        if ($channel->status !== 'connected' || trim((string) $channel->access_token) === '') {
+            return ['success' => false, 'error_code' => 'account_disconnected'];
+        }
+
+        try {
+            $response = Http::timeout(15)->post('https://graph.facebook.com/' . config('services.meta.graph_version', 'v26.0') . '/' . rawurlencode($event->comment_id), [
+                'is_hidden' => $hidden ? 'true' : 'false',
+                'access_token' => $channel->access_token,
+            ]);
+        } catch (ConnectionException) {
+            return ['success' => false, 'retryable' => true, 'error_code' => 'transport_error'];
+        }
+
+        if (!$response->successful() || $response->json('success') !== true) {
+            return ['success' => false, 'error_code' => (string) ($response->json('error.code') ?? $response->status())];
+        }
+
+        return ['success' => true];
     }
 
     /** Meta private replies are comment-scoped and intentionally never fall back to /me/messages. */

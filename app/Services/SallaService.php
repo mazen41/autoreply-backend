@@ -639,68 +639,107 @@ class SallaService
     ): int
     {
         $countryCode = strtoupper(trim($countryCode));
-        if ($startPage < 1 || $startPage > 2000) {
-            throw new \InvalidArgumentException('The resume page must be between 1 and 2000.');
+        if ($startPage !== 1) {
+            throw new \InvalidArgumentException('Partial-page sync is disabled because it cannot prove catalog completeness. Start a full sync instead.');
+        }
+        if (!preg_match('/^[A-Z]{2}$/', $countryCode)) {
+            throw new \InvalidArgumentException('A two-letter ISO country code is required.');
         }
 
-        if ($onProgress) {
-            $onProgress(['stage' => 'countries_request', 'country_code' => $countryCode]);
-        }
-        $countriesResponse = $this->apiCallForChannel($channel, 'GET', '/countries');
-        $country = collect($countriesResponse['data'] ?? [])->first(
-            fn ($candidate) => strtoupper((string) ($candidate['code'] ?? '')) === $countryCode
-        );
-        $countryId = $country['id'] ?? null;
+        $sync = \App\Models\SallaCityCatalogSync::query()->firstOrNew([
+            'channel_id' => $channel->id,
+            'country_code' => $countryCode,
+        ]);
+        $sync->status = 'running';
+        $sync->pages_completed = 0;
+        $sync->attempt_expected_city_count = null;
+        $sync->started_at = now();
+        $sync->last_error_code = null;
+        $sync->last_error_message = null;
+        $sync->save();
 
-        if (!$countryId) {
-            throw new \RuntimeException("Salla country {$countryCode} was not found in the country catalog.");
-        }
+        try {
+            $grantedScopes = $channel->metadata['scopes'] ?? null;
+            if (is_string($grantedScopes) && trim($grantedScopes) !== '') {
+                $granted = preg_split('/[\s,]+/', trim($grantedScopes)) ?: [];
+                if (!in_array('metadata.read', $granted, true)) {
+                    throw new \RuntimeException('Salla authorization is missing metadata.read. Reconnect the store with this permission granted.');
+                }
+            }
 
-        $endpoint = "/countries/{$countryId}/cities";
-        $existingCount = DB::table('salla_cities')
-            ->where('channel_id', $channel->id)
-            ->where('country_code', $countryCode)
-            ->count();
-        if ($startPage > 1 && $existingCount === 0) {
-            throw new \RuntimeException('Cannot resume: no previously synced city pages exist for this channel and country.');
-        }
-
-        $totalSynced = $startPage > 1 ? $existingCount : 0;
-        $now = now();
-
-        for ($page = $startPage; $page <= 2000; $page++) {
             if ($onProgress) {
-                $onProgress([
-                    'stage' => 'page_request',
-                    'country_code' => $countryCode,
+                $onProgress(['stage' => 'countries_request', 'country_code' => $countryCode]);
+            }
+            $countriesResponse = $this->apiCallForChannel($channel, 'GET', '/countries');
+            $countries = $countriesResponse['data'] ?? null;
+            if (!is_array($countries)) {
+                throw new \UnexpectedValueException('Salla returned an invalid countries response.');
+            }
+            $country = collect($countries)->first(
+                fn ($candidate) => strtoupper((string) ($candidate['code'] ?? '')) === $countryCode
+            );
+            $countryId = filter_var($country['id'] ?? null, FILTER_VALIDATE_INT);
+            if (!$countryId || $countryId < 1) {
+                throw new \RuntimeException("Salla country {$countryCode} was not found or had an invalid ID.");
+            }
+
+            $endpoint = "/countries/{$countryId}/cities";
+            $staged = [];
+            $pagesCompleted = 0;
+            $expectedCount = null;
+            $totalPages = null;
+            $now = now();
+
+            for ($page = 1; $page <= 2000; $page++) {
+                if ($onProgress) {
+                    $onProgress(['stage' => 'page_request', 'country_code' => $countryCode, 'page' => $page]);
+                }
+                $response = $this->apiCallForChannel($channel, 'GET', $endpoint, [
                     'page' => $page,
+                    'per_page' => 60,
+                    'count' => 60,
                 ]);
-            }
+                $cities = $response['data'] ?? null;
+                $pagination = $response['pagination'] ?? null;
+                if (!is_array($cities) || !is_array($pagination)) {
+                    throw new \UnexpectedValueException("Salla returned an invalid cities response on page {$page}.");
+                }
 
-            $response = $this->apiCallForChannel($channel, 'GET', $endpoint, [
-                'page' => $page,
-                'per_page' => 60,
-                'count' => 60,
-            ]);
-            $cities = $response['data'] ?? [];
+                $pageTotalPages = filter_var($pagination['totalPages'] ?? $pagination['total_pages'] ?? null, FILTER_VALIDATE_INT);
+                $pageExpectedCount = filter_var($pagination['total'] ?? $pagination['totalCount'] ?? $pagination['total_count'] ?? null, FILTER_VALIDATE_INT);
+                if (!$pageTotalPages || $pageTotalPages < 1 || $pageExpectedCount === false || $pageExpectedCount === null || $pageExpectedCount < 1) {
+                    throw new \UnexpectedValueException("Salla omitted valid total city and page counts on page {$page}.");
+                }
+                if ($totalPages !== null && ($totalPages !== $pageTotalPages || $expectedCount !== $pageExpectedCount)) {
+                    throw new \UnexpectedValueException('Salla city pagination totals changed during synchronization.');
+                }
+                $totalPages = $pageTotalPages;
+                $expectedCount = $pageExpectedCount;
+                if ($page > $totalPages || $page > 2000) {
+                    throw new \UnexpectedValueException('Salla city pagination exceeded its validated page range.');
+                }
 
-            if ($page === $startPage && empty($cities)) {
-                throw new \RuntimeException("Salla returned no cities for {$countryCode}; local catalog was not updated.");
-            }
-
-            if ($cities) {
-                $rows = [];
                 foreach ($cities as $city) {
-                    if (empty($city['id'])) {
-                        continue;
+                    $cityId = filter_var($city['id'] ?? null, FILTER_VALIDATE_INT);
+                    if (!$cityId || $cityId < 1) {
+                        throw new \UnexpectedValueException("Salla returned a city with an invalid ID on page {$page}.");
                     }
-
-                    $rows[] = [
+                    if (isset($city['country_id']) && (int) $city['country_id'] !== (int) $countryId) {
+                        throw new \UnexpectedValueException("Salla returned a city assigned to a different country on page {$page}.");
+                    }
+                    if (isset($staged[$cityId])) {
+                        throw new \UnexpectedValueException("Salla returned duplicate city ID {$cityId} across its pagination.");
+                    }
+                    $name = trim((string) ($city['name'] ?? $city['name_en'] ?? $city['name_ar'] ?? ''));
+                    if ($name === '') {
+                        throw new \UnexpectedValueException("Salla returned city {$cityId} without a usable name.");
+                    }
+                    $staged[$cityId] = [
                         'channel_id' => $channel->id,
                         'country_code' => $countryCode,
                         'country_id' => (int) $countryId,
-                        'salla_city_id' => (int) $city['id'],
-                        'name' => (string) ($city['name'] ?? $city['name_en'] ?? $city['name_ar'] ?? ''),
+                        'salla_city_id' => (int) $cityId,
+                        'name' => $name,
                         'name_en' => isset($city['name_en']) ? (string) $city['name_en'] : null,
                         'name_ar' => isset($city['name_ar']) ? (string) $city['name_ar'] : null,
                         'synced_at' => $now,
@@ -708,53 +747,116 @@ class SallaService
                         'updated_at' => $now,
                     ];
                 }
+                $pagesCompleted = $page;
+                // `expected_city_count` remains tied to the last successful
+                // catalog; attempt counters describe this refresh separately.
+                $sync->update([
+                    'pages_completed' => $pagesCompleted,
+                    'attempt_expected_city_count' => $expectedCount,
+                ]);
 
-                if ($rows) {
-                    DB::table('salla_cities')->upsert(
-                        $rows,
-                        ['channel_id', 'country_code', 'salla_city_id'],
-                        ['country_id', 'name', 'name_en', 'name_ar', 'synced_at', 'updated_at']
-                    );
-                    $totalSynced += count($rows);
+                if ($onProgress) {
+                    $onProgress([
+                        'stage' => 'page_complete',
+                        'country_code' => $countryCode,
+                        'page' => $page,
+                        'total_pages' => $totalPages,
+                        'response_per_page' => (int) ($pagination['perPage'] ?? $pagination['per_page'] ?? 0),
+                        'page_count' => count($cities),
+                        'total_synced' => count($staged),
+                    ]);
+                }
+                if ($page === $totalPages) {
+                    break;
+                }
+                if ($page === 2000) {
+                    throw new \RuntimeException('Salla city pagination exceeded the 2000-page safety limit.');
                 }
             }
 
-            $pagination = $response['pagination'] ?? [];
-            $totalPages = (int) ($pagination['totalPages'] ?? $pagination['total_pages'] ?? 1);
-            if ($onProgress) {
-                $onProgress([
-                    'stage' => 'page_complete',
-                    'country_code' => $countryCode,
-                    'page' => $page,
-                    'total_pages' => $totalPages,
-                    'response_per_page' => (int) ($pagination['perPage'] ?? $pagination['per_page'] ?? 0),
-                    'page_count' => count($cities),
-                    'total_synced' => $totalSynced,
-                ]);
+            if (count($staged) !== $expectedCount || $pagesCompleted !== $totalPages) {
+                throw new \UnexpectedValueException(sprintf(
+                    'Salla city catalog was incomplete: collected %d/%d cities across %d/%d pages.',
+                    count($staged), $expectedCount, $pagesCompleted, $totalPages
+                ));
             }
 
-            $hasNextPage = $page < $totalPages || !empty($pagination['links']['next']);
-            if (!$hasNextPage) {
-                break;
-            }
+            $savedCount = DB::transaction(function () use ($channel, $countryCode, $staged, $expectedCount): int {
+                DB::table('salla_cities')->upsert(
+                    array_values($staged),
+                    ['channel_id', 'country_code', 'salla_city_id'],
+                    ['country_id', 'name', 'name_en', 'name_ar', 'synced_at', 'updated_at']
+                );
+                DB::table('salla_cities')
+                    ->where('channel_id', $channel->id)
+                    ->where('country_code', $countryCode)
+                    ->whereNotIn('salla_city_id', array_keys($staged))
+                    ->delete();
+                $count = (int) DB::table('salla_cities')
+                    ->where('channel_id', $channel->id)
+                    ->where('country_code', $countryCode)
+                    ->count();
+                if ($count !== $expectedCount) {
+                    throw new \UnexpectedValueException("Saved Salla city count {$count} does not match API total {$expectedCount}.");
+                }
+                return $count;
+            });
 
-            if ($page === 2000) {
-                throw new \RuntimeException('Salla city pagination exceeded the 2000-page safety limit.');
-            }
+            $sync->update([
+                'status' => 'succeeded',
+                'pages_completed' => $pagesCompleted,
+                'attempt_expected_city_count' => $expectedCount,
+                'expected_city_count' => $expectedCount,
+                'saved_city_count' => $savedCount,
+                'last_successful_sync_at' => $now,
+                'last_error_code' => null,
+                'last_error_message' => null,
+            ]);
+
+            Log::info('Salla city catalog sync completed', [
+                'channel_id' => $channel->id,
+                'country_code' => $countryCode,
+                'pages' => $pagesCompleted,
+                'expected_city_count' => $expectedCount,
+                'saved_city_count' => $savedCount,
+            ]);
+
+            return $savedCount;
+        } catch (\Throwable $exception) {
+            $safeMessage = \App\Services\OrderCheckoutService::maskSensitive($exception->getMessage());
+            $sync->update([
+                'status' => 'failed',
+                'last_error_code' => class_basename($exception),
+                'last_error_message' => mb_substr($safeMessage, 0, 2000),
+            ]);
+            Log::error('Salla city catalog sync failed; prior successful catalog preserved', [
+                'channel_id' => $channel->id,
+                'country_code' => $countryCode,
+                'pages_completed' => (int) $sync->pages_completed,
+                'exception_type' => get_class($exception),
+                'message' => $safeMessage,
+            ]);
+            throw $exception;
         }
+    }
 
-        if ($startPage === 1) {
-            DB::table('salla_cities')
-                ->where('channel_id', $channel->id)
-                ->where('country_code', $countryCode)
-                ->where('synced_at', '<', $now)
-                ->delete();
+    /** A catalog is usable only after a fully validated sync and exact row-count check. */
+    public function hasHealthyCityCatalog(Channel $channel, string $countryCode): bool
+    {
+        $countryCode = strtoupper(trim($countryCode));
+        $sync = \App\Models\SallaCityCatalogSync::query()
+            ->where('channel_id', $channel->id)
+            ->where('country_code', $countryCode)
+            ->first();
+        if (!$sync || !$sync->last_successful_sync_at || (int) $sync->saved_city_count < 1
+            || (int) $sync->saved_city_count !== (int) $sync->expected_city_count) {
+            return false;
         }
 
         return (int) DB::table('salla_cities')
             ->where('channel_id', $channel->id)
             ->where('country_code', $countryCode)
-            ->count();
+            ->count() === (int) $sync->saved_city_count;
     }
 
     protected function normalizeCitySearchText(string $value): string
@@ -811,10 +913,22 @@ class SallaService
             return null;
         }
 
-        $cities = DB::table('salla_cities')
-            ->where('channel_id', $channel->id)
-            ->where('country_code', $countryCode)
-            ->get();
+        $catalogHealthy = $this->hasHealthyCityCatalog($channel, $countryCode);
+        if (!$catalogHealthy) {
+            try {
+                \App\Jobs\SyncSallaCityCatalog::dispatch((int) $channel->id, $countryCode);
+            } catch (\Throwable $exception) {
+                Log::warning('Salla city catalog recovery could not be queued', [
+                    'channel_id' => $channel->id,
+                    'country_code' => $countryCode,
+                    'exception_type' => get_class($exception),
+                ]);
+            }
+        }
+
+        $cities = $catalogHealthy
+            ? DB::table('salla_cities')->where('channel_id', $channel->id)->where('country_code', $countryCode)->get()
+            : collect();
         $countryId = $cities->first()->country_id ?? null;
         $matchedCityId = null;
         $matchedCityNameLength = 0;
@@ -848,7 +962,7 @@ class SallaService
                 'country_id' => (int) $countryId,
                 'country_code' => $countryCode,
                 'address'    => $freeformAddress,
-                'catalog_synced' => $cities->isNotEmpty(),
+                'catalog_synced' => $catalogHealthy,
                 'cities_checked' => count($availableCityNames),
                 'available_city_names_sample' => array_slice($availableCityNames, 0, 30),
             ]);
@@ -929,6 +1043,7 @@ class SallaService
         }
 
         $freeformAddress = $checkoutState['address'] ?? '';
+        $countryCode = SallaPhoneHelper::getCountryCode($phone) ?? 'SA';
         $shippingAddress = $this->resolveShippingAddressForChannel($channel, $freeformAddress, $phone);
 
         if (!$shippingAddress) {
@@ -941,23 +1056,66 @@ class SallaService
 
         $postalCode = $checkoutState['postal_code'] ?? $shippingAddress['postal_code'] ?? null;
         $coordinates = $checkoutState['geo_coordinates'] ?? null;
-        $buildingNumber = $checkoutState['building_number'] ?? $shippingAddress['street_number'] ?? null;
-        $streetNumber = $shippingAddress['street_number'] ?? $buildingNumber;
+        $buildingNumber = $checkoutState['building_number'] ?? ($countryCode === 'SA' ? null : ($shippingAddress['street_number'] ?? null));
+        $streetNumber = $checkoutState['street_number'] ?? ($countryCode === 'SA' ? null : ($shippingAddress['street_number'] ?? $buildingNumber));
         $block = $checkoutState['block'] ?? $shippingAddress['block'] ?? null;
 
-        // Postal code, building number, block, coordinates, short address,
-        // additional number and district are NOT pre-emptively required here.
-        // They are optional National-Address metadata: Salla's own
-        // POST /orders validation is authoritative on whether a given store /
-        // shipping method actually needs them (see createOrderForChannel,
-        // which surfaces any Salla-reported missing ship_to fields back to the
-        // caller so the customer is asked only for what Salla truly requires).
-        // Coordinates specifically are resolved from the city via geocoding
-        // when available; customers are never asked to provide them directly.
-        $countryCode = SallaPhoneHelper::getCountryCode($phone) ?? 'SA';
+        // Saudi National Address values come from explicit customer input. Do
+        // not substitute city-centroid geocoding or reuse the building number
+        // as the street number.
+
+        $rawLineItems = $checkoutState['salla_line_items'] ?? [];
+        if (!is_array($rawLineItems)) {
+            return null;
+        }
+        $normalizedLineItems = [];
+        if ($rawLineItems !== []) {
+            $seenLineItemIds = [];
+            foreach ($rawLineItems as $index => $lineItem) {
+                if (!is_array($lineItem)) {
+                    return null;
+                }
+                $lineItemId = (string) ($lineItem['line_item_id'] ?? $index);
+                $lineProductId = filter_var($lineItem['salla_product_id'] ?? $lineItem['product_id'] ?? null, FILTER_VALIDATE_INT);
+                $quantity = filter_var($lineItem['quantity'] ?? 1, FILTER_VALIDATE_INT);
+                if ($lineItemId === '' || isset($seenLineItemIds[$lineItemId]) || !$lineProductId || $lineProductId < 1
+                    || !$quantity || $quantity < 1 || $quantity > 100
+                    || !isset($lineItem['price']) || !is_numeric($lineItem['price']) || (float) $lineItem['price'] < 0) {
+                    Log::warning('SallaService: invalid canonical line item; refusing order payload', [
+                        'channel_id' => $channel->id,
+                        'line_item_index' => $index,
+                    ]);
+                    return null;
+                }
+                $seenLineItemIds[$lineItemId] = true;
+                $optionMap = $lineItem['options'] ?? $lineItem['salla_options'] ?? [];
+                if (!is_array($optionMap)) {
+                    return null;
+                }
+                $normalizedOptions = [];
+                foreach ($optionMap as $optionId => $valueIds) {
+                    $validOptionId = filter_var($optionId, FILTER_VALIDATE_INT);
+                    if (!$validOptionId || $validOptionId < 1) {
+                        return null;
+                    }
+                    $values = array_values(array_unique(array_filter(array_map('strval', (array) $valueIds), static fn ($value) => $value !== '')));
+                    if ($values !== []) {
+                        $normalizedOptions[(string) $validOptionId] = $values;
+                    }
+                }
+                $normalizedLineItems[] = [
+                    'line_item_id' => $lineItemId,
+                    'product_id' => (int) $lineProductId,
+                    'quantity' => (int) $quantity,
+                    'price' => (float) $lineItem['price'],
+                    'name' => trim((string) ($lineItem['product_name'] ?? $lineItem['name'] ?? 'Product')),
+                    'options' => $normalizedOptions,
+                ];
+            }
+        }
 
         $productId = (int)($checkoutState['salla_product_id'] ?? null);
-        if (!$productId && !empty($checkoutState['product_name'])) {
+        if ($normalizedLineItems === [] && !$productId && !empty($checkoutState['product_name'])) {
             try {
                 $productsRes = $this->getProductsForChannel($channel, ['per_page' => 20]);
                 $items = $productsRes['data'] ?? [];
@@ -987,7 +1145,7 @@ class SallaService
             }
         }
 
-        if (!$productId) {
+        if ($normalizedLineItems === [] && !$productId) {
             Log::warning('SallaService: missing salla_product_id for order creation', [
                 'channel_id' => $channel->id,
                 'checkout_state' => $checkoutState,
@@ -1065,28 +1223,49 @@ class SallaService
         $customerMobile = SallaPhoneHelper::formatForCustomerMobile($phone);
         // ISO country code from phone, fallback to SA for Salla-based stores
 
-        $products = [[
-            'identifier_type' => 'id',
-            'identifier'      => $productId,
-            'quantity'        => 1,
-        ]];
-        $selectedOptions = $checkoutState['salla_options'] ?? [];
-        if (is_array($selectedOptions) && $selectedOptions !== []) {
-            $products[0]['options'] = array_values(array_filter(array_map(
-                static function ($optionId, $valueIds): ?array {
-                    $values = array_values(array_filter(array_map('strval', (array) $valueIds), fn ($value) => $value !== ''));
-                    return $values === [] ? null : ['id' => (int) $optionId, 'value' => $values];
-                },
-                array_keys($selectedOptions),
-                array_values($selectedOptions)
-            )));
-            if ($products[0]['options'] === []) {
-                unset($products[0]['options']);
+        $products = [];
+        if ($normalizedLineItems !== []) {
+            foreach ($normalizedLineItems as $lineItem) {
+                $product = [
+                    'identifier_type' => 'id',
+                    'identifier' => $lineItem['product_id'],
+                    'quantity' => $lineItem['quantity'],
+                ];
+                if ($lineItem['options'] !== []) {
+                    $product['options'] = [];
+                    foreach ($lineItem['options'] as $optionId => $valueIds) {
+                        $product['options'][] = ['id' => (int) $optionId, 'value' => $valueIds];
+                    }
+                }
+                $products[] = $product;
+            }
+        } else {
+            $products = [[
+                'identifier_type' => 'id',
+                'identifier' => $productId,
+                'quantity' => 1,
+            ]];
+            $selectedOptions = $checkoutState['salla_options'] ?? [];
+            if (is_array($selectedOptions) && $selectedOptions !== []) {
+                $products[0]['options'] = array_values(array_filter(array_map(
+                    static function ($optionId, $valueIds): ?array {
+                        $validOptionId = filter_var($optionId, FILTER_VALIDATE_INT);
+                        $values = array_values(array_unique(array_filter(array_map('strval', (array) $valueIds), static fn ($value) => $value !== '')));
+                        return !$validOptionId || $values === [] ? null : ['id' => (int) $validOptionId, 'value' => $values];
+                    },
+                    array_keys($selectedOptions),
+                    array_values($selectedOptions)
+                )));
+                if ($products[0]['options'] === []) {
+                    unset($products[0]['options']);
+                }
             }
         }
 
         $currency = $checkoutState['product_currency'] ?? $selectedRate['total']['currency'] ?? 'SAR';
-        $productAmount = (float) ($checkoutState['product_price'] ?? 0);
+        $productAmount = $normalizedLineItems !== []
+            ? array_sum(array_map(static fn (array $lineItem): float => $lineItem['price'] * $lineItem['quantity'], $normalizedLineItems))
+            : (float) ($checkoutState['product_price'] ?? 0);
         $shippingAmount = (float) ($selectedRate['total']['amount'] ?? 0);
         $codServiceAmount = 0.0;
         foreach (($selectedRate['services'] ?? []) as $service) {
@@ -1105,6 +1284,33 @@ class SallaService
             ],
         ];
 
+        $shipTo = [
+            'country' => $shippingAddress['country_id'] ?? null,
+            'city' => $shippingAddress['city_id'] ?? null,
+            'district' => $districtId,
+            'street_number' => $streetNumber,
+            'block' => $block,
+            'address' => $shippingAddress['address'] ?? $freeformAddress,
+            'address_line' => $checkoutState['address_line'] ?? $shippingAddress['address'] ?? $freeformAddress,
+            'postal_code' => $postalCode,
+            'geo_coordinates' => isset($coordinates['lat'], $coordinates['lng']) ? ['lat' => (float) $coordinates['lat'], 'lng' => (float) $coordinates['lng']] : null,
+            'building_number' => $buildingNumber,
+            'short_address' => $checkoutState['short_address'] ?? null,
+            'additional_number' => $checkoutState['additional_number'] ?? null,
+        ];
+        foreach (['block', 'postal_code', 'additional_number'] as $nullableField) {
+            if (is_string($shipTo[$nullableField])
+                && in_array(mb_strtolower(trim($shipTo[$nullableField])), ['n/a', 'na', 'none', 'not applicable', 'لا يوجد', 'غير متوفر'], true)) {
+                $shipTo[$nullableField] = null;
+            }
+        }
+        if ($districtId === null) {
+            unset($shipTo['district']);
+        }
+        if ($countryCode !== 'SA') {
+            $shipTo = array_filter($shipTo, fn ($value) => !is_null($value) && $value !== '');
+        }
+
         return [
             'customer' => array_filter([
                 'id'     => $customerId,
@@ -1121,20 +1327,7 @@ class SallaService
             ], fn ($value) => !is_null($value) && $value !== ''),
             'delivery_method' => 'shipping',
             'courier_id' => (int) $selectedRate['company_id'],
-            'ship_to' => array_filter([
-                'country'       => $shippingAddress['country_id'] ?? null,
-                'city'          => $shippingAddress['city_id'] ?? null,
-                'district'      => $districtId,
-                'street_number' => $streetNumber,
-                'block'         => $block,
-                'address'       => $shippingAddress['address'] ?? $freeformAddress,
-                'address_line'  => $shippingAddress['address'] ?? $freeformAddress,
-                'postal_code'   => $postalCode,
-                'geo_coordinates' => isset($coordinates['lat'], $coordinates['lng']) ? ['lat' => (float) $coordinates['lat'], 'lng' => (float) $coordinates['lng']] : null,
-                'building_number' => $buildingNumber,
-                'short_address' => $checkoutState['short_address'] ?? null,
-                'additional_number' => $checkoutState['additional_number'] ?? null,
-            ], fn ($value) => !is_null($value) && $value !== ''),
+            'ship_to' => $shipTo,
             'products' => $products,
             'payment'  => $payment,
         ];
@@ -1195,7 +1388,50 @@ class SallaService
     public function createOrderForChannel(Channel $channel, array $data = []): array
     {
         if (isset($data['salla_product_id']) || isset($data['address']) || isset($data['full_name'])) {
+            $grantedScopes = $channel->metadata['scopes'] ?? null;
+            if (is_string($grantedScopes) && trim($grantedScopes) !== '') {
+                $granted = preg_split('/[\s,]+/', trim($grantedScopes)) ?: [];
+                if (!in_array('orders.read_write', $granted, true)) {
+                    throw new \RuntimeException('Salla authorization is missing orders.read_write. Reconnect the store with order access enabled.');
+                }
+            }
+
+            $phoneCountry = SallaPhoneHelper::getCountryCode((string) ($data['phone'] ?? $data['customer_phone'] ?? ''));
+            if ($phoneCountry === 'SA') {
+                $requiredNationalFields = ['street_number', 'building_number', 'block', 'short_address', 'additional_number', 'postal_code', 'geo_coordinates'];
+                $missingNationalFields = array_values(array_filter($requiredNationalFields, static function (string $field) use ($data): bool {
+                    $value = $data[$field] ?? null;
+                    if ($field === 'geo_coordinates') {
+                        return !is_array($value) || !isset($value['lat'], $value['lng'])
+                            || !is_numeric($value['lat']) || !is_numeric($value['lng'])
+                            || (float) $value['lat'] < -90 || (float) $value['lat'] > 90
+                            || (float) $value['lng'] < -180 || (float) $value['lng'] > 180;
+                    }
+                    if (in_array($field, ['block', 'additional_number', 'postal_code'], true)
+                        && is_string($value)
+                        && in_array(mb_strtolower(trim($value)), ['n/a', 'na', 'none', 'not applicable', 'لا يوجد', 'غير متوفر'], true)) {
+                        return false;
+                    }
+                    return $value === null || trim((string) $value) === '';
+                }));
+                if ($missingNationalFields !== []) {
+                    return ['status' => 'needs_fields', 'missing_fields' => $missingNationalFields];
+                }
+            }
+
+            $phone = (string) ($data['phone'] ?? $data['customer_phone'] ?? '');
+            $address = (string) ($data['address'] ?? $data['customer_address'] ?? '');
+            if (!$this->resolveShippingAddressForChannel($channel, $address, $phone)) {
+                return ['status' => 'needs_fields', 'missing_fields' => ['delivery_city']];
+            }
+
             $data = $this->buildCanonicalOrderPayload($channel, $data);
+            if ($data === null) {
+                Log::warning('Salla order payload preflight failed before order request', [
+                    'channel_id' => $channel->id,
+                ]);
+                return ['status' => 'needs_fields', 'missing_fields' => ['delivery_city']];
+            }
         }
 
         if (empty($data)) {
@@ -1213,7 +1449,21 @@ class SallaService
         ]);
 
         try {
-            $res = $this->apiCallForChannel($channel, 'POST', '/orders', $data);
+            try {
+                $res = $this->apiCallForChannel($channel, 'POST', '/orders', $data);
+            } catch (SallaOrderValidationException $e) {
+                throw $e;
+            } catch (\Throwable $e) {
+                $status = null;
+                if (preg_match('/API call failed: (?:HTTP\s*)?(\d{3})\b/', $e->getMessage(), $statusMatch)) {
+                    $status = (int) $statusMatch[1];
+                }
+                throw new \App\Exceptions\SallaOrderSubmissionException(
+                    \App\Services\OrderCheckoutService::maskSensitive($e->getMessage()),
+                    $status,
+                    $e
+                );
+            }
 
             Log::info('SALLA_ORDER_CREATE_RESPONSE', [
                 'channel_id' => $channel->id,
@@ -1239,7 +1489,7 @@ class SallaService
                 'receiver.phone' => 'phone', 'customer.mobile' => 'phone',
                 'ship_to.postal_code' => 'postal_code', 'postal_code' => 'postal_code',
                 'ship_to.building_number' => 'building_number', 'building_number' => 'building_number',
-                'ship_to.street_number' => 'building_number',
+                'ship_to.street_number' => 'street_number', 'street_number' => 'street_number',
                 'ship_to.block' => 'block', 'block' => 'block',
                 'ship_to.district' => 'district', 'district' => 'district',
                 'ship_to.geo_coordinates' => 'geo_coordinates', 'geo_coordinates' => 'geo_coordinates',

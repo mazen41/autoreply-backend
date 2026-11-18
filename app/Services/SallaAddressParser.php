@@ -53,6 +53,12 @@ class SallaAddressParser
             }
         }
 
+        foreach (['street_number', 'short_address', 'additional_number'] as $key) {
+            if (!empty($state[$key])) {
+                $state[$key] = trim((string) $state[$key]);
+            }
+        }
+
         return $state;
     }
 
@@ -63,9 +69,12 @@ class SallaAddressParser
 
         return [
             'building_number' => OrderCheckoutService::extractBuildingNumber($text),
+            'street_number' => self::labelled($text, '/(?:street\s*(?:number|no\.?|#)|رقم\s*(?:الشارع|الطريق))\s*(?:is\s+|[:=#-]\s*)?(\d{1,8}[A-Za-z]?)/iu'),
             'postal_code' => self::postalCode($text),
             'block' => self::block($text),
             'district' => self::labelled($text, '/(?:district|neighborhood|area|حي|منطقة)\s*[:#-]?\s*(\p{L}[\p{L}\s\-]{1,30}?)(?=\s*(?:,|$|\b(?:street|st|block|postal|zip|and)\b))/iu'),
+            'short_address' => self::labelled($text, '/(?:short\s*(?:national\s*)?address|national\s*address\s*(?:code|number)?|العنوان\s*الوطني\s*(?:المختصر)?|العنوان\s*المختصر)\s*(?:is\s+|[:=#-]\s*)?([A-Z]{4}\d{4})/iu'),
+            'additional_number' => self::labelled($text, '/(?:additional\s*(?:address\s*)?number|secondary\s*number|الرقم\s*الإضافي)\s*(?:is\s+|[:=#-]\s*)?(\d{1,8})/iu'),
             'address_line' => self::streetLine($text),
         ];
     }

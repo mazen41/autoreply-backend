@@ -11,7 +11,7 @@ use Google\Service\Gmail;
 
 class ResyncGmailHtml extends Command
 {
-    protected $signature = 'gmail:resync-html {--channel-id= : Specific channel ID to resync}';
+    protected $signature = 'gmail:resync-html {--channel-id= : Specific channel ID to resync} {--message-id= : Specific local Gmail message ID to resync}';
     protected $description = 'Resync Gmail messages to extract HTML content';
 
     public function handle()
@@ -29,7 +29,8 @@ class ResyncGmailHtml extends Command
             return 1;
         }
 
-        $this->info("Processing Gmail channel: " . $channel->page_name);
+        $messageId = $this->option('message-id');
+        $this->info("Processing Gmail channel ID: " . $channel->id);
 
         try {
             $client = $this->getAuthenticatedClient($channel);
@@ -42,13 +43,19 @@ class ResyncGmailHtml extends Command
             $updatedCount = 0;
 
             // Get messages that belong to THIS channel and don't have HTML yet
-            $messages = Message::whereHas('conversation', function ($q) use ($channel) {
+            $messagesQuery = Message::whereHas('conversation', function ($q) use ($channel) {
                     $q->where('channel_id', $channel->id);
                 })
                 ->where('gmail_message_id', '!=', null)
-                ->whereNull('content_html')
-                ->limit(50)
-                ->get();
+                ->whereNull('content_html');
+
+            if ($messageId !== null && $messageId !== '') {
+                $messagesQuery->whereKey((int) $messageId);
+            } else {
+                $messagesQuery->limit(50);
+            }
+
+            $messages = $messagesQuery->get();
 
             $this->info("Found " . $messages->count() . " messages to resync");
 

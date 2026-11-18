@@ -138,8 +138,12 @@ class PollGmailInbox implements ShouldQueue
         $senderEmail = $m[1] ?? $from;
 
         $body = $this->extractBody($msg->getPayload());
+        // Gmail polling is the primary path for unread mail. Keep both MIME
+        // alternatives: plain text feeds AI/search, while HTML is needed to
+        // display newsletter/order emails as recipients see them in Gmail.
+        $bodyHtml = app(GmailController::class)->extractHtmlBody($msg->getPayload());
 
-        if (empty(trim($body))) {
+        if (empty(trim($body)) && empty(trim($bodyHtml))) {
             Log::info('Gmail: skipping email with no text body', ['msg_id' => $msgId]);
             return;
         }
@@ -182,7 +186,8 @@ class PollGmailInbox implements ShouldQueue
             'conversation_id'  => $conversation->id,
             'channel_id'       => $channel->id,
             'platform_message_id' => $msgId,
-            'content'          => $body,
+            'content'          => $body !== '' ? $body : $this->htmlToPlainText($bodyHtml),
+            'content_html'     => $bodyHtml !== '' ? $bodyHtml : null,
             'direction'        => 'inbound',
             'is_ai'            => false,
             'status'           => 'received',
@@ -228,6 +233,13 @@ class PollGmailInbox implements ShouldQueue
         }
 
         return '';
+    }
+
+    private function htmlToPlainText(string $html): string
+    {
+        $withoutActiveContent = preg_replace('/<(style|script)[^>]*>.*?<\/\1>/si', '', $html) ?? $html;
+        $text = html_entity_decode(strip_tags($withoutActiveContent), ENT_QUOTES | ENT_HTML5, 'UTF-8');
+        return trim(preg_replace('/\s+/', ' ', $text) ?? $text);
     }
 
     private function sendEmailReply(Gmail $gmail, string $to, string $subject, string $threadId, string $inReplyToId, string $body): void

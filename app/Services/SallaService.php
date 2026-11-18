@@ -1233,6 +1233,12 @@ class SallaService
                 $shipTo[$nullableField] = null;
             }
         }
+        // Salla's validation rejects `null` for ship_to.block on some stores/couriers even though
+        // the field is logically optional for the customer. Rather than fail checkout, substitute a
+        // safe non-empty placeholder so the order can still be created.
+        if ($shipTo['block'] === null) {
+            $shipTo['block'] = '-';
+        }
         if ($districtId === null) {
             unset($shipTo['district']);
         }
@@ -1329,6 +1335,19 @@ class SallaService
             $address = (string) ($data['address'] ?? $data['customer_address'] ?? '');
             if (!$this->resolveShippingAddressForChannel($channel, $address, $phone)) {
                 return ['status' => 'needs_fields', 'missing_fields' => ['delivery_city']];
+            }
+
+            // Pre-submit check: ask for missing required fields before any Salla request.
+            $presubmitMissing = SallaOrderValidator::missingFields(
+                $data,
+                (array) ($data['salla_required_fields'] ?? [])
+            );
+            if ($presubmitMissing !== []) {
+                Log::info('SALLA_PRESUBMIT_MISSING_FIELDS', [
+                    'channel_id' => $channel->id,
+                    'missing_fields' => $presubmitMissing,
+                ]);
+                return ['status' => 'needs_fields', 'missing_fields' => $presubmitMissing];
             }
 
             $data = $this->buildCanonicalOrderPayload($channel, $data);

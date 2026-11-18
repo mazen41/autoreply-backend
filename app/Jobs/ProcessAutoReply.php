@@ -2930,6 +2930,14 @@ $aiResponse = $intro
                         $updatedCheckoutState['confirmation_summary_fingerprint'],
                         $updatedCheckoutState['confirmation_summary_sent_at']
                     );
+                    // Salla's 422 is the ground truth: whatever field it named must be
+                    // treated as missing even if our local checkout_state holds a stale
+                    // or placeholder value (e.g. "__not_applicable__") for it. Otherwise
+                    // computeFieldStatus() won't flag it, the intersection below collapses
+                    // to empty, and the customer gets stuck in an infinite confirm loop.
+                    foreach ((array) ($orderData['missing_fields'] ?? []) as $sallaMissingField) {
+                        unset($updatedCheckoutState[$sallaMissingField]);
+                    }
                     $conversation->update(['checkout_state' => $updatedCheckoutState]);
                     $checkoutState = $updatedCheckoutState;
                     $fieldStatus = $checkoutService->computeFieldStatus(
@@ -2951,10 +2959,13 @@ $aiResponse = $intro
                         'additional_number' => 'additional address number',
                         'address' => 'complete delivery address',
                     ];
-                    $stillMissing = array_values(array_intersect(
-                        (array) ($orderData['missing_fields'] ?? []),
-                        (array) ($fieldStatus['missing_fields'] ?? [])
-                    ));
+                    // Trust Salla's own 422 response for which fields are still
+                    // missing — it is the authority on what the store requires.
+                    // (Previously this intersected against our local field-status
+                    // check, which could silently collapse to an empty set and
+                    // produce a vague, unfixable message, trapping the customer
+                    // in an infinite "confirm order" loop.)
+                    $stillMissing = array_values(array_unique((array) ($orderData['missing_fields'] ?? [])));
                     $requestedFields = array_values(array_unique(array_map(
                         fn ($field) => $labels[$field] ?? str_replace('_', ' ', (string) $field),
                         $stillMissing

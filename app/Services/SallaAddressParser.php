@@ -67,6 +67,25 @@ class SallaAddressParser
     {
         $text = trim($text);
 
+        // A bare confirmation/cancellation reply ("confirm order", "تأكيد",
+        // "cancel", ...) is not delivery address text. Without this guard,
+        // streetLine() happily returns the leftover text as `address_line`,
+        // clobbering the customer's real street address with the literal
+        // words "confirm order" and permanently breaking checkout (see the
+        // Salla 422 infinite-loop bug).
+        if (self::isConfirmationOrCancellationOnly($text)) {
+            return [
+                'building_number' => null,
+                'street_number' => null,
+                'postal_code' => null,
+                'block' => null,
+                'district' => null,
+                'short_address' => null,
+                'additional_number' => null,
+                'address_line' => null,
+            ];
+        }
+
         return [
             'building_number' => OrderCheckoutService::extractBuildingNumber($text),
             'street_number' => self::labelled($text, '/(?:street\s*(?:number|no\.?|#)|رقم\s*(?:الشارع|الطريق))\s*(?:is\s+|[:=#-]\s*)?(\d{1,8}[A-Za-z]?)/iu'),
@@ -77,6 +96,20 @@ class SallaAddressParser
             'additional_number' => self::labelled($text, '/(?:additional\s*(?:address\s*)?number|secondary\s*number|الرقم\s*الإضافي)\s*(?:is\s+|[:=#-]\s*)?(\d{1,8})/iu'),
             'address_line' => self::streetLine($text),
         ];
+    }
+
+    /** True when the whole message is just a confirm/cancel reply, in English or Arabic. */
+    private static function isConfirmationOrCancellationOnly(string $text): bool
+    {
+        return preg_match(
+            '/^(?:'
+            . 'confirm(?:\s+(?:the\s+)?order)?'
+            . '|cancel(?:\s+(?:the\s+)?order)?'
+            . '|يلغي|إلغاء|الغاء|إلغاء\s+الطلب|الغاء\s+الطلب'
+            . '|تأكيد(?:\s+الطلب)?|أكد(?:\s+الطلب)?'
+            . ')\s*[.!؟?]*$/iu',
+            $text
+        ) === 1;
     }
 
     private static function block(string $text): ?string
@@ -129,6 +162,9 @@ class SallaAddressParser
         $line = preg_replace('/\b(?:building|house|villa|apt|apartment|flat)\s*(?:number|no\.?|#)?\s*(?:is\s+)?\d{1,6}[A-Za-z]?\b/i', ' ', $line) ?? $line;
         $line = preg_replace('/^\s*\d{1,5}[A-Za-z]?\s+(?=\p{L})/u', '', $line) ?? $line;
         $line = preg_replace('/\s+(?:and|و)\s*$/iu', '', $line) ?? $line;
+        // Confirm/cancel words are commands, not address text. Strip them so a message
+        // like "confirm order" can never be stored as address_line.
+        $line = preg_replace('/\b(?:confirm(?:\s+order)?|cancel)\b|تأكيد(?:\s+الطلب)?|إلغاء/iu', ' ', $line) ?? $line;
         $line = trim(preg_replace('/[\s,،]+/u', ' ', $line) ?? $line, " ,،.-");
 
         return $line === '' ? null : $line;

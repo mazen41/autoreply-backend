@@ -113,10 +113,11 @@ class ChannelController extends Controller
             return response()->json(['success' => false, 'error' => 'Salla store not found or already claimed'], 404);
         }
 
-        $userId   = $request->user()->getAuthIdentifier();
-        $business = \App\Models\BusinessProfile::where('user_id', $userId)->first();
+        $userId = $request->user()->getAuthIdentifier();
+        $business = app(\App\Services\ActiveBusiness::class)->resolve($request, permission: 'write');
 
         $existing = Channel::where('user_id', $userId)
+            ->where('business_id', $business->id)
             ->where('type', 'salla')
             ->where('page_id', $channel->page_id)
             ->first();
@@ -130,13 +131,14 @@ class ChannelController extends Controller
                 'status'           => 'connected',
                 'connected_at'     => now(),
                 'metadata'         => $channel->metadata,
+                'business_id'      => $business->id,
             ]);
             $channel->delete();
             $channel = $existing;
         } else {
             $channel->update([
                 'user_id'      => $userId,
-                'business_id'  => $business?->id,
+                'business_id'  => $business->id,
                 'status'       => 'connected',
                 'connected_at' => now(),
             ]);

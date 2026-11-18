@@ -782,11 +782,18 @@ class SallaService
             }
 
             $savedCount = DB::transaction(function () use ($channel, $countryCode, $staged, $expectedCount): int {
-                DB::table('salla_cities')->upsert(
-                    array_values($staged),
-                    ['channel_id', 'country_code', 'salla_city_id'],
-                    ['country_id', 'name', 'name_en', 'name_ar', 'synced_at', 'updated_at']
-                );
+                // MySQL limits the number of bound placeholders in one prepared
+                // statement. A full Salla country catalog can contain tens of
+                // thousands of cities, so write bounded batches inside the same
+                // transaction to keep the refresh atomic without exceeding that
+                // limit.
+                foreach (array_chunk(array_values($staged), 400) as $cityBatch) {
+                    DB::table('salla_cities')->upsert(
+                        $cityBatch,
+                        ['channel_id', 'country_code', 'salla_city_id'],
+                        ['country_id', 'name', 'name_en', 'name_ar', 'synced_at', 'updated_at']
+                    );
+                }
                 DB::table('salla_cities')
                     ->where('channel_id', $channel->id)
                     ->where('country_code', $countryCode)

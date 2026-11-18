@@ -862,6 +862,9 @@ class SallaService
     protected function normalizeCitySearchText(string $value): string
     {
         $value = mb_strtolower(trim($value));
+        $value = strtr($value, [
+            'أ' => 'ا', 'إ' => 'ا', 'آ' => 'ا', 'ى' => 'ي', 'ة' => 'ه',
+        ]);
         $value = preg_replace('/[^\\p{L}\\p{N}\\s]/u', ' ', $value) ?? $value;
         $value = preg_replace('/\\s+/u', ' ', $value) ?? $value;
         $value = trim($value);
@@ -869,6 +872,77 @@ class SallaService
         // Salla names may include the common transliterated prefixes "Al"/"El"
         // while customers usually write the shorter city name (e.g. "Giza").
         return preg_replace('/^(?:al|el)\\s+/u', '', $value) ?? $value;
+    }
+
+    /**
+     * Return known spelling/transliteration variants for a canonical Salla city.
+     * Keep this deliberately explicit: fuzzy matching is only a fallback and
+     * must never turn a similar-looking place into a different delivery city.
+     */
+    protected function cityNameSearchVariants(string $cityName): array
+    {
+        $normalized = $this->normalizeCitySearchText($cityName);
+        $groups = [
+            ['mecca', 'makkah', 'makka', 'makkah al mukarramah', 'makkah mukarramah', 'مكه', 'مكه المكرمه'],
+            ['jeddah', 'jedda', 'jidda', 'jiddah', 'جده'],
+            ['medina', 'madinah', 'madina', 'al madinah', 'المدينه', 'المدينه المنوره'],
+            ['riyadh', 'riyad', 'الرياض'],
+            ['dammam', 'ad dammam', 'الدمام'],
+        ];
+
+        foreach ($groups as $group) {
+            $normalizedGroup = array_map(fn (string $name) => $this->normalizeCitySearchText($name), $group);
+            if (in_array($normalized, $normalizedGroup, true)) {
+                return array_values(array_unique($normalizedGroup));
+            }
+        }
+
+        return $normalized === '' ? [] : [$normalized];
+    }
+
+    /** Find a unique close Latin spelling when no exact/known alias matched. */
+    protected function findFuzzyCityMatch($cities, string $normalizedAddress): ?int
+    {
+        $addressTokens = preg_split('/\\s+/u', $normalizedAddress, -1, PREG_SPLIT_NO_EMPTY) ?: [];
+        $bestDistance = PHP_INT_MAX;
+        $bestCityIds = [];
+
+        foreach ($cities as $city) {
+            $cityDistance = PHP_INT_MAX;
+            foreach ([$city->name, $city->name_en, $city->name_ar] as $name) {
+                $normalizedName = $this->normalizeCitySearchText(trim((string) $name));
+                foreach (preg_split('/\\s+/u', $normalizedName, -1, PREG_SPLIT_NO_EMPTY) ?: [] as $cityToken) {
+                    // Edit distance is byte-oriented in PHP, so use it only for
+                    // Latin words. Arabic variants are handled by normalization
+                    // and the explicit alias groups above.
+                    if (mb_strlen($cityToken) < 5 || !preg_match('/^[a-z]+$/', $cityToken)) {
+                        continue;
+                    }
+                    foreach ($addressTokens as $addressToken) {
+                        if (mb_strlen($addressToken) < 5 || !preg_match('/^[a-z]+$/', $addressToken)) {
+                            continue;
+                        }
+                        $distance = levenshtein($cityToken, $addressToken);
+                        $maxDistance = mb_strlen($cityToken) >= 9 ? 2 : 1;
+                        if ($distance <= $maxDistance) {
+                            $cityDistance = min($cityDistance, $distance);
+                        }
+                    }
+                }
+            }
+
+            if ($cityDistance < $bestDistance) {
+                $bestDistance = $cityDistance;
+                $bestCityIds = [(int) $city->salla_city_id];
+            } elseif ($cityDistance === $bestDistance && $cityDistance !== PHP_INT_MAX) {
+                $bestCityIds[] = (int) $city->salla_city_id;
+            }
+        }
+
+        $bestCityIds = array_values(array_unique($bestCityIds));
+        return count($bestCityIds) === 1 && $bestDistance !== PHP_INT_MAX
+            ? $bestCityIds[0]
+            : null;
     }
 
     /**
@@ -943,16 +1017,21 @@ class SallaService
                 }
 
                 $availableCityNames[] = $cityName;
-                $normalizedCityName = $this->normalizeCitySearchText($cityName);
-                $cityNameLength = mb_strlen($normalizedCityName);
-                if (
-                    $cityNameLength > $matchedCityNameLength
-                    && str_contains($normalizedAddress, $normalizedCityName)
-                ) {
-                    $matchedCityId = (int) $city->salla_city_id;
-                    $matchedCityNameLength = $cityNameLength;
+                foreach ($this->cityNameSearchVariants($cityName) as $normalizedCityName) {
+                    $cityNameLength = mb_strlen($normalizedCityName);
+                    if (
+                        $cityNameLength > $matchedCityNameLength
+                        && str_contains($normalizedAddress, $normalizedCityName)
+                    ) {
+                        $matchedCityId = (int) $city->salla_city_id;
+                        $matchedCityNameLength = $cityNameLength;
+                    }
                 }
             }
+        }
+
+        if (!$matchedCityId) {
+            $matchedCityId = $this->findFuzzyCityMatch($cities, $normalizedAddress);
         }
 
         // STRICT RULE 1: If city cannot be matched against merchant's Salla city list, DO NOT fake city_id = 1! Return null.

@@ -2938,6 +2938,11 @@ $aiResponse = $intro
                     foreach ((array) ($orderData['missing_fields'] ?? []) as $sallaMissingField) {
                         unset($updatedCheckoutState[$sallaMissingField]);
                     }
+                    // Product options rejected by Salla: the next customer reply must be read
+                    // as an option choice, not as free-text order detail.
+                    if (in_array('salla_options', (array) ($orderData['missing_fields'] ?? []), true)) {
+                        $updatedCheckoutState['confirmation_state'] = 'selecting_salla_option';
+                    }
                     $conversation->update(['checkout_state' => $updatedCheckoutState]);
                     $checkoutState = $updatedCheckoutState;
                     $fieldStatus = $checkoutService->computeFieldStatus(
@@ -2958,6 +2963,7 @@ $aiResponse = $intro
                         'short_address' => 'Saudi National Address short code',
                         'additional_number' => 'additional address number',
                         'address' => 'complete delivery address',
+                        'salla_options' => 'product option (for example size or color)',
                     ];
                     // Trust Salla's own 422 response for which fields are still
                     // missing — it is the authority on what the store requires.

@@ -1444,6 +1444,10 @@ class SallaService
                 $normalized = strtolower((string) $sallaField);
                 if (isset($fieldMap[$normalized])) {
                     $missingFields[] = $fieldMap[$normalized];
+                } elseif ($normalized === 'options' || str_starts_with($normalized, 'options.')) {
+                    // Salla rejected the product options (e.g. size/color not chosen or
+                    // malformed). Route to option selection instead of a dead-end failure.
+                    $missingFields[] = 'salla_options';
                 }
             }
             $missingFields = array_values(array_unique($missingFields));
@@ -1451,6 +1455,7 @@ class SallaService
             Log::warning('SALLA_ORDER_CREATE_VALIDATION_FAILED', [
                 'channel_id' => $channel->id,
                 'salla_fields' => array_keys($e->fields),
+                'salla_field_details' => $e->fields,
                 'mapped_missing_fields' => $missingFields,
             ]);
 

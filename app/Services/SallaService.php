@@ -1229,7 +1229,7 @@ class SallaService
         ];
         foreach (['block', 'postal_code', 'additional_number'] as $nullableField) {
             if (is_string($shipTo[$nullableField])
-                && in_array(mb_strtolower(trim($shipTo[$nullableField])), ['n/a', 'na', 'none', 'not applicable', 'لا يوجد', 'غير متوفر'], true)) {
+                && in_array(mb_strtolower(trim($shipTo[$nullableField])), ['__not_applicable__', 'n/a', 'na', 'none', 'not applicable', 'لا يوجد', 'غير متوفر'], true)) {
                 $shipTo[$nullableField] = null;
             }
         }
@@ -1322,29 +1322,6 @@ class SallaService
                 $granted = preg_split('/[\s,]+/', trim($grantedScopes)) ?: [];
                 if (!in_array('orders.read_write', $granted, true)) {
                     throw new \RuntimeException('Salla authorization is missing orders.read_write. Reconnect the store with order access enabled.');
-                }
-            }
-
-            $phoneCountry = SallaPhoneHelper::getCountryCode((string) ($data['phone'] ?? $data['customer_phone'] ?? ''));
-            if ($phoneCountry === 'SA') {
-                $requiredNationalFields = ['street_number', 'building_number', 'block', 'short_address', 'additional_number', 'postal_code', 'geo_coordinates'];
-                $missingNationalFields = array_values(array_filter($requiredNationalFields, static function (string $field) use ($data): bool {
-                    $value = $data[$field] ?? null;
-                    if ($field === 'geo_coordinates') {
-                        return !is_array($value) || !isset($value['lat'], $value['lng'])
-                            || !is_numeric($value['lat']) || !is_numeric($value['lng'])
-                            || (float) $value['lat'] < -90 || (float) $value['lat'] > 90
-                            || (float) $value['lng'] < -180 || (float) $value['lng'] > 180;
-                    }
-                    if (in_array($field, ['block', 'additional_number', 'postal_code'], true)
-                        && is_string($value)
-                        && in_array(mb_strtolower(trim($value)), ['n/a', 'na', 'none', 'not applicable', 'لا يوجد', 'غير متوفر'], true)) {
-                        return false;
-                    }
-                    return $value === null || trim((string) $value) === '';
-                }));
-                if ($missingNationalFields !== []) {
-                    return ['status' => 'needs_fields', 'missing_fields' => $missingNationalFields];
                 }
             }
 

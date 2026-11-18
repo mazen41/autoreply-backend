@@ -695,17 +695,6 @@ class OrderCheckoutService
             $requiredFields = array_values(array_unique(array_merge($requiredFields, $sallaRequiredFields)));
         }
 
-        // Salla's current Create Order contract requires the Saudi National
-        // Address fields before the customer confirms. Collect precise values
-        // from the customer; never synthesize coordinates or address numbers.
-        $phoneCountry = SallaPhoneHelper::getCountryCode((string) ($normalizedState['phone'] ?? ''));
-        if ($requireSallaShippingDetails && $phoneCountry === 'SA') {
-            $requiredFields = array_values(array_unique(array_merge($requiredFields, [
-                'delivery_city', 'address_line', 'street_number', 'building_number',
-                'block', 'short_address', 'additional_number', 'postal_code', 'geo_coordinates',
-            ])));
-        }
-
         $fieldAliases = [
             'email' => ['customer_email'],
         ];
@@ -727,7 +716,7 @@ class OrderCheckoutService
             }
             if (in_array($field, ['block', 'additional_number', 'postal_code'], true)
                 && is_string($value)
-                && in_array(mb_strtolower(trim($value)), ['n/a', 'na', 'none', 'not applicable', 'لا يوجد', 'غير متوفر'], true)) {
+                && in_array(mb_strtolower(trim($value)), ['__not_applicable__', 'n/a', 'na', 'none', 'not applicable', 'لا يوجد', 'غير متوفر'], true)) {
                 $value = '__not_applicable__';
             }
             if (!empty($value)) {

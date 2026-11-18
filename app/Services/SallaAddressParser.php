@@ -84,12 +84,17 @@ class SallaAddressParser
         // Salla's `block` field is also used for floor details (their API
         // example is "الدور الثاني"). Accept explicit labels only; never
         // guess a block from a P.O. Box, city, street, or postal code.
-        $labelledBlock = self::labelled($text, '/(?:block|blk|bl\.?|بلوك|قطعة)\s*(?:no\.?|number|#)?\s*(?:(?:is|equals?)\s+|[:=\-#]\s*)?([\p{L}\d][\p{L}\d\s\-\/]{0,30}?)(?=\s*(?:,|$|\b(?:street|st|district|area|postal|zip|and)\b))/iu');
+        $labelledBlock = self::labelled($text, '/(?:block\s*\/\s*floor|floor\s*\/\s*block|block|blk|bl\.?|بلوك|قطعة|floor|level|apartment|apt\.?|unit|الدور|الطابق|الطابقه|شقة|وحدة)\s*(?:no\.?|number|#)?\s*(?:(?:is|equals?)\s+|[:=\-#]\s*)?([\p{L}\d][\p{L}\d\s\-\/]{0,30}?)(?=\s*(?:[,;.؟]|$|\b(?:street|st|district|area|postal|zip|short\s*(?:national\s*)?address|additional\s*(?:address\s*)?number|and)\b))/iu');
         if ($labelledBlock !== null) {
-            return $labelledBlock;
+            return self::notApplicable($labelledBlock) ? '__not_applicable__' : $labelledBlock;
         }
 
-        return self::labelled($text, '/(?:floor|level|apartment|apt\.?|unit|الدور|الطابق|الطابقه|شقة|وحدة)\s*(?:(?:is|number|no\.?|رقم)\s+|[:=#\-]\s*)?([\p{L}\d][\p{L}\d\s\-\/]{0,25}?)(?=\s*(?:,|$|\b(?:street|st|district|area|postal|zip|and)\b))/iu');
+        return null;
+    }
+
+    private static function notApplicable(string $value): bool
+    {
+        return in_array(mb_strtolower(trim($value)), ['n/a', 'na', 'none', 'not applicable', 'لا يوجد', 'غير متوفر'], true);
     }
 
     private static function postalCode(string $text): ?string

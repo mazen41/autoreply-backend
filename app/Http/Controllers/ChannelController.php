@@ -58,8 +58,9 @@ class ChannelController extends Controller
             if ($claimed) {
                 $claimed->update($fields);
                 $this->queueSallaCityCatalogs();
+                $citiesStatus = app(\App\Services\SharedSallaCityCatalogService::class)->isFresh('SA') ? 'matched' : 'processing';
                 Log::info('Salla install: refreshed tokens on existing channel', ['channel_id' => $claimed->id]);
-                return redirect($frontend . '/dashboard/channels?success=salla_connected');
+                return redirect($frontend . '/dashboard/channels?success=salla_connected&cities=' . $citiesStatus);
             }
 
             $channel = Channel::where('type', 'salla')->where('page_id', $storeId)->whereNull('user_id')->first();
@@ -144,8 +145,13 @@ class ChannelController extends Controller
 
         Log::info('Salla channel claimed', ['channel_id' => $channel->id, 'user_id' => $userId]);
         $this->queueSallaCityCatalogs();
+        $citiesStatus = app(\App\Services\SharedSallaCityCatalogService::class)->isFresh('SA') ? 'matched' : 'processing';
 
-        return response()->json(['success' => true, 'channel_id' => $channel->id]);
+        return response()->json([
+            'success'       => true,
+            'channel_id'    => $channel->id,
+            'cities_status' => $citiesStatus,
+        ]);
     }
 
     public function index(Request $request)
@@ -803,8 +809,11 @@ class ChannelController extends Controller
             $this->subscribeSallaWebhooks($channel, $accessToken);
 
             $this->queueSallaCityCatalogs();
+            $citiesStatus = app(\App\Services\SharedSallaCityCatalogService::class)->isFresh('SA') ? 'matched' : 'processing';
 
-            $returnPath = ($stateData['context']['redirect'] ?? null) === 'onboarding' ? '/onboarding?success=salla_connected&channel=salla' : '/dashboard/channels?success=salla_connected';
+            $returnPath = ($stateData['context']['redirect'] ?? null) === 'onboarding'
+                ? "/onboarding?success=salla_connected&cities={$citiesStatus}&channel=salla"
+                : "/dashboard/channels?success=salla_connected&cities={$citiesStatus}";
             return redirect(env('FRONTEND_URL') . $returnPath);
 
         } catch (\Exception $e) {

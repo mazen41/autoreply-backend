@@ -14,7 +14,9 @@ use Throwable;
 
 class SharedSallaCityCatalogService
 {
-    public const FRESH_FOR_HOURS = 24;
+    // Salla's global city reference data changes infrequently. Keep using the
+    // last complete catalog for 90 days before scheduling a background refresh.
+    public const FRESH_FOR_HOURS = 2160;
     public const PAGES_PER_JOB = 20;
     private const REQUEST_DELAY_MICROSECONDS = 200000;
 

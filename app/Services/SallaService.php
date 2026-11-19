@@ -793,6 +793,34 @@ class SallaService
     }
 
     /**
+     * Detect the shipping country from country names written in the delivery address.
+     * Returns null when the address names no country.
+     */
+    private function countryFromAddress(string $freeformAddress): ?string
+    {
+        $addressLower = mb_strtolower($freeformAddress);
+
+        foreach ([
+            'EG' => ['egypt', 'مصر'], 'SA' => ['saudi arabia', 'ksa', 'السعودية'],
+            'AE' => ['united arab emirates', 'uae', 'الإمارات'], 'KW' => ['kuwait', 'الكويت'],
+            'QA' => ['qatar', 'قطر'], 'BH' => ['bahrain', 'البحرين'], 'OM' => ['oman', 'عمان'],
+            'YE' => ['yemen', 'اليمن'], 'IQ' => ['iraq', 'العراق'], 'SY' => ['syria', 'سوريا'],
+            'JO' => ['jordan', 'الأردن'], 'LB' => ['lebanon', 'لبنان'], 'PS' => ['palestine', 'فلسطين'],
+            'LY' => ['libya', 'ليبيا'], 'TN' => ['tunisia', 'تونس'], 'DZ' => ['algeria', 'الجزائر'],
+            'MA' => ['morocco', 'المغرب'], 'SD' => ['sudan', 'السودان'], 'SO' => ['somalia', 'الصومال'],
+            'DJ' => ['djibouti', 'جيبوتي'], 'KM' => ['comoros', 'جزر القمر'], 'MR' => ['mauritania', 'موريتانيا'],
+        ] as $code => $aliases) {
+            foreach ($aliases as $alias) {
+                if (mb_stripos($addressLower, mb_strtolower($alias)) !== false) {
+                    return $code;
+                }
+            }
+        }
+
+        return null;
+    }
+
+    /**
      * Dynamically resolve Salla shipping address fields against the merchant's Salla account data.
      * Returns null if city_id or required address components cannot be confidently resolved.
      */
@@ -802,30 +830,10 @@ class SallaService
             return null;
         }
 
-        // Match the phone's country to the locally synced Salla catalog, keeping
-        // network pagination out of the checkout/order-creation path.
-        $countryCode = SallaPhoneHelper::getCountryCode($phone);
-
-        if (!$countryCode) {
-            $addressLower = mb_strtolower($freeformAddress);
-            foreach ([
-                'EG' => ['egypt', 'مصر'], 'SA' => ['saudi arabia', 'ksa', 'السعودية'],
-                'AE' => ['united arab emirates', 'uae', 'الإمارات'], 'KW' => ['kuwait', 'الكويت'],
-                'QA' => ['qatar', 'قطر'], 'BH' => ['bahrain', 'البحرين'], 'OM' => ['oman', 'عمان'],
-                'YE' => ['yemen', 'اليمن'], 'IQ' => ['iraq', 'العراق'], 'SY' => ['syria', 'سوريا'],
-                'JO' => ['jordan', 'الأردن'], 'LB' => ['lebanon', 'لبنان'], 'PS' => ['palestine', 'فلسطين'],
-                'LY' => ['libya', 'ليبيا'], 'TN' => ['tunisia', 'تونس'], 'DZ' => ['algeria', 'الجزائر'],
-                'MA' => ['morocco', 'المغرب'], 'SD' => ['sudan', 'السودان'], 'SO' => ['somalia', 'الصومال'],
-                'DJ' => ['djibouti', 'جيبوتي'], 'KM' => ['comoros', 'جزر القمر'], 'MR' => ['mauritania', 'موريتانيا'],
-            ] as $code => $aliases) {
-                foreach ($aliases as $alias) {
-                    if (mb_stripos($addressLower, mb_strtolower($alias)) !== false) {
-                        $countryCode = $code;
-                        break 2;
-                    }
-                }
-            }
-        }
+        // The delivery address decides the shipping country. The phone number only shows
+        // where the SIM is registered, and a customer with an Egyptian number can still
+        // ship to Makkah, Saudi Arabia. The phone is used only when the address names no country.
+        $countryCode = $this->countryFromAddress($freeformAddress) ?? SallaPhoneHelper::getCountryCode($phone);
 
         if (!$countryCode) {
             Log::info('SallaService: country could not be determined for shipping address', [
@@ -882,6 +890,44 @@ class SallaService
                 ? DB::table('salla_city_reference_cities')->where('country_id', $countryId)->get()
                 : collect();
             $matchedCityId = $this->findFuzzyCityMatch($cities, $normalizedAddress);
+        }
+
+        if (!$matchedCityId && $countryCode !== 'SA') {
+            // Fallback: If no city matched in the foreign phone country, check the primary market (Saudi Arabia).
+            // A customer with an Egyptian/UAE/foreign phone number often enters a Saudi address without explicitly writing "Saudi Arabia".
+            $saCatalog = DB::table('salla_city_catalogs')->where('country_code', 'SA')->first();
+            if ($saCatalog && $saCatalog->country_id) {
+                $saCities = $this->findIndexedCityCandidates((int) $saCatalog->country_id, $normalizedAddress);
+                foreach ($saCities as $city) {
+                    foreach ([$city->name, $city->name_en, $city->name_ar] as $cityName) {
+                        $cityName = trim((string) $cityName);
+                        if ($cityName === '') {
+                            continue;
+                        }
+                        foreach ($this->cityNameSearchVariants($cityName) as $normalizedCityName) {
+                            $cityNameLength = mb_strlen($normalizedCityName);
+                            if (
+                                $cityNameLength > $matchedCityNameLength
+                                && str_contains($normalizedAddress, $normalizedCityName)
+                            ) {
+                                $matchedCityId = (int) $city->salla_city_id;
+                                $matchedCityNameLength = $cityNameLength;
+                                $countryCode = 'SA';
+                                $countryId = $saCatalog->country_id;
+                            }
+                        }
+                    }
+                }
+                if (!$matchedCityId) {
+                    $allSaCities = DB::table('salla_city_reference_cities')->where('country_id', $saCatalog->country_id)->get();
+                    $fuzzyMatched = $this->findFuzzyCityMatch($allSaCities, $normalizedAddress);
+                    if ($fuzzyMatched) {
+                        $matchedCityId = $fuzzyMatched;
+                        $countryCode = 'SA';
+                        $countryId = $saCatalog->country_id;
+                    }
+                }
+            }
         }
 
         // STRICT RULE 1: If city cannot be matched against merchant's Salla city list, DO NOT fake city_id = 1! Return null.

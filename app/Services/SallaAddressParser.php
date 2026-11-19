@@ -8,10 +8,42 @@ namespace App\Services;
  */
 class SallaAddressParser
 {
+    /** Remove conversational labels accidentally saved in older checkout addresses. */
+    public static function cleanAddress(string $text): ?string
+    {
+        $text = trim($text, " \t\n\r\0\x0B,;:-");
+
+        for ($i = 0; $i < 5; $i++) {
+            $cleaned = preg_replace(
+                '/^(?:(?:and\s+)?(?:(?:the|my)\s+)?(?:delivery\s+)?address\s*(?:(?:is|:|-)\s*)?|is\s+and\s+|here\s+)/iu',
+                '',
+                $text,
+                1
+            ) ?? $text;
+            $cleaned = trim($cleaned, " \t\n\r\0\x0B,;:-");
+            if ($cleaned === $text) {
+                break;
+            }
+            $text = $cleaned;
+        }
+
+        // Drop a phone/email clause accidentally captured after the address.
+        $text = preg_replace('/\s+(?:and\s+)?(?:the\s+)?(?:phone|mobile|email)\b.*$/iu', '', $text) ?? $text;
+        $text = trim($text, " \t\n\r\0\x0B,;:-");
+
+        return $text === '' ? null : $text;
+    }
+
     /** Fills empty fields from the stored address text; never overwrites a value already saved. */
     public static function fillMissing(array $state): array
     {
         $address = (string) ($state['address'] ?? '');
+        if ($address !== '' && ($cleanAddress = self::cleanAddress($address))) {
+            $state['address'] = $address = $cleanAddress;
+        }
+        if (!empty($state['address_line']) && ($cleanLine = self::cleanAddress((string) $state['address_line']))) {
+            $state['address_line'] = $cleanLine;
+        }
         $poBox = $state['po_box'] ?? OrderCheckoutService::extractPoBox($address);
         if (!empty($poBox)) {
             $state['po_box'] = (string) $poBox;

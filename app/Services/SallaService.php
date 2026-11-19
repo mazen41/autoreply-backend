@@ -1466,7 +1466,7 @@ class SallaService
                 'ship_to.geo_coordinates' => 'geo_coordinates', 'geo_coordinates' => 'geo_coordinates',
                 'ship_to.short_address' => 'short_address', 'short_address' => 'short_address',
                 'ship_to.additional_number' => 'additional_number', 'additional_number' => 'additional_number',
-                'ship_to.address' => 'address', 'ship_to.address_line' => 'address',
+                'ship_to.address' => 'address', 'ship_to.address_line' => 'address_line',
             ];
             $missingFields = [];
             $flattenFieldNames = function (array $fields, string $prefix = '') use (&$flattenFieldNames): array {

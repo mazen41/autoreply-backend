@@ -3189,9 +3189,9 @@ $aiResponse = $intro
                 ]);
             } else {
                 if ($detectedLanguage === 'arabic') {
-                    $aiResponse = "لم يتم إرسال الطلب بعد. لإتمامه، أحتاج إلى: " . implode('، ', $missingDetails) . ". من فضلك أرسل البيانات الناقصة.";
+                    $aiResponse = "تمام، أقدر أساعدك في الطلب. قبل ما أجهزه للتأكيد، ابعتلي البيانات دي كلها في رسالة واحدة: " . implode('، ', $missingDetails) . ".";
                 } else {
-                    $aiResponse = "I haven't submitted the order yet. To complete it, please send: " . implode(', ', $missingDetails) . ".";
+                    $aiResponse = "Sure, I can help with that. Before I prepare the order for your confirmation, please send these details together in one message: " . implode(', ', $missingDetails) . ".";
                 }
             }
 

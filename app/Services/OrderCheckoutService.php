@@ -496,6 +496,9 @@ class OrderCheckoutService
                 $extractedAddress = $candidate;
             }
         }
+        if ($extractedAddress !== null) {
+            $extractedAddress = \App\Services\SallaAddressParser::cleanAddress($extractedAddress);
+        }
 
         // When a product is already in checkout and the customer still owes an
         // address, they often answer with only the address (without repeating
@@ -519,6 +522,11 @@ class OrderCheckoutService
         // A platform display name is not a verified delivery name. Only keep
         // a name the customer explicitly supplied in checkout state.
         $existingName  = $existingState['full_name'] ?? null;
+        $existingAddress = \App\Services\SallaAddressParser::cleanAddress((string) (
+            $existingState['address'] ?? $existingState['customer_address'] ?? ''
+        ));
+        $existingAddressLine = \App\Services\SallaAddressParser::cleanAddress((string) ($existingState['address_line'] ?? ''));
+        $mergedAddress = $extractedAddress ?? $existingAddress;
 
         // Merge fields: preserve existing values if new extraction is null (NO OVERWRITING WITH NULL!)
         $mergedState = array_merge($existingState, array_filter([
@@ -532,14 +540,14 @@ class OrderCheckoutService
             'full_name'        => $extractedName                     ?? $existingName,
             'phone'            => $extractedPhone                    ?? $existingPhone,
             'customer_phone'   => $extractedPhone                    ?? $existingPhone, // Alias for backward compatibility
-            'address'          => $extractedAddress                  ?? ($existingState['address']          ?? null),
+            'address'          => $mergedAddress,
             'email'            => $extractedEmail                    ?? ($existingState['email']             ?? null),
             'customer_email'   => $extractedEmail                    ?? ($existingState['customer_email']    ?? $existingState['email'] ?? null),
             'postal_code'      => $extractedPostalCode               ?? ($existingState['postal_code']       ?? null),
             'geo_coordinates'  => $extractedCoordinates              ?? ($existingState['geo_coordinates']   ?? null),
             'building_number'  => $extractedBuildingNumber           ?? ($existingState['building_number']   ?? null),
             'street_number'    => $parsedAddressExtras['street_number'] ?? ($existingState['street_number'] ?? null),
-            'address_line'     => $parsedAddressExtras['address_line'] ?? ($existingState['address_line'] ?? null),
+            'address_line'     => $mergedAddress ?? $extractedAddress ?? $existingAddressLine ?? $parsedAddressExtras['address_line'] ?? null,
             'po_box'           => $extractedPoBox                    ?? ($existingState['po_box']            ?? null),
             'block'            => $extractedBlock                    ?? ($existingState['block']             ?? null),
             'district'         => $extractedDistrict                 ?? ($existingState['district']          ?? null),
@@ -682,6 +690,13 @@ class OrderCheckoutService
 
         $normalizedState = $requireSallaShippingDetails ? \App\Services\SallaAddressParser::fillMissing($normalizedState) : $normalizedState;
         $requiredFields = self::REQUIRED_FIELDS;
+
+        // Salla's order API requires a customer email. Collect it with the
+        // initial order details so checkout does not discover it only after
+        // the customer has confirmed a summary.
+        if ($requireSallaShippingDetails) {
+            $requiredFields[] = 'email';
+        }
 
         // National-address extras (postal code, building number, block,
         // coordinates, district, short address, additional number) are NOT

@@ -2067,7 +2067,32 @@ class ProcessAutoReply implements ShouldQueue
             ? config('services.groq.model', 'openai/gpt-oss-120b')
             : config('services.gemini.model', 'gemini-2.5-flash')));
 
+        if (!empty($aiResult['success'])) {
+            try {
+                \Illuminate\Support\Facades\Cache::forget('ai_reply_failures:conversation:' . $conversation->id);
+            } catch (\Throwable $cacheException) {
+                // A healthy AI reply should proceed even if the cache backend
+                // is temporarily unavailable.
+            }
+        }
+
         if (!$aiResult['success']) {
+            // Keep transient/model-format problems recoverable. A single failed
+            // AI turn should not immediately disable automation or hand off the
+            // conversation. Escalate only after three consecutive failed turns.
+            $aiFailureKey = 'ai_reply_failures:conversation:' . $conversation->id;
+            try {
+                \Illuminate\Support\Facades\Cache::add($aiFailureKey, 0, now()->addMinutes(15));
+                $consecutiveAiFailures = (int) \Illuminate\Support\Facades\Cache::increment($aiFailureKey);
+                \Illuminate\Support\Facades\Cache::put($aiFailureKey, $consecutiveAiFailures, now()->addMinutes(15));
+            } catch (\Throwable $cacheException) {
+                // Cache is only a guardrail; if unavailable, prefer the safe
+                // non-escalating first-failure behavior.
+                $consecutiveAiFailures = 1;
+            }
+            $shouldEscalateAiFailure = $consecutiveAiFailures >= 3;
+            $aiFailureCode = (string) ($aiResult['failure_code'] ?? data_get($aiResult, 'validation.reasons.0', 'ai_failure'));
+
             Log::error('ProcessAutoReply: AI call failed', [
                 'conversation_id' => $conversation->id,
                 'message_id' => $message->id,
@@ -2077,6 +2102,8 @@ class ProcessAutoReply implements ShouldQueue
                 'error_type' => isset($aiResult['error']) ? get_debug_type($aiResult['error']) : null,
                 'error_code' => is_array($aiResult['error'] ?? null) ? ($aiResult['error']['code'] ?? null) : null,
                 'failure_code' => $aiResult['failure_code'] ?? data_get($aiResult, 'validation.reasons.0'),
+                'consecutive_failures' => $consecutiveAiFailures,
+                'escalation_after_repeated_failure' => $shouldEscalateAiFailure,
                 'confirmation_phrase' => (bool) $containsConfirmPhrase,
                 'confirmation_state' => $checkoutState['confirmation_state'] ?? null,
                 'valid_summary' => (bool) $hasValidOrderSummary,
@@ -2143,8 +2170,21 @@ class ProcessAutoReply implements ShouldQueue
                 }
             }
 
-            // Fallback + Escalate
-            if (!$productBrowseFallback) {
+            if ($productBrowseFallback) {
+                // A catalog-backed answer succeeded for this turn, so it
+                // breaks the consecutive AI-failure streak.
+                $shouldEscalateAiFailure = false;
+                try {
+                    \Illuminate\Support\Facades\Cache::forget($aiFailureKey);
+                } catch (\Throwable $cacheException) {
+                    // Do not block the data-backed fallback reply.
+                }
+            }
+
+            // Explain the recoverable issue in customer language without
+            // exposing provider errors or pretending a human is already
+            // handling it. Offer a concrete next step; hand off after repeats.
+            if (!$productBrowseFallback && $shouldEscalateAiFailure) {
                 $conversation->update([
                     'requires_human' => true,
                     'escalated_at' => now(),
@@ -2153,9 +2193,29 @@ class ProcessAutoReply implements ShouldQueue
                 app(\App\Services\HandoffTaskService::class)->openForConversation($conversation, 'ai_failure_fallback');
             }
 
-            // Provide a user-friendly fallback message
+            $failureExplanation = match ($aiFailureCode) {
+                'provider_exception' => "I couldn't reach the assistant service just now, so I haven't completed that request. Please send it once more in a moment.",
+                'malformed_json_object', 'invalid_json', 'raw_json_reply_field', 'response_validation_failed' => "I received an unreadable response while processing that request, so I haven't taken action. Please rephrase it or send the key details in one short message.",
+                default => "I couldn't safely complete that request because the assistant couldn't process it. Please try again with the key details, and I'll continue from there.",
+            };
+            if ($shouldEscalateAiFailure) {
+                $failureExplanation .= " I've also asked a team member to review it.";
+            }
+            if ($detectedLanguage === 'arabic') {
+                $failureExplanation = match ($aiFailureCode) {
+                    'provider_exception' => 'تعذر الاتصال بخدمة المساعد الآن، لذلك لم أُكمل طلبك. أرسل رسالتك مرة أخرى بعد قليل من فضلك.',
+                    'malformed_json_object', 'invalid_json', 'raw_json_reply_field', 'response_validation_failed' => 'وصلني رد غير واضح أثناء معالجة طلبك، لذلك لم أنفذ أي إجراء. أعد صياغة طلبك أو أرسل التفاصيل الأساسية في رسالة قصيرة.',
+                    default => 'لم أتمكن من معالجة طلبك بأمان. أرسل التفاصيل الأساسية مرة أخرى وسأتابع معك.',
+                };
+                if ($shouldEscalateAiFailure) {
+                    $failureExplanation .= ' وطلبت من أحد أعضاء الفريق مراجعته.';
+                }
+            }
+
+            // Product browsing can use the catalog data already loaded even
+            // when the model is unavailable.
             $fallbackMessage = $productBrowseFallback
-                ?? ($aiResult['reply'] ?? "I apologize, but I'm having technical difficulties right now. A human agent will be with you shortly to help with your request.");
+                ?? $failureExplanation;
             
             $replyMessage = Message::create([
                 'conversation_id' => $message->conversation_id,
@@ -2189,8 +2249,9 @@ class ProcessAutoReply implements ShouldQueue
             if ($channel->user_id) {
                 broadcast(new \App\Events\MessageReceived($replyMessage, $conversation, $channel->user_id));
                 
-                // Notify business owner about AI failure
-                $this->notifyAIFailure($channel->user, $conversation, $aiResult['error'] ?? 'Unknown AI error');
+                if ($shouldEscalateAiFailure && !$productBrowseFallback) {
+                    $this->notifyAIFailure($channel->user, $conversation, $aiFailureCode);
+                }
             }
             $this->sendReply($channel, $conversation, $replyMessage);
             return;

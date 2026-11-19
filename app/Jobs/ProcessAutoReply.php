@@ -1760,6 +1760,15 @@ class ProcessAutoReply implements ShouldQueue
             $updatedCheckoutState
         );
         $confirmationStateBeforeUpdate = $updatedCheckoutState['confirmation_state'] ?? null;
+        // A Salla option prompt is an explicit numbered-choice flow. Interpret
+        // the customer's next message as a checkout answer (or a clarification
+        // retry) before applying generic AI confidence/intent escalation.
+        // This keeps a valid reply such as "2" from being handed off just
+        // because the model labels it as a low-confidence generic question.
+        $isSallaOptionFollowUp = $confirmationStateBeforeUpdate === 'selecting_salla_option';
+        if ($isSallaOptionFollowUp) {
+            $intent = 'place_order';
+        }
         $updatedCheckoutState = $checkoutService->updateConfirmationState(
             $updatedCheckoutState,
             $message->content,

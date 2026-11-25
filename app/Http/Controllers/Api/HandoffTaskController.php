@@ -7,6 +7,8 @@ use App\Models\HandoffTask;
 use App\Models\TeamMember;
 use App\Services\ActiveBusiness;
 use Illuminate\Http\Request;
+use Illuminate\Support\Facades\DB;
+use Illuminate\Support\Facades\Schema;
 
 class HandoffTaskController extends Controller
 {
@@ -50,20 +52,53 @@ class HandoffTaskController extends Controller
     public function resolve(Request $request, int $taskId, ActiveBusiness $activeBusiness)
     {
         $business = $activeBusiness->resolve($request, permission: 'conversation_write');
-        $task = HandoffTask::query()
-            ->whereHas('conversation', fn ($q) => $q->whereIn('channel_id', $business->channels()->select('id')))
-            ->findOrFail($taskId);
-        $this->ensureAgentOwnsTask($request, $business->id, $task);
+        $validated = $request->validate(['resolution_note' => ['sometimes', 'nullable', 'string', 'max:2000']]);
+        $noteWasProvided = array_key_exists('resolution_note', $validated);
+        $note = $validated['resolution_note'] ?? null;
+        abort_unless(
+            Schema::hasColumn('conversations', 'human_handling_started_at')
+                && Schema::hasColumn('conversations', 'human_handled_count'),
+            503,
+            'Conversation handling migration has not been applied yet.'
+        );
 
-        $note = $request->validate(['resolution_note' => ['sometimes', 'nullable', 'string', 'max:2000']])['resolution_note'] ?? $task->resolution_note;
+        [$task, $error] = DB::transaction(function () use ($request, $business, $taskId, $note, $noteWasProvided): array {
+            $task = HandoffTask::query()
+                ->whereHas('conversation', fn ($q) => $q->whereIn('channel_id', $business->channels()->select('id')))
+                ->lockForUpdate()
+                ->findOrFail($taskId);
+            $this->ensureAgentOwnsTask($request, $business->id, $task);
+            $conversation = $task->conversation()->lockForUpdate()->firstOrFail();
+            $resolvedNote = $noteWasProvided ? $note : $task->resolution_note;
 
-        $task->update(['status' => 'resolved', 'resolved_at' => now(), 'resolution_note' => $note]);
-        $task->conversation()->update([
-            'requires_human' => false,
-            'status' => 'open',
+            if ($task->status !== 'open') return [$task, 'already_resolved'];
+            if (!$conversation->requires_human || !$conversation->human_handling_started_at) {
+                return [$task, 'manual_reply_required'];
+            }
+
+            $conversation->update([
+                'requires_human' => false,
+                'ai_enabled' => true,
+                'status' => 'open',
+                'human_handling_started_at' => null,
+                'human_handled_count' => (int) $conversation->human_handled_count + 1,
+            ]);
+            $task->update(['status' => 'resolved', 'resolved_at' => now(), 'resolution_note' => $resolvedNote]);
+
+            return [$task->fresh(), null];
+        });
+
+        if ($error === 'already_resolved') return response()->json(['error' => 'This handoff has already been handled.'], 409);
+        if ($error === 'manual_reply_required') return response()->json(['error' => 'Send a manual reply in the conversation before marking this handoff handled.'], 422);
+
+        broadcast(new \App\Events\ConversationUpdated($task->conversation()->first()->fresh()));
+
+        return response()->json([
+            'task' => $task->fresh(),
+            'message' => 'Handoff handled. Auto-reply is active again.',
+            'human_handled_count' => $task->conversation()->value('human_handled_count'),
+            'ai_enabled' => true,
         ]);
-
-        return response()->json(['task' => $task->fresh(), 'message' => 'Handoff task resolved.']);
     }
 
     public function assign(Request $request, int $taskId, ActiveBusiness $activeBusiness)

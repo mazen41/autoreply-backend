@@ -275,6 +275,8 @@ class InboxRealtimeTest extends TestCase
     public function test_status_change_broadcasts_conversation_updated()
     {
         $conversation = $this->makeConversation(['status' => 'open']);
+        $task = app(\App\Services\HandoffTaskService::class)->openForConversation($conversation, 'test_escalation');
+        $conversation->update(['requires_human' => true, 'ai_enabled' => false]);
 
         Event::fake();
 
@@ -284,6 +286,10 @@ class InboxRealtimeTest extends TestCase
             ]);
 
         $response->assertStatus(200);
+
+        $this->assertSame('resolved', $task->fresh()->status);
+        $this->assertFalse((bool) $conversation->fresh()->requires_human);
+        $this->assertFalse((bool) $conversation->fresh()->ai_enabled);
 
         Event::assertDispatched(ConversationUpdated::class, function ($event) use ($conversation) {
             $payload = $event->broadcastWith();

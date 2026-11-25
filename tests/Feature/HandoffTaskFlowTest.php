@@ -177,11 +177,24 @@ class HandoffTaskFlowTest extends TestCase
             ->assertJsonPath('data.0.status', 'open');
 
         $this->patchJson('/api/handoff-tasks/' . $task->id . '/resolve', ['resolution_note' => 'Refund was reviewed and explained.'], ['X-Business-Id' => (string) $business->id])
+            ->assertUnprocessable()
+            ->assertJsonPath('error', 'Send a manual reply in the conversation before marking this handoff handled.');
+
+        $this->assertSame('open', $task->fresh()->status);
+        $this->assertTrue((bool) $conversation->fresh()->requires_human);
+
+        // A successful agent reply sets this marker in InboxController.
+        $conversation->update(['human_handling_started_at' => now()]);
+        $this->patchJson('/api/handoff-tasks/' . $task->id . '/resolve', ['resolution_note' => 'Refund was reviewed and explained.'], ['X-Business-Id' => (string) $business->id])
             ->assertOk()
             ->assertJsonPath('task.status', 'resolved')
-            ->assertJsonPath('task.resolution_note', 'Refund was reviewed and explained.');
+            ->assertJsonPath('task.resolution_note', 'Refund was reviewed and explained.')
+            ->assertJsonPath('ai_enabled', true)
+            ->assertJsonPath('human_handled_count', 1);
 
         $this->assertFalse((bool) $conversation->fresh()->requires_human);
+        $this->assertTrue((bool) $conversation->fresh()->ai_enabled);
+        $this->assertSame(1, (int) $conversation->fresh()->human_handled_count);
         $this->assertNotNull($task->fresh()->resolved_at);
     }
 

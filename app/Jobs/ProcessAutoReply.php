@@ -1330,7 +1330,7 @@ class ProcessAutoReply implements ShouldQueue
                 'hard_keyword_override: ' . $hardEscalation['matched_keyword']
             );
 
-            $escalationMessage = "Sure 👍 I'm connecting you with a human agent now. Please wait a moment.";
+            $escalationMessage = "Sure ðŸ‘ I'm connecting you with a human agent now. Please wait a moment.";
             $replyMessage = Message::create([
                 'conversation_id' => $message->conversation_id,
                 'content' => $escalationMessage,
@@ -2666,7 +2666,7 @@ if (!$isProductBrowseMessage && $commerceChannel && !$summaryConfirmTurn) {
             // Use custom fallback message if configured
             $escalationMessage = !empty($effectiveEscalationConfig['fallback_message'])
                 ? $effectiveEscalationConfig['fallback_message']
-                : "Sure 👍 I'm connecting you with a team member now. Please wait a moment.";
+                : "Sure ðŸ‘ I'm connecting you with a team member now. Please wait a moment.";
 
             $replyMessage = Message::create([
                 'conversation_id' => $message->conversation_id,
@@ -2818,7 +2818,7 @@ $aiResponse = $intro
             ]);
             $aiResponse = $detectedLanguage === 'arabic'
                 ? "عذرًا، لا أستطيع إرسال صور المنتج الآن. سأقوم بتوصيلك بأحد أفراد الفريق ليرسلها لك مباشرة 🙏"
-                : "I'm sorry, I'm not able to send product photos right now. Let me connect you with a team member who can send them directly 🙏";
+                : "I'm sorry, I'm not able to send product photos right now. Let me connect you with a team member who can send them directly ðŸ™";
         }
 
         if ($orderCreationFailedReason === 'salla_store_not_connected') {
@@ -2880,7 +2880,7 @@ $aiResponse = $intro
                 
                 $aiResponse = $detectedLanguage === 'arabic'
                     ? "عذراً، لم أتمكن من تأكيد الطلب لأن مدينتك غير موجودة في نظام الشحن الخاص بنا. هل يمكنك توضيح اسم مدينتك والحي بدقة حتى أتمكن من إرسال الطلب؟ 🙏"
-                    : "I'm sorry, I couldn't confirm your order because your city name wasn't recognized by our shipping system. Could you please reply with your exact city and neighborhood name so I can place it? 🙏";
+                    : "I'm sorry, I couldn't confirm your order because your city name wasn't recognized by our shipping system. Could you please reply with your exact city and neighborhood name so I can place it? ðŸ™";
             }
         }
 
@@ -3032,7 +3032,7 @@ $aiResponse = $intro
                             (!empty($customerName) ? " Thank you, {$customerName}" : '') . "\n" .
                             (!empty($productName)  ? "Product: {$productName}\n" : '') .
                             "Order #: {$realOrderId}\n" .
-                            "We'll contact you shortly to confirm the details 🚀";
+                            "We'll contact you shortly to confirm the details ðŸš€";
                     }
 
                     // Persist completed checkout state so tests/callers can verify the order ID
@@ -3179,7 +3179,7 @@ $aiResponse = $intro
                         $aiResponse = "عذراً، واجهنا مشكلة تقنية في إتمام طلبك الآن 😔\n" .
                             "سيتواصل معك أحد فريقنا قريباً لإتمام الطلب يدوياً. نعتذر عن الإزعاج.";
                     } else {
-                        $aiResponse = "I'm sorry, we encountered a technical issue processing your order 😔\n" .
+                        $aiResponse = "I'm sorry, we encountered a technical issue processing your order ðŸ˜”\n" .
                             "A team member will contact you shortly to complete your order manually. We apologize for the inconvenience.";
                     }
 
@@ -3310,6 +3310,22 @@ $aiResponse = $intro
             $checkoutState['confirmation_state'] ?? null,
             (bool) $containsConfirmPhrase
         );
+        // Block claimed-action hallucinations across ALL conversation states.
+        if (\App\Models\FeatureFlag::isEnabled('ai_action_claim_guard', (int) $conversation->business_id)) {
+            $successfulActionTypes = \App\Models\AiActionLog::query()
+                ->where('conversation_id', $conversation->id)
+                ->where('message_id', $message->id)
+                ->where('status', 'executed')
+                ->pluck('action_type')
+                ->map(fn ($type) => (string) $type)
+                ->all();
+            $aiResponse = \App\Services\ConfirmationGuard::blockUngroundedActionClaim(
+                (string) $aiResponse,
+                !empty($realOrderId),
+                $detectedLanguage,
+                $successfulActionTypes
+            );
+        }
         if (trim((string) $message->content) === '') {
             $aiResponse = \App\Services\ConfirmationGuard::attachmentWithoutTextReply($detectedLanguage === 'arabic');
         }
@@ -3400,6 +3416,28 @@ $aiResponse = $intro
                 'missing_fields' => $fieldStatus['missing_fields'] ?? [],
                 'order_record_present' => $claimGuard['order_record_present'],
             ]);
+        }
+
+        if (\App\Models\FeatureFlag::isEnabled('ai_action_claim_guard', (int) $conversation->business_id)) {
+            $actionClaimGuard = app(\App\Services\AIActionClaimGuard::class)->inspect(
+                (string) $aiResponse,
+                $detectedLanguage
+            );
+            if ($actionClaimGuard['blocked']) {
+                $aiResponse = $actionClaimGuard['replacement'];
+                $messageMetadata = is_array($replyMessage->metadata) ? $replyMessage->metadata : [];
+                $messageMetadata['ai_action_claim_guard'] = [
+                    'decision' => 'replaced',
+                    'reason' => $actionClaimGuard['reason'],
+                ];
+                $replyMessage->metadata = $messageMetadata;
+                Log::warning('AI action claim replaced', [
+                    'business_id' => (int) $conversation->business_id,
+                    'conversation_id' => $conversation->id,
+                    'message_id' => $replyMessage->id,
+                    'reason' => $actionClaimGuard['reason'],
+                ]);
+            }
         }
 
         // The checkout state is already saved by the pre-AI confirmation block above.
@@ -4325,7 +4363,7 @@ $aiResponse = $intro
             ? "✅ تم تأكيد طلبك بنجاح!" . ($customerName !== '' ? " شكرًا {$customerName}" : '') . "\n"
                 . ($productName !== '' ? "المنتج: {$productName}\n" : '') . "رقم الطلب: #{$orderId}\nسيتم التواصل معك قريبًا لتأكيد التفاصيل 🚀"
             : "✅ Your order has been placed successfully!" . ($customerName !== '' ? " Thank you, {$customerName}" : '') . "\n"
-                . ($productName !== '' ? "Product: {$productName}\n" : '') . "Order #: {$orderId}\nWe'll contact you shortly to confirm the details 🚀";
+                . ($productName !== '' ? "Product: {$productName}\n" : '') . "Order #: {$orderId}\nWe'll contact you shortly to confirm the details ðŸš€";
 
         $completedState = array_merge(
             is_array($conversation->fresh()->checkout_state) ? $conversation->fresh()->checkout_state : [],

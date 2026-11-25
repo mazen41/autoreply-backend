@@ -75,7 +75,7 @@ class SallaWebhookController extends Controller
             $verified = true;
             $verificationMode = 'signature';
         } elseif ($securityStrategy === 'token' && $authToken) {
-            // Token strategy REQUIRES the secret to be configured — if it is
+            // Token strategy requires Salla's explicit strategy header and a configured secret — if it is
             // missing this is a configuration error, not an auth failure.
             if (empty($webhookSecret)) {
                 Log::error('Salla webhook: Token strategy selected but SALLA_WEBHOOK_SECRET not configured');

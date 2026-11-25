@@ -1769,4 +1769,5 @@ class SallaService
 
         return ['first' => $firstName, 'last' => $lastName];
     }
+
 }

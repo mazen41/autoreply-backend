@@ -3,8 +3,11 @@
 namespace Tests\Feature;
 
 use App\Jobs\SallaWebhookJob;
+use App\Models\BusinessProfile;
+use App\Models\Channel;
 use App\Services\SallaService;
 use Illuminate\Foundation\Testing\RefreshDatabase;
+use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Queue;
 use Tests\TestCase;
 
@@ -122,5 +125,62 @@ class SallaWebhookTest extends TestCase
 
         $response->assertUnauthorized();
         Queue::assertNotPushed(SallaWebhookJob::class);
+    }
+
+    public function test_webhook_rejects_token_when_strategy_header_is_missing(): void
+    {
+        Queue::fake();
+        config(['services.salla.webhook_secret' => 'test_secret']);
+
+        $response = $this->call('POST', '/api/salla/webhook', [], [], [], $this->transformHeadersToServerVars([
+            'Authorization' => 'Bearer test_secret',
+            'Content-Type' => 'application/json',
+        ]), json_encode(['event' => 'order.created', 'data' => []]));
+
+        $response->assertUnauthorized();
+        Queue::assertNotPushed(SallaWebhookJob::class);
+    }
+
+    public function test_app_uninstalled_cleanup_is_safe_when_delivered_twice(): void
+    {
+        $business = BusinessProfile::factory()->create();
+        $channel = Channel::factory()->create([
+            'user_id' => $business->user_id,
+            'business_id' => $business->id,
+            'type' => 'salla',
+            'page_id' => 'test-merchant-'.uniqid(),
+            'access_token' => 'fake-test-token',
+            'refresh_token' => 'fake-test-refresh-token',
+            'status' => 'connected',
+        ]);
+        $conversationId = DB::table('conversations')->insertGetId([
+            'channel_id' => $channel->id,
+            'business_id' => $business->id,
+            'sender_id' => 'fake-test-sender',
+            'sender_name' => 'Test Fixture',
+            'status' => 'open',
+            'created_at' => now(),
+            'updated_at' => now(),
+        ]);
+        DB::table('messages')->insert([
+            'conversation_id' => $conversationId,
+            'channel_id' => $channel->id,
+            'content' => 'Synthetic uninstall fixture',
+            'type' => 'text',
+            'direction' => 'inbound',
+            'status' => 'received',
+            'is_ai' => false,
+            'created_at' => now(),
+            'updated_at' => now(),
+        ]);
+
+        $job = new SallaWebhookJob('app.uninstalled', ['merchant_id' => $channel->page_id]);
+        $job->handle();
+        $job->handle();
+
+        $this->assertSame('disconnected', $channel->fresh()->status);
+        $this->assertNull($channel->fresh()->access_token);
+        $this->assertDatabaseMissing('conversations', ['id' => $conversationId]);
+        $this->assertDatabaseMissing('messages', ['conversation_id' => $conversationId]);
     }
 }

@@ -1128,7 +1128,24 @@ class InboxController extends Controller
         $conversation = $this->conversationQuery($request, 'conversation_write')
             ->findOrFail($conversationId);
 
-        $conversation->update(['status' => $request->status]);
+        DB::transaction(function () use ($conversation, $request): void {
+            $conversation->update([
+                'status' => $request->status,
+                ...($request->status === 'closed' ? ['requires_human' => false, 'ai_enabled' => false] : []),
+            ]);
+
+            if ($request->status === 'closed') {
+                \App\Models\HandoffTask::query()
+                    ->where('conversation_id', $conversation->id)
+                    ->where('status', 'open')
+                    ->update([
+                        'status' => 'resolved',
+                        'resolved_at' => now(),
+                        'resolution_note' => 'Conversation closed from the inbox.',
+                        'updated_at' => now(),
+                    ]);
+            }
+        });
 
         // Cancel active sequence enrollments when conversation is closed
         if ($request->status === 'closed') {

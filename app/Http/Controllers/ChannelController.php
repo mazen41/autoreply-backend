@@ -789,14 +789,20 @@ class ChannelController extends Controller
                 return redirect(env('FRONTEND_URL') . '/dashboard/channels?error=store_info_failed');
             }
 
-            // 3. Check for an orphaned placeholder created by app.installed webhook
-            $existing = Channel::where('type', 'salla')
-                ->where('page_id', $storeId)
-                ->whereNull('user_id')
-                ->orWhere(fn ($q) => $q->where('type', 'salla')
+            // 3. Check for an orphaned/disconnected placeholder keyed on the stable merchant id.
+            // Both conditions (null/0 user_id placeholder AND disconnected row for this user)
+            // must be scoped to type+page_id to avoid cross-merchant matches.
+            $existing = Channel::where(function ($q) use ($storeId) {
+                $q->where('type', 'salla')
                     ->where('page_id', $storeId)
-                    ->where('user_id', 0))
-                ->first();
+                    ->where(fn ($inner) => $inner->whereNull('user_id')->orWhere('user_id', 0));
+            })->orWhere(function ($q) use ($storeId, $userId) {
+                // Reinstall: reuse an existing disconnected channel for this user.
+                $q->where('type', 'salla')
+                    ->where('page_id', $storeId)
+                    ->where('user_id', $userId)
+                    ->where('status', 'disconnected');
+            })->first();
 
             if ($existing) {
                 // Claim the placeholder for this user

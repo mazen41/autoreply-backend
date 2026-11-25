@@ -51,6 +51,39 @@ class Conversation extends Model
         'commerce_context_resolved_at' => 'datetime',
     ];
 
+    /**
+     * Store checkout_state as valid UTF-8 JSON. A single malformed byte in a
+     * customer message used to make json_encode fail and roll back the whole
+     * checkout save, so orders could never be confirmed. Invalid bytes are
+     * replaced; valid Arabic text is kept as-is.
+     */
+    public function setCheckoutStateAttribute($value): void
+    {
+        if ($value === null) {
+            $this->attributes['checkout_state'] = null;
+            return;
+        }
+
+        $clean = self::scrubUtf8($value);
+        $this->attributes['checkout_state'] = json_encode(
+            $clean,
+            JSON_UNESCAPED_UNICODE | JSON_INVALID_UTF8_SUBSTITUTE
+        ) ?: null;
+    }
+
+    private static function scrubUtf8(mixed $value): mixed
+    {
+        if (is_string($value)) {
+            return mb_scrub($value, 'UTF-8');
+        }
+        if (is_array($value)) {
+            foreach ($value as $key => $item) {
+                $value[$key] = self::scrubUtf8($item);
+            }
+        }
+        return $value;
+    }
+
     public function channel()
     {
         return $this->belongsTo(Channel::class);

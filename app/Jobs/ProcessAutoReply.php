@@ -1100,19 +1100,10 @@ class ProcessAutoReply implements ShouldQueue
                 }
             }
 
-            if ($isOrderAggregate) {
-                try {
-                    $sallaService = new SallaService();
-                    $raw = $sallaService->getOrdersForChannel($sallaChannel, ['per_page' => 10]);
-                    $ordersAggregateContext = $sallaService->formatOrdersListForAI($raw);
-                    Log::info('ProcessAutoReply: Salla orders aggregate fetched', [
-                        'total_count' => $ordersAggregateContext['total_count'] ?? null,
-                    ]);
-                } catch (\Exception $e) {
-                    Log::error('ProcessAutoReply: Salla orders aggregate fetch failed', ['exception_type' => get_class($e)]);
-                    $ordersAggregateContext = ['error' => $e->getMessage()];
-                }
-            }
+            // Store-wide order lists are never sent to the model. A status question
+            // must be answered only from the customer's own order (verified by phone or
+            // order number below). Feeding the store's latest order here made the bot
+            // present another customer's order as the sender's.
 
             // ── ORDER STATUS FLOW ────────────────────────────────────────────
             if ($isOrderStatus) {
@@ -1129,6 +1120,10 @@ class ProcessAutoReply implements ShouldQueue
                         if (preg_match('/^#?(\d{5,12})$/', $trimmedMsg, $bareOrderMatch)) {
                             $raw   = $sallaService->getOrderForChannel($sallaChannel, $bareOrderMatch[1]);
                             $order = $raw['data'] ?? $raw ?? null;
+                            if ($order && !$this->orderBelongsToSender($order, [$rawPhone])) {
+                                Log::warning('ProcessAutoReply: order number does not belong to sender; not disclosed');
+                                $order = null;
+                            }
                             if ($order) {
                                 $sallaContext = $sallaService->formatOrderForAI($order);
                                 Log::info('ProcessAutoReply: Salla order found by order number (WhatsApp follow-up)', [
@@ -1176,6 +1171,10 @@ class ProcessAutoReply implements ShouldQueue
                             if ($orderNumberMatch) {
                                 $raw   = $sallaService->getOrder($sallaChannel->access_token, $orderNumberMatch);
                                 $order = $raw['data'] ?? $raw ?? null;
+                                if ($order && !$this->orderBelongsToSender($order, [$phoneMatch, $this->senderPhoneDigits($conversation)])) {
+                                    Log::warning('ProcessAutoReply: order number does not belong to sender; not disclosed');
+                                    $order = null;
+                                }
                             } elseif ($phoneMatch) {
                                 $order = $sallaService->getLatestOrderByPhone($sallaChannel->access_token, $phoneMatch);
                             }
@@ -3539,7 +3538,7 @@ $aiResponse = $intro
                 ->all();
             $aiResponse = \App\Services\ConfirmationGuard::blockUngroundedActionClaim(
                 (string) $aiResponse,
-                !empty($realOrderId),
+                !empty($realOrderId) || ($isOrderStatus && !empty($sallaContext)),
                 $detectedLanguage,
                 $successfulActionTypes
             );
@@ -5585,6 +5584,23 @@ $aiResponse = $intro
             'action_url' => '/dashboard/billing',
             'is_read' => false,
         ]);
+    }
+
+    /** True only when the order's customer phone matches one of the sender's phones (last 9 digits). */
+    private function orderBelongsToSender(array $order, array $senderPhones): bool
+    {
+        $orderPhone = preg_replace('/[^0-9]/', '', (string) ($order['customer']['mobile'] ?? $order['customer']['phone'] ?? ''));
+        if ($orderPhone === '') {
+            return false;
+        }
+        $orderLast9 = substr($orderPhone, -9);
+        foreach ($senderPhones as $phone) {
+            $digits = preg_replace('/[^0-9]/', '', (string) $phone);
+            if ($digits !== '' && substr($digits, -9) === $orderLast9) {
+                return true;
+            }
+        }
+        return false;
     }
 
     /** Digits of the sender ID, only when the channel's sender ID is itself a phone number (WhatsApp). */

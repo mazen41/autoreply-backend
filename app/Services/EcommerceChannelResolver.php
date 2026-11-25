@@ -50,7 +50,7 @@ class EcommerceChannelResolver
         return ['status' => 'unresolved', 'source' => 'unresolved', 'connection' => null];
     }
 
-    public function resolveConversation(Conversation $conversation, ?Bot $bot = null): array
+    public function resolveConversation(Conversation $conversation, ?Bot $bot = null, bool $preferCurrentDefault = false): array
     {
         $bot ??= $conversation->bot;
         $businessId = (int) $conversation->business_id;
@@ -76,7 +76,7 @@ class EcommerceChannelResolver
                         ->value('ecommerce_connection_id')
                     : null;
 
-                if (empty($conversation->checkout_state)
+                if (($preferCurrentDefault || empty($conversation->checkout_state))
                     && $botDefaultId && (int) $botDefaultId !== (int) $stored->id
                     && in_array((int) $botDefaultId, $eligibleIds, true)) {
                     // Bot default changed — clear sticky so we re-resolve below.

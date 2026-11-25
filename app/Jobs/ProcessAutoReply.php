@@ -619,10 +619,17 @@ class ProcessAutoReply implements ShouldQueue
             'focus' => 'support'
         ]);
         
+        $isProductBrowseMessage = (bool) preg_match(
+            '/(?:\b(?:show|see|view|browse|list|display|send)\b.{0,60}\b(?:products?|items?|catalog(?:ue)?|images?|photos?|pictures?)\b|\b(?:products?|items?|catalog(?:ue)?)\b.{0,60}\b(?:images?|photos?|pictures?|show|see|view|browse|list|all)\b|i\s+wanna\s+see\s+products?)/iu',
+            $message->content
+        );
+
         // Resolve the store once before reference or intent handling. References must
         // be validated against the same deterministic conversation commerce context.
+        // A fresh product browse should follow the bot's current default, even when a
+        // previous turn left stale checkout details on the conversation.
         $commerceContext = app(\App\Services\EcommerceChannelResolver::class)
-            ->resolveConversation($conversation, $bot);
+            ->resolveConversation($conversation, $bot, $isProductBrowseMessage);
         $commerceChannel = $commerceContext['connection'];
         $sallaChannel = $commerceChannel?->type === 'salla' ? $commerceChannel : null;
 
@@ -646,11 +653,6 @@ class ProcessAutoReply implements ShouldQueue
         if ($this->handleExplicitCheckoutCancellation($channel, $conversation, $message, $checkoutState)) {
             return;
         }
-
-        $isProductBrowseMessage = (bool) preg_match(
-            '/(?:\b(?:show|see|view|browse|list|display|send)\b.{0,60}\b(?:products?|items?|catalog(?:ue)?|images?|photos?|pictures?)\b|\b(?:products?|items?|catalog(?:ue)?)\b.{0,60}\b(?:images?|photos?|pictures?|show|see|view|browse|list|all)\b|i\s+wanna\s+see\s+products?)/iu',
-            $message->content
-        );
 
         // A browse request starts a product inquiry, even if it quotes an old
         // product image or a stale checkout_state still contains a product.

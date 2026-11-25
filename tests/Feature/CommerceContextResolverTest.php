@@ -139,7 +139,7 @@ class CommerceContextResolverTest extends TestCase
         $this->assertSame($storeB->id, $resolvedBAfterChange['connection']->id);
     }
 
-    public function test_resolved_conversation_context_switches_when_bot_default_changes(): void
+    public function test_product_browse_switches_stale_checkout_context_to_new_bot_default(): void
     {
         [$user, $business] = $this->makeBusiness();
         $chat = $this->makeChannel($user, $business, 'instagram', 'Instagram');
@@ -154,9 +154,10 @@ class CommerceContextResolverTest extends TestCase
         $conversation->forceFill([
             'ecommerce_connection_id' => $first->id,
             'commerce_context_status' => 'resolved',
+            'checkout_state' => ['status' => 'collecting_info'],
         ])->save();
 
-        $context = app(EcommerceChannelResolver::class)->resolveConversation($conversation, $bot);
+        $context = app(EcommerceChannelResolver::class)->resolveConversation($conversation, $bot, true);
 
         $this->assertSame('bot_default', $context['source']);
         $this->assertSame($second->id, $context['connection']->id);

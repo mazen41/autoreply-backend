@@ -1728,7 +1728,10 @@ class ProcessAutoReply implements ShouldQueue
                         $selectedIds = [(string) $values[0]['id']];
                         $sallaOptionChosenThisMessage = true;
                     } elseif ($selectedIds === [] && $selectingSallaOption) {
-                        $selectionText = mb_strtolower(trim((string) $message->content));
+                        $selectionText = strtr(mb_strtolower(trim((string) $message->content)), [
+                            '٠' => '0', '١' => '1', '٢' => '2', '٣' => '3', '٤' => '4',
+                            '٥' => '5', '٦' => '6', '٧' => '7', '٨' => '8', '٩' => '9',
+                        ]);
                         $index = preg_match('/^\s*(\d{1,2})\s*\.?\s*$/u', $selectionText, $numberMatch)
                             ? ((int) $numberMatch[1] - 1)
                             : null;
@@ -1806,6 +1809,22 @@ class ProcessAutoReply implements ShouldQueue
         $isSallaOptionFollowUp = $confirmationStateBeforeUpdate === 'selecting_salla_option';
         if ($isSallaOptionFollowUp) {
             $intent = 'place_order';
+            // A number-only answer has no detectable language. Keep the
+            // language used by the option prompt so the next checkout reply
+            // does not unexpectedly switch to English mid-conversation.
+            if (!preg_match('/[\x{0600}-\x{06FF}]/u', (string) $message->content)) {
+                $previousOptionPrompt = Message::query()
+                    ->where('conversation_id', $conversation->id)
+                    ->where('direction', 'outbound')
+                    ->where('is_ai', true)
+                    ->where('id', '<', $message->id)
+                    ->latest('id')
+                    ->value('content');
+                if (is_string($previousOptionPrompt)
+                    && preg_match('/[\x{0600}-\x{06FF}]/u', $previousOptionPrompt)) {
+                    $detectedLanguage = 'arabic';
+                }
+            }
         }
         $updatedCheckoutState = $checkoutService->updateConfirmationState(
             $updatedCheckoutState,
@@ -2400,6 +2419,22 @@ class ProcessAutoReply implements ShouldQueue
         $intent              = $aiResult['intent'] ?? 'unknown';
         $confidenceScore     = $aiResult['confidence'] ?? 1.0;
 
+        // The customer is answering a numbered Salla option prompt. Treat
+        // that answer as checkout input even if the model calls "1" a generic
+        // question or returns low confidence. The AI classification was
+        // overwriting the checkout intent set before the AI call, which sent
+        // valid size choices to the human handoff path.
+        if ($isSallaOptionFollowUp) {
+            $intent = 'place_order';
+            $aiResult['intent'] = 'place_order';
+            if (!in_array($escalationReason, ['customer_requested_human', 'complaint', 'sensitive_issue'], true)) {
+                $needsEscalation = false;
+                $aiResult['needs_escalation'] = false;
+                $escalationReason = 'none';
+                $aiResult['escalation_reason'] = 'none';
+            }
+        }
+
         if ($isProductBrowseMessage) {
             $intent = 'question';
             $aiResult['intent'] = 'question';
@@ -2799,8 +2834,9 @@ $aiResponse = $intro
                 foreach ($values as $index => $value) {
                     $choices[] = ($index + 1) . '. ' . $value['name'];
                 }
-                $aiResponse = 'Which ' . mb_strtolower($option['name']) . ' would you like? Reply with its number or exact name:' . "\n"
-                    . implode("\n", $choices);
+                $aiResponse = $detectedLanguage === 'arabic'
+                    ? 'اختار ' . mb_strtolower($option['name']) . ' المناسب لك، واكتب رقم الاختيار أو اسمه:' . "\n" . implode("\n", $choices)
+                    : 'Which ' . mb_strtolower($option['name']) . ' would you like? Reply with its number or exact name:' . "\n" . implode("\n", $choices);
             }
         }
 

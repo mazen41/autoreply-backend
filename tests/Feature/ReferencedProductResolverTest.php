@@ -6,6 +6,7 @@ use App\Models\BusinessProfile;
 use App\Models\Channel;
 use App\Models\Conversation;
 use App\Models\Message;
+use App\Models\Product;
 use App\Models\ProductMessageMap;
 use App\Models\User;
 use App\Services\ReferencedProductResolver;
@@ -68,6 +69,72 @@ class ReferencedProductResolverTest extends TestCase
             'image_url' => 'https://images.example.test/' . $externalId . '.jpg',
             'sent_at' => now()->subMinute(),
         ]);
+    }
+
+    public function test_resolves_named_catalog_product_even_when_out_of_stock(): void
+    {
+        $f = $this->setupCommerce();
+        Product::create([
+            'business_id' => $f['business']->id,
+            'commerce_channel_id' => $f['store']->id,
+            'commerce_external_id' => 'qa-shirt-100',
+            'name' => 'QA TEST Blue T-Shirt',
+            'price' => 100,
+            'stock_quantity' => 0,
+            'is_active' => true,
+            'metadata' => ['currency' => 'SAR'],
+        ]);
+        $message = $this->inbound($f['conversation'], 'Do you have the QA TEST Blue T-Shirt? How much is it?');
+        $resolver = app(ReferencedProductResolver::class);
+
+        $result = $resolver->resolve($message, $f['conversation'], $f['store']);
+
+        $this->assertSame('resolved', $result['resolution']);
+        $this->assertSame('catalog_name', $result['match_method']);
+        $this->assertSame('qa-shirt-100', $result['product']['commerce_external_id']);
+        $this->assertFalse($result['product']['available']);
+        $this->assertSame('question', $resolver->intentFor($message->content, $result));
+    }
+
+    public function test_resolves_english_product_category_by_explicit_price_in_store_scope(): void
+    {
+        $f = $this->setupCommerce();
+        Product::create([
+            'business_id' => $f['business']->id,
+            'commerce_channel_id' => $f['store']->id,
+            'commerce_external_id' => 'skirt-94',
+            'name' => 'تنورة',
+            'price' => 94,
+            'stock_quantity' => 3,
+            'is_active' => true,
+        ]);
+        Product::create([
+            'business_id' => $f['business']->id,
+            'commerce_channel_id' => $f['store']->id,
+            'commerce_external_id' => 'skirt-84',
+            'name' => 'تنورة',
+            'price' => 84,
+            'stock_quantity' => 2,
+            'is_active' => true,
+        ]);
+        Product::create([
+            'business_id' => $f['business']->id,
+            'commerce_channel_id' => $f['store']->id,
+            'commerce_external_id' => 'dress-94',
+            'name' => 'فستان',
+            'price' => 94,
+            'stock_quantity' => 1,
+            'is_active' => true,
+        ]);
+        $message = $this->inbound($f['conversation'], 'Please place the order now. Product: skirt تنورة 94 SAR qty 1. COD.');
+        $resolver = app(ReferencedProductResolver::class);
+
+        $result = $resolver->resolve($message, $f['conversation'], $f['store']);
+
+        $this->assertSame('resolved', $result['resolution']);
+        $this->assertSame('catalog_name', $result['match_method']);
+        $this->assertSame('skirt-94', $result['product']['commerce_external_id']);
+        $this->assertSame('place_order', $resolver->intentFor($message->content, $result));
     }
 
     private function inbound(Conversation $conversation, string $text, array $metadata = []): Message

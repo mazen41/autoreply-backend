@@ -5,6 +5,7 @@ namespace App\Services;
 use App\Models\Channel;
 use App\Models\Conversation;
 use App\Models\Message;
+use App\Models\Product;
 use App\Models\ProductMessageMap;
 use Illuminate\Support\Facades\Log;
 
@@ -219,6 +220,11 @@ if ($referenceId !== null && $referenceId !== '') {
             }
         }
 
+        $catalogResolution = $this->resolveCatalogMention($content, $eligibleConnection, (int) $conversation->business_id);
+        if ($catalogResolution !== null) {
+            return array_merge($base, $catalogResolution);
+        }
+
         if (!$pointer && empty($referenceId)) {
             return $base;
         }
@@ -260,7 +266,9 @@ if ($referenceId !== null && $referenceId !== '') {
             return 'place_order';
         }
 
-        $hasDirectReference = in_array($resolution['match_method'] ?? 'none', ['quote', 'thread', 'choice_number'], true);
+        $hasDirectReference = in_array($resolution['match_method'] ?? 'none', [
+            'quote', 'thread', 'choice_number', 'catalog_name', 'catalog_sku', 'catalog_alias_price',
+        ], true);
         if (empty($resolution['is_pointer']) && !$hasDirectReference) {
             return null;
         }
@@ -369,5 +377,152 @@ if ($referenceId !== null && $referenceId !== '') {
             'currency' => $map->currency ?: 'SAR',
             'image' => $map->image_url,
         ];
+    }
+
+    /** Resolve explicit product names/SKUs against this conversation's connected store only. */
+    private function resolveCatalogMention(string $text, Channel $connection, int $businessId): ?array
+    {
+        $message = $this->normalizeCatalogText($text);
+        if ($message === '') {
+            return null;
+        }
+
+        $price = $this->explicitPrice($text);
+        $aliases = [
+            'تنورة' => ['skirt'],
+            'فستان' => ['dress'],
+            'بنطلون' => ['pants', 'trousers'],
+            'جاكيت' => ['jacket'],
+            'بلوزة' => ['blouse', 'top'],
+        ];
+        $stopWords = ['the', 'please', 'order', 'product', 'products', 'item', 'items', 'name', 'price', 'how', 'much', 'you', 'have', 'with', 'want', 'now', 'qty', 'cash', 'delivery', 'sar', 'sr', 'city', 'address', 'first'];
+        $terms = array_values(array_filter(
+            explode(' ', $message),
+            fn (string $term) => mb_strlen($term) >= 3 && !in_array($term, $stopWords, true)
+        ));
+        foreach ($aliases as $canonical => $englishTerms) {
+            foreach ($englishTerms as $englishTerm) {
+                if (in_array($englishTerm, $terms, true)) {
+                    $terms[] = $this->normalizeCatalogText($canonical);
+                    break;
+                }
+            }
+        }
+        $terms = array_values(array_unique($terms));
+        $productsQuery = Product::query()
+            ->where('business_id', $businessId)
+            ->where('commerce_channel_id', $connection->id)
+            ->where('is_active', true);
+        if ($terms === []) {
+            return null;
+        }
+        $products = $productsQuery
+            ->where(function ($query) use ($terms): void {
+                foreach ($terms as $term) {
+                    $query->orWhere('name', 'like', '%' . $term . '%')
+                        ->orWhere('sku', 'like', '%' . $term . '%');
+                }
+            })
+            ->limit(500)
+            ->get();
+
+        $exact = $products->filter(function (Product $product) use ($message): bool {
+            $name = $this->normalizeCatalogText((string) $product->name);
+            $sku = $this->normalizeCatalogText((string) $product->sku);
+
+            return ($name !== '' && str_contains(' ' . $message . ' ', ' ' . $name . ' '))
+                || ($sku !== '' && str_contains(' ' . $message . ' ', ' ' . $sku . ' '));
+        })->values();
+
+        $matchMethod = 'catalog_name';
+        $matches = $exact;
+        if ($exact->isEmpty()) {
+            $matches = $products->filter(function (Product $product) use ($message, $price, $aliases): bool {
+                $name = $this->normalizeCatalogText((string) $product->name);
+                $categoryMentioned = false;
+                foreach ($aliases as $canonical => $terms) {
+                    if (str_contains($name, $this->normalizeCatalogText($canonical))) {
+                        foreach ($terms as $term) {
+                            if (preg_match('/(?<![\p{L}\p{N}])' . preg_quote($term, '/') . '(?![\p{L}\p{N}])/u', $message)) {
+                                $categoryMentioned = true;
+                                break 2;
+                            }
+                        }
+                    }
+                }
+
+                return $categoryMentioned && $price !== null && abs((float) $product->price - $price) < 0.005;
+            })->values();
+            $matchMethod = 'catalog_alias_price';
+        }
+
+        if ($price !== null && $matches->count() > 1) {
+            $matches = $matches->filter(fn (Product $product) => abs((float) $product->price - $price) < 0.005)->values();
+        }
+
+        if ($matches->isEmpty()) {
+            return null;
+        }
+
+        $toCandidate = function (Product $product) use ($connection): array {
+            $metadata = $product->metadata ?? [];
+            $externalId = (string) $product->commerce_external_id;
+
+            return [
+                'id' => $externalId,
+                'salla_product_id' => $connection->type === 'salla' ? $externalId : null,
+                'commerce_external_id' => $externalId,
+                'commerce_channel_id' => (int) $connection->id,
+                'provider' => $connection->type,
+                'name' => (string) $product->name,
+                'price' => (float) $product->price,
+                'currency' => $metadata['currency'] ?? 'SAR',
+                'sku' => $product->sku,
+                'available' => (int) $product->stock_quantity > 0,
+                'stock_quantity' => (int) $product->stock_quantity,
+                'image' => $metadata['image_url'] ?? null,
+            ];
+        };
+
+        if ($matches->count() > 1) {
+            return [
+                'resolution' => 'ambiguous',
+                'match_method' => $matchMethod,
+                'candidates' => $matches->map($toCandidate)->all(),
+            ];
+        }
+
+        $product = $matches->first();
+        $name = $this->normalizeCatalogText((string) $product->name);
+        $sku = $this->normalizeCatalogText((string) $product->sku);
+        if ($sku !== '' && str_contains(' ' . $message . ' ', ' ' . $sku . ' ')) {
+            $matchMethod = 'catalog_sku';
+        } elseif ($exact->isEmpty()) {
+            $matchMethod = 'catalog_alias_price';
+        }
+
+        return [
+            'resolution' => 'resolved',
+            'match_method' => $matchMethod,
+            'product' => $toCandidate($product),
+        ];
+    }
+
+    private function normalizeCatalogText(string $text): string
+    {
+        $text = mb_strtolower($text);
+        $text = preg_replace('/[\x{064B}-\x{065F}\x{0670}\x{0640}]/u', '', $text) ?? $text;
+        $text = strtr($text, ['أ' => 'ا', 'إ' => 'ا', 'آ' => 'ا', 'ى' => 'ي']);
+        $text = preg_replace('/[^\p{L}\p{N}]+/u', ' ', $text) ?? $text;
+        return trim(preg_replace('/\s+/u', ' ', $text) ?? $text);
+    }
+
+    private function explicitPrice(string $text): ?float
+    {
+        if (!preg_match('/(?:\b(?:sar|sr)\b|ريال)\s*([0-9]+(?:\.[0-9]{1,2})?)|([0-9]+(?:\.[0-9]{1,2})?)\s*(?:\b(?:sar|sr)\b|ريال)/iu', $text, $match)) {
+            return null;
+        }
+
+        return (float) (($match[1] ?? '') !== '' ? $match[1] : $match[2]);
     }
 }

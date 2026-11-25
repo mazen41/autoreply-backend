@@ -639,6 +639,30 @@ class ProcessAutoReply implements ShouldQueue
         $quotedMessageId = $referenceResolution['referenced_platform_message_id'];
         $referenceIntent = $referencedProductResolver->intentFor($message->content, $referenceResolution);
 
+        if ($referenceIntent === 'place_order' && array_key_exists('available', $referencedProduct ?? []) && !$referencedProduct['available']) {
+            $replyMessage = Message::create([
+                'conversation_id' => $conversation->id,
+                'content' => $detectedLanguage === 'arabic'
+                    ? 'المنتج ' . ($referencedProduct['name'] ?? '') . ' سعره ' . ($referencedProduct['price'] ?? '') . ' ' . ($referencedProduct['currency'] ?? 'SAR') . '، لكنه غير متوفر حاليًا، لذلك لم أبدأ الطلب. تحب أعرض لك بدائل متوفرة؟'
+                    : ($referencedProduct['name'] ?? 'This item') . ' is listed at ' . ($referencedProduct['price'] ?? '') . ' ' . ($referencedProduct['currency'] ?? 'SAR') . ', but it is currently out of stock, so I did not start an order. Would you like available alternatives?',
+                'direction' => 'outbound',
+                'status' => 'auto',
+                'is_ai' => false,
+                'source' => 'catalog_unavailable',
+                'send_status' => 'pending',
+            ]);
+            if ($channel->user_id) {
+                broadcast(new \App\Events\MessageReceived($replyMessage, $conversation, $channel->user_id));
+            }
+            Log::info('ProcessAutoReply: blocked order request for unavailable catalog product', [
+                'conversation_id' => $conversation->id,
+                'commerce_channel_id' => $commerceChannel?->id,
+                'product_id' => $referencedProduct['commerce_external_id'] ?? null,
+            ]);
+            $this->sendReply($channel, $conversation, $replyMessage);
+            return;
+        }
+
         // A referenced product is evidence about identity, not permission to
         // place an order. Ordering language is required; pointer-only messages
         // remain product questions and still pass through the order summary flow.
@@ -2385,7 +2409,8 @@ if (!$isProductBrowseMessage && $commerceChannel && !$summaryConfirmTurn) {
                 $options = [];
                 foreach (array_values($referenceResolution['candidates']) as $index => $candidate) {
                     $options[] = ($index + 1) . '. ' . ($candidate['name'] ?? 'Product') . ' — '
-                        . ($candidate['price'] ?? '?') . ' ' . ($candidate['currency'] ?? '');
+                        . ($candidate['price'] ?? '?') . ' ' . ($candidate['currency'] ?? '')
+                        . (!empty($candidate['sku']) ? ' (SKU: ' . $candidate['sku'] . ')' : '');
                 }
                 if ($options) {
                     $aiResult['reply'] = $detectedLanguage === 'arabic'

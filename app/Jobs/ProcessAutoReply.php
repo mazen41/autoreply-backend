@@ -3134,7 +3134,21 @@ $aiResponse = $intro
                         $sallaCheckoutActive,
                         (array) ($updatedCheckoutState['salla_required_fields'] ?? [])
                     );
-                    $labels = [
+                    $labels = $detectedLanguage === 'arabic' ? [
+                        'email' => 'البريد الإلكتروني',
+                        'postal_code' => 'الرمز البريدي',
+                        'building_number' => 'رقم المبنى',
+                        'street_number' => 'رقم الشارع',
+                        'address_line' => 'اسم الشارع وعنوان التوصيل',
+                        'delivery_city' => 'مدينة التوصيل التي يدعمها المتجر',
+                        'block' => 'رقم الدور أو الشقة',
+                        'district' => 'اسم الحي',
+                        'geo_coordinates' => 'المدينة والعنوان بالتفصيل لتحديد الموقع',
+                        'short_address' => 'العنوان الوطني المختصر، إن وجد',
+                        'additional_number' => 'الرقم الإضافي للمبنى',
+                        'address' => 'عنوان التوصيل بالكامل',
+                        'salla_options' => 'اختيار المنتج مثل المقاس أو اللون',
+                    ] : [
                         'email' => 'email address',
                         'postal_code' => 'postal code',
                         'building_number' => 'building or house number',
@@ -3161,7 +3175,9 @@ $aiResponse = $intro
                         $stillMissing
                     )));
                     if ($requestedFields === []) {
-                        $requestedFields = ['a corrected delivery detail requested by the store'];
+                        $requestedFields = [$detectedLanguage === 'arabic'
+                            ? 'بيانات العنوان التي طلبها المتجر'
+                            : 'a corrected delivery detail requested by the store'];
                     }
                     if ($detectedLanguage === 'arabic') {
                         $aiResponse = 'لم يتم إرسال الطلب بعد. طلب المتجر هذه البيانات الإضافية فقط: ' . implode('، ', $requestedFields) . '. أرسلها في رسالة واحدة من فضلك.';
@@ -3252,7 +3268,22 @@ $aiResponse = $intro
                 || $intent === 'place_order'
                 || \App\Services\ShopifyOrderIntent::wantsToOrder((string) $message->content))
         ) {
-            $missingLabels = [
+            $missingLabels = $detectedLanguage === 'arabic' ? [
+                'full_name' => 'الاسم بالكامل',
+                'phone' => 'رقم الهاتف أو الجوال',
+                'address' => 'عنوان التوصيل بالتفصيل',
+                'email' => 'البريد الإلكتروني',
+                'postal_code' => 'الرمز البريدي',
+                'geo_coordinates' => 'اسم المدينة والحي والشارع بوضوح لتحديد موقع التوصيل',
+                'building_number' => 'رقم المبنى',
+                'street_number' => 'رقم الشارع',
+                'address_line' => 'اسم الشارع وعنوان التوصيل',
+                'delivery_city' => 'مدينة التوصيل، مثل الرياض أو جدة',
+                'block' => 'رقم الدور أو الشقة',
+                'district' => 'اسم الحي',
+                'short_address' => 'العنوان الوطني المختصر، إن وجد',
+                'additional_number' => 'الرقم الإضافي للمبنى، إن وجد',
+            ] : [
                 'full_name' => 'full name',
                 'phone' => 'phone number',
                 'address' => 'delivery address',

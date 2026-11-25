@@ -3562,6 +3562,7 @@ $aiResponse = $intro
         if (
             !$claimGuard['allowed']
             && !empty($claimGuard['should_send_order_summary'])
+            && ($aiResult['intent'] ?? null) !== 'order_status'
             && !empty($fieldStatus['is_complete'])
             && !$shopifyVariantSelectionRequired
             && !empty($guardCheckoutState['product_name'])

@@ -106,12 +106,15 @@ class EcommerceChannelResolver
                     $source = 'conversation';
                 }
             } else {
-                Log::warning('Commerce context invalidated; refusing implicit store switch', [
-                    'business_id' => $businessId,
-                    'bot_id' => $bot?->id,
+                // FIX-4: Stored connection is disconnected or not in eligible set.
+                // Clear the stale sticky so resolution falls through to current stores.
+                Log::info('Commerce context: stored connection disconnected or unauthorized; clearing sticky', [
+                    'business_id'    => $businessId,
+                    'bot_id'         => $bot?->id,
                     'conversation_id' => $conversation->id,
-                    'connection_id' => $conversation->ecommerce_connection_id,
+                    'connection_id'  => $conversation->ecommerce_connection_id,
                 ]);
+                $conversation->forceFill(['ecommerce_connection_id' => null])->save();
             }
         }
 
@@ -270,7 +273,17 @@ class EcommerceChannelResolver
             return $mapped;
         }
 
-        if ($bot->ecommerceConnections()->exists()) {
+        // FIX-3: Only block the single-store fallback when the bot has at
+        // least one pivot row whose channel is still connected. If all pivot
+        // rows point to disconnected/deleted channels, fall through so the
+        // zero-config single-store path can pick up the new connected store.
+        $hasConnectedPivot = DB::table('bot_ecommerce_connections as bec')
+            ->join('channels as c', 'c.id', '=', 'bec.ecommerce_connection_id')
+            ->where('bec.bot_id', $bot->id)
+            ->where('c.status', 'connected')
+            ->exists();
+
+        if ($hasConnectedPivot) {
             // An explicit but disabled Bot mapping must not be revived by the
             // legacy scalar column or the zero-configuration fallback.
             return [];

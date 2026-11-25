@@ -158,6 +158,10 @@ class ChannelController extends Controller
         }
 
         Log::info('Salla channel claimed', ['channel_id' => $channel->id, 'user_id' => $userId]);
+
+        // FIX-1: Register claimed channel in bot_ecommerce_connections.
+        $this->syncSallaChannelToBots($channel);
+
         $this->queueSallaCityCatalogs();
         $citiesStatus = app(\App\Services\SharedSallaCityCatalogService::class)->isFresh('SA') ? 'matched' : 'processing';
 
@@ -624,6 +628,34 @@ class ChannelController extends Controller
             ->where('business_id', $business->id)
             ->firstOrFail();
 
+        // FIX-2a: Remove bot_ecommerce_connections pivot rows for this channel
+        // so eligibleConnectionIds() stops seeing it and bots don't try to load
+        // products from a disconnected store.
+        \Illuminate\Support\Facades\DB::table('bot_ecommerce_connections')
+            ->where('ecommerce_connection_id', $channel->id)
+            ->delete();
+
+        // FIX-2b: Clear ecommerce_connection_id on conversations that were
+        // sticky to this store, so the next message resolves to a live store.
+        \Illuminate\Support\Facades\DB::table('conversations')
+            ->where('ecommerce_connection_id', $channel->id)
+            ->update([
+                'ecommerce_connection_id'   => null,
+                'commerce_context_status'   => 'unresolved',
+                'commerce_context_source'   => null,
+            ]);
+
+        // FIX-2c: Clear bot_channels rows that point to this channel as the
+        // per-channel store route, so bots don't route to a deleted store.
+        \Illuminate\Support\Facades\DB::table('bot_channels')
+            ->where('ecommerce_connection_id', $channel->id)
+            ->update(['ecommerce_connection_id' => null]);
+
+        Log::info('Channel disconnected; pivot and sticky state cleared', [
+            'channel_id'  => $channel->id,
+            'channel_type' => $channel->type,
+        ]);
+
         $channel->delete();
 
         return response()->json(['message' => 'Channel disconnected']);
@@ -849,6 +881,11 @@ class ChannelController extends Controller
                 'channel_id' => $channel->id,
             ]);
 
+            // FIX-1: Register this Salla channel in bot_ecommerce_connections
+            // for every active bot in the business that has no connected store
+            // yet, so the bot can immediately load products from the new store.
+            $this->syncSallaChannelToBots($channel);
+
             $this->subscribeSallaWebhooks($channel, $accessToken);
 
             $citiesStatus = 'processing';
@@ -877,6 +914,68 @@ class ChannelController extends Controller
                 'exception_type' => get_class($e),
             ]);
             return redirect($this->frontendUrl() . '/dashboard/channels?error=salla_oauth_failed');
+        }
+    }
+
+    /**
+     * FIX-1 helper: Register a newly connected Salla channel in
+     * bot_ecommerce_connections for every active bot in the same business
+     * that currently has no connected store pivot row.
+     *
+     * We only auto-register when the bot has ZERO connected pivot rows so we
+     * never override an intentional multi-store setup. If the bot already has
+     * a connected store, the merchant must wire up the new one explicitly in
+     * the bot settings UI.
+     */
+    protected function syncSallaChannelToBots(Channel $channel): void
+    {
+        if ($channel->status !== 'connected' || empty($channel->business_id)) {
+            return;
+        }
+
+        $businessId = (int) $channel->business_id;
+
+        // Find active bots in this business.
+        $bots = \App\Models\Bot::where('business_profile_id', $businessId)
+            ->where('status', 'active')
+            ->get();
+
+        foreach ($bots as $bot) {
+            // Count how many pivot rows this bot has that point to a currently
+            // connected channel — if none, auto-register the new store.
+            $hasConnected = \Illuminate\Support\Facades\DB::table('bot_ecommerce_connections as bec')
+                ->join('channels as c', 'c.id', '=', 'bec.ecommerce_connection_id')
+                ->where('bec.bot_id', $bot->id)
+                ->where('c.status', 'connected')
+                ->exists();
+
+            if ($hasConnected) {
+                // Bot already has a configured store; leave it alone.
+                Log::info('Salla channel sync: bot already has a connected store, skipping auto-register', [
+                    'bot_id'     => $bot->id,
+                    'channel_id' => $channel->id,
+                ]);
+                continue;
+            }
+
+            // Insert or update the pivot row: enabled + default (since it's the
+            // only store for this bot right now).
+            \Illuminate\Support\Facades\DB::table('bot_ecommerce_connections')
+                ->upsert(
+                    [
+                        'bot_id'                 => $bot->id,
+                        'ecommerce_connection_id' => $channel->id,
+                        'is_enabled'             => true,
+                        'is_default'             => true,
+                    ],
+                    ['bot_id', 'ecommerce_connection_id'],
+                    ['is_enabled', 'is_default']
+                );
+
+            Log::info('Salla channel auto-registered to bot', [
+                'bot_id'     => $bot->id,
+                'channel_id' => $channel->id,
+            ]);
         }
     }
 

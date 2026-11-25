@@ -7,6 +7,7 @@ use App\Models\BusinessProfile;
 use App\Models\User;
 use App\Services\OAuthStateService;
 use Illuminate\Foundation\Testing\RefreshDatabase;
+use Illuminate\Support\Facades\Config;
 use Illuminate\Support\Facades\Queue;
 use Tests\TestCase;
 use Laravel\Sanctum\Sanctum;
@@ -39,6 +40,7 @@ class SallaOAuthTest extends TestCase
 
     public function test_salla_callback_creates_channel(): void
     {
+        Config::set('app.frontend_url', 'https://nazbiz.io');
         Queue::fake();
         $user = User::forceCreate([
             'name' => 'Test',
@@ -54,7 +56,7 @@ class SallaOAuthTest extends TestCase
 
         $response = $this->get('/api/channels/callback/salla?code=test_code&state=' . $state);
 
-        $response->assertRedirect(env('FRONTEND_URL') . '/dashboard/channels?success=salla_connected&cities=processing');
+        $response->assertRedirect('https://nazbiz.io/dashboard/channels?success=salla_connected&cities=processing');
 
         $this->assertDatabaseHas('channels', [
             'user_id' => $user->id,
@@ -65,6 +67,7 @@ class SallaOAuthTest extends TestCase
 
     public function test_salla_callback_with_error(): void
     {
+        Config::set('app.frontend_url', 'https://nazbiz.io');
         $user = User::forceCreate([
             'name' => 'Test',
             'email' => 'test' . rand() . '@test.com',
@@ -75,7 +78,7 @@ class SallaOAuthTest extends TestCase
 
         $response = $this->get('/api/channels/callback/salla?error=access_denied&state=' . $state);
 
-        $response->assertRedirect(env('FRONTEND_URL') . '/dashboard/channels?error=salla_denied');
+        $response->assertRedirect('https://nazbiz.io/dashboard/channels?error=salla_denied');
     }
 
     protected function mockSallaServiceResponses(): void

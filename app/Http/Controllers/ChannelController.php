@@ -34,7 +34,7 @@ class ChannelController extends Controller
      */
     protected function handleSallaInstallWithoutUser(string $code)
     {
-        $frontend = env('FRONTEND_URL');
+        $frontend = $this->frontendUrl();
 
         try {
             $sallaService = new SallaService();
@@ -727,13 +727,13 @@ class ChannelController extends Controller
         // NazBiz state (or the old user-id state format) as an Easy Mode install.
         if (!$stateData && ($state === '' || str_starts_with($state, 'naz_') || preg_match('/^\d+:/', $state))) {
             if ($state !== '') {
-                return redirect(env('FRONTEND_URL') . '/dashboard/channels?error=salla_invalid_state');
+                return redirect($this->frontendUrl() . '/dashboard/channels?error=salla_invalid_state');
             }
         }
 
         if ($error || !$code) {
             Log::error('Salla OAuth denied or no code', ['has_provider_error' => !empty($error)]);
-            return redirect(env('FRONTEND_URL') . '/dashboard/channels?error=salla_denied');
+            return redirect($this->frontendUrl() . '/dashboard/channels?error=salla_denied');
         }
 
         $userId = $stateData['user_id'] ?? null;
@@ -753,7 +753,7 @@ class ChannelController extends Controller
                 hideUnauthorized: false,
             );
         } catch (\Throwable) {
-            return redirect(env('FRONTEND_URL') . '/dashboard/channels?error=salla_invalid_state');
+            return redirect($this->frontendUrl() . '/dashboard/channels?error=salla_invalid_state');
         }
 
         try {
@@ -786,7 +786,7 @@ class ChannelController extends Controller
                     'user_info_keys' => array_keys($userInfo),
                     'store_info_keys' => array_keys($storeInfo),
                 ]);
-                return redirect(env('FRONTEND_URL') . '/dashboard/channels?error=store_info_failed');
+                return redirect($this->frontendUrl() . '/dashboard/channels?error=store_info_failed');
             }
 
             // 3. Check for an orphaned/disconnected placeholder keyed on the stable merchant id.
@@ -870,13 +870,13 @@ class ChannelController extends Controller
             $returnPath = ($stateData['context']['redirect'] ?? null) === 'onboarding'
                 ? "/onboarding?success=salla_connected&cities={$citiesStatus}&channel=salla"
                 : "/dashboard/channels?success=salla_connected&cities={$citiesStatus}";
-            return redirect(env('FRONTEND_URL') . $returnPath);
+            return redirect($this->frontendUrl() . $returnPath);
 
         } catch (\Exception $e) {
             Log::error('Salla OAuth callback error', [
                 'exception_type' => get_class($e),
             ]);
-            return redirect(env('FRONTEND_URL') . '/dashboard/channels?error=salla_oauth_failed');
+            return redirect($this->frontendUrl() . '/dashboard/channels?error=salla_oauth_failed');
         }
     }
 
@@ -898,6 +898,12 @@ class ChannelController extends Controller
                 ]);
             }
         }
+    }
+
+    /** Return the frontend base URL from Laravel's loaded configuration. */
+    protected function frontendUrl(): string
+    {
+        return rtrim((string) config('app.frontend_url'), '/');
     }
 
     /**

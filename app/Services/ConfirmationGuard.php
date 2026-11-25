@@ -87,7 +87,7 @@ class ConfirmationGuard
                 'update' => ['update_customer', 'update_address', 'update_order'],
                 'booking' => ['book_appointment', 'create_booking'],
                 'create' => ['create_order', 'create_booking', 'create_ticket', 'create_record'],
-                'confirm' => ['confirm_order', 'confirm_booking'],
+                'confirm' => ['confirm_order', 'confirm_booking', 'book_appointment'],
                 'generic' => [],
                 default => [],
             };

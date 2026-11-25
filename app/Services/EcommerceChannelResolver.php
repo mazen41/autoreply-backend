@@ -66,8 +66,19 @@ class EcommerceChannelResolver
         if ($conversation->ecommerce_connection_id) {
             $stored = $this->connectedAccount((int) $conversation->ecommerce_connection_id, $businessId);
             if ($stored && (!$bot || in_array($stored->id, $eligibleIds, true))) {
-                // Check if bot now has an explicit default that differs from
-                // the stored connection — meaning the store was swapped.
+                // A browse turn should follow the current channel route first,
+                // then the bot default. Conversations created before a store
+                // was connected can otherwise keep a stale Shopify connection
+                // forever, even after the page is explicitly routed to Salla.
+                $channelRouteId = $bot && $channel
+                    ? DB::table('bot_channels')
+                        ->where('bot_id', $bot->id)
+                        ->where('channel_id', $channel->id)
+                        ->value('ecommerce_connection_id')
+                    : null;
+                if (!$channelRouteId || !in_array((int) $channelRouteId, $eligibleIds, true)) {
+                    $channelRouteId = null;
+                }
                 $botDefaultId = $bot
                     ? DB::table('bot_ecommerce_connections')
                         ->where('bot_id', $bot->id)
@@ -75,17 +86,19 @@ class EcommerceChannelResolver
                         ->where('is_default', true)
                         ->value('ecommerce_connection_id')
                     : null;
+                $preferredId = $channelRouteId ?: $botDefaultId;
 
                 if (($preferCurrentDefault || empty($conversation->checkout_state))
-                    && $botDefaultId && (int) $botDefaultId !== (int) $stored->id
-                    && in_array((int) $botDefaultId, $eligibleIds, true)) {
-                    // Bot default changed — clear sticky so we re-resolve below.
-                    Log::info('Commerce context: bot default changed; clearing stale sticky connection', [
+                    && $preferredId && (int) $preferredId !== (int) $stored->id
+                    && in_array((int) $preferredId, $eligibleIds, true)) {
+                    // Current route/default changed — clear sticky so we re-resolve below.
+                    Log::info('Commerce context: current bot route changed; clearing stale sticky connection', [
                         'business_id'       => $businessId,
                         'bot_id'            => $bot?->id,
                         'conversation_id'   => $conversation->id,
                         'old_connection_id' => $stored->id,
-                        'new_default_id'    => $botDefaultId,
+                        'new_connection_id' => $preferredId,
+                        'resolution_source' => $channelRouteId ? 'channel' : 'bot_default',
                     ]);
                     $conversation->forceFill(['ecommerce_connection_id' => null])->save();
                 } else {

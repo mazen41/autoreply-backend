@@ -164,6 +164,34 @@ class CommerceContextResolverTest extends TestCase
         $this->assertSame($second->id, $conversation->fresh()->ecommerce_connection_id);
     }
 
+    public function test_product_browse_switches_stale_context_to_current_channel_store_route(): void
+    {
+        [$user, $business] = $this->makeBusiness();
+        $chat = $this->makeChannel($user, $business, 'facebook', 'Facebook');
+        $shopify = $this->makeChannel($user, $business, 'shopify', 'Old Store');
+        $salla = $this->makeChannel($user, $business, 'salla', 'Current Store');
+        $bot = Bot::create(['business_profile_id' => $business->id, 'name' => 'Bot', 'status' => 'active']);
+        $bot->ecommerceConnections()->attach([
+            $shopify->id => ['is_enabled' => true, 'is_default' => false],
+            $salla->id => ['is_enabled' => true, 'is_default' => false],
+        ]);
+        $bot->channels()->attach($chat->id, [
+            'is_primary' => true,
+            'ecommerce_connection_id' => $salla->id,
+        ]);
+        $conversation = $this->makeConversation($business, $bot, $chat);
+        $conversation->forceFill([
+            'ecommerce_connection_id' => $shopify->id,
+            'commerce_context_status' => 'resolved',
+        ])->save();
+
+        $context = app(EcommerceChannelResolver::class)->resolveConversation($conversation, $bot, true);
+
+        $this->assertSame('channel', $context['source']);
+        $this->assertSame($salla->id, $context['connection']->id);
+        $this->assertSame($salla->id, $conversation->fresh()->ecommerce_connection_id);
+    }
+
     public function test_resolved_conversation_context_stays_sticky_when_bot_default_matches(): void
     {
         [$user, $business] = $this->makeBusiness();

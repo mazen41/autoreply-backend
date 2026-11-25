@@ -67,7 +67,7 @@ class ConfirmationGuard
 
         $claimTypes = [
             'order' => '/(?:\border\s*(?:number|no\.?|id)\s*(?:is|:)?\s*#?\d{5,}|awaiting review|waiting for review|\b(?:order|purchase)\b[^.!?\n]{0,70}\b(?:placed|created|submitted|confirmed|processed|completed|done)\b|\b(?:placed|created|submitted)\b[^.!?\n]{0,30}\border\b|تم\s*(?:تأكيد|إنشاء|تسجيل|استلام|تجهيز|إتمام)\s*(?:ال)?(?:طلب|الطلب)?|(?:طلبك|الطلب)\s*(?:اتأكد|تأكد|اتسجل|اتعمل|تم))/u',
-            'cancel' => '/(?:\b(?:order|booking|appointment|subscription)\b[^.!?\n]{0,60}\bcancel(?:led|ed)?\b|\bcancel(?:led|ed)?\b[^.!?\n]{0,25}\b(?:order|booking|appointment)\b|تم\s*(?:إلغاء|الغاء)|(?:اتلغى|أُلغي)\s*(?:ال)?(?:طلب|حجز))/u',
+            'cancel' => '/(?:\b(?:order|booking|appointment|subscription)\b[^.!?\n]{0,60}\bcancel(?:led|ed)\b|\bcancel(?:led|ed)\b[^.!?\n]{0,25}\b(?:order|booking|appointment)\b|تم\s*(?:إلغاء|الغاء)|(?:اتلغى|أُلغي)\s*(?:ال)?(?:طلب|حجز))/u',
             'refund' => '/(?:\b(?:refund|refunded|money back)\b|تم\s*(?:استرداد|رد)\s*(?:المبلغ|الفلوس)?)/u',
             'update' => '/(?:\b(?:updated|changed|saved)\b[^.!?\n]{0,50}\b(?:address|account|profile|record|details)\b|\b(?:address|account|profile|record|details)\b[^.!?\n]{0,50}\b(?:updated|changed|saved)\b|تم\s*(?:تحديث|تعديل|حفظ)\s*(?:بيانات|عنوان|حساب|ملف))/u',
             'booking' => '/(?:\b(?:booking|appointment|reservation)\b[^.!?\n]{0,50}\b(?:booked|confirmed|created|scheduled|done|complete)\b|\b(?:booked|confirmed|scheduled)\b[^.!?\n]{0,30}\b(?:appointment|reservation)\b|تم\s*(?:تأكيد|إنشاء|حجز)\s*(?:الموعد|الحجز))/u',

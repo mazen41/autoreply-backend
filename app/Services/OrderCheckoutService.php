@@ -617,6 +617,107 @@ class OrderCheckoutService
         return $mergedState;
     }
 
+    /** Merge AI-extracted checkout spans only when each value occurs in the latest customer message. */
+    public function mergeVerifiedAiFields(array $state, array $fields, string $incomingText): array
+    {
+        $normalize = static function (string $value): string {
+            $value = mb_strtolower($value);
+            $value = strtr($value, ['أ' => 'ا', 'إ' => 'ا', 'آ' => 'ا', 'ى' => 'ي']);
+            $value = preg_replace('/[\x{064B}-\x{065F}\x{0670}]/u', '', $value) ?? $value;
+            return preg_replace('/[^\p{L}\p{N}]+/u', '', $value) ?? '';
+        };
+
+        $normalizedMessage = $normalize($incomingText);
+        if ($normalizedMessage === '') {
+            return $state;
+        }
+
+        $limits = [
+            'full_name' => 120, 'phone' => 32, 'email' => 254, 'address' => 500,
+            'postal_code' => 16, 'building_number' => 24, 'block' => 80,
+            'district' => 100, 'short_address' => 16, 'additional_number' => 16,
+        ];
+        foreach ($limits as $field => $maxLength) {
+            $candidate = $fields[$field] ?? null;
+            if (!is_string($candidate)) {
+                continue;
+            }
+            $candidate = trim($candidate);
+            $normalizedCandidate = $normalize($candidate);
+            if ($candidate === '' || mb_strlen($candidate) > $maxLength || $normalizedCandidate === '') {
+                continue;
+            }
+            // The model may identify and trim a phrase, but it cannot add or
+            // normalize a fact into existence. It must point to a literal span.
+            if (!str_contains($normalizedMessage, $normalizedCandidate)) {
+                continue;
+            }
+            if ($field === 'phone') {
+                $candidate = strtr($candidate, [
+                    '٠' => '0', '١' => '1', '٢' => '2', '٣' => '3', '٤' => '4',
+                    '٥' => '5', '٦' => '6', '٧' => '7', '٨' => '8', '٩' => '9',
+                    '۰' => '0', '۱' => '1', '۲' => '2', '۳' => '3', '۴' => '4',
+                    '۵' => '5', '۶' => '6', '۷' => '7', '۸' => '8', '۹' => '9',
+                ]);
+                if (!self::isValidPhone($candidate)) {
+                    continue;
+                }
+            }
+            if ($field === 'email' && !filter_var($candidate, FILTER_VALIDATE_EMAIL)) {
+                continue;
+            }
+            if ($field === 'full_name') {
+                $explicitNameCue = (bool) preg_match('/(?:my name is|name is|اسمي|أنا|انا)/iu', $incomingText);
+                $wordCount = preg_match_all('/[\p{L}]+/u', $candidate);
+                if (preg_match('/\d/u', $candidate) || str_contains($candidate, '@')
+                    || preg_match('/phone|address|street|road|district|neighbou?rhood|email|delivery|شارع|الحي|مدينة|عنوان|جوال|هاتف|رقم/iu', $candidate)
+                    || (!$explicitNameCue && $wordCount < 2)
+                    || ($explicitNameCue && mb_strlen($candidate) < 3)) {
+                    continue;
+                }
+            }
+            if ($field === 'address' && mb_strlen($candidate) < 8) {
+                continue;
+            }
+            if ($field === 'address'
+                && !preg_match('/\d|address|street|road|city|district|neighbou?rhood|العنوان|شارع|حي|مدينة|مكة|الرياض|جدة|الدمام|القاهرة|الإسكندرية/iu', $candidate)) {
+                continue;
+            }
+            $fieldCuePatterns = [
+                'postal_code' => '/postal|zip|الرمز\s*البريدي/iu',
+                'building_number' => '/building|house\s*(?:no|number)?|مبنى|مبنى|عمارة|رقم\s*(?:المبنى|المنزل)/iu',
+                'block' => '/block|floor|بلوك|الدور|الطابق|رقم\s*الدور/iu',
+                'district' => '/district|neighbou?rhood|area|حي|منطقة/iu',
+                'short_address' => '/short\s*(?:national\s*)?address|national\s*address|العنوان\s*الوطني\s*المختصر|العنوان\s*المختصر/iu',
+                'additional_number' => '/additional\s*(?:address\s*)?number|secondary\s*number|الرقم\s*الإضافي/iu',
+            ];
+            if (isset($fieldCuePatterns[$field]) && !preg_match($fieldCuePatterns[$field], $incomingText)) {
+                continue;
+            }
+
+            $state[$field] = $field === 'address'
+                ? (SallaAddressParser::cleanAddress($candidate) ?: $candidate)
+                : $candidate;
+            if ($field === 'full_name') {
+                $state['customer_name'] = $candidate;
+            } elseif ($field === 'phone') {
+                $state['customer_phone'] = $candidate;
+            } elseif ($field === 'email') {
+                $state['customer_email'] = $candidate;
+            } elseif ($field === 'address') {
+                $state['customer_address'] = $state['address'];
+                $state['address_line'] = $state['address'];
+            }
+        }
+
+        if (isset($state['short_address'])) {
+            $state['short_address'] = mb_strtoupper((string) $state['short_address']);
+        }
+        $state['updated_at'] = now()->toISOString();
+
+        return $state;
+    }
+
     /** Resolve only Google Maps short links; return the final URL without logging it. */
     private function expandGoogleMapsShortLink(string $text): ?string
     {

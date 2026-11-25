@@ -670,6 +670,12 @@ class ProcessAutoReply implements ShouldQueue
         $checkoutState = is_array($conversation->checkout_state)
             ? \App\Services\OrderCheckoutService::sanitizeStoredPhone($conversation->checkout_state)
             : null;
+        // Keep the checkout's language for replies such as "1" or "2", which
+        // contain no language signal of their own.
+        if (!empty($checkoutState['checkout_language'])
+            && !preg_match('/[\p{L}]/u', (string) $message->content)) {
+            $detectedLanguage = $checkoutState['checkout_language'] === 'arabic' ? 'arabic' : 'english';
+        }
 
         // Handle explicit checkout cancellation before product recovery, AI
         // classification, or any provider order API can run. This transition is
@@ -1408,8 +1414,8 @@ class ProcessAutoReply implements ShouldQueue
 
         // ── STRUCTURED CONVERSATION STATE ────────────────────────────────────
         // Build authoritative structured state for the AI. The AI must NEVER
-        // invent or override these values — it may only interpret intent and
-        // propose responses. Application code validates all state transitions.
+        // invent or override these values. It may propose literal field spans;
+        // application code validates and stores them.
         $structuredState = [
             'customer' => [
                 'name' => $checkoutState['full_name'] ?? $checkoutState['customer_name'] ?? null,
@@ -1553,10 +1559,18 @@ class ProcessAutoReply implements ShouldQueue
                 }
             }
         }
+        $checkoutStateBeforeIncoming = is_array($conversation->checkout_state)
+            ? $conversation->checkout_state
+            : [];
         $updatedCheckoutState = $isProductBrowseMessage
             ? []
             : $checkoutService->extractAndMergeState($conversation, $message->content, $referencedProduct);
         if (!empty($updatedCheckoutState)) {
+            $hasArabicText = (bool) preg_match('/[\x{0600}-\x{06FF}]/u', (string) $message->content);
+            $hasLatinText = (bool) preg_match('/[A-Za-z]/', (string) $message->content);
+            $updatedCheckoutState['checkout_language'] = $hasArabicText
+                ? 'arabic'
+                : ($hasLatinText ? 'english' : ($updatedCheckoutState['checkout_language'] ?? $detectedLanguage));
             $attachmentCoordinates = data_get($message->metadata, 'attachment.coordinates');
             if (is_array($attachmentCoordinates)
                 && is_numeric($attachmentCoordinates['lat'] ?? null)
@@ -2155,6 +2169,12 @@ class ProcessAutoReply implements ShouldQueue
             // Active partial order state (persisted across turns so the AI
             // knows which fields have already been collected and won't re-ask).
             'cart'                     => !empty($updatedCheckoutState) ? $updatedCheckoutState : null,
+            'checkout_extraction'      => ($sallaCheckoutActive
+                && ($updatedCheckoutState['confirmation_state'] ?? null) !== 'selecting_salla_option'
+                && !empty($fieldStatus['missing_fields'])) ? [
+                'fields' => ['full_name', 'phone', 'email', 'address', 'postal_code', 'building_number', 'block', 'district', 'short_address', 'additional_number'],
+                'language' => $detectedLanguage,
+            ] : null,
             'incoming_attachment'      => ($attachment = data_get($message->metadata, 'attachment'))
                 ? [
                     'type' => $attachment['type'] ?? 'unknown',
@@ -2401,6 +2421,74 @@ class ProcessAutoReply implements ShouldQueue
             return;
         }
 
+        // Use this same AI turn to extract explicit checkout spans. The
+        // checkout service accepts only literal values found in the latest
+        // inbound message and validates phone/email before persistence.
+        $checkoutAiFieldsSaved = [];
+        if (is_array($context['checkout_extraction'] ?? null) && is_array($aiResult['checkout_fields'] ?? null)) {
+            $beforeAiExtraction = $updatedCheckoutState;
+            $aiFields = $aiResult['checkout_fields'];
+            $existingAliases = [
+                'full_name' => ['full_name', 'customer_name'], 'phone' => ['phone', 'customer_phone'],
+                'email' => ['email', 'customer_email'], 'address' => ['address', 'customer_address'],
+                'postal_code' => ['postal_code'], 'building_number' => ['building_number'],
+                'block' => ['block'], 'district' => ['district'], 'short_address' => ['short_address'],
+                'additional_number' => ['additional_number'],
+            ];
+            $correctionCue = (bool) preg_match('/\b(?:actually|correction|correct|updated|change|instead)\b|(?:تصحيح|الصحيح|عدّل|غيرت|بدل)/iu', (string) $message->content);
+            foreach ($existingAliases as $field => $aliases) {
+                $hadPreviousValue = false;
+                foreach ($aliases as $alias) {
+                    if (!empty($checkoutStateBeforeIncoming[$alias])) {
+                        $hadPreviousValue = true;
+                        break;
+                    }
+                }
+                if ($hadPreviousValue && !$correctionCue) {
+                    unset($aiFields[$field]);
+                }
+            }
+            $updatedCheckoutState = $checkoutService->mergeVerifiedAiFields(
+                $updatedCheckoutState,
+                $aiFields,
+                (string) $message->content
+            );
+            foreach (['full_name', 'phone', 'email', 'address', 'postal_code', 'building_number', 'block', 'district', 'short_address', 'additional_number'] as $field) {
+                if (($updatedCheckoutState[$field] ?? null) !== ($beforeAiExtraction[$field] ?? null)
+                    && !empty($updatedCheckoutState[$field])) {
+                    $checkoutAiFieldsSaved[] = $field;
+                }
+            }
+            if ($checkoutAiFieldsSaved !== []) {
+                $conversation->update(['checkout_state' => $updatedCheckoutState]);
+                $fieldStatus = $checkoutService->computeFieldStatus(
+                    $updatedCheckoutState,
+                    $sallaCheckoutActive,
+                    (array) ($updatedCheckoutState['salla_required_fields'] ?? [])
+                );
+                $updatedCheckoutState = $checkoutService->updateConfirmationState(
+                    $updatedCheckoutState,
+                    (string) $message->content,
+                    (bool) ($fieldStatus['is_complete'] ?? false),
+                    (bool) $hasValidOrderSummary
+                );
+                $conversation->update(['checkout_state' => $updatedCheckoutState]);
+                $checkoutState = $updatedCheckoutState;
+                $structuredState['customer'] = array_merge($structuredState['customer'] ?? [], [
+                    'name' => $updatedCheckoutState['full_name'] ?? $updatedCheckoutState['customer_name'] ?? null,
+                    'phone' => $updatedCheckoutState['phone'] ?? $updatedCheckoutState['customer_phone'] ?? null,
+                    'address' => $updatedCheckoutState['address'] ?? $updatedCheckoutState['customer_address'] ?? null,
+                ]);
+                $structuredState['pending_action'] = $this->determinePendingAction($updatedCheckoutState, $isPlaceOrder, $fieldStatus);
+                Log::info('ProcessAutoReply: AI checkout spans validated and stored', [
+                    'conversation_id' => $conversation->id,
+                    'message_id' => $message->id,
+                    'saved_field_names' => $checkoutAiFieldsSaved,
+                    'missing_field_names' => array_values($fieldStatus['missing_fields'] ?? []),
+                ]);
+            }
+        }
+
         // Step 5: Intelligent Escalation Decision
         //
         // ONLY escalate for:
@@ -2440,6 +2528,32 @@ class ProcessAutoReply implements ShouldQueue
             $aiResult['intent'] = 'question';
             if (preg_match('/\b(images?|photos?|pictures?|pics?)\b/i', $message->content)) {
                 $aiResult['needs_images'] = true;
+            }
+        }
+
+        if ($checkoutAiFieldsSaved !== [] && $intent === 'place_order' && empty($fieldStatus['is_complete'])) {
+            $fieldLabels = $detectedLanguage === 'arabic' ? [
+                'full_name' => 'الاسم الكامل', 'phone' => 'رقم الجوال', 'address' => 'عنوان التوصيل',
+                'email' => 'البريد الإلكتروني', 'postal_code' => 'الرمز البريدي',
+                'building_number' => 'رقم المبنى', 'block' => 'الحي أو رقم الدور',
+                'district' => 'الحي', 'short_address' => 'العنوان الوطني المختصر',
+                'additional_number' => 'الرقم الإضافي', 'delivery_city' => 'المدينة',
+            ] : [
+                'full_name' => 'full name', 'phone' => 'phone number', 'address' => 'delivery address',
+                'email' => 'email address', 'postal_code' => 'postal code',
+                'building_number' => 'building number', 'block' => 'block or floor',
+                'district' => 'district', 'short_address' => 'short national address',
+                'additional_number' => 'additional address number', 'delivery_city' => 'delivery city',
+            ];
+            $stillMissing = array_values(array_filter(
+                (array) ($fieldStatus['missing_fields'] ?? []),
+                static fn ($field) => $field !== 'geo_coordinates'
+            ));
+            $labels = array_values(array_filter(array_map(static fn ($field) => $fieldLabels[$field] ?? null, $stillMissing)));
+            if ($labels !== []) {
+                $aiResult['reply'] = $detectedLanguage === 'arabic'
+                    ? 'تمام، سجلت البيانات اللي بعتها. عشان أكمل الطلب، ابعتلي ' . implode('، ', $labels) . ' في رسالة واحدة.'
+                    : 'Thanks, I saved the details you sent. To continue, please send ' . implode(', ', $labels) . ' together in one message.';
             }
         }
 

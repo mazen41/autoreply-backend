@@ -59,14 +59,16 @@ class HandoffTaskFlowTest extends TestCase
     public function test_customer_request_for_a_human_creates_task_before_sending_the_promise(): void
     {
         config(['handoff.email_notifications' => false, 'features.fail_closed_no_agent' => false]);
+        config(['services.groq.api_key' => 'test-groq-key']);
         Package::create([
             'name' => 'Free', 'name_ar' => 'Free', 'price_monthly' => 0, 'price_yearly' => 0,
             'ai_replies_limit' => -1, 'is_active' => true,
         ]);
         [$user, $business, $conversation] = $this->conversation();
+        $this->activatePaidTestPlan($business);
         $channel = $conversation->channel;
         $channel->update(['ai_enabled' => true]);
-        $conversation->update(['ai_enabled' => true]);
+        $conversation->update(['ai_enabled' => true, 'requires_human' => false, 'status' => 'open']);
         $bot = Bot::create([
             'business_profile_id' => $business->id,
             'name' => 'Human Request Test Agent',
@@ -81,7 +83,18 @@ class HandoffTaskFlowTest extends TestCase
             'direction' => 'inbound',
             'is_ai' => false,
         ]);
-        Http::fake(['graph.facebook.com/*' => Http::response(['message_id' => 'test-message'], 200), '*' => Http::response([], 200)]);
+        Http::fake([
+            'generativelanguage.googleapis.com/*embedContent*' => Http::response(['embedding' => ['values' => []]], 200),
+            'api.groq.com/openai/v1/chat/completions' => Http::response(['choices' => [[
+                'message' => ['content' => json_encode([
+                    'reply' => 'I will connect you with a team member.', 'intent' => 'customer_requested_human',
+                    'needs_escalation' => true, 'confidence' => 0.99,
+                    'escalation_reason' => 'customer_requested_human', 'needs_images' => false,
+                ])],
+            ]]], 200),
+            'graph.facebook.com/*' => Http::response(['message_id' => 'test-message'], 200),
+            '*' => Http::response([], 200),
+        ]);
 
         (new ProcessAutoReply($message->id))->handle();
 
@@ -102,14 +115,16 @@ class HandoffTaskFlowTest extends TestCase
     public function test_agent_keyword_and_confidence_configuration_drives_runtime_escalation(): void
     {
         config(['handoff.email_notifications' => false, 'features.fail_closed_no_agent' => false]);
+        config(['services.groq.api_key' => 'test-groq-key']);
         Package::create([
             'name' => 'Free', 'name_ar' => 'Free', 'price_monthly' => 0, 'price_yearly' => 0,
             'ai_replies_limit' => -1, 'is_active' => true,
         ]);
         [, $business, $conversation] = $this->conversation();
+        $this->activatePaidTestPlan($business);
         $channel = $conversation->channel;
         $channel->update(['ai_enabled' => true]);
-        $conversation->update(['ai_enabled' => true]);
+        $conversation->update(['ai_enabled' => true, 'requires_human' => false, 'status' => 'open']);
         $bot = Bot::create([
             'business_profile_id' => $business->id,
             'name' => 'Configured escalation agent',
@@ -128,6 +143,7 @@ class HandoffTaskFlowTest extends TestCase
             'is_ai' => false,
         ]);
         Http::fake([
+            'generativelanguage.googleapis.com/*embedContent*' => Http::response(['embedding' => ['values' => []]], 200),
             'api.groq.com/openai/v1/chat/completions' => Http::response(['choices' => [[
                 'message' => ['content' => json_encode([
                     'reply' => 'I can help with that.', 'intent' => 'question', 'needs_escalation' => false,

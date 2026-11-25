@@ -30,7 +30,7 @@ class AiSetupVerificationService
 
         $hasInstructions = filled($business->ai_instructions)
             || filled($business->knowledge_base)
-            || $business->knowledgeFiles()->whereIn('status', ['processed', 'completed'])->exists()
+            || $business->knowledgeFiles()->whereIn('status', ['active', 'processed', 'completed'])->exists()
             || $business->bots()->where('status', 'active')->whereNotNull('ai_instructions')
                 ->where('ai_instructions', '!=', '')->exists();
 

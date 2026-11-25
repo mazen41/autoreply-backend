@@ -1311,7 +1311,7 @@ class ProcessAutoReply implements ShouldQueue
         }
 
         // Step 2: Hard Escalation Override (Pre-AI Check)
-        $hardEscalation = AICapabilitiesService::checkHardEscalation($message->content);
+        $hardEscalation = AICapabilitiesService::checkHardEscalation($message->content, (int) $business->id);
         if ($hardEscalation['force_escalation']) {
             Log::info('ProcessAutoReply: Hard escalation override triggered', [
                 'conversation_id' => $conversation->id,
@@ -1549,11 +1549,17 @@ class ProcessAutoReply implements ShouldQueue
             );
             $conversation->update(['checkout_state' => $merged]);
         } elseif (!is_null($conversation->checkout_state)) {
-            // Previously stored checkout_state exists but new extraction yielded
-            // nothing meaningful — preserve the existing state rather than
-            // wiping out collected customer fields (full_name, phone, address).
-            // Only clear it if there is genuinely no prior data.
-            $conversation->update(['checkout_state' => null]);
+            // A confirmation or short follow-up often contains no extractable
+            // customer fields. Preserve the existing checkout instead of
+            // clearing the data needed to create the order.
+            $existingCheckoutState = is_array($conversation->checkout_state)
+                ? $conversation->checkout_state
+                : [];
+            if ($existingCheckoutState !== []) {
+                $updatedCheckoutState = $existingCheckoutState;
+            } else {
+                $conversation->update(['checkout_state' => null]);
+            }
         }
         $sallaCheckoutActive = (bool) $sallaChannel && !empty($updatedCheckoutState['salla_product_id']);
         $addressGeocodingStatus = null;
@@ -1894,6 +1900,11 @@ class ProcessAutoReply implements ShouldQueue
         // retrieved document text or a copy of the prompt.
         $knowledgeFileIds = [];
         $knowledgeChunkIds = [];
+        $knowledgeFailsafeEnabled = $business
+            && \App\Models\FeatureFlag::isEnabled('knowledge_embedding_failsafe', (int) $business->id);
+        $knowledgeShadowEnabled = $business && !$isSallaFlow
+            && \App\Models\FeatureFlag::isEnabled('knowledge_relevance_floor_shadow', (int) $business->id);
+        $knowledgeStatus = $knowledgeFailsafeEnabled ? 'unavailable' : null;
 
         $context = [
             'business_id' => $business?->id,
@@ -1921,18 +1932,38 @@ class ProcessAutoReply implements ShouldQueue
                 'type' => $commerceChannel->type, 'name' => $commerceChannel->page_name ?? null,
             ] : null),
             'customer'       => $customerContext,
-            'knowledge_base' => (function() use ($business, $bot, $channel, $message, $isSallaFlow, &$knowledgeFileIds, &$knowledgeChunkIds) {
+            'knowledge_base' => (function() use ($business, $bot, $channel, $message, $isSallaFlow, $knowledgeFailsafeEnabled, $knowledgeShadowEnabled, &$knowledgeStatus, &$knowledgeFileIds, &$knowledgeChunkIds) {
                 if (!$business || $isSallaFlow) {
                     return '';
                 }
-                $embeddingsService = app(\App\Services\EmbeddingsService::class);
                 $vectorSearch = app(\App\Services\VectorSearchService::class);
 
                 // 1. Get embedding for the user's message
-                $queryEmbedding = $embeddingsService->embedChunk($message->content, $business, \App\Services\AiGateway::stableOperationId('knowledge-query:' . $message->id));
+                try {
+                    $embeddingsService = app(\App\Services\EmbeddingsService::class);
+                    $queryEmbedding = $embeddingsService->embedChunk($message->content, $business, \App\Services\AiGateway::stableOperationId('knowledge-query:' . $message->id));
+                } catch (\Throwable $exception) {
+                    if (!$knowledgeFailsafeEnabled) {
+                        throw $exception;
+                    }
+
+                    $knowledgeStatus = 'unavailable';
+                    Log::warning('ProcessAutoReply: knowledge embedding unavailable', [
+                        'business_id' => $business->id,
+                        'exception_type' => get_class($exception),
+                    ]);
+                    return '';
+                }
                 
                 if (empty($queryEmbedding)) {
+                    if ($knowledgeFailsafeEnabled) {
+                        $knowledgeStatus = 'unavailable';
+                    }
                     return ''; // Fallback if embedding fails
+                }
+
+                if ($knowledgeFailsafeEnabled) {
+                    $knowledgeStatus = 'no_match';
                 }
 
                 // 2. Determine allowed knowledge file IDs for the Bot + Channel.
@@ -1961,12 +1992,54 @@ class ProcessAutoReply implements ShouldQueue
                             'exception_type' => get_class($e),
                             'bot_id' => $bot->id,
                         ]);
+                        if ($knowledgeFailsafeEnabled) {
+                            $knowledgeStatus = 'filtered';
+                        }
+                        return '';
+                    }
+
+                    if ($knowledgeFailsafeEnabled && empty($allowedFileIds)) {
+                        $knowledgeStatus = 'filtered';
                         return '';
                     }
                 }
 
                 // 3. Search for relevant chunks
-                $relevantChunks = $vectorSearch->search($queryEmbedding, $business->id, 5, $allowedFileIds);
+                $relevantChunks = $vectorSearch->search(
+                    $queryEmbedding,
+                    $business->id,
+                    5,
+                    $allowedFileIds,
+                    $embeddingsService->activeProvider(),
+                    $embeddingsService->activeModel(),
+                    $embeddingsService->dimension()
+                );
+
+                if ($knowledgeShadowEnabled) {
+                    $scores = array_map(fn ($chunk) => (float) ($chunk->similarity_score ?? 0), $relevantChunks);
+                    $topScore = $scores ? max($scores) : null;
+                    $scoreBucket = match (true) {
+                        $topScore === null => 'none',
+                        $topScore < 0.55 => 'below_055',
+                        $topScore < 0.65 => 'from_055_to_064',
+                        $topScore < 0.75 => 'from_065_to_074',
+                        default => 'at_least_075',
+                    };
+                    Log::info('Knowledge relevance shadow sample', [
+                        'business_id' => $business->id,
+                        'top_score_bucket' => $scoreBucket,
+                        'top_chunk_count' => count($scores),
+                        'would_filter_below_055' => count(array_filter($scores, fn ($score) => $score < 0.55)),
+                        'would_filter_below_065' => count(array_filter($scores, fn ($score) => $score < 0.65)),
+                        'would_filter_below_075' => count(array_filter($scores, fn ($score) => $score < 0.75)),
+                    ]);
+                }
+
+                if ($knowledgeFailsafeEnabled && empty($relevantChunks)
+                    && (($vectorSearch->lastSearchStats()['skipped_dimension_mismatch_count'] ?? 0)
+                        + ($vectorSearch->lastSearchStats()['skipped_metadata_mismatch_count'] ?? 0)) > 0) {
+                    $knowledgeStatus = 'unavailable';
+                }
 
                 if (empty($relevantChunks)) {
                     return '';
@@ -1981,6 +2054,10 @@ class ProcessAutoReply implements ShouldQueue
                     $fileName = $chunk->file ? $chunk->file->filename : 'Knowledge Base';
                     $knowledgeText .= "\n[Source: {$fileName}] (Relevance Top " . ($index + 1) . ")\n";
                     $knowledgeText .= $chunk->content . "\n";
+                }
+
+                if ($knowledgeFailsafeEnabled) {
+                    $knowledgeStatus = 'ok';
                 }
 
                 return $knowledgeText;
@@ -2056,6 +2133,13 @@ class ProcessAutoReply implements ShouldQueue
             // Structured conversation state — AI must NEVER invent or override these values
             'structured_state'             => $structuredState,
         ];
+
+        // Do not change the prompt unless this business has explicitly opted
+        // into the default-off retrieval failsafe. Salla conversations keep
+        // their existing commerce-only prompt contract.
+        if ($knowledgeFailsafeEnabled && !$isSallaFlow) {
+            $context['knowledge_status'] = $knowledgeStatus ?? 'unavailable';
+        }
 
         // Step 4: Single AI Call with JSON Output
         try {
@@ -3064,7 +3148,7 @@ $aiResponse = $intro
                     $latestAttempt = \App\Models\CommerceOrderAttempt::query()
                         ->where('conversation_id', $conversation->id)
                         ->where('connection_id', $commerceChannel?->id)
-                        ->where('checkout_fingerprint', $attemptFingerprint)
+                        ->whereIn('status', ['submitting', 'unknown'])
                         ->latest('id')
                         ->first();
                     $providerOutcomeUnknown = in_array($latestAttempt?->status, ['submitting', 'unknown'], true);
@@ -4534,8 +4618,9 @@ $aiResponse = $intro
                         $e->getMessage(),
                         'Canonical Salla order payload could not be constructed'
                     );
-                    $definiteSallaRejection = $e instanceof \App\Exceptions\SallaOrderSubmissionException
-                        && $e->isDefinitiveRejection();
+                    $definiteSallaRejection = $e instanceof \App\Exceptions\SallaOrderValidationException
+                        || ($e instanceof \App\Exceptions\SallaOrderSubmissionException
+                            && $e->isDefinitiveRejection());
                     if ($sallaPreflightRejected || $definiteSallaRejection
                         || str_contains(strtolower($e->getMessage()), 'token expired')
                         || str_contains(strtolower($e->getMessage()), 'scope missing')
@@ -5121,7 +5206,8 @@ $aiResponse = $intro
         Message $incoming,
         mixed $checkoutState,
     ): bool {
-        if ($incoming->direction !== 'inbound' || !is_array($checkoutState) || !$this->isExplicitCheckoutCancellation($incoming->content)) {
+        if ($incoming->direction !== 'inbound' || !is_array($checkoutState)
+            || !$this->isExplicitCheckoutCancellation($incoming->content, (int) $conversation->business_id)) {
             return false;
         }
 
@@ -5188,17 +5274,23 @@ $aiResponse = $intro
         return true;
     }
 
-    private function isExplicitCheckoutCancellation(string $message): bool
+    private function isExplicitCheckoutCancellation(string $message, ?int $businessId = null): bool
     {
         $message = mb_strtolower(trim($message));
-        return (bool) preg_match(
+        $pattern =
             '/^(?:(?:please|kindly)\s+)?(?:cancel|stop)(?:\s+(?:(?:my|the)\s+)?(?:order|checkout))?[.!?\s]*$'
                 . '|^(?:i\s+)?(?:want|need)\s+to\s+cancel\s+(?:(?:my|the)\s+)?(?:order|checkout)[.!?\s]*$'
                 . '|^(?:i\s+)?(?:changed\s+my\s+mind|do\s+not\s+proceed|don.t\s+proceed)(?:\s+with\s+(?:the\s+)?order)?[.!?\s]*$'
-                . '|^(?:من\s+فضلك\s+)?(?:إلغاء|الغاء|ألغِ|الغي)(?:\s+(?:الطلب|طلبي|عملية\s+الطلب))?[.!؟\s]*$'
-                . '|^(?:أريد|اريد|عايز|عاوز|أبغى|ابغى)\s+(?:إلغاء|الغاء|ألغي|الغي)\s+(?:الطلب|طلبي)[.!؟\s]*$/u',
-            $message
-        );
+                . '|^(?:من\s+فضلك\s+)?(?:إلغاء|الغاء|ألغِ|الغي)(?:\s+(?:الطلب|طلبي|عملية\s+الطلب))?[.!؟\s]*$/u';
+        if ($businessId && \App\Models\FeatureFlag::isEnabled('salla_workflow_guardrails', $businessId)) {
+            $pattern = str_replace(
+                '$/u',
+                '|^(?:أريد|اريد|عايز|عاوز|أبغى|ابغى)\s+(?:إلغاء|الغاء|ألغي|الغي)\s+(?:الطلب|طلبي|الأوردر|الاوردر|ده|دا)[.!؟\s]*'
+                    . '|^(?:خلاص\s+)?(?:لا\s+)?(?:الغِ|الغى|الغاء|إلغاء|ألغي|الغي)(?:\s+(?:الطلب|طلبي|الأوردر|الاوردر|ده|دا))?$/u',
+                $pattern
+            );
+        }
+        return (bool) preg_match($pattern, $message);
     }
 
     /** Notify the business once for each inbound message skipped for lack of AI credits. */

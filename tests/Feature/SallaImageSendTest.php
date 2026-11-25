@@ -75,6 +75,7 @@ class SallaImageSendTest extends TestCase
             'user_id' => $user->id,
             'business_name' => 'Demo Store',
         ]);
+        $this->activatePaidTestPlan($business);
 
         // Rate limiting uses Redis (outside RefreshDatabase's transaction),
         // and test databases reuse primary keys. Reset this fixture's key so
@@ -310,7 +311,8 @@ class SallaImageSendTest extends TestCase
             'can I see photos of the dress and pants',
             'Here are some of our products: 1. Dress (174 SAR), 2. Pants (94 SAR).'
         );
-        Package::where('name', 'Free')->update(['outbound_messages_limit' => 2]);
+        $subscription = \App\Models\Subscription::query()->where('business_id', $fixture['business']->id)->firstOrFail();
+        $subscription->package->update(['outbound_messages_limit' => 2]);
 
         Http::fake([
             'generativelanguage.googleapis.com/*embedContent*' => Http::response(['embedding' => ['values' => []]], 200),

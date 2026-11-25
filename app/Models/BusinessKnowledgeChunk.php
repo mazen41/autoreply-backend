@@ -13,10 +13,14 @@ class BusinessKnowledgeChunk extends Model
         'chunk_index',
         'content',
         'embedding',
+        'embedding_provider',
+        'embedding_model',
+        'embedding_dim',
     ];
 
     protected $casts = [
         'embedding' => 'array',
+        'embedding_dim' => 'integer',
     ];
 
     public function file(): BelongsTo

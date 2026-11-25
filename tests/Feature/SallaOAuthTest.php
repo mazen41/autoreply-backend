@@ -7,6 +7,7 @@ use App\Models\BusinessProfile;
 use App\Models\User;
 use App\Services\OAuthStateService;
 use Illuminate\Foundation\Testing\RefreshDatabase;
+use Illuminate\Support\Facades\Queue;
 use Tests\TestCase;
 use Laravel\Sanctum\Sanctum;
 
@@ -22,6 +23,7 @@ class SallaOAuthTest extends TestCase
             'password' => '123'
         ]);
         $business = BusinessProfile::create(['user_id' => $user->id, 'name' => 'Salla test business']);
+        $this->activatePaidTestPlan($business);
         Sanctum::actingAs($user);
 
         $response = $this->postJson('/api/channels/connect/salla', [], ['X-Business-Id' => (string) $business->id]);
@@ -37,12 +39,14 @@ class SallaOAuthTest extends TestCase
 
     public function test_salla_callback_creates_channel(): void
     {
+        Queue::fake();
         $user = User::forceCreate([
             'name' => 'Test',
             'email' => 'test' . rand() . '@test.com',
             'password' => '123'
         ]);
         $business = BusinessProfile::create(['user_id' => $user->id, 'name' => 'Salla test business']);
+        $this->activatePaidTestPlan($business);
         $state = app(OAuthStateService::class)->issue('salla', $user->id, ['business_id' => $business->id]);
         
         // Mock the Salla service responses
@@ -50,7 +54,7 @@ class SallaOAuthTest extends TestCase
 
         $response = $this->get('/api/channels/callback/salla?code=test_code&state=' . $state);
 
-        $response->assertRedirect(env('FRONTEND_URL') . '/dashboard/channels?success=salla_connected');
+        $response->assertRedirect(env('FRONTEND_URL') . '/dashboard/channels?success=salla_connected&cities=processing');
 
         $this->assertDatabaseHas('channels', [
             'user_id' => $user->id,

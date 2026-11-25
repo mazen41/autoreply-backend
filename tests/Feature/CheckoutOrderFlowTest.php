@@ -45,18 +45,34 @@ class CheckoutOrderFlowTest extends TestCase
 
     private function seedSallaCity(Channel $channel, string $name, int $cityId): void
     {
-        DB::table('salla_cities')->insert([
-            'channel_id' => $channel->id,
-            'country_code' => 'SA',
+        $now = now();
+        $normalized = app(\App\Services\SallaService::class)->normalizeCitySearchText($name);
+        DB::table('salla_city_reference_cities')->insert([
             'country_id' => 1473353380,
             'salla_city_id' => $cityId,
             'name' => $name,
             'name_en' => $name,
             'name_ar' => null,
-            'synced_at' => now(),
-            'created_at' => now(),
-            'updated_at' => now(),
+            'normalized_name' => $normalized,
+            'normalized_en' => $normalized,
+            'normalized_ar' => null,
+            'synced_at' => $now,
+            'created_at' => $now,
+            'updated_at' => $now,
         ]);
+        \App\Models\SallaCityCatalog::updateOrCreate(
+            ['country_code' => 'SA'],
+            [
+                'country_id' => 1473353380,
+                'status' => 'succeeded',
+                'pages_completed' => 1,
+                'total_pages' => 1,
+                'expected_city_count' => 1,
+                'staged_city_count' => 1,
+                'saved_city_count' => 1,
+                'synced_at' => $now,
+            ]
+        );
     }
 
     private function saveSentOrderSummary(Conversation $conversation): void
@@ -76,6 +92,7 @@ class CheckoutOrderFlowTest extends TestCase
             (string) ($state['commerce_channel_id'] ?? ''),
             (string) ($state['commerce_external_id'] ?? $state['salla_product_id'] ?? ''),
             (string) ($state['commerce_variant_id'] ?? ''),
+            json_encode($state['salla_options'] ?? [], JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE) ?: '',
             preg_replace('/\D+/', '', (string) ($state['phone'] ?? $state['customer_phone'] ?? '')),
             mb_strtolower(trim((string) ($state['address'] ?? $state['customer_address'] ?? ''))),
         ]));
@@ -209,6 +226,7 @@ class CheckoutOrderFlowTest extends TestCase
     {
         $user = User::factory()->create();
         $business = BusinessProfile::factory()->create(['user_id' => $user->id, 'ai_provider' => 'groq']);
+        $this->activatePaidTestPlan($business);
         $commerceChannel = Channel::factory()->create([
             'user_id' => $user->id,
             'business_id' => $business->id,
@@ -245,6 +263,7 @@ class CheckoutOrderFlowTest extends TestCase
     {
         $user = User::factory()->create();
         $business = BusinessProfile::factory()->create(['user_id' => $user->id]);
+        $this->activatePaidTestPlan($business);
         $channel = Channel::factory()->create(['user_id' => $user->id, 'business_id' => $business->id]);
         $conversation = Conversation::factory()->create([
             'channel_id' => $channel->id,
@@ -287,6 +306,7 @@ class CheckoutOrderFlowTest extends TestCase
 
         $user = User::factory()->create();
         $business = BusinessProfile::factory()->create(['user_id' => $user->id]);
+        $this->activatePaidTestPlan($business);
         Channel::factory()->create([
             'user_id' => $user->id,
             'business_id' => $business->id,
@@ -353,6 +373,7 @@ class CheckoutOrderFlowTest extends TestCase
     {
         \Illuminate\Support\Facades\Event::fake();
         Http::fake([
+            'generativelanguage.googleapis.com/*embedContent*' => Http::response(['embedding' => ['values' => []]], 200),
             'api.groq.com/*' => Http::response(['choices' => [['message' => ['content' => json_encode([
                 'success' => true,
                 'reply' => 'Your order has been placed successfully.',
@@ -372,6 +393,7 @@ class CheckoutOrderFlowTest extends TestCase
             'ai_provider' => 'groq',
             'auto_order_confirmation_enabled' => false,
         ]);
+        $this->activatePaidTestPlan($business);
         $store = Channel::factory()->create([
             'user_id' => $user->id,
             'business_id' => $business->id,
@@ -379,6 +401,7 @@ class CheckoutOrderFlowTest extends TestCase
             'status' => 'connected',
             'access_token' => 'test-store-token',
         ]);
+        $this->seedSallaCity($store, 'Riyadh', 1);
         $channel = Channel::factory()->create([
             'user_id' => $user->id,
             'business_id' => $business->id,
@@ -404,7 +427,7 @@ class CheckoutOrderFlowTest extends TestCase
                 'commerce_channel_id' => $store->id, 'product_name' => 'Test Product',
                 'product_price' => 50, 'product_currency' => 'SAR',
                 'full_name' => 'Mazen Hossny', 'phone' => '+966501234567',
-                'address' => 'Riyadh', 'email' => 'mazen@example.com',
+                'address' => 'Riyadh', 'delivery_city' => 'Riyadh', 'street_number' => '1', 'email' => 'mazen@example.com',
                 'postal_code' => '12345', 'block' => '5', 'district' => 'Nasr City', 'geo_coordinates' => ['lat' => 24.7, 'lng' => 46.6],
                 'building_number' => '1', 'short_address' => 'RRAA1234', 'additional_number' => '5678',
                 'confirmation_state' => 'confirmation_pending',
@@ -435,6 +458,7 @@ class CheckoutOrderFlowTest extends TestCase
     {
         \Illuminate\Support\Facades\Event::fake();
         Http::fake([
+            'generativelanguage.googleapis.com/*embedContent*' => Http::response(['embedding' => ['values' => []]], 200),
             'api.groq.com/*' => Http::response(['choices' => [['message' => ['content' => json_encode([
                 'success' => true,
                 'reply' => 'Great, Alex Rivera Stone, we have your full name, phone, and address. Your order for Sample Product (600 SAR) is now being processed and you will receive a confirmation shortly.',
@@ -450,6 +474,7 @@ class CheckoutOrderFlowTest extends TestCase
 
         $user = User::factory()->create();
         $business = BusinessProfile::factory()->create(['user_id' => $user->id, 'ai_provider' => 'groq']);
+        $this->activatePaidTestPlan($business);
         $store = Channel::factory()->create([
             'user_id' => $user->id, 'business_id' => $business->id,
             'type' => 'shopify', 'page_id' => 'incident-test.myshopify.com', 'status' => 'connected',
@@ -566,18 +591,22 @@ class CheckoutOrderFlowTest extends TestCase
             'full_name' => 'Mazen Hossny',
             'phone' => '966 50 530 8084',
             'address' => '36 Al Olaya Street, Riyadh',
+            'delivery_city' => 'Riyadh',
+            'street_number' => '36',
             'postal_code' => '12211',
             'building_number' => '36',
             'block' => 'Block 12',
             'district' => 'Al Olaya',
             'short_address' => 'RRRR1234',
             'additional_number' => '5678',
+            'geo_coordinates' => ['lat' => 24.7136, 'lng' => 46.6753],
         ];
 
         $completeWithoutOptionalGeo = $checkout->computeFieldStatus($state, true);
         $this->assertTrue($completeWithoutOptionalGeo['is_complete']);
         $this->assertNotContains('email', $completeWithoutOptionalGeo['missing_fields']);
 
+        unset($state['geo_coordinates']);
         $missingGeo = $checkout->computeFieldStatus($state, true, ['geo_coordinates']);
         $this->assertContains('geo_coordinates', $missingGeo['missing_fields']);
 
@@ -589,6 +618,7 @@ class CheckoutOrderFlowTest extends TestCase
     {
         $user = User::factory()->create();
         $business = BusinessProfile::factory()->create(['user_id' => $user->id]);
+        $this->activatePaidTestPlan($business);
         $channel = Channel::factory()->create([
             'user_id' => $user->id,
             'business_id' => $business->id,
@@ -634,6 +664,7 @@ class CheckoutOrderFlowTest extends TestCase
             'name' => 'NazBiz Store',
             'ai_provider' => 'groq',
         ]);
+        $this->activatePaidTestPlan($business);
         try { Redis::del("rate_limit:{$business->id}:{$user->id}"); } catch (\Throwable) {}
 
         $commerceChannel = Channel::factory()->create([
@@ -696,6 +727,7 @@ class CheckoutOrderFlowTest extends TestCase
         ]);
 
         Http::fake([
+            'generativelanguage.googleapis.com/*embedContent*' => Http::response(['embedding' => ['values' => []]], 200),
             'graph.facebook.com/*' => Http::response(['message_id' => 'meta-summary'], 200),
             'api.groq.com/*' => Http::response([
                 'choices' => [
@@ -764,7 +796,7 @@ class CheckoutOrderFlowTest extends TestCase
         $conversation->refresh();
         $this->assertNotNull($conversation->checkout_state);
         $this->assertEquals('completed', $conversation->checkout_state['status']);
-        $this->assertEquals('SAL-889900', $conversation->checkout_state['order_id']);
+        $this->assertEquals('889900', $conversation->checkout_state['order_id']);
         Http::assertSent(fn ($request) => $request->method() === 'POST'
             && str_ends_with(parse_url($request->url(), PHP_URL_PATH), '/orders')
             && ($request['ship_to']['country'] ?? null) === 1473353380);
@@ -781,7 +813,7 @@ class CheckoutOrderFlowTest extends TestCase
         $job3->handle();
 
         $conversation->refresh();
-        $this->assertEquals('SAL-889900', $conversation->checkout_state['order_id']);
+        $this->assertEquals('889900', $conversation->checkout_state['order_id']);
     }
 
     /** @test */
@@ -789,6 +821,7 @@ class CheckoutOrderFlowTest extends TestCase
     {
         $user = User::factory()->create();
         $business = BusinessProfile::factory()->create(['user_id' => $user->id, 'ai_provider' => 'groq']);
+        $this->activatePaidTestPlan($business);
         try { Redis::del("rate_limit:{$business->id}:{$user->id}"); } catch (\Throwable) {}
         $commerceChannel = Channel::factory()->create([
             'user_id' => $user->id,
@@ -836,6 +869,8 @@ class CheckoutOrderFlowTest extends TestCase
                 'full_name' => 'Sara Mohamed',
                 'phone' => '+966501234567',
                 'address' => 'Riyadh Al Olaya',
+                'delivery_city' => 'Riyadh',
+                'street_number' => '12',
                 'email' => 'sara@example.com',
                 'postal_code' => '12345', 'block' => '5', 'district' => 'Nasr City',
                 'geo_coordinates' => ['lat' => 24.7136, 'lng' => 46.6753],
@@ -855,6 +890,7 @@ class CheckoutOrderFlowTest extends TestCase
         ]);
 
         Http::fake([
+            'generativelanguage.googleapis.com/*embedContent*' => Http::response(['embedding' => ['values' => []]], 200),
             'graph.facebook.com/*' => Http::response(['message_id' => 'meta-error-summary'], 200),
             'api.groq.com/*' => Http::response([
                 'choices' => [['message' => ['content' => json_encode([
@@ -923,6 +959,7 @@ class CheckoutOrderFlowTest extends TestCase
             'name' => 'NazBiz Store',
             'ai_provider' => 'groq',
         ]);
+        $this->activatePaidTestPlan($business);
         try { Redis::del("rate_limit:{$business->id}:{$user->id}"); } catch (\Throwable) {}
 
         $instagramChannel = Channel::factory()->create([
@@ -963,6 +1000,13 @@ class CheckoutOrderFlowTest extends TestCase
                 'phone' => '+966501234567',
                 'customer_phone' => '+966501234567',
                 'address' => 'Riyadh, Saudi Arabia',
+                'delivery_city' => 'Riyadh',
+                'street_number' => '36',
+                'building_number' => '36',
+                'block' => 'Block 12',
+                'short_address' => 'RRRR1234',
+                'additional_number' => '5678',
+                'postal_code' => '12345',
             ],
         ]);
         $message = Message::create([
@@ -973,6 +1017,7 @@ class CheckoutOrderFlowTest extends TestCase
         ]);
 
         Http::fake([
+            'generativelanguage.googleapis.com/*embedContent*' => Http::response(['embedding' => ['values' => []]], 200),
             'api.groq.com/*' => Http::response([
                 'choices' => [[
                     'message' => ['content' => json_encode([
@@ -1003,10 +1048,11 @@ class CheckoutOrderFlowTest extends TestCase
     }
 
     /** @test */
-    public function it_allows_retry_after_salla_failure_and_succeeds_when_api_returns_2xx()
+    public function it_blocks_retry_after_ambiguous_salla_5xx_until_the_order_is_reconciled()
     {
         $user = User::factory()->create();
         $business = BusinessProfile::factory()->create(['user_id' => $user->id, 'ai_provider' => 'groq']);
+        $this->activatePaidTestPlan($business);
         try { Redis::del("rate_limit:{$business->id}:{$user->id}"); } catch (\Throwable) {}
         $commerceChannel = Channel::factory()->create([
             'user_id' => $user->id,
@@ -1048,6 +1094,7 @@ class CheckoutOrderFlowTest extends TestCase
                 'full_name' => 'Mazen',
                 'phone' => '+966501234567',
                 'address' => 'Jeddah',
+                'delivery_city' => 'Jeddah',
                 'email' => 'mazen@example.com',
                 'postal_code' => '23456', 'block' => '5', 'district' => 'Nasr City',
                 'geo_coordinates' => ['lat' => 21.5433, 'lng' => 39.1728],
@@ -1068,6 +1115,7 @@ class CheckoutOrderFlowTest extends TestCase
         ]);
 
         Http::fake([
+            'generativelanguage.googleapis.com/*embedContent*' => Http::response(['embedding' => ['values' => []]], 200),
             'graph.facebook.com/*' => Http::response(['message_id' => 'meta-retry-summary'], 200),
             'api.groq.com/*' => Http::sequence()
                 ->push(['choices' => [['message' => ['content' => json_encode([
@@ -1123,13 +1171,9 @@ class CheckoutOrderFlowTest extends TestCase
         $this->assertNotEquals('completed', $conversation->checkout_state['status'] ?? null);
         $this->assertEmpty($conversation->checkout_state['order_id'] ?? null);
 
-        // A provider 5xx is escalated to a human and pauses AI. Simulate the
-        // operator resolving that handoff and re-enabling AI before asserting
-        // that a later explicit confirmation can retry the order.
+        // A provider 5xx can happen after the order was accepted. Re-enabling
+        // AI without reconciling the provider attempt must not repeat the POST.
         $conversation->update(['ai_enabled' => true, 'requires_human' => false, 'status' => 'active']);
-        \App\Models\HandoffTask::where('conversation_id', $conversation->id)
-            ->where('status', 'open')
-            ->update(['status' => 'resolved', 'resolved_at' => now()]);
 
         $msg2 = Message::create([
             'conversation_id' => $conversation->id,
@@ -1143,11 +1187,14 @@ class CheckoutOrderFlowTest extends TestCase
         $job2->handle();
 
         $conversation->refresh();
-        $this->assertEquals('completed', $conversation->checkout_state['status']);
-        $this->assertEquals('SAL-991122', $conversation->checkout_state['order_id']);
+        $this->assertSame('provider_outcome_unknown', $conversation->checkout_state['confirmation_state'] ?? null);
+        $this->assertEmpty($conversation->checkout_state['order_id'] ?? null);
         $this->assertDatabaseHas('handoff_tasks', [
             'conversation_id' => $conversation->id,
-            'status' => 'resolved',
+            'status' => 'open',
         ]);
+        $orderPosts = Http::recorded(fn ($request) => $request->method() === 'POST'
+            && str_ends_with(parse_url($request->url(), PHP_URL_PATH), '/orders'));
+        $this->assertCount(1, $orderPosts);
     }
 }

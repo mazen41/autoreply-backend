@@ -64,6 +64,7 @@ class SallaProductBrowseIntentTest extends TestCase
             'knowledge_base' => 'We are a great store.',
             'ai_provider'   => 'gemini',
         ]);
+        $this->activatePaidTestPlan($business);
         try { Redis::del("rate_limit:{$business->id}:{$user->id}"); } catch (\Throwable) {}
 
         $whatsappChannel = Channel::create([

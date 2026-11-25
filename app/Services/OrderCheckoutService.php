@@ -485,12 +485,12 @@ class OrderCheckoutService
         // matched that first occurrence and swallowed the customer's name,
         // phone, and the later actual address into one geocoding query.
         $extractedAddress = null;
-        $addressPattern = '/(?:\bmy\s+address\s+is\b|\bdelivery\s+address(?:\s+is)?\b|\baddress\s+is\b|(?:^|[,;\n]\s*|\band\s+(?:the\s+)?)(?:address|العنوان|عنواني)\b|\b(?:live\s+in|located\s+at)\b|\b(?:حي|شارع|مدينة|محافظة|الرياض|جدة|مكة|الدمام|القاهرة|الإسكندرية)\b)\s*[:\-]?\s*(.+)$/isu';
-        if (preg_match_all($addressPattern, $incomingText, $addressMatches, PREG_SET_ORDER)) {
-            // If several address-like phrases occur, the last explicit one is
-            // the actual delivery location (for example, "full address ... and
-            // the address Ghaali Mitri ...").
-            $candidate = trim((string) (end($addressMatches)[1] ?? ''));
+        $addressCuePattern = '/\b(?:my\s+address\s+is|delivery\s+address(?:\s+is)?|address\s+is|address|العنوان|عنواني|live\s+in|located\s+at)\b\s*[:\-]?\s*|\b(?:حي|شارع|مدينة|محافظة|الرياض|جدة|مكة|الدمام|القاهرة|الإسكندرية)\b\s*/iu';
+        if (preg_match_all($addressCuePattern, $incomingText, $addressMatches, PREG_OFFSET_CAPTURE)) {
+            // Use the last address label so repeated phrases don't cause the
+            // earlier conversational filler to be stored as the address.
+            $lastCue = end($addressMatches[0]);
+            $candidate = trim(substr($incomingText, $lastCue[1] + strlen($lastCue[0])));
             if (strlen($candidate) >= 4
                 && !preg_match('/^(?:hi|hello|hey|yes|no|ok|sure|thanks|the dress|this one|that one|مرحبا|سلام|نعم|لا|حسنا|شكرا|الفستان|هذا|هذه)$/ui', $candidate)) {
                 $extractedAddress = $candidate;
@@ -691,23 +691,23 @@ class OrderCheckoutService
         $normalizedState = $requireSallaShippingDetails ? \App\Services\SallaAddressParser::fillMissing($normalizedState) : $normalizedState;
         $requiredFields = self::REQUIRED_FIELDS;
 
-        // Salla's order API requires a customer email. Collect it with the
-        // initial order details so checkout does not discover it only after
-        // the customer has confirmed a summary.
-        if ($requireSallaShippingDetails) {
-            $requiredFields[] = 'email';
-        }
-
-        // National-address extras (postal code, building number, block,
-        // coordinates, district, short address, additional number) are NOT
-        // universally mandatory — Salla's own order/shipping-method validation
-        // decides that per store. We only require them here once a real Salla
-        // order attempt has actually told us they are missing (see
-        // $sallaRequiredFields, populated from the store's own API response by
-        // SallaService). This avoids asking customers for data Salla never
-        // needed, while still honouring genuinely required fields.
+        // A base Salla order needs name, phone and address; email is optional.
+        // Saudi National Address fields are collected before submission so
+        // the store's preflight never starts an order with known-missing data.
         if ($requireSallaShippingDetails && $sallaRequiredFields !== []) {
             $requiredFields = array_values(array_unique(array_merge($requiredFields, $sallaRequiredFields)));
+        }
+        if ($requireSallaShippingDetails) {
+            $country = $this->deliveryCountryForAddress(
+                (string) ($normalizedState['address'] ?? $normalizedState['customer_address'] ?? ''),
+                (string) ($normalizedState['phone'] ?? $normalizedState['customer_phone'] ?? ''),
+            );
+            if (($country['dial'] ?? null) === '966') {
+                $requiredFields = array_values(array_unique(array_merge($requiredFields, [
+                    'delivery_city', 'street_number', 'building_number', 'block', 'short_address',
+                    'additional_number', 'postal_code', 'geo_coordinates',
+                ])));
+            }
         }
 
         $fieldAliases = [
@@ -768,6 +768,13 @@ class OrderCheckoutService
 
         if (!empty($orderId) && ($state['status'] ?? '') === 'completed') {
             $state['confirmation_state'] = 'order_placed';
+            return $state;
+        }
+
+        // A timeout or server error may have happened after Salla accepted the
+        // order. Keep that outcome unresolved until a human or webhook
+        // reconciles it; a new confirmation must never turn it into a retry.
+        if ($currentState === 'provider_outcome_unknown') {
             return $state;
         }
 

@@ -20,6 +20,7 @@ class TeamInvitationAcceptanceTest extends TestCase
         Mail::fake();
         $owner = User::factory()->create();
         $business = BusinessProfile::factory()->create(['user_id' => $owner->id]);
+        $this->activatePaidTestPlan($business);
         $invitee = User::factory()->create(['email' => 'invitee@example.test']);
         Sanctum::actingAs($owner);
 
@@ -50,6 +51,7 @@ class TeamInvitationAcceptanceTest extends TestCase
         Mail::fake();
         $owner = User::factory()->create();
         $business = BusinessProfile::factory()->create(['user_id' => $owner->id]);
+        $this->activatePaidTestPlan($business);
         $invitee = User::factory()->create(['email' => 'notice@example.test']);
         Sanctum::actingAs($owner);
         $response = $this->postJson("/api/businesses/{$business->id}/team/invite", [
@@ -72,6 +74,7 @@ class TeamInvitationAcceptanceTest extends TestCase
     {
         $owner = User::factory()->create();
         $business = BusinessProfile::factory()->create(['user_id' => $owner->id]);
+        $this->activatePaidTestPlan($business);
         $invitee = User::factory()->create(['email' => 'right@example.test']);
         $attacker = User::factory()->create(['email' => 'wrong@example.test']);
         $invitation = TeamInvitation::create([
@@ -94,6 +97,7 @@ class TeamInvitationAcceptanceTest extends TestCase
     {
         $owner = User::factory()->create();
         $business = BusinessProfile::factory()->create(['user_id' => $owner->id]);
+        $this->activatePaidTestPlan($business);
         $invitee = User::factory()->create(['email' => 'invitee@example.test']);
         $revoked = TeamInvitation::create([
             'business_id' => $business->id, 'invited_by' => $owner->id, 'email' => $invitee->email,
@@ -116,6 +120,7 @@ class TeamInvitationAcceptanceTest extends TestCase
         Mail::fake();
         $owner = User::factory()->create();
         $business = BusinessProfile::factory()->create(['user_id' => $owner->id]);
+        $this->activatePaidTestPlan($business);
         Sanctum::actingAs($owner);
         $created = $this->postJson("/api/businesses/{$business->id}/team/invite", [
             'email' => 'resend@example.test', 'role' => 'agent',

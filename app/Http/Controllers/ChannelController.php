@@ -5,12 +5,26 @@ namespace App\Http\Controllers;
 use App\Models\Channel;
 use App\Services\SallaService;
 use App\Services\OAuthStateService;
+use App\Jobs\SyncSallaProducts;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\Http;
 use Illuminate\Support\Facades\Log;
 
 class ChannelController extends Controller
 {
+    public function syncSalla(Request $request, int $channelId)
+    {
+        $channel = Channel::query()->whereKey($channelId)->where('type', 'salla')
+            ->where('user_id', $request->user()->id)->where('status', 'connected')->firstOrFail();
+        $metadata = $channel->metadata ?? [];
+        $metadata['sync_status'] = 'queued';
+        unset($metadata['sync_error']);
+        $channel->forceFill(['metadata' => $metadata])->save();
+        SyncSallaProducts::dispatch($channel->id);
+
+        return response()->json(['success' => true, 'status' => 'queued']);
+    }
+
     /**
      * Salla-initiated install (portal "Install" button / Easy Mode). Salla supplies its own
      * random `state`, so we can't tell which Naz user this is. Authorization codes are
@@ -212,15 +226,15 @@ class ChannelController extends Controller
                 'comment_webhook_error_code' => in_array($channel->type, ['facebook', 'instagram'], true)
                     ? ($channel->metadata['comment_webhook_error_code'] ?? null)
                     : null,
-                'status'               => in_array($channel->type, ['shopify', 'woocommerce'], true)
-                    && (($channel->metadata['sync_status'] ?? '') === 'error'
+                'status'               => in_array($channel->type, ['shopify', 'woocommerce', 'salla'], true)
+                    && (in_array(($channel->metadata['sync_status'] ?? ''), ['error', 'failed'], true)
                         || in_array(($channel->metadata['webhook_status'] ?? ''), ['error', 'partial'], true))
                         ? 'error'
-                        : (in_array($channel->type, ['shopify', 'woocommerce'], true)
+                        : (in_array($channel->type, ['shopify', 'woocommerce', 'salla'], true)
                             && in_array(($channel->metadata['sync_status'] ?? ''), ['queued', 'syncing'], true)
                                 ? 'syncing'
                                 : $channel->status),
-                    'status_message'       => in_array($channel->type, ['shopify', 'woocommerce'], true)
+                'status_message'       => in_array($channel->type, ['shopify', 'woocommerce', 'salla'], true)
                         ? ($channel->metadata['sync_error']
                         ?? (in_array(($channel->metadata['webhook_status'] ?? ''), ['error', 'partial'], true)
                             ? (($channel->metadata['webhook_failure_message'] ?? null)
@@ -245,10 +259,14 @@ class ChannelController extends Controller
                     'pivot' => ['is_primary' => (bool) ($bot->pivot->is_primary ?? false)],
                 ])->values(),
                 'default_ecommerce_connection_id' => $channel->default_ecommerce_connection_id,
-                'integration'          => in_array($channel->type, ['shopify', 'woocommerce'], true) ? [
+                'integration'          => in_array($channel->type, ['shopify', 'woocommerce', 'salla'], true) ? [
                     'store_url' => $channel->metadata['store_url'] ?? $channel->page_id,
                     'sync_status' => $channel->metadata['sync_status'] ?? 'connected',
-                    'sync_counts' => $channel->metadata['sync_counts'] ?? ['products' => 0, 'orders' => 0, 'customers' => 0],
+                    'sync_counts' => $channel->metadata['sync_counts'] ?? [
+                        'products' => $channel->metadata['products_synced'] ?? 0,
+                        'orders' => 0,
+                        'customers' => 0,
+                    ],
                     'last_synced_at' => $channel->metadata['last_synced_at'] ?? null,
                     'sync_error' => $channel->metadata['sync_error'] ?? null,
                     'sync_warnings' => $channel->metadata['sync_warnings'] ?? [],
@@ -618,6 +636,25 @@ class ChannelController extends Controller
             ->where('business_id', $business->id)
             ->firstOrFail();
 
+        if ($channel->type === 'tiktok' && $request->boolean('ai_enabled')) {
+            return response()->json([
+                'message' => 'TikTok messaging is unsupported; automated replies cannot be enabled for this channel.',
+            ], 422);
+        }
+
+        if ($request->boolean('ai_enabled')
+            && \App\Models\FeatureFlag::isEnabled('phase3_setup_verification_required', (int) $business->id)) {
+            $readiness = app(\App\Services\AiSetupVerificationService::class)->checklist($business);
+            if (!$readiness['ready']) {
+                return response()->json([
+                    'message' => 'Complete AI setup verification before enabling automated replies.',
+                    'ready' => false,
+                    'checks' => $readiness['checks'],
+                    'missing' => $readiness['missing'],
+                ], 422);
+            }
+        }
+
         $validated = $request->validate([
             'default_ecommerce_connection_id' => 'nullable|integer',
             'auto_order_confirmation_enabled' => 'nullable|boolean',
@@ -808,8 +845,21 @@ class ChannelController extends Controller
 
             $this->subscribeSallaWebhooks($channel, $accessToken);
 
-            $this->queueSallaCityCatalogs();
-            $citiesStatus = app(\App\Services\SharedSallaCityCatalogService::class)->isFresh('SA') ? 'matched' : 'processing';
+            $citiesStatus = 'processing';
+            try {
+                $this->queueSallaCityCatalogs();
+                if (app(\App\Services\SharedSallaCityCatalogService::class)->isFresh('SA')) {
+                    $citiesStatus = 'matched';
+                }
+            } catch (\Throwable $exception) {
+                // OAuth completion is independent of optional shared metadata.
+                // A failed city refresh remains retryable and must not turn a
+                // successful merchant connection into an OAuth error.
+                Log::warning('Salla OAuth completed while city catalog refresh was unavailable', [
+                    'channel_id' => $channel->id,
+                    'exception_type' => get_class($exception),
+                ]);
+            }
 
             $returnPath = ($stateData['context']['redirect'] ?? null) === 'onboarding'
                 ? "/onboarding?success=salla_connected&cities={$citiesStatus}&channel=salla"

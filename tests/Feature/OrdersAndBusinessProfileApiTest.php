@@ -127,6 +127,7 @@ class OrdersAndBusinessProfileApiTest extends TestCase
     {
         $user = User::factory()->create();
         $business = BusinessProfile::factory()->create(['user_id' => $user->id]);
+        $this->activatePaidTestPlan($business);
         $channel = Channel::factory()->create([
             'user_id' => $user->id,
             'business_id' => $business->id,

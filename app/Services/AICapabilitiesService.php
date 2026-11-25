@@ -59,6 +59,9 @@ class AICapabilitiesService
         $platform         = $context['platform']      ?? 'whatsapp';
         $language         = $context['language']      ?? 'english';
         $hasKnowledgeBase = !empty($context['knowledge_base']);
+        $groundedKnowledgeMode = empty($context['salla_exclusive_mode'])
+            && !empty($context['business_id'])
+            && \App\Models\FeatureFlag::isEnabled('knowledge_relevance_floor', (int) $context['business_id']);
         $hasOrderData     = !empty($context['order_data']);
         $hasProducts      = !empty($context['products']);
         $hasCartState     = !empty($context['cart']);
@@ -70,6 +73,10 @@ class AICapabilitiesService
             : "CRITICAL: You MUST reply ONLY in English. Never use Arabic under any circumstances.\n\n";
 
         $p = $langRule;
+        if (!empty($context['business_id'])
+            && \App\Models\FeatureFlag::isEnabled('salla_workflow_guardrails', (int) $context['business_id'])) {
+            $p .= "For Salla checkout, follow the Salla workflow guardrails: use shipping fees only when supplied store data explicitly contains them; otherwise say the fee or coverage is unavailable and direct the customer to checkout or the merchant. Never invent a fee or promise free shipping.\n\n";
+        }
 
         if (!empty($context['incoming_attachment'])) {
             $attachment = $context['incoming_attachment'];
@@ -132,7 +139,9 @@ ROLE;
             $p .= "• Use this information to answer general questions about the business.\n";
             $p .= "• This defines what the business is, what it does, its services, policies, tone, etc.\n";
             $p .= "• If the answer exists here → use it directly.\n";
-            $p .= "• If partially available → combine with reasoning.\n";
+            $p .= $groundedKnowledgeMode
+                ? "• Answer only from the sources below. If they do not fully answer, say what is missing and offer a human.\n"
+                : "• If partially available → combine with reasoning.\n";
             $p .= "• This is static profile text about {$businessName} — it is NEVER a source for live product/order counts or lists. See STORE AGGREGATE QUERIES below for that; do not answer count/list questions from this section even if it happens to mention products or orders.\n\n";
         }
 
@@ -188,6 +197,19 @@ ROLE;
 
         // ── Uploaded Knowledge Base ───────────────────────────────────────────
         $hasKnowledgeBase = !empty($context['knowledge_base']);
+        if (in_array($context['knowledge_status'] ?? null, ['ok', 'unavailable', 'no_match', 'filtered'], true)) {
+            $p .= 'Knowledge retrieval status: ' . $context['knowledge_status'] . "\n";
+        }
+        if ($groundedKnowledgeMode) {
+            $p .= "GROUNDED KNOWLEDGE RULES\n";
+            $p .= "• Answer only from the supplied business profile and uploaded knowledge sources. If those sources do not fully answer, say what is missing and offer a human.\n";
+            $p .= "• If two supplied sources conflict, say they conflict and offer a human. Prefer the source with the most recent updated date when one is provided.\n";
+            $p .= "• Name a source as [Source: filename] only if the customer asks where the information came from.\n";
+            if (in_array($context['knowledge_status'] ?? null, ['unavailable', 'no_match', 'filtered'], true) && !$hasKnowledgeBase) {
+                $p .= "• No usable uploaded knowledge was retrieved for this question. Do not imply that you checked or found an answer in the knowledge base; explain that the information is unavailable and offer a human.\n";
+            }
+            $p .= "\n";
+        }
         if ($hasKnowledgeBase && empty($context['salla_exclusive_mode'])) {            $p .= "\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n";
             $p .= "UPLOADED KNOWLEDGE BASE\n";
             $p .= "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n";
@@ -196,7 +218,9 @@ ROLE;
             $p .= "• Use this information for detailed information from uploaded documents.\n";
             $p .= "• These are additional detailed documents/files provided by the business.\n";
             $p .= "• If the answer exists here → use it directly.\n";
-            $p .= "• If partially available → combine with reasoning.\n";
+            $p .= $groundedKnowledgeMode
+                ? "• Answer only from the sources below. If they do not fully answer, say what is missing and offer a human.\n"
+                : "• If partially available → combine with reasoning.\n";
             $p .= "• If not available in either source → do NOT guess. Ask for details or escalate.\n";
             $p .= "• NEVER use this section to answer live product/order count or list questions — uploaded documents can be stale or unrelated to the merchant's real-time Salla inventory. See STORE AGGREGATE QUERIES below for that.\n\n";
         }
@@ -635,7 +659,7 @@ JSON;
      * handoff request. We require a phrase that unambiguously means the customer
      * wants a human to take over the conversation.
      */
-    public static function checkHardEscalation(string $message): array
+    public static function checkHardEscalation(string $message, ?int $businessId = null): array
     {
         $messageLower = strtolower(trim($message));
 
@@ -649,6 +673,16 @@ JSON;
             'خدمة عملاء', 'كلم انسان', 'ابي موظف', 'ابغا موظف', 'عايز موظف',
             'تواصل مع موظف', 'اتكلم مع شخص', 'وصلني لموظف',
         ];
+        if ($businessId && \App\Models\FeatureFlag::isEnabled('salla_workflow_guardrails', $businessId)) {
+            $hardPhrases = array_merge($hardPhrases, [
+                'عايز اكلم حد', 'عايز أكلم حد', 'عاوز اكلم حد', 'محتاج اكلم حد',
+                'محتاج أكلم حد', 'عايز اتكلم مع حد', 'عايز أتكلم مع حد',
+                'خدمة العملاء', 'ممكن اكلم خدمة العملاء', 'ممكن أكلم خدمة العملاء', 'عايز خدمة العملاء',
+                'اريد التحدث مع موظف', 'أريد التحدث مع موظف', 'أريد التحدث إلى شخص',
+                'ابغى اكلم موظف', 'أبغى أكلم موظف', 'ابي اكلم موظف', 'أبي أكلم موظف',
+                'ودي اكلم موظف', 'أحتاج موظف', 'احتاج موظف', 'حولني لموظف', 'حوّلني لموظف',
+            ]);
+        }
 
         foreach ($hardPhrases as $phrase) {
             if (str_contains($messageLower, $phrase)) {

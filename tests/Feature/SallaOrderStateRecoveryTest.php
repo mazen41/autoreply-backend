@@ -18,6 +18,8 @@ use App\Models\Message;
 use App\Models\ProductMessageMap;
 use App\Models\Package;
 use App\Jobs\ProcessAutoReply;
+use App\Services\EmbeddingsService;
+use Mockery;
 
 class SallaOrderStateRecoveryTest extends TestCase
 {
@@ -27,7 +29,15 @@ class SallaOrderStateRecoveryTest extends TestCase
     {
         parent::setUp();
         Cache::flush();
-        config(['services.groq.api_key' => 'test-groq-key']);
+        config([
+            'services.groq.api_key' => 'test-groq-key',
+        ]);
+        // This test covers order-state recovery, not semantic retrieval. Keep
+        // embeddings deterministic and independent of machine-local provider
+        // credentials or AI model pricing configuration.
+        $embeddings = Mockery::mock(EmbeddingsService::class);
+        $embeddings->shouldReceive('embedChunk')->zeroOrMoreTimes()->andReturn(null);
+        $this->app->instance(EmbeddingsService::class, $embeddings);
         
         // Suppress expected logs during test to keep output clean
         Log::shouldReceive('info')->zeroOrMoreTimes();
@@ -55,6 +65,7 @@ class SallaOrderStateRecoveryTest extends TestCase
             'name' => 'NazBiz Clothes',
             'ai_provider' => 'groq',
         ]);
+        $this->activatePaidTestPlan($business);
         try { Redis::del("rate_limit:{$business->id}:{$user->id}"); } catch (\Throwable) {}
         
         $commerceChannel = Channel::factory()->create([
@@ -79,13 +90,25 @@ class SallaOrderStateRecoveryTest extends TestCase
             'ecommerce_channel_id' => $commerceChannel->id,
         ]);
         $bot->channels()->attach($channel->id, ['is_primary' => true]);
-        DB::table('salla_cities')->insert([
-            'channel_id' => $commerceChannel->id,
+        DB::table('salla_city_catalogs')->insert([
             'country_code' => 'EG',
+            'country_id' => 1723506348,
+            'status' => 'synced',
+            'saved_city_count' => 1,
+            'expected_city_count' => 1,
+            'synced_at' => now(),
+            'created_at' => now(),
+            'updated_at' => now(),
+        ]);
+        DB::table('salla_city_reference_cities')->insert([
             'country_id' => 1723506348,
             'salla_city_id' => 1,
             'name' => 'Cairo',
             'name_en' => 'Cairo',
+            'name_ar' => 'القاهرة',
+            'normalized_name' => 'cairo',
+            'normalized_en' => 'cairo',
+            'normalized_ar' => 'القاهرة',
             'synced_at' => now(),
             'created_at' => now(),
             'updated_at' => now(),

@@ -11,7 +11,7 @@ namespace App\Services;
 class SallaOrderValidator
 {
     /** Always required for an order, whatever the store has learned. */
-    private const BASE_REQUIRED = ['full_name', 'phone', 'email', 'address'];
+    private const BASE_REQUIRED = ['full_name', 'phone', 'address'];
 
     /** Alternative keys that can hold the same logical value. */
     private const ALIASES = [

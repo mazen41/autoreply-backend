@@ -37,6 +37,24 @@ class AiSetupVerificationTest extends TestCase
             ->assertJsonPath('checks.handoff_recipient_configured.passed', false);
     }
 
+    public function test_active_knowledge_file_counts_as_business_knowledge(): void
+    {
+        config(['services.gemini.api_key' => null, 'services.groq.api_key' => null, 'services.claude.api_key' => null]);
+        [$user, $business] = $this->business();
+        BusinessKnowledgeFile::create([
+            'business_profile_id' => $business->id,
+            'filename' => 'active-knowledge.txt',
+            'file_type' => 'txt',
+            'extracted_text' => 'Verified business information.',
+            'status' => 'active',
+        ]);
+        Sanctum::actingAs($user);
+
+        $this->getJson('/api/ai/setup-verification', ['X-Business-Id' => (string) $business->id])
+            ->assertOk()
+            ->assertJsonPath('checks.knowledge_or_instructions.passed', true);
+    }
+
     public function test_provider_check_accepts_the_connected_agents_configured_provider(): void
     {
         [$user, $business, , $bot] = $this->readyBusiness();
@@ -115,6 +133,7 @@ class AiSetupVerificationTest extends TestCase
     public function test_test_reply_uses_the_configured_groq_provider_and_skips_empty_knowledge_search(): void
     {
         [$user, $business] = $this->business();
+        $this->activatePaidTestPlan($business);
         $this->enableSetupVerification($business->id);
         config([
             'services.ai.provider' => 'groq',
@@ -230,6 +249,7 @@ class AiSetupVerificationTest extends TestCase
     private function readyBusiness(): array
     {
         [$user, $business] = $this->business();
+        $this->activatePaidTestPlan($business);
         $business->update([
             'ai_provider' => 'gemini', 'ai_instructions' => 'Answer clearly and accurately.',
             'consent_policy_acknowledged_at' => now(), 'handoff_notification_email' => 'support@example.test',

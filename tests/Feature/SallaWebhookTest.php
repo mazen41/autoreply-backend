@@ -31,12 +31,7 @@ class SallaWebhookTest extends TestCase
     public function test_webhook_accepts_valid_signature(): void
     {
         Queue::fake();
-        
-        // Set webhook secret for testing
         config(['services.salla.webhook_secret' => 'test_secret']);
-        putenv('SALLA_WEBHOOK_SECRET=test_secret');
-        $_ENV['SALLA_WEBHOOK_SECRET'] = 'test_secret';
-        $_SERVER['SALLA_WEBHOOK_SECRET'] = 'test_secret';
 
         $payload = json_encode(['event' => 'order.created', 'data' => ['id' => 123]]);
         $signature = hash_hmac('sha256', $payload, 'test_secret');
@@ -54,9 +49,6 @@ class SallaWebhookTest extends TestCase
     {
         Queue::fake();
         config(['services.salla.webhook_secret' => 'test_secret']);
-        putenv('SALLA_WEBHOOK_SECRET=test_secret');
-        $_ENV['SALLA_WEBHOOK_SECRET'] = 'test_secret';
-        $_SERVER['SALLA_WEBHOOK_SECRET'] = 'test_secret';
 
         $events = [
             'order.created',
@@ -83,9 +75,6 @@ class SallaWebhookTest extends TestCase
     {
         Queue::fake();
         config(['services.salla.webhook_secret' => 'test_secret']);
-        putenv('SALLA_WEBHOOK_SECRET=test_secret');
-        $_ENV['SALLA_WEBHOOK_SECRET'] = 'test_secret';
-        $_SERVER['SALLA_WEBHOOK_SECRET'] = 'test_secret';
 
         $events = [
             'customer.created',
@@ -103,5 +92,35 @@ class SallaWebhookTest extends TestCase
 
             Queue::assertPushed(SallaWebhookJob::class);
         }
+    }
+
+    public function test_webhook_accepts_token_strategy_with_bearer_header_and_case_insensitive_strategy(): void
+    {
+        Queue::fake();
+        config(['services.salla.webhook_secret' => 'test_secret']);
+
+        $response = $this->call('POST', '/api/salla/webhook', [], [], [], $this->transformHeadersToServerVars([
+            'X-Salla-Security-Strategy' => 'tOkEn',
+            'Authorization' => 'Bearer test_secret',
+            'Content-Type' => 'application/json',
+        ]), json_encode(['event' => 'order.created', 'data' => []]));
+
+        $response->assertOk()->assertJsonPath('verification_mode', 'token');
+        Queue::assertPushed(SallaWebhookJob::class);
+    }
+
+    public function test_webhook_rejects_wrong_token_strategy_credential(): void
+    {
+        Queue::fake();
+        config(['services.salla.webhook_secret' => 'test_secret']);
+
+        $response = $this->call('POST', '/api/salla/webhook', [], [], [], $this->transformHeadersToServerVars([
+            'X-Salla-Security-Strategy' => 'Token',
+            'Authorization' => 'Bearer wrong_secret',
+            'Content-Type' => 'application/json',
+        ]), json_encode(['event' => 'order.created', 'data' => []]));
+
+        $response->assertUnauthorized();
+        Queue::assertNotPushed(SallaWebhookJob::class);
     }
 }

@@ -25,6 +25,7 @@ class TeamAccessMatrixTest extends TestCase
         parent::setUp();
         $this->owner = User::factory()->create();
         $this->business = BusinessProfile::factory()->create(['user_id' => $this->owner->id]);
+        $this->activatePaidTestPlan($this->business);
         $channel = Channel::factory()->create(['business_id' => $this->business->id, 'user_id' => $this->owner->id]);
         $this->conversation = Conversation::factory()->create([
             'business_id' => $this->business->id,
@@ -165,6 +166,7 @@ class TeamAccessMatrixTest extends TestCase
         $agent = $this->member('agent');
         $secondOwner = User::factory()->create();
         $secondBusiness = BusinessProfile::factory()->create(['user_id' => $secondOwner->id]);
+        $this->activatePaidTestPlan($secondBusiness);
         $secondChannel = Channel::factory()->create([
             'business_id' => $secondBusiness->id,
             'user_id' => $secondOwner->id,

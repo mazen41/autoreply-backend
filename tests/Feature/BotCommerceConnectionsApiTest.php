@@ -7,6 +7,7 @@ use App\Models\Channel;
 use App\Models\Bot;
 use App\Models\User;
 use App\Models\Package;
+use App\Models\Subscription;
 use Illuminate\Foundation\Testing\RefreshDatabase;
 use Laravel\Sanctum\Sanctum;
 use Tests\TestCase;
@@ -19,11 +20,12 @@ class BotCommerceConnectionsApiTest extends TestCase
     {
         parent::setUp();
         Package::create([
-            'name' => 'Free',
-            'name_ar' => 'Free',
+            'name' => 'Starter',
+            'name_ar' => 'Starter',
             'price_monthly' => 0,
             'price_yearly' => 0,
             'ai_replies_limit' => -1,
+            'ai_credits_monthly' => 100000,
             'is_active' => true,
         ]);
     }
@@ -33,6 +35,7 @@ class BotCommerceConnectionsApiTest extends TestCase
         $user = User::factory()->create();
         $business = BusinessProfile::factory()->create(['user_id' => $user->id, 'name' => 'Multi-store']);
         $user->forceFill(['business_id' => $business->id])->save();
+        $this->subscribe($user, $business);
         $shopA = $this->commerceChannel($user, $business, 'shopify', 'Shopify Egypt');
         $shopB = $this->commerceChannel($user, $business, 'shopify', 'Shopify Saudi');
         Sanctum::actingAs($user);
@@ -67,8 +70,10 @@ class BotCommerceConnectionsApiTest extends TestCase
         $owner = User::factory()->create();
         $business = BusinessProfile::factory()->create(['user_id' => $owner->id, 'name' => 'Business A']);
         $owner->forceFill(['business_id' => $business->id])->save();
+        $this->subscribe($owner, $business);
         $foreignOwner = User::factory()->create();
         $foreignBusiness = BusinessProfile::factory()->create(['user_id' => $foreignOwner->id, 'name' => 'Business B']);
+        $this->subscribe($foreignOwner, $foreignBusiness);
         $foreignStore = $this->commerceChannel($foreignOwner, $foreignBusiness, 'woocommerce', 'Foreign Store');
         Sanctum::actingAs($owner);
 
@@ -180,8 +185,23 @@ class BotCommerceConnectionsApiTest extends TestCase
         $user = User::factory()->create();
         $business = BusinessProfile::factory()->create(['user_id' => $user->id, 'name' => $name]);
         $user->forceFill(['business_id' => $business->id])->save();
+        $this->subscribe($user, $business);
 
         return [$user, $business];
+    }
+
+    private function subscribe(User $user, BusinessProfile $business): void
+    {
+        Subscription::create([
+            'user_id' => $user->id,
+            'business_id' => $business->id,
+            'package_id' => Package::query()->where('name', 'Starter')->value('id'),
+            'status' => 'active',
+            'billing_cycle' => 'monthly',
+            'amount_paid' => 0,
+            'starts_at' => now()->subDay(),
+            'ends_at' => now()->addMonth(),
+        ]);
     }
 
     private function communicationChannel(User $user, BusinessProfile $business, string $type, string $name): Channel

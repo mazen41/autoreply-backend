@@ -53,6 +53,7 @@ class CustomerResolutionTest extends TestCase
             'user_id' => $user->id,
             'business_name' => 'NazBiz',
         ]);
+        $this->activatePaidTestPlan($business);
 
         return compact('user', 'business');
     }
@@ -392,6 +393,7 @@ class CustomerResolutionTest extends TestCase
 
         config(['services.groq.api_key' => 'test-key']);
         Http::fake([
+            'generativelanguage.googleapis.com/*embedContent*' => Http::response(['embedding' => ['values' => []]], 200),
             'api.groq.com/openai/v1/chat/completions' => Http::response([
                 'choices' => [[
                     'message' => ['content' => json_encode([

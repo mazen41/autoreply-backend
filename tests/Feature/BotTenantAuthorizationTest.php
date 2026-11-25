@@ -21,11 +21,12 @@ class BotTenantAuthorizationTest extends TestCase
     {
         parent::setUp();
         Package::create([
-            'name' => 'Free',
-            'name_ar' => 'Free',
+            'name' => 'Starter',
+            'name_ar' => 'Starter',
             'price_monthly' => 0,
             'price_yearly' => 0,
             'ai_replies_limit' => -1,
+            'ai_credits_monthly' => 100000,
             'is_active' => true,
         ]);
     }
@@ -277,6 +278,16 @@ class BotTenantAuthorizationTest extends TestCase
         $user = User::factory()->create();
         $business = BusinessProfile::factory()->create(['user_id' => $user->id, 'name' => $name]);
         $user->forceFill(['business_id' => $business->id])->save();
+        \App\Models\Subscription::create([
+            'user_id' => $user->id,
+            'business_id' => $business->id,
+            'package_id' => Package::query()->where('name', 'Starter')->value('id'),
+            'status' => 'active',
+            'billing_cycle' => 'monthly',
+            'amount_paid' => 0,
+            'starts_at' => now()->subDay(),
+            'ends_at' => now()->addMonth(),
+        ]);
 
         return [$user, $business];
     }

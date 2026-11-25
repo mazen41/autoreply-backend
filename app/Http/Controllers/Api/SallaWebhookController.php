@@ -33,10 +33,11 @@ class SallaWebhookController extends Controller
 
         // Check for Token-based authentication (Salla's Token strategy)
         $authToken = $request->header('authorization');
-        $securityStrategy = $request->header('x-salla-security-strategy');
+        $securityStrategy = strtolower(trim((string) $request->header('x-salla-security-strategy')));
 
         $payload = $request->getContent();
-        $webhookSecret = env('SALLA_WEBHOOK_SECRET');
+        // Read through Laravel config so this works when configuration is cached.
+        $webhookSecret = (string) config('services.salla.webhook_secret', '');
 
         // Phase 4: every response now carries an EXPLICIT verification/
         // configuration status. The previous version returned a plain
@@ -73,7 +74,7 @@ class SallaWebhookController extends Controller
             }
             $verified = true;
             $verificationMode = 'signature';
-        } elseif ($securityStrategy === 'Token' && $authToken) {
+        } elseif ($securityStrategy === 'token' && $authToken) {
             // Token strategy REQUIRES the secret to be configured — if it is
             // missing this is a configuration error, not an auth failure.
             if (empty($webhookSecret)) {
@@ -85,7 +86,9 @@ class SallaWebhookController extends Controller
                     'error'             => 'webhook_secret_not_configured',
                 ], 500);
             }
-            if (!hash_equals((string) $webhookSecret, (string) $authToken)) {
+            // Salla may send the configured token directly or as a Bearer credential.
+            $providedToken = preg_replace('/^Bearer\s+/i', '', trim((string) $authToken));
+            if (!hash_equals((string) $webhookSecret, (string) $providedToken)) {
                 app(\App\Support\OperationalMetricCounter::class)->increment('webhook_signature_failures');
                 Log::error('Invalid Salla webhook token', [
                     'strategy' => 'token',

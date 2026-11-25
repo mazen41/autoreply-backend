@@ -133,7 +133,7 @@ return [
     'ai' => [
         'provider' => env('AI_PROVIDER', 'gemini'),
         'fallback_provider' => env('AI_FALLBACK_PROVIDER', 'claude'),
-        'prompt_version' => env('AI_PROMPT_VERSION', 'v1'),
+        'prompt_version' => env('AI_PROMPT_VERSION', 'v2'),
         'temperature' => (float) env('AI_TEMPERATURE', 0.7),
         'max_tokens' => (int) env('AI_MAX_TOKENS', 500),
         'timeout' => (int) env('AI_TIMEOUT', 30),

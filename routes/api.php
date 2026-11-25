@@ -271,6 +271,7 @@ Route::middleware('auth:sanctum')->group(function () {
     Route::delete('/campaign-templates/{id}', [\App\Http\Controllers\Api\CampaignAudienceController::class, 'destroyTemplate']);
     
     Route::post('/channels/salla/claim', [ChannelController::class, 'claimSalla'])->middleware('plan.enforce:max_channels');
+    Route::post('/channels/salla/{channelId}/sync', [ChannelController::class, 'syncSalla']);
     // New channel endpoints (protected)
     Route::post('/channels/telegram/connect', [TelegramController::class, 'connect'])->middleware('plan.enforce:max_channels');
     Route::post('/channels/telegram/set-webhook', [TelegramController::class, 'setWebhook']);

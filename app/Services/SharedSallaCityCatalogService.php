@@ -57,7 +57,23 @@ class SharedSallaCityCatalogService
             return false;
         }
 
-        SyncSallaSharedCityCatalog::dispatch($countryCode);
+        try {
+            $pendingDispatch = SyncSallaSharedCityCatalog::dispatch($countryCode);
+            // PendingDispatch runs from its destructor; force it inside this
+            // guarded block so the sync queue driver cannot leak a provider
+            // exception into the OAuth request that triggered the refresh.
+            unset($pendingDispatch);
+        } catch (\Throwable $exception) {
+            // With the sync queue driver, a metadata-scope or provider error
+            // runs inline. Catalog refresh must not roll back an otherwise
+            // successful store connection; the failed catalog can be retried
+            // by the scheduled sync once a healthy source is available.
+            Log::warning('Salla shared city catalog dispatch failed', [
+                'country_code' => $countryCode,
+                'exception_type' => get_class($exception),
+            ]);
+            return false;
+        }
         return true;
     }
 
@@ -111,6 +127,9 @@ class SharedSallaCityCatalogService
 
             $channel = $this->selectSourceChannel($preferredChannelId ?? $catalog->source_channel_id);
             if (!$channel) {
+                if ($this->hasConnectedClaimedChannelMissingMetadataScope()) {
+                    throw new \RuntimeException('Salla API scope missing: metadata.read or metadata.read_write.');
+                }
                 throw new \RuntimeException('No connected, claimed Salla store with a usable metadata scope is available as a catalog source.');
             }
 
@@ -479,6 +498,34 @@ class SharedSallaCityCatalogService
             }
         }
         return $eligible;
+    }
+
+    /** Return true when a claimed, connected store explicitly lacks metadata access. */
+    private function hasConnectedClaimedChannelMissingMetadataScope(): bool
+    {
+        return Channel::query()
+            ->where('type', 'salla')
+            ->where('status', 'connected')
+            ->whereNotNull('user_id')
+            ->whereNotNull('business_id')
+            ->get()
+            ->contains(function (Channel $channel): bool {
+                if (!is_string($channel->access_token) || trim($channel->access_token) === '') {
+                    return false;
+                }
+
+                $scopes = $channel->metadata['scopes'] ?? null;
+                if (is_array($scopes)) {
+                    return $scopes !== []
+                        && array_intersect(['metadata.read', 'metadata.read_write'], $scopes) === [];
+                }
+                if (is_string($scopes) && trim($scopes) !== '') {
+                    $granted = preg_split('/[\s,]+/', trim($scopes)) ?: [];
+                    return array_intersect(['metadata.read', 'metadata.read_write'], $granted) === [];
+                }
+
+                return false;
+            });
     }
 
     private function fetchPageWithRetry(

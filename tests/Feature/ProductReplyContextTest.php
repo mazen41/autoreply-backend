@@ -68,6 +68,7 @@ class ProductReplyContextTest extends TestCase
             'user_id' => $user->id,
             'business_name' => 'Demo Store',
         ]);
+        $this->activatePaidTestPlan($business);
 
         $whatsappChannel = Channel::create([
             'user_id' => $user->id,
@@ -263,9 +264,10 @@ class ProductReplyContextTest extends TestCase
 
         (new ProcessAutoReply($replyMessage->id))->handle();
 
+
         // The generic Salla product list must NEVER be re-fetched — the
         // product is already known deterministically.
-        Http::assertNotSent(fn($r) => str_contains($r->url(), 'salla.dev'));
+        Http::assertNotSent(fn($r) => parse_url($r->url(), PHP_URL_PATH) === '/admin/v2/products');
 
         // The AI must have been told exactly which product this is.
         Http::assertSent(function ($r) {

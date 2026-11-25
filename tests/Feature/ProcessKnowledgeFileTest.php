@@ -149,13 +149,19 @@ class ProcessKnowledgeFileTest extends TestCase
             'embedding' => [1.0, 0.0],
         ]);
         $embeddings = \Mockery::mock(EmbeddingsService::class);
-        $embeddings->shouldReceive('embedBatch')->once()->andReturn([[0.0, 1.0]]);
+        $embeddings->shouldReceive('embedBatch')->once()->andReturn([array_fill(0, 1536, 0.01)]);
+        $embeddings->shouldReceive('activeProvider')->once()->andReturn('openai');
+        $embeddings->shouldReceive('activeModel')->once()->andReturn('text-embedding-3-small');
+        $embeddings->shouldReceive('dimension')->once()->andReturn(1536);
 
         (new ProcessKnowledgeFile($file->id))->handle($embeddings);
 
         $chunks = BusinessKnowledgeChunk::where('business_knowledge_file_id', $file->id)->get();
         $this->assertCount(1, $chunks);
         $this->assertSame('Current indexed catalog text.', $chunks[0]->content);
+        $this->assertSame('openai', $chunks[0]->embedding_provider);
+        $this->assertSame('text-embedding-3-small', $chunks[0]->embedding_model);
+        $this->assertSame(1536, $chunks[0]->embedding_dim);
         $this->assertSame('active', $file->fresh()->status);
         $this->assertNull($file->fresh()->error_message);
     }

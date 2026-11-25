@@ -33,39 +33,36 @@ class SallaOrderPayloadPhoneTest extends TestCase
             'access_token' => 'test-token',
         ]);
 
-        DB::table('salla_cities')->insert([
-            'channel_id' => $channel->id,
-            'country_code' => 'EG',
-            'country_id' => 1723506348,
-            'salla_city_id' => 552977415,
-            'name' => 'الجيزة',
-            'name_en' => 'Giza',
-            'synced_at' => now(),
-            'created_at' => now(),
-            'updated_at' => now(),
-        ]);
-
-        DB::table('salla_cities')->insert([
-            'channel_id' => $channel->id,
-            'country_code' => 'SA',
-            'country_id' => 1473353380,
-            'salla_city_id' => 1473353380,
-            'name' => 'الرياض',
-            'name_en' => 'Riyadh',
-            'synced_at' => now(),
-            'created_at' => now(),
-            'updated_at' => now(),
-        ]);
-
-        foreach (['EG' => 1, 'SA' => 1] as $countryCode => $count) {
-            \App\Models\SallaCityCatalogSync::updateOrCreate(
-                ['channel_id' => $channel->id, 'country_code' => $countryCode],
+        foreach ([
+            'EG' => ['country_id' => 1723506348, 'city_id' => 552977415, 'name' => 'الجيزة', 'name_en' => 'Giza'],
+            'SA' => ['country_id' => 1473353380, 'city_id' => 1473353380, 'name' => 'الرياض', 'name_en' => 'Riyadh'],
+        ] as $countryCode => $city) {
+            $now = now();
+            $normalizer = app(SallaService::class);
+            DB::table('salla_city_reference_cities')->insert([
+                'country_id' => $city['country_id'],
+                'salla_city_id' => $city['city_id'],
+                'name' => $city['name'],
+                'name_en' => $city['name_en'],
+                'name_ar' => $city['name'],
+                'normalized_name' => $normalizer->normalizeCitySearchText($city['name']),
+                'normalized_en' => $normalizer->normalizeCitySearchText($city['name_en']),
+                'normalized_ar' => $normalizer->normalizeCitySearchText($city['name']),
+                'synced_at' => $now,
+                'created_at' => $now,
+                'updated_at' => $now,
+            ]);
+            \App\Models\SallaCityCatalog::updateOrCreate(
+                ['country_code' => $countryCode],
                 [
+                    'country_id' => $city['country_id'],
                     'status' => 'succeeded',
                     'pages_completed' => 1,
-                    'expected_city_count' => $count,
-                    'saved_city_count' => $count,
-                    'last_successful_sync_at' => now(),
+                    'total_pages' => 1,
+                    'expected_city_count' => 1,
+                    'staged_city_count' => 1,
+                    'saved_city_count' => 1,
+                    'synced_at' => $now,
                 ]
             );
         }

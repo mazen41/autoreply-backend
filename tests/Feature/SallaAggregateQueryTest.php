@@ -67,6 +67,7 @@ class SallaAggregateQueryTest extends TestCase
             // answer live product/order count questions.
             'knowledge_base' => 'NazBiz Pro subscription plan includes unlimited AI replies and 5 connected channels.',
         ]);
+        $this->activatePaidTestPlan($business);
 
         $whatsappChannel = Channel::create([
             'user_id' => $user->id,

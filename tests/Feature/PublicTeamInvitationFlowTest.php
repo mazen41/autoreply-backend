@@ -106,6 +106,7 @@ class PublicTeamInvitationFlowTest extends TestCase
     {
         $owner = User::factory()->create();
         $business = BusinessProfile::factory()->create(['user_id' => $owner->id]);
+        $this->activatePaidTestPlan($business);
         $token = str_repeat('InviteToken7', 5) . 'ABCD';
         $invitation = TeamInvitation::create([
             'business_id' => $business->id,

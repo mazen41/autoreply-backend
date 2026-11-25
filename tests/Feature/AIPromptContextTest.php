@@ -51,6 +51,7 @@ class AIPromptContextTest extends TestCase
             'ai_provider' => 'groq',
             'ai_model' => 'llama-3.3-70b-versatile',
         ]);
+        $this->activatePaidTestPlan($business);
 
         // Bot assigned to a specific Salla store (ecommerce_channel_id) — the
         // store context must name THAT store, not another one.
@@ -187,6 +188,7 @@ class AIPromptContextTest extends TestCase
             'business_name' => 'NazBiz',
             'ai_provider' => 'groq',
         ]);
+        $this->activatePaidTestPlan($business);
 
         $channel = Channel::create([
             'user_id' => $user->id,

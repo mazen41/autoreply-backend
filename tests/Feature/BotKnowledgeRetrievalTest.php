@@ -9,17 +9,21 @@ use App\Models\BusinessKnowledgeChunk;
 use App\Models\BusinessKnowledgeFile;
 use App\Models\BusinessProfile;
 use App\Models\BusinessFeatureFlagAssignment;
+use App\Models\AiProvider;
 use App\Models\Channel;
 use App\Models\Conversation;
 use App\Models\FeatureFlag;
 use App\Models\HandoffTask;
 use App\Models\Message;
 use App\Models\Package;
+use App\Models\Subscription;
 use App\Models\User;
 use App\Services\EmbeddingsService;
+use App\Services\AiGateway;
 use Illuminate\Foundation\Testing\RefreshDatabase;
 use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\Http;
+use Illuminate\Support\Facades\Log;
 use Tests\TestCase;
 
 /**
@@ -51,6 +55,57 @@ class BotKnowledgeRetrievalTest extends TestCase
 
     private const UNIQUE_A = 'XYZUNIQUE-SALES-PLAYBOOK-RETURN-POLICY-30-DAYS';
     private const UNIQUE_B = 'XYZUNIQUE-INTERNAL-HR-SALARY-CONFIDENTIAL';
+
+    public function test_knowledge_embedding_failsafe_flag_is_disabled_by_default(): void
+    {
+        $fixture = $this->makeFixture();
+
+        $this->assertFalse(FeatureFlag::isEnabled('knowledge_embedding_failsafe', $fixture['business']->id));
+    }
+
+    public function test_relevance_shadow_flag_does_not_change_prompt_or_customer_reply(): void
+    {
+        $baseline = $this->makeFixture();
+        [$baselineFile] = $this->seedKnowledgeFiles($baseline['business']->id);
+        $baselineBot = $this->makeBot($baseline['business']->id);
+        $baseline['conversation']->update(['bot_id' => $baselineBot->id]);
+        BotKnowledgeAssignment::create([
+            'bot_id' => $baselineBot->id,
+            'business_knowledge_file_id' => $baselineFile->id,
+            'channel_id' => null,
+        ]);
+        $this->fakeEmbeddings();
+        $baselinePrompt = $this->runAndCaptureSystemPrompt($baseline);
+        $baselineReply = Message::query()->where('conversation_id', $baseline['conversation']->id)
+            ->where('direction', 'outbound')->latest('id')->value('content');
+
+        $shadow = $this->makeFixture();
+        [$shadowFile] = $this->seedKnowledgeFiles($shadow['business']->id);
+        $shadowBot = $this->makeBot($shadow['business']->id);
+        $shadow['conversation']->update(['bot_id' => $shadowBot->id]);
+        BotKnowledgeAssignment::create([
+            'bot_id' => $shadowBot->id,
+            'business_knowledge_file_id' => $shadowFile->id,
+            'channel_id' => null,
+        ]);
+        $this->enableKnowledgeRelevanceShadow($shadow['business']->id);
+        $this->fakeEmbeddings();
+        Log::spy();
+        $shadowPrompt = $this->runAndCaptureSystemPrompt($shadow);
+        $shadowReply = Message::query()->where('conversation_id', $shadow['conversation']->id)
+            ->where('direction', 'outbound')->latest('id')->value('content');
+
+        $this->assertSame($baselinePrompt, $shadowPrompt);
+        $this->assertSame($baselineReply, $shadowReply);
+        Log::shouldHaveReceived('info')->with('Knowledge relevance shadow sample', \Mockery::on(function (array $context) use ($shadow): bool {
+            return $context['business_id'] === $shadow['business']->id
+                && $context['top_score_bucket'] === 'at_least_075'
+                && $context['top_chunk_count'] === 1
+                && $context['would_filter_below_055'] === 0
+                && !array_key_exists('message_id', $context)
+                && !array_key_exists('customer_text', $context);
+        }));
+    }
 
     public function test_inactive_assigned_bot_fails_closed_and_marks_conversation_for_human(): void
     {
@@ -144,12 +199,23 @@ class BotKnowledgeRetrievalTest extends TestCase
         ]);
     }
 
+    private function enableKnowledgeRelevanceShadow(int $businessId): void
+    {
+        $flag = FeatureFlag::where('key', 'knowledge_relevance_floor_shadow')->firstOrFail();
+        BusinessFeatureFlagAssignment::create([
+            'business_id' => $businessId,
+            'feature_flag_id' => $flag->id,
+            'enabled' => true,
+        ]);
+    }
+
     private function makeFixture(?Bot $bot = null, array $channelOverrides = []): array
     {
         Package::create([
-            'name' => 'Free', 'name_ar' => 'مجاني',
+            'name' => 'Knowledge Test Plan', 'name_ar' => 'باقة اختبار',
             'price_monthly' => 0, 'price_yearly' => 0,
             'ai_replies_limit' => -1, 'is_active' => true,
+            'ai_credits_monthly' => 100000,
         ]);
 
         $user = User::forceCreate([
@@ -161,6 +227,18 @@ class BotKnowledgeRetrievalTest extends TestCase
             'user_id' => $user->id,
             'business_name' => 'NazBiz',
             'knowledge_base' => 'We sell dresses.',
+        ]);
+
+        $package = Package::query()->where('name', 'Knowledge Test Plan')->firstOrFail();
+        Subscription::create([
+            'user_id' => $user->id,
+            'business_id' => $business->id,
+            'package_id' => $package->id,
+            'status' => 'active',
+            'billing_cycle' => 'monthly',
+            'amount_paid' => 0,
+            'starts_at' => now()->subDay(),
+            'ends_at' => now()->addMonth(),
         ]);
 
         $channel = Channel::create(array_merge([
@@ -232,6 +310,10 @@ class BotKnowledgeRetrievalTest extends TestCase
             {
                 return [1.0, 0.0];
             }
+
+            public function activeProvider(): string { return 'gemini'; }
+            public function activeModel(): string { return 'gemini-embedding-001'; }
+            public function dimension(): int { return 768; }
         });
     }
 
@@ -414,5 +496,165 @@ class BotKnowledgeRetrievalTest extends TestCase
             'is_ai' => true,
         ]);
         Http::assertNothingSent();
+    }
+
+    public function test_embedding_http_401_does_not_block_reply_when_failsafe_is_enabled(): void
+    {
+        $this->assertEmbeddingFailureStillReplies(401);
+    }
+
+    public function test_embedding_http_500_does_not_block_reply_when_failsafe_is_enabled(): void
+    {
+        $this->assertEmbeddingFailureStillReplies(500);
+    }
+
+    public function test_missing_embedding_key_is_reported_and_reply_continues(): void
+    {
+        $this->disableEmbeddingProvidersAndClearKeys();
+        $embeddingService = new EmbeddingsService();
+        $this->assertNull($embeddingService->embedChunk('What is your return policy?'));
+
+        $this->activateProviderKey('groq', 'test-chat-key');
+        $fixture = $this->makeFixture();
+        $bot = $this->makeBot($fixture['business']->id);
+        $fixture['conversation']->update(['bot_id' => $bot->id]);
+        $this->enableKnowledgeEmbeddingFailsafe($fixture['business']->id);
+        $this->app->instance(EmbeddingsService::class, $embeddingService);
+
+        $this->mockAiGatewayOperations();
+        $prompt = $this->fakeChatAndRun($fixture);
+
+        $this->assertStringContainsString('Knowledge retrieval status: unavailable', $prompt);
+        $this->assertDatabaseHas('messages', [
+            'conversation_id' => $fixture['conversation']->id,
+            'direction' => 'outbound',
+            'is_ai' => true,
+            'content' => 'Our return policy is 30 days.',
+        ]);
+    }
+
+    private function assertEmbeddingFailureStillReplies(int $status): void
+    {
+        $this->disableEmbeddingProvidersAndClearKeys();
+        $this->activateProviderKey('gemini', 'test-embedding-key');
+        $this->activateProviderKey('groq', 'test-chat-key');
+
+        $fixture = $this->makeFixture();
+        $bot = $this->makeBot($fixture['business']->id);
+        $fixture['conversation']->update(['bot_id' => $bot->id]);
+        $this->enableKnowledgeEmbeddingFailsafe($fixture['business']->id);
+        $this->mockAiGatewayOperations();
+        Log::spy();
+
+        $prompt = $this->fakeEmbeddingFailureAndChat($fixture, $status);
+
+        $this->assertStringContainsString('Knowledge retrieval status: unavailable', $prompt);
+        $this->assertSame(1, substr_count($prompt, 'Knowledge retrieval status: unavailable'));
+        $this->assertDatabaseHas('messages', [
+            'conversation_id' => $fixture['conversation']->id,
+            'direction' => 'outbound',
+            'is_ai' => true,
+            'content' => 'Our return policy is 30 days.',
+        ]);
+        Log::shouldHaveReceived('warning')->with(
+            'ProcessAutoReply: knowledge embedding unavailable',
+            [
+                'business_id' => $fixture['business']->id,
+                'exception_type' => \App\Exceptions\AiProviderRequestException::class,
+            ]
+        )->once();
+    }
+
+    private function disableEmbeddingProvidersAndClearKeys(): void
+    {
+        config([
+            'services.openai.api_key' => '',
+            'services.claude.api_key' => '',
+            'services.gemini.api_key' => '',
+            'services.groq.api_key' => '',
+        ]);
+
+        foreach (AiProvider::query()->get() as $provider) {
+            $provider->forceFill(['is_active' => false, 'credentials' => null])->save();
+        }
+    }
+
+    private function activateProviderKey(string $slug, string $key): void
+    {
+        AiProvider::query()->where('slug', $slug)->firstOrFail()
+            ->forceFill(['is_active' => true, 'credentials' => ['api_key' => $key]])
+            ->save();
+    }
+
+    private function enableKnowledgeEmbeddingFailsafe(int $businessId): void
+    {
+        $flag = FeatureFlag::query()->where('key', 'knowledge_embedding_failsafe')->firstOrFail();
+        BusinessFeatureFlagAssignment::create([
+            'business_id' => $businessId,
+            'feature_flag_id' => $flag->id,
+            'enabled' => true,
+        ]);
+    }
+
+    private function mockAiGatewayOperations(): void
+    {
+        $gateway = \Mockery::mock(AiGateway::class);
+        $gateway->shouldReceive('execute')->andReturnUsing(
+            fn (...$arguments) => ($arguments[6])()
+        );
+        $this->app->instance(AiGateway::class, $gateway);
+    }
+
+    private function fakeEmbeddingFailureAndChat(array $fixture, int $embeddingStatus): string
+    {
+        $captured = null;
+        Http::fake(function ($request) use (&$captured, $embeddingStatus) {
+            if (str_contains($request->url(), 'embedContent')) {
+                return Http::response([], $embeddingStatus);
+            }
+            if (str_contains($request->url(), 'chat/completions')) {
+                $captured = $request;
+                return Http::response(['choices' => [[
+                    'message' => ['content' => json_encode([
+                        'reply' => 'Our return policy is 30 days.',
+                        'intent' => 'question',
+                        'needs_escalation' => false,
+                        'needs_images' => false,
+                        'confidence' => 0.95,
+                        'escalation_reason' => 'none',
+                    ])],
+                ]]], 200);
+            }
+            return Http::response(['message_id' => 'mid_fake'], 200);
+        });
+
+        (new ProcessAutoReply($fixture['message']->id))->handle();
+        $this->assertNotNull($captured, 'The customer reply provider must still be called.');
+        return (string) data_get($captured->data(), 'messages.0.content', '');
+    }
+
+    private function fakeChatAndRun(array $fixture): string
+    {
+        $captured = null;
+        Http::fake(function ($request) use (&$captured) {
+            if (str_contains($request->url(), 'chat/completions')) {
+                $captured = $request;
+                return Http::response(['choices' => [[
+                    'message' => ['content' => json_encode([
+                        'reply' => 'Our return policy is 30 days.',
+                        'intent' => 'question',
+                        'needs_escalation' => false,
+                        'needs_images' => false,
+                        'confidence' => 0.95,
+                        'escalation_reason' => 'none',
+                    ])],
+                ]]], 200);
+            }
+            return Http::response(['message_id' => 'mid_fake'], 200);
+        });
+
+        (new ProcessAutoReply($fixture['message']->id))->handle();
+        $this->assertNotNull($captured, 'The customer reply provider must still be called.');
+        return (string) data_get($captured->data(), 'messages.0.content', '');
     }
 }

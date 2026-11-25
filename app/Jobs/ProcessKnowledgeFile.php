@@ -56,7 +56,10 @@ class ProcessKnowledgeFile implements ShouldQueue, ShouldBeUnique
         try {
             $file->update(['status' => 'processing']);
 
-            $fullText = $file->extracted_text;
+            $fullText = app(\App\Services\PiiRedactor::class)->redact((string) $file->extracted_text)['text'];
+            if ($fullText !== $file->extracted_text) {
+                $file->update(['extracted_text' => $fullText]);
+            }
             
             if (empty(trim($fullText))) {
                 $file->update([
@@ -93,6 +96,10 @@ class ProcessKnowledgeFile implements ShouldQueue, ShouldBeUnique
                 throw new \Exception("Failed to generate embeddings for all chunks");
             }
 
+            $embeddingProvider = $embeddingsService->activeProvider();
+            $embeddingModel = $embeddingsService->activeModel();
+            $embeddingDimension = $embeddingsService->dimension();
+
             // 3. Save chunks to DB
             $chunksData = [];
             foreach ($chunks as $index => $chunkText) {
@@ -102,6 +109,9 @@ class ProcessKnowledgeFile implements ShouldQueue, ShouldBeUnique
                     'chunk_index' => $index,
                     'content' => $chunkText,
                     'embedding' => json_encode($embeddings[$index]),
+                    'embedding_provider' => $embeddingProvider,
+                    'embedding_model' => $embeddingModel,
+                    'embedding_dim' => $embeddingDimension,
                     'created_at' => now(),
                     'updated_at' => now(),
                 ];

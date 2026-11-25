@@ -5,7 +5,10 @@ namespace App\Http\Controllers\Api;
 use App\Http\Controllers\Controller;
 use App\Models\MessageCorrection;
 use App\Models\BusinessProfile;
+use App\Models\Bot;
+use App\Models\BotKnowledgeAssignment;
 use App\Services\TrainingStatsService;
+use App\Services\KnowledgeFileIngestionService;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\Auth;
 use Illuminate\Support\Facades\Log;
@@ -25,6 +28,17 @@ class TrainingController extends Controller
             })
             ->orderBy('created_at', 'desc')
             ->get();
+
+        $redactor = app(\App\Services\PiiRedactor::class);
+        foreach ($corrections as $correction) {
+            $correction->ai_draft = $redactor->redact((string) $correction->ai_draft)['text'];
+            $correction->human_correction = $redactor->redact((string) $correction->human_correction)['text'];
+            $correction->makeHidden('approvedBy');
+            if ($correction->originalMessage) {
+                $correction->originalMessage->content = $redactor->redact((string) $correction->originalMessage->content)['text'];
+                $correction->originalMessage->makeHidden('conversation');
+            }
+        }
 
         return response()->json([
             'corrections' => $corrections,
@@ -48,6 +62,10 @@ class TrainingController extends Controller
             return response()->json(['error' => 'Correction not found'], 404);
         }
 
+        $validated = $request->validate($correction->learning_type === 'faq'
+            ? ['question' => 'required|string|min:5|max:300']
+            : ['question' => 'nullable|string|min:5|max:300']);
+
         $correction->update([
             'approved' => true,
             'approved_by' => $user->id,
@@ -55,7 +73,13 @@ class TrainingController extends Controller
         ]);
 
         // Apply the correction to training data
-        $this->applyCorrectionToTraining($correction);
+        $this->applyCorrectionToTraining($correction, $validated['question'] ?? null);
+
+        $responseMessage = match ($correction->learning_type) {
+            'faq' => 'Added to FAQs for this business.',
+            'knowledge' => 'Saved as a knowledge file and indexing started.',
+            default => 'Recorded for review. It does not change replies yet.',
+        };
 
         Log::info('Message correction approved', [
             'correction_id' => $id,
@@ -64,8 +88,7 @@ class TrainingController extends Controller
         ]);
 
         return response()->json([
-            'message' => 'Correction approved and added to training',
-            'correction' => $correction->fresh()
+            'message' => $responseMessage,
         ]);
     }
 
@@ -130,7 +153,7 @@ class TrainingController extends Controller
     /**
      * Apply correction to business training data
      */
-    private function applyCorrectionToTraining(MessageCorrection $correction): void
+    private function applyCorrectionToTraining(MessageCorrection $correction, ?string $reviewerQuestion = null): void
     {
         $business = $correction->originalMessage->conversation->channel->business;
         if (!$business) {
@@ -139,7 +162,7 @@ class TrainingController extends Controller
 
         switch ($correction->learning_type) {
             case 'faq':
-                $this->addToFAQs($business, $correction);
+                $this->addToFAQs($business, $correction, $reviewerQuestion ?? '');
                 break;
             case 'tone':
                 $this->updateToneStyle($business, $correction);
@@ -153,11 +176,12 @@ class TrainingController extends Controller
         }
     }
 
-    private function addToFAQs(BusinessProfile $business, MessageCorrection $correction): void
+    private function addToFAQs(BusinessProfile $business, MessageCorrection $correction, string $reviewerQuestion): void
     {
         $faqs = $business->faqs ?? [];
-        $question = $correction->originalMessage->content;
-        $answer = $correction->human_correction;
+        $redactor = app(\App\Services\PiiRedactor::class);
+        $question = $redactor->redact($reviewerQuestion)['text'];
+        $answer = $redactor->redact((string) $correction->human_correction)['text'];
 
         // Check if similar FAQ exists
         $similarExists = collect($faqs)->contains(function ($faq) use ($question) {
@@ -190,21 +214,38 @@ class TrainingController extends Controller
 
     private function addToKnowledgeBase(BusinessProfile $business, MessageCorrection $correction): void
     {
-        // Create a knowledge file from the correction
-        $knowledgeFile = \App\Models\BusinessKnowledgeFile::create([
-            'business_profile_id' => $business->id,
-            'filename' => 'learning_correction_' . now()->format('Y-m-d_His') . '_' . md5($correction->human_correction) . '.txt',
-            'file_type' => 'text/plain',
-            'file_size' => strlen($correction->human_correction),
-            'extracted_text' => "Question: {$correction->originalMessage->content}\n\nAnswer: {$correction->human_correction}",
-            'status' => 'pending', // Important for the job to pick it up or display correctly
-        ]);
+        $redactor = app(\App\Services\PiiRedactor::class);
+        $extractedText = $redactor->redact("Question: {$correction->originalMessage->content}\n\nAnswer: {$correction->human_correction}")['text'];
+        $ingestion = app(KnowledgeFileIngestionService::class)->ingest(
+            $business,
+            'reviewed_correction_' . $correction->id . '.txt',
+            'text/plain',
+            $extractedText,
+            strlen($extractedText)
+        );
+        $knowledgeFile = $ingestion['file'];
 
-        \App\Jobs\ProcessKnowledgeFile::dispatch($knowledgeFile->id);
+        $conversation = $correction->originalMessage->conversation;
+        $botId = $conversation?->bot_id;
+        if ($botId && $conversation?->channel_id) {
+            $botBelongsToBusiness = Bot::query()
+                ->whereKey($botId)
+                ->where('business_profile_id', $business->id)
+                ->exists();
 
-        Log::info('Added correction to knowledge base and dispatched for embedding', [
+            if ($botBelongsToBusiness) {
+                BotKnowledgeAssignment::firstOrCreate([
+                    'bot_id' => $botId,
+                    'business_knowledge_file_id' => $knowledgeFile->id,
+                    'channel_id' => $conversation->channel_id,
+                ]);
+            }
+        }
+
+        Log::info('Correction linked to knowledge base', [
             'knowledge_file_id' => $knowledgeFile->id,
-            'business_id' => $business->id
+            'business_id' => $business->id,
+            'duplicate' => $ingestion['duplicate'],
         ]);
     }
 

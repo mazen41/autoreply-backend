@@ -5,12 +5,23 @@ namespace Tests\Feature;
 use App\Models\CentralPayment;
 use App\Models\PaymentClient;
 use Illuminate\Foundation\Testing\RefreshDatabase;
+use Illuminate\Support\Facades\Schema;
 use Illuminate\Support\Str;
 use Tests\TestCase;
 
 class CentralPaymentClientAuthTest extends TestCase
 {
     use RefreshDatabase;
+
+    protected function setUp(): void
+    {
+        parent::setUp();
+
+        if (!Schema::connection('central_payments')->hasTable('payment_clients')) {
+            $migration = require database_path('migrations/2026_11_11_000100_create_central_payment_gateway_tables.php');
+            $migration->up();
+        }
+    }
 
     public function test_client_can_only_read_its_own_payment_and_nonce_cannot_be_replayed(): void
     {

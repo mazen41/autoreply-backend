@@ -1379,14 +1379,23 @@ class SallaService
 
             $phone = (string) ($data['phone'] ?? $data['customer_phone'] ?? '');
             $address = (string) ($data['address'] ?? $data['customer_address'] ?? '');
-            if (!$this->resolveShippingAddressForChannel($channel, $address, $phone)) {
+            $shippingAddress = $this->resolveShippingAddressForChannel($channel, $address, $phone);
+            if (!$shippingAddress) {
                 return ['status' => 'needs_fields', 'missing_fields' => ['delivery_city']];
             }
 
             // Pre-submit check: ask for missing required fields before any Salla request.
+            $requiredFields = (array) ($data['salla_required_fields'] ?? []);
+            $shippingCountryCode = $this->countryFromAddress($address) ?? SallaPhoneHelper::getCountryCode($phone);
+            if ($shippingCountryCode === 'SA') {
+                $requiredFields = array_merge($requiredFields, [
+                    'street_number', 'building_number', 'block', 'short_address',
+                    'additional_number', 'postal_code', 'geo_coordinates',
+                ]);
+            }
             $presubmitMissing = SallaOrderValidator::missingFields(
                 $data,
-                (array) ($data['salla_required_fields'] ?? [])
+                $requiredFields
             );
             if ($presubmitMissing !== []) {
                 Log::info('SALLA_PRESUBMIT_MISSING_FIELDS', [

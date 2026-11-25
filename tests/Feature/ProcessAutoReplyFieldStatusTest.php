@@ -165,6 +165,7 @@ class ProcessAutoReplyFieldStatusTest extends TestCase
             'business_name' => 'NazBiz',
             'knowledge_base' => 'We sell dresses.',
         ]);
+        $this->activatePaidTestPlan($business);
 
         $channel = Channel::create([
             'user_id' => $user->id,

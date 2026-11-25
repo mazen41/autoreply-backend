@@ -34,6 +34,7 @@ class AuditSecurityAndSequenceTriggersTest extends TestCase
     {
         $user = User::factory()->create();
         $business = BusinessProfile::create(['user_id' => $user->id, 'name' => 'OAuth test business']);
+        $this->activatePaidTestPlan($business);
         Sanctum::actingAs($user);
 
         $response = $this->withHeader('X-Business-Id', (string) $business->id)->postJson('/api/channels/connect/facebook')->assertOk();

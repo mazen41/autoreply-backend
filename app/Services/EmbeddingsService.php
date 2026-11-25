@@ -13,7 +13,8 @@ class EmbeddingsService
     // Note: Claude and Groq do not have native embeddings APIs;
     // they fall back to OpenAI-compatible endpoints where available.
     private const PROVIDER_PRIORITY = ['openai', 'gemini', 'claude', 'groq'];
-    private const OUTPUT_DIMENSIONALITY = 768;
+    private const GEMINI_OUTPUT_DIMENSIONALITY = 768;
+    private const OPENAI_OUTPUT_DIMENSIONALITY = 1536;
 
     private string $activeProvider = '';
     private string $apiKey = '';
@@ -34,6 +35,29 @@ class EmbeddingsService
             }
         }
         Log::warning('EmbeddingsService: no embedding provider is configured; semantic knowledge search is unavailable');
+    }
+
+    public function activeProvider(): ?string
+    {
+        return $this->activeProvider !== '' ? $this->activeProvider : null;
+    }
+
+    public function activeModel(): ?string
+    {
+        return $this->model !== '' ? $this->model : null;
+    }
+
+    public function dimension(): ?int
+    {
+        if ($this->activeProvider === '') {
+            return null;
+        }
+
+        return match ($this->activeProvider) {
+            'openai', 'claude' => self::OPENAI_OUTPUT_DIMENSIONALITY,
+            'gemini', 'groq' => self::GEMINI_OUTPUT_DIMENSIONALITY,
+            default => null,
+        };
     }
 
     private function providerConfig(string $provider): array
@@ -115,7 +139,7 @@ class EmbeddingsService
             ->post("{$this->baseUrl}/models/{$model}:embedContent?key={$this->apiKey}", [
                 'model'               => "models/{$model}",
                 'content'             => ['parts' => [['text' => $text]]],
-                'outputDimensionality' => self::OUTPUT_DIMENSIONALITY,
+                'outputDimensionality' => self::GEMINI_OUTPUT_DIMENSIONALITY,
             ]);
         if (!$response->successful()) throw new AiProviderRequestException('Gemini embeddings', $response->status());
         $data   = $response->json();
@@ -132,7 +156,7 @@ class EmbeddingsService
     private function geminiEmbedBatch(array $chunks, int $estimate, string $model): array
     {
         $requests = array_map(
-            fn ($chunk) => ['model' => "models/{$model}", 'content' => ['parts' => [['text' => $chunk]]], 'outputDimensionality' => self::OUTPUT_DIMENSIONALITY],
+            fn ($chunk) => ['model' => "models/{$model}", 'content' => ['parts' => [['text' => $chunk]]], 'outputDimensionality' => self::GEMINI_OUTPUT_DIMENSIONALITY],
             $chunks
         );
         $response = Http::timeout(20)->connectTimeout(10)
@@ -161,6 +185,9 @@ class EmbeddingsService
             ->post("{$this->baseUrl}/embeddings", [
                 'model' => $model,
                 'input' => $text,
+                ...($this->activeProvider === 'openai' || $this->activeProvider === 'claude'
+                    ? ['dimensions' => self::OPENAI_OUTPUT_DIMENSIONALITY]
+                    : []),
             ]);
         if (!$response->successful()) throw new AiProviderRequestException("{$this->activeProvider} embeddings", $response->status());
         $data   = $response->json();
@@ -181,6 +208,9 @@ class EmbeddingsService
             ->post("{$this->baseUrl}/embeddings", [
                 'model' => $model,
                 'input' => array_values($chunks),
+                ...($this->activeProvider === 'openai' || $this->activeProvider === 'claude'
+                    ? ['dimensions' => self::OPENAI_OUTPUT_DIMENSIONALITY]
+                    : []),
             ]);
         if (!$response->successful()) throw new AiProviderRequestException("{$this->activeProvider} batch embeddings", $response->status());
         $data       = $response->json();

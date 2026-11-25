@@ -285,7 +285,15 @@ class KnowledgeController extends Controller
 
         $queryEmbedding = $embeddingsService->embedChunk($queryStr, $profile, $request->header('Idempotency-Key') ? \App\Services\AiGateway::stableOperationId('knowledge-search:' . $profile->id . ':' . $request->header('Idempotency-Key')) : (string) \Illuminate\Support\Str::uuid());
         if (!empty($queryEmbedding)) {
-            $relevantChunks = $vectorSearch->search($queryEmbedding, $profile->id, $limit);
+            $relevantChunks = $vectorSearch->search(
+                $queryEmbedding,
+                $profile->id,
+                $limit,
+                null,
+                $embeddingsService->activeProvider(),
+                $embeddingsService->activeModel(),
+                $embeddingsService->dimension()
+            );
             foreach ($relevantChunks as $chunk) {
                 $results[] = [
                     'source' => $chunk->file ? $chunk->file->filename : 'Knowledge Base',
@@ -397,7 +405,15 @@ class KnowledgeController extends Controller
 
             $queryEmbedding = $embeddingsService->embedChunk($query, $business, $idempotencyKey ? \App\Services\AiGateway::stableOperationId('knowledge-answer:' . $business->id . ':' . $idempotencyKey) : (string) \Illuminate\Support\Str::uuid());
             if (!empty($queryEmbedding)) {
-                $relevantChunks = $vectorSearch->search($queryEmbedding, $business->id, 5);
+                $relevantChunks = $vectorSearch->search(
+                    $queryEmbedding,
+                    $business->id,
+                    5,
+                    null,
+                    $embeddingsService->activeProvider(),
+                    $embeddingsService->activeModel(),
+                    $embeddingsService->dimension()
+                );
                 foreach ($relevantChunks as $index => $chunk) {
                     $fileName = $chunk->file ? $chunk->file->filename : 'Knowledge Base';
                     $knowledgeText .= "\n[Source: {$fileName}] (Relevance Top " . ($index + 1) . ")\n";

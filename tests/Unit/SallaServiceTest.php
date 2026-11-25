@@ -91,18 +91,9 @@ class SallaServiceTest extends TestCase
     public function test_unknown_phone_and_address_country_do_not_default_shipping_to_saudi(): void
     {
         $channel = Channel::factory()->create(['type' => 'salla', 'status' => 'connected']);
-        \Illuminate\Support\Facades\DB::table('salla_cities')->insert([
-            'channel_id' => $channel->id,
-            'country_code' => 'SA',
-            'country_id' => 1473353380,
-            'salla_city_id' => 4,
-            'name' => 'Riyadh',
-            'name_en' => 'Riyadh',
-            'synced_at' => now(),
-            'created_at' => now(),
-            'updated_at' => now(),
+        $this->seedSharedCityCatalog('SA', 1473353380, [
+            ['id' => 4, 'name' => 'Riyadh', 'name_en' => 'Riyadh'],
         ]);
-        $this->markCityCatalogHealthy($channel, 'SA');
 
         $unknown = $this->sallaService->resolveShippingAddressForChannel($channel, 'Riyadh, Main Street', '1234567890');
         $explicitSaudi = $this->sallaService->resolveShippingAddressForChannel($channel, 'Riyadh, Saudi Arabia', '1234567890');
@@ -224,6 +215,7 @@ class SallaServiceTest extends TestCase
             'type' => 'salla',
             'status' => 'connected',
             'access_token' => 'access-token',
+            'user_id' => \App\Models\User::factory()->create()->id,
         ]);
 
         Http::fake([
@@ -259,8 +251,8 @@ class SallaServiceTest extends TestCase
         Http::assertSent(fn ($request) => str_contains($request->url(), 'cities?page=2'));
         Http::assertSent(fn ($request) =>
             str_contains($request->url(), '/cities')
-            && str_contains($request->url(), 'per_page=60')
-            && str_contains($request->url(), 'count=60')
+            && str_contains($request->url(), 'per_page=15')
+            && str_contains($request->url(), 'count=15')
         );
     }
 
@@ -268,13 +260,11 @@ class SallaServiceTest extends TestCase
     {
         $channel = Channel::factory()->create([
             'type' => 'salla', 'status' => 'connected', 'access_token' => 'access-token',
+            'user_id' => \App\Models\User::factory()->create()->id,
         ]);
-        \Illuminate\Support\Facades\DB::table('salla_cities')->insert([
-            'channel_id' => $channel->id, 'country_code' => 'SA', 'country_id' => 55,
-            'salla_city_id' => 99, 'name' => 'Existing City', 'name_en' => 'Existing City',
-            'synced_at' => now(), 'created_at' => now(), 'updated_at' => now(),
-        ]);
-        $this->markCityCatalogHealthy($channel, 'SA');
+        $this->seedSharedCityCatalog('SA', 55, [
+            ['id' => 99, 'name' => 'Existing City', 'name_en' => 'Existing City'],
+        ], 'failed');
 
         Http::fake([
             'https://api.salla.dev/admin/v2/countries' => Http::response([
@@ -290,14 +280,14 @@ class SallaServiceTest extends TestCase
             $this->sallaService->syncCityCatalog($channel, 'SA');
             $this->fail('The invalid pagination response should fail the sync.');
         } catch (\UnexpectedValueException) {
-            $this->assertDatabaseHas('salla_cities', [
-                'channel_id' => $channel->id, 'country_code' => 'SA', 'salla_city_id' => 99,
+            $this->assertDatabaseHas('salla_city_reference_cities', [
+                'country_id' => 55, 'salla_city_id' => 99,
             ]);
-            $this->assertDatabaseMissing('salla_cities', [
-                'channel_id' => $channel->id, 'country_code' => 'SA', 'salla_city_id' => 100,
+            $this->assertDatabaseMissing('salla_city_reference_cities', [
+                'country_id' => 55, 'salla_city_id' => 100,
             ]);
-            $this->assertDatabaseHas('salla_city_catalog_syncs', [
-                'channel_id' => $channel->id, 'country_code' => 'SA', 'status' => 'failed',
+            $this->assertDatabaseHas('salla_city_catalogs', [
+                'country_code' => 'SA', 'status' => 'failed',
                 'saved_city_count' => 1,
             ]);
         }
@@ -307,6 +297,7 @@ class SallaServiceTest extends TestCase
     {
         $channel = Channel::factory()->create([
             'type' => 'salla', 'status' => 'connected', 'access_token' => 'access-token',
+            'user_id' => \App\Models\User::factory()->create()->id,
             'metadata' => ['scopes' => 'orders.read_write'],
         ]);
         Http::preventStrayRequests();
@@ -316,8 +307,8 @@ class SallaServiceTest extends TestCase
             $this->fail('Missing metadata.read must block sync.');
         } catch (\RuntimeException $exception) {
             $this->assertStringContainsString('metadata.read', $exception->getMessage());
-            $this->assertDatabaseHas('salla_city_catalog_syncs', [
-                'channel_id' => $channel->id, 'country_code' => 'SA', 'status' => 'failed',
+            $this->assertDatabaseHas('salla_city_catalogs', [
+                'country_code' => 'SA', 'status' => 'failed',
             ]);
         }
     }
@@ -330,18 +321,9 @@ class SallaServiceTest extends TestCase
             'access_token' => 'test-token',
         ]);
 
-        \Illuminate\Support\Facades\DB::table('salla_cities')->insert([
-            'channel_id' => $channel->id,
-            'country_code' => 'SA',
-            'country_id' => 1473353380,
-            'salla_city_id' => 4,
-            'name' => 'Riyadh',
-            'name_en' => 'Riyadh',
-            'synced_at' => now(),
-            'created_at' => now(),
-            'updated_at' => now(),
+        $this->seedSharedCityCatalog('SA', 1473353380, [
+            ['id' => 4, 'name' => 'Riyadh', 'name_en' => 'Riyadh'],
         ]);
-        $this->markCityCatalogHealthy($channel, 'SA');
 
         Http::fake([
             'https://api.salla.dev/admin/v2/customers*' => Http::response([
@@ -429,18 +411,9 @@ class SallaServiceTest extends TestCase
             'access_token' => 'test-token',
         ]);
 
-        \Illuminate\Support\Facades\DB::table('salla_cities')->insert([
-            'channel_id' => $channel->id,
-            'country_code' => 'SA',
-            'country_id' => 1473353380,
-            'salla_city_id' => 4,
-            'name' => 'Riyadh',
-            'name_en' => 'Riyadh',
-            'synced_at' => now(),
-            'created_at' => now(),
-            'updated_at' => now(),
+        $this->seedSharedCityCatalog('SA', 1473353380, [
+            ['id' => 4, 'name' => 'Riyadh', 'name_en' => 'Riyadh'],
         ]);
-        $this->markCityCatalogHealthy($channel, 'SA');
 
         Http::fake([
             'https://api.salla.dev/admin/v2/customers*' => Http::response([
@@ -495,18 +468,9 @@ class SallaServiceTest extends TestCase
             'access_token' => 'test-token',
         ]);
 
-        \Illuminate\Support\Facades\DB::table('salla_cities')->insert([
-            'channel_id' => $channel->id,
-            'country_code' => 'EG',
-            'country_id' => 1723506348,
-            'salla_city_id' => 778,
-            'name' => 'Giza',
-            'name_en' => 'Giza',
-            'synced_at' => now(),
-            'created_at' => now(),
-            'updated_at' => now(),
+        $this->seedSharedCityCatalog('EG', 1723506348, [
+            ['id' => 778, 'name' => 'Giza', 'name_en' => 'Giza'],
         ]);
-        $this->markCityCatalogHealthy($channel, 'EG');
 
         Http::fake([
             'https://api.salla.dev/admin/v2/customers*' => Http::response([
@@ -553,20 +517,37 @@ class SallaServiceTest extends TestCase
         $this->assertSame('+201001234567', $payload['customer']['mobile']);
     }
 
-    private function markCityCatalogHealthy(Channel $channel, string $countryCode): void
+    private function seedSharedCityCatalog(string $countryCode, int $countryId, array $cities, string $status = 'succeeded'): void
     {
-        $count = (int) \Illuminate\Support\Facades\DB::table('salla_cities')
-            ->where('channel_id', $channel->id)
-            ->where('country_code', $countryCode)
-            ->count();
-        \App\Models\SallaCityCatalogSync::updateOrCreate(
-            ['channel_id' => $channel->id, 'country_code' => $countryCode],
+        $now = now();
+        foreach ($cities as $city) {
+            $name = (string) ($city['name'] ?? '');
+            $nameEn = (string) ($city['name_en'] ?? '');
+            \Illuminate\Support\Facades\DB::table('salla_city_reference_cities')->insert([
+                'country_id' => $countryId,
+                'salla_city_id' => $city['id'],
+                'name' => $name,
+                'name_en' => $nameEn !== '' ? $nameEn : null,
+                'name_ar' => preg_match('/[\x{0600}-\x{06FF}]/u', $name) ? $name : null,
+                'normalized_name' => $this->sallaService->normalizeCitySearchText($name),
+                'normalized_en' => $nameEn !== '' ? $this->sallaService->normalizeCitySearchText($nameEn) : null,
+                'normalized_ar' => preg_match('/[\x{0600}-\x{06FF}]/u', $name) ? $this->sallaService->normalizeCitySearchText($name) : null,
+                'synced_at' => $now,
+                'created_at' => $now,
+                'updated_at' => $now,
+            ]);
+        }
+        \App\Models\SallaCityCatalog::updateOrCreate(
+            ['country_code' => $countryCode],
             [
-                'status' => 'succeeded',
+                'country_id' => $countryId,
+                'status' => $status,
                 'pages_completed' => 1,
-                'expected_city_count' => $count,
-                'saved_city_count' => $count,
-                'last_successful_sync_at' => now(),
+                'total_pages' => 1,
+                'expected_city_count' => count($cities),
+                'staged_city_count' => count($cities),
+                'saved_city_count' => count($cities),
+                'synced_at' => $now,
             ]
         );
     }

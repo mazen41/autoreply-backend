@@ -117,6 +117,8 @@ class ReportsMetricDefinitionsTest extends TestCase
         $this->assertStringContainsString("'=HYPERLINK", $csv);
     }
 
+    #[\PHPUnit\Framework\Attributes\RunInSeparateProcess]
+    #[\PHPUnit\Framework\Attributes\PreserveGlobalState(false)]
     public function test_pdf_export_uses_unicode_text_and_discloses_row_limit_and_period(): void
     {
         $fixture = $this->reportFixture();

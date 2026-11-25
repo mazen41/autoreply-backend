@@ -67,9 +67,12 @@ class ConfirmationGuard
 
         $claimTypes = [
             'order' => '/(?:\border\s*(?:number|no\.?|id)\s*(?:is|:)?\s*#?\d{5,}|awaiting review|waiting for review|\b(?:order|purchase)\b[^.!?\n]{0,70}\b(?:placed|created|submitted|confirmed|processed|completed|done)\b|\b(?:placed|created|submitted)\b[^.!?\n]{0,30}\border\b|تم\s*(?:تأكيد|إنشاء|تسجيل|استلام|تجهيز|إتمام)\s*(?:ال)?(?:طلب|الطلب)?|(?:طلبك|الطلب)\s*(?:اتأكد|تأكد|اتسجل|اتعمل|تم))/u',
-            'cancel' => '/(?:\b(?:order|booking|appointment|subscription)\b[^.!?\n]{0,60}\bcancel(?:led|ed)\b|\bcancel(?:led|ed)\b[^.!?\n]{0,25}\b(?:order|booking|appointment)\b|تم\s*(?:إلغاء|الغاء)|(?:اتلغى|أُلغي)\s*(?:ال)?(?:طلب|حجز))/u',
+            // Only match an assertion that cancellation is already complete.
+            // Requests, offers, and instructions containing “cancel” are not claims.
+            'cancel' => '/(?:\b(?:your\s+)?(?:order|booking|appointment|subscription)\s+(?:has\s+been|was|is)\s+cancel(?:led|ed)\b|\b(?:cancelled|canceled)\s+(?:your\s+)?(?:order|booking|appointment|subscription)\b|\bi\s+(?:have\s+)?cancelled\s+(?:your\s+)?(?:order|booking|appointment|subscription)\b|تم\s*(?:إلغاء|الغاء)\s*(?:ال)?(?:طلب|حجز|موعد)|(?:اتلغى|أُلغي)\s*(?:ال)?(?:طلب|حجز|موعد))/u',
             'refund' => '/(?:\b(?:refund|refunded|money back)\b|تم\s*(?:استرداد|رد)\s*(?:المبلغ|الفلوس)?)/u',
-            'update' => '/(?:\b(?:updated|changed|saved)\b[^.!?\n]{0,50}\b(?:address|account|profile|record|details)\b|\b(?:address|account|profile|record|details)\b[^.!?\n]{0,50}\b(?:updated|changed|saved)\b|تم\s*(?:تحديث|تعديل|حفظ)\s*(?:بيانات|عنوان|حساب|ملف))/u',
+            // Match explicit completed changes, not questions/prompts about updating.
+            'update' => '/(?:\b(?:your\s+)?(?:address|account|profile|record|details)\s+(?:has\s+been|have\s+been|was|were)\s+(?:updated|changed|saved)\b|\b(?:i\s+(?:have\s+)?|we\s+(?:have\s+)?)?(?:updated|changed|saved)\s+(?:your\s+)?(?:address|account|profile|record|details)\b|تم\s*(?:تحديث|تعديل|حفظ)\s*(?:بيانات|عنوان|حساب|ملف)(?:ك|ك\s+)?)/u',
             'booking' => '/(?:\b(?:booking|appointment|reservation)\b[^.!?\n]{0,50}\b(?:booked|confirmed|created|scheduled|done|complete)\b|\b(?:booked|confirmed|scheduled)\b[^.!?\n]{0,30}\b(?:appointment|reservation)\b|تم\s*(?:تأكيد|إنشاء|حجز)\s*(?:الموعد|الحجز))/u',
             'create' => '/(?:\b(?:i(?:\s+have|\x27ve)?\s+)?(?:successfully\s+)?created\s+(?:it|that|this|your|the)\b|\bcreated\s+successfully\b|تم\s*(?:إنشاء|تجهيز|إعداد)\s*(?:لك|بنـجاح)?)/u',
             'confirm' => '/(?:\b(?:is|has been|was)\s+confirmed\b|\bconfirmed\s+(?:successfully|for you|it|that)\b|تم\s*تأكيد\b)/u',

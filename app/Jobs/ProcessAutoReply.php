@@ -3658,6 +3658,50 @@ $aiResponse = $intro
             }
         }
 
+        // Give deterministic guidance for these two common cases after model
+        // and claim guards have run, so generic fallbacks cannot obscure them.
+        $confirmedSallaCheckoutWithAutomationOff = $sallaChannel
+            && !$autoOrderConfirmationEnabled
+            && $containsConfirmPhrase
+            && $hasValidOrderSummary
+            && in_array($checkoutState['confirmation_state'] ?? null, ['confirmed', 'order_placed'], true)
+            && !empty($fieldStatus['is_complete']);
+        if ($confirmedSallaCheckoutWithAutomationOff) {
+            $aiResponse = $detectedLanguage === 'arabic'
+                ? 'لا أستطيع تسجيل الطلب تلقائيًا من المتجر حاليًا، لذلك لم يتم إرسال الطلب. سيتواصل معك أحد أفراد الفريق لتأكيده ومساعدتك في إتمامه.'
+                : 'I can’t place this order automatically right now, so it has not been submitted. A team member will follow up to confirm it and help complete it.';
+        }
+
+        $isSallaOrderStatusWithoutLookupDetails = $isOrderStatus && $sallaChannel
+            && $this->senderPhoneDigits($conversation) === '';
+        if ($isSallaOrderStatusWithoutLookupDetails) {
+            $recentStatusMessages = Message::query()
+                ->where('conversation_id', $conversation->id)
+                ->where('direction', 'inbound')
+                ->orderByDesc('created_at')
+                ->limit(6)
+                ->pluck('content');
+            $hasOrderNumber = false;
+            $hasPhoneNumber = false;
+            foreach ($recentStatusMessages as $recentStatusMessage) {
+                $recentStatusText = (string) $recentStatusMessage;
+                if (!$hasOrderNumber && (
+                    preg_match('/(?:\border\b|طلب)\s*(?:number|no\.?|رقم)?\s*[:#-]?\s*#?\d{4,12}/iu', $recentStatusText)
+                    || preg_match('/^\s*#?\d{4,12}\s*$/u', $recentStatusText)
+                )) {
+                    $hasOrderNumber = true;
+                }
+                if (!$hasPhoneNumber && preg_match('/\+?\d(?:[\s().-]*\d){8,14}/u', $recentStatusText)) {
+                    $hasPhoneNumber = true;
+                }
+            }
+            if (!$hasOrderNumber && !$hasPhoneNumber) {
+                $aiResponse = $detectedLanguage === 'arabic'
+                    ? 'أكيد أساعدك في متابعة طلبك. ابعتلي رقم الطلب أو رقم الجوال المستخدم وقت الشراء عشان أقدر أتحقق من حالته.'
+                    : 'I can help check your order. Please send the order number or the phone number used at checkout so I can look it up.';
+            }
+        }
+
         // The checkout state is already saved by the pre-AI confirmation block above.
         // No post-AI order creation — orders are created BEFORE the AI reply so
         // the AI can correctly reference the real order ID in its response.

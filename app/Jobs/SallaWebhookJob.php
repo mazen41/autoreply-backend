@@ -3,13 +3,10 @@
 namespace App\Jobs;
 
 use App\Models\Channel;
-use App\Models\Customer;
 use App\Models\CustomerIdentity;
-use App\Models\CustomerNote;
 use App\Models\Conversation;
 use App\Models\Message;
 use App\Models\SallaWebhookReceipt;
-use App\Services\IncomingMediaStorage;
 use App\Services\SequenceTriggerService;
 use Illuminate\Bus\Queueable;
 use Illuminate\Contracts\Queue\ShouldQueue;
@@ -18,8 +15,6 @@ use Illuminate\Queue\InteractsWithQueue;
 use Illuminate\Queue\SerializesModels;
 use Illuminate\Support\Facades\Log;
 use Illuminate\Support\Facades\Cache;
-use Illuminate\Support\Facades\DB;
-use Illuminate\Support\Facades\Storage;
 
 class SallaWebhookJob implements ShouldQueue
 {
@@ -492,7 +487,7 @@ class SallaWebhookJob implements ShouldQueue
         }
     }
 
-    /** Remove this store's local connection and conversation data on uninstall. */
+    /** Disconnect this store on uninstall while preserving conversation history. */
     protected function handleAppUninstalled(array $data): void
     {
         $merchantId = data_get($data, 'merchant.id')
@@ -531,116 +526,21 @@ class SallaWebhookJob implements ShouldQueue
         }
 
         $channel = $channels->first();
-        if (empty($channel->business_id)) {
-            $this->disconnectUninstalledChannel($channel, (string) $merchantId);
-            Log::warning('Salla uninstall token cleared, but data cleanup skipped because channel has no business scope', [
-                'channel_id' => $channel->id,
-            ]);
-            return;
-        }
+        // Salla revokes the merchant grant. Clear local credentials but retain
+        // conversations, messages, customer identities, notes, and media.
+        $this->disconnectUninstalledChannel($channel, (string) $merchantId);
+        $conversationCount = Conversation::query()->where('channel_id', $channel->id)->count();
+        $messageCount = Message::query()
+            ->whereIn('conversation_id', Conversation::query()->select('id')->where('channel_id', $channel->id))
+            ->count();
+        $identityCount = CustomerIdentity::query()->where('channel_id', $channel->id)->count();
 
-        $foreignConversationCount = Conversation::query()->where('channel_id', $channel->id)
-            ->where(function ($query) use ($channel): void {
-                $query->whereNull('business_id')->orWhere('business_id', '!=', $channel->business_id);
-            })->count();
-        $foreignIdentityCount = CustomerIdentity::query()->where('channel_id', $channel->id)
-            ->where('business_profile_id', '!=', $channel->business_id)->count();
-        if ($foreignConversationCount > 0 || $foreignIdentityCount > 0) {
-            $this->disconnectUninstalledChannel($channel, (string) $merchantId);
-            Log::error('Salla uninstall found cross-business records; sensitive data cleanup skipped', [
-                'channel_id' => $channel->id,
-                'conversation_count' => $foreignConversationCount,
-                'identity_count' => $foreignIdentityCount,
-            ]);
-            return;
-        }
-
-        $mediaStorage = app(IncomingMediaStorage::class);
-        $conversationIds = Conversation::query()->where('channel_id', $channel->id)
-            ->where('business_id', $channel->business_id)->pluck('id');
-        $mediaRows = Message::query()->whereIn('conversation_id', $conversationIds)
-            ->whereNotNull('media_url')->get(['media_url', 'metadata']);
-        $mediaPaths = [];
-        foreach ($mediaRows as $message) {
-            $disk = (string) data_get($message->metadata, 'media.storage_disk', $mediaStorage->diskName());
-            $path = (string) $message->media_url;
-            if ($mediaStorage->absolutePath($path, $disk) !== null) {
-                $mediaPaths[] = [$disk, $path];
-            }
-        }
-
-        $counts = DB::transaction(function () use ($channel, $merchantId): array {
-            $conversationIds = Conversation::query()->where('channel_id', $channel->id)
-                ->where('business_id', $channel->business_id)->pluck('id');
-            $customerIds = CustomerIdentity::query()->where('channel_id', $channel->id)
-                ->where('business_profile_id', $channel->business_id)->pluck('customer_id')
-                ->merge(Conversation::query()->whereIn('id', $conversationIds)->whereNotNull('customer_id')->pluck('customer_id'))
-                ->unique()->values();
-
-            $messageCount = Message::query()->whereIn('conversation_id', $conversationIds)->count();
-            $conversationCount = $conversationIds->count();
-            $identityCount = CustomerIdentity::query()->where('channel_id', $channel->id)
-                ->where('business_profile_id', $channel->business_id)->count();
-
-            // Salla's uninstall revokes the merchant grant. Remove local credentials; do not
-            // call an undocumented token-revocation URL or retain a usable token locally.
-            $this->disconnectUninstalledChannel($channel, (string) $merchantId);
-
-            CustomerIdentity::query()->where('channel_id', $channel->id)
-                ->where('business_profile_id', $channel->business_id)->delete();
-            Message::query()->whereIn('conversation_id', $conversationIds)->delete();
-            Conversation::query()->where('channel_id', $channel->id)
-                ->where('business_id', $channel->business_id)->forceDelete();
-
-            $anonymized = 0;
-            foreach ($customerIds as $customerId) {
-                $customer = Customer::query()->where('business_profile_id', $channel->business_id)
-                    ->whereKey($customerId)->first();
-                if (!$customer) continue;
-
-                $hasOtherConversation = Conversation::withTrashed()->where('customer_id', $customer->id)->exists();
-                $hasOtherIdentity = CustomerIdentity::query()->where('customer_id', $customer->id)->exists();
-                $belongsToAnotherStore = $customer->commerce_channel_id !== null
-                    && (int) $customer->commerce_channel_id !== (int) $channel->id;
-                if ($hasOtherConversation || $hasOtherIdentity || $belongsToAnotherStore) continue;
-
-                $customer->forceFill([
-                    'name' => null,
-                    'phone' => null,
-                    'email' => null,
-                    'avatar' => null,
-                    'custom_fields' => null,
-                    'commerce_channel_id' => null,
-                    'commerce_external_id' => null,
-                ])->save();
-                CustomerNote::query()->where('customer_id', $customer->id)->delete();
-                $anonymized++;
-            }
-
-            return compact('conversationCount', 'messageCount', 'identityCount', 'anonymized');
-        });
-
-        $mediaDeleted = 0;
-        $mediaFailures = 0;
-        foreach ($mediaPaths as [$disk, $path]) {
-            try {
-                if (Storage::disk($disk)->delete($path)) $mediaDeleted++;
-                else $mediaFailures++;
-            } catch (\Throwable $exception) {
-                $mediaFailures++;
-                Log::warning('Salla uninstall media cleanup failed', [
-                    'channel_id' => $channel->id,
-                    'exception_type' => get_class($exception),
-                ]);
-            }
-        }
-
-        Log::info('Salla uninstall cleanup completed', [
+        Log::info('Salla app.uninstalled: channel disconnected; local history retained', [
             'channel_id' => $channel->id,
             'merchant_id' => $merchantId,
-            ...$counts,
-            'media_files_deleted' => $mediaDeleted,
-            'media_cleanup_failures' => $mediaFailures,
+            'conversation_count' => $conversationCount,
+            'message_count' => $messageCount,
+            'identity_count' => $identityCount,
         ]);
     }
 

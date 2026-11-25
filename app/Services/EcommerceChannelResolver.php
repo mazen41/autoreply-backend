@@ -60,13 +60,38 @@ class EcommerceChannelResolver
         $chosen = null;
         $source = 'unresolved';
 
-        // A persisted context is sticky. If it is no longer authorized, do not
-        // silently switch the customer to a different store.
+        // A persisted context is sticky unless the bot now has a different
+        // default store (e.g. the business swapped from Shopify to Salla).
+        // In that case we clear the stale sticky and re-resolve fresh.
         if ($conversation->ecommerce_connection_id) {
             $stored = $this->connectedAccount((int) $conversation->ecommerce_connection_id, $businessId);
             if ($stored && (!$bot || in_array($stored->id, $eligibleIds, true))) {
-                $chosen = $stored;
-                $source = 'conversation';
+                // Check if bot now has an explicit default that differs from
+                // the stored connection — meaning the store was swapped.
+                $botDefaultId = $bot
+                    ? DB::table('bot_ecommerce_connections')
+                        ->where('bot_id', $bot->id)
+                        ->where('is_enabled', true)
+                        ->where('is_default', true)
+                        ->value('ecommerce_connection_id')
+                    : null;
+
+                if (empty($conversation->checkout_state)
+                    && $botDefaultId && (int) $botDefaultId !== (int) $stored->id
+                    && in_array((int) $botDefaultId, $eligibleIds, true)) {
+                    // Bot default changed — clear sticky so we re-resolve below.
+                    Log::info('Commerce context: bot default changed; clearing stale sticky connection', [
+                        'business_id'       => $businessId,
+                        'bot_id'            => $bot?->id,
+                        'conversation_id'   => $conversation->id,
+                        'old_connection_id' => $stored->id,
+                        'new_default_id'    => $botDefaultId,
+                    ]);
+                    $conversation->forceFill(['ecommerce_connection_id' => null])->save();
+                } else {
+                    $chosen = $stored;
+                    $source = 'conversation';
+                }
             } else {
                 Log::warning('Commerce context invalidated; refusing implicit store switch', [
                     'business_id' => $businessId,
@@ -75,7 +100,9 @@ class EcommerceChannelResolver
                     'connection_id' => $conversation->ecommerce_connection_id,
                 ]);
             }
-        } else {
+        }
+
+        if (!$chosen) {
             // Commerce webhooks can create conversations directly on a
             // provider channel. That account is deterministic by origin.
             if (

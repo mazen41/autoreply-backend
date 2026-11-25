@@ -139,7 +139,7 @@ class CommerceContextResolverTest extends TestCase
         $this->assertSame($storeB->id, $resolvedBAfterChange['connection']->id);
     }
 
-    public function test_resolved_conversation_context_stays_sticky(): void
+    public function test_resolved_conversation_context_switches_when_bot_default_changes(): void
     {
         [$user, $business] = $this->makeBusiness();
         $chat = $this->makeChannel($user, $business, 'instagram', 'Instagram');
@@ -158,8 +158,32 @@ class CommerceContextResolverTest extends TestCase
 
         $context = app(EcommerceChannelResolver::class)->resolveConversation($conversation, $bot);
 
+        $this->assertSame('bot_default', $context['source']);
+        $this->assertSame($second->id, $context['connection']->id);
+        $this->assertSame($second->id, $conversation->fresh()->ecommerce_connection_id);
+    }
+
+    public function test_resolved_conversation_context_stays_sticky_when_bot_default_matches(): void
+    {
+        [$user, $business] = $this->makeBusiness();
+        $chat = $this->makeChannel($user, $business, 'instagram', 'Instagram');
+        $store = $this->makeChannel($user, $business, 'salla', 'Salla');
+        $other = $this->makeChannel($user, $business, 'shopify', 'Shopify');
+        $bot = Bot::create(['business_profile_id' => $business->id, 'name' => 'Bot', 'status' => 'active']);
+        $bot->ecommerceConnections()->attach([
+            $store->id => ['is_enabled' => true, 'is_default' => true],
+            $other->id => ['is_enabled' => true, 'is_default' => false],
+        ]);
+        $conversation = $this->makeConversation($business, $bot, $chat);
+        $conversation->forceFill([
+            'ecommerce_connection_id' => $store->id,
+            'commerce_context_status' => 'resolved',
+        ])->save();
+
+        $context = app(EcommerceChannelResolver::class)->resolveConversation($conversation, $bot);
+
         $this->assertSame('conversation', $context['source']);
-        $this->assertSame($first->id, $context['connection']->id);
+        $this->assertSame($store->id, $context['connection']->id);
     }
 
     public function test_multiple_allowed_stores_without_route_or_default_are_unresolved(): void

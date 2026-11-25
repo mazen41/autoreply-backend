@@ -729,6 +729,15 @@ class OrderCheckoutService
                     && (float) $value['lng'] <= 180;
                 $value = $validCoordinates ? $value : null;
             }
+            // Coordinates are an internal geocoding result, not information a
+            // customer should be asked to type. If the customer already gave
+            // a city and a street/address line, let Salla validate the textual
+            // address rather than trapping checkout on a missing GPS pin.
+            if ($field === 'geo_coordinates' && empty($value)
+                && !empty($normalizedState['delivery_city'])
+                && !empty($normalizedState['address_line'] ?? $normalizedState['address'] ?? null)) {
+                continue;
+            }
             if (in_array($field, ['block', 'additional_number', 'postal_code'], true)
                 && is_string($value)
                 && in_array(mb_strtolower(trim($value)), ['__not_applicable__', 'n/a', 'na', 'none', 'not applicable', 'لا يوجد', 'غير متوفر'], true)) {

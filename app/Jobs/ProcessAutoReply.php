@@ -3318,11 +3318,11 @@ $aiResponse = $intro
             $updatedCheckoutState['missing_fields_last_asked'] = $missingFieldsKey;
             $updatedCheckoutState['missing_fields_repeat_count'] = $repeatCount;
 
-            if ($repeatCount >= 3) {
+            if ($repeatCount >= 2) {
                 if ($detectedLanguage === 'arabic') {
-                    $aiResponse = "أعتذر، لم أتمكن من إكمال طلبك تلقائياً لأن بيانات العنوان المطلوبة (" . implode('، ', $missingDetails) . ") لم تصل بعد. سيتواصل معك أحد أعضاء فريقنا لإتمام الطلب يدوياً.";
+                    $aiResponse = "وصلتني بياناتك، شكرًا. ما زالت بيانات العنوان التالية غير متوفرة: " . implode('، ', $missingDetails) . ". لن أكرر طلبها؛ سأحوّلك لموظف ليتأكد من إمكانية إتمام الطلب بدونها.";
                 } else {
-                    $aiResponse = "Sorry, I haven't been able to get " . implode(', ', $missingDetails) . " from you automatically. I'm connecting you with a team member to finish this order with you directly.";
+                    $aiResponse = "Thanks, I received your details. These address details are still missing: " . implode(', ', $missingDetails) . ". I won't keep asking; I'm connecting you with a team member to check whether the order can proceed without them.";
                 }
                 app(\App\Services\HandoffTaskService::class)->openForConversation(
                     $conversation,

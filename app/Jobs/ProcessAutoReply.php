@@ -3318,7 +3318,7 @@ $aiResponse = $intro
             $updatedCheckoutState['missing_fields_last_asked'] = $missingFieldsKey;
             $updatedCheckoutState['missing_fields_repeat_count'] = $repeatCount;
 
-            if ($repeatCount >= 2) {
+            if ($repeatCount >= 3) {
                 if ($detectedLanguage === 'arabic') {
                     $aiResponse = "وصلتني بياناتك، شكرًا. ما زالت بيانات العنوان التالية غير متوفرة: " . implode('، ', $missingDetails) . ". لن أكرر طلبها؛ سأحوّلك لموظف ليتأكد من إمكانية إتمام الطلب بدونها.";
                 } else {
@@ -3341,6 +3341,12 @@ $aiResponse = $intro
                     'missing_fields' => $fieldStatus['missing_fields'],
                     'repeat_count' => $repeatCount,
                 ]);
+            } elseif ($repeatCount === 2) {
+                if ($detectedLanguage === 'arabic') {
+                    $aiResponse = 'وصلتني التفاصيل اللي أرسلتها. لسه مش قادر أقرأ: ' . implode('، ', $missingDetails) . '. لو عندك العنوان الوطني المختصر اكتبه مثل ABCD1234، والرقم الإضافي اكتبه كما هو في العنوان. لو معلومة منهم مش موجودة عندك، اكتب «مش متوفر» عشان أوضح لك الخطوة التالية.';
+                } else {
+                    $aiResponse = 'I received the details you sent, but I still could not identify: ' . implode(', ', $missingDetails) . '. Please use the exact labels shown; for example, a short national address like ABCD1234. If a detail is not available to you, say “not available” and I will explain the next step.';
+                }
             } else {
                 if ($detectedLanguage === 'arabic') {
                     $aiResponse = "تمام، أقدر أساعدك في الطلب. قبل ما أجهزه للتأكيد، ابعتلي البيانات دي كلها في رسالة واحدة: " . implode('، ', $missingDetails) . ".";

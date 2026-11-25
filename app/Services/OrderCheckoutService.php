@@ -414,7 +414,7 @@ class OrderCheckoutService
         $extractedAdditionalNumber = null;
         if (!empty($parsedAddressExtras['additional_number'])) {
             $extractedAdditionalNumber = trim((string) $parsedAddressExtras['additional_number']);
-        } elseif (preg_match('/(?:additional number|secondary number|الرقم الإضافي)\s*(?:(?:is|equals?)\s+|[:#-]\s*)?([A-Z0-9-]{2,12})/iu', $incomingText, $additionalNumberMatch)) {
+        } elseif (preg_match('/(?:additional number|secondary number|الرقم الإضافي(?:\s*(?:للمبنى|للعنوان))?)\s*(?:(?:is|equals?)\s+|[:#-]\s*)?([A-Z0-9-]{2,12})/iu', $incomingText, $additionalNumberMatch)) {
             $extractedAdditionalNumber = trim($additionalNumberMatch[1]);
         }
 

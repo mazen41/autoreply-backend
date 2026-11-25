@@ -620,7 +620,7 @@ class ProcessAutoReply implements ShouldQueue
         ]);
         
         $isProductBrowseMessage = (bool) preg_match(
-            '/(?:\b(?:show|see|view|browse|list|display|send)\b.{0,60}\b(?:products?|items?|catalog(?:ue)?|images?|photos?|pictures?)\b|\b(?:products?|items?|catalog(?:ue)?)\b.{0,60}\b(?:images?|photos?|pictures?|show|see|view|browse|list|all)\b|i\s+wanna\s+see\s+products?)/iu',
+            '/(?:\b(?:show|see|view|browse|list|display|send)\b.{0,60}\b(?:products?|items?|catalog(?:ue)?|images?|photos?|pictures?)\b|\b(?:products?|items?|catalog(?:ue)?)\b.{0,60}\b(?:images?|photos?|pictures?|show|see|view|browse|list|all)\b|i\s+wanna\s+see\s+products?|(?:عايز|عايزة|ابغى|أبغى|اريد|أريد|وريني|اريني|أرني|اعرض|أعرض|هات).{0,60}(?:المنتجات?|منتجات|المنتج|البضايع))/iu',
             $message->content
         );
 

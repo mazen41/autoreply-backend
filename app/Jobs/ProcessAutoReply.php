@@ -1573,6 +1573,9 @@ class ProcessAutoReply implements ShouldQueue
                 is_array($conversation->checkout_state) ? $conversation->checkout_state : [],
                 $updatedCheckoutState
             );
+            // Provider product/address data can contain malformed byte sequences.
+            // Keep one bad field from crashing this reply job while persisting JSON.
+            $merged = json_decode(json_encode($merged, JSON_INVALID_UTF8_SUBSTITUTE), true) ?? [];
             $conversation->update(['checkout_state' => $merged]);
         } elseif (!is_null($conversation->checkout_state)) {
             // A confirmation or short follow-up often contains no extractable

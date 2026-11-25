@@ -401,9 +401,14 @@ if ($referenceId !== null && $referenceId !== '') {
             fn (string $term) => mb_strlen($term) >= 3 && !in_array($term, $stopWords, true)
         ));
         foreach ($aliases as $canonical => $englishTerms) {
+            $normalizedCanonical = $this->normalizeCatalogText($canonical);
+            if (str_contains(' ' . $message . ' ', ' ' . $normalizedCanonical . ' ')
+                || str_contains(' ' . $message . ' ', ' ال' . $normalizedCanonical . ' ')) {
+                $terms[] = $normalizedCanonical;
+            }
             foreach ($englishTerms as $englishTerm) {
                 if (in_array($englishTerm, $terms, true)) {
-                    $terms[] = $this->normalizeCatalogText($canonical);
+                    $terms[] = $normalizedCanonical;
                     break;
                 }
             }
@@ -431,6 +436,7 @@ if ($referenceId !== null && $referenceId !== '') {
             $sku = $this->normalizeCatalogText((string) $product->sku);
 
             return ($name !== '' && str_contains(' ' . $message . ' ', ' ' . $name . ' '))
+                || ($name !== '' && str_contains(' ' . $message . ' ', ' ال' . $name . ' '))
                 || ($sku !== '' && str_contains(' ' . $message . ' ', ' ' . $sku . ' '));
         })->values();
 

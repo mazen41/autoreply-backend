@@ -1385,7 +1385,9 @@ class ProcessAutoReply implements ShouldQueue
             // For now use the robust parser; the real fix is passing $order directly.
             $orderContext = $this->parseSallaContext($sallaContext);
             // Log what we're sending to AI so we can verify
-            Log::info('ProcessAutoReply: order context built for AI', ['order_context' => $orderContext]);
+            Log::info('ProcessAutoReply: order context built for AI', [
+                'order_context_fields' => array_keys(is_array($orderContext) ? $orderContext : []),
+            ]);
         }
 
         // Precedence: Bot setting overrides BusinessProfile default fallback
@@ -1770,8 +1772,7 @@ class ProcessAutoReply implements ShouldQueue
         }
 
         if ($commerceChannel?->type === 'salla'
-            && !empty($updatedCheckoutState['address'])
-            && \App\Helpers\SallaPhoneHelper::getCountryCode((string) ($updatedCheckoutState['phone'] ?? '')) === 'SA') {
+            && !empty($updatedCheckoutState['address'])) {
             $resolvedShipping = (new SallaService())->resolveShippingAddressForChannel(
                 $commerceChannel,
                 (string) $updatedCheckoutState['address'],
@@ -1779,8 +1780,10 @@ class ProcessAutoReply implements ShouldQueue
             );
             if ($resolvedShipping && !empty($resolvedShipping['city_id'])) {
                 $updatedCheckoutState['delivery_city'] = (string) $resolvedShipping['city_id'];
+                $updatedCheckoutState['delivery_country_code'] = $resolvedShipping['country_code'] ?? null;
             } else {
                 unset($updatedCheckoutState['delivery_city']);
+                unset($updatedCheckoutState['delivery_country_code']);
             }
         }
         $checkoutState = $updatedCheckoutState;
@@ -2805,10 +2808,6 @@ $aiResponse = $intro
             $aiResponse = $detectedLanguage === 'arabic'
                 ? 'من فضلك اذكر الدولة والمدينة التي سيتم التوصيل إليها حتى أتمكن من متابعة الطلب.'
                 : 'Please tell me the country and city for delivery so I can continue with the order.';
-        } elseif ($sallaCheckoutActive && $addressGeocodingStatus === 'not_found') {
-            $aiResponse = $detectedLanguage === 'arabic'
-                ? 'لم أتمكن من تحديد المدينة. من فضلك أرسل اسم المدينة فقط؛ لا تحتاج إلى إرسال إحداثيات أو رابط خرائط.'
-                : "I couldn't identify the delivery city. Please send the city name only; you don't need to provide coordinates or a map link.";
         }
 
         // ── IMAGE SEND VERIFICATION (fixes: bot claiming "here are the photos"
@@ -3169,17 +3168,19 @@ $aiResponse = $intro
                     // check, which could silently collapse to an empty set and
                     // produce a vague, unfixable message, trapping the customer
                     // in an infinite "confirm order" loop.)
-                    $stillMissing = array_values(array_unique((array) ($orderData['missing_fields'] ?? [])));
+                    $stillMissing = array_values(array_diff(
+                        array_unique((array) ($orderData['missing_fields'] ?? [])),
+                        ['geo_coordinates']
+                    ));
                     $requestedFields = array_values(array_unique(array_map(
                         fn ($field) => $labels[$field] ?? str_replace('_', ' ', (string) $field),
                         $stillMissing
                     )));
                     if ($requestedFields === []) {
-                        $requestedFields = [$detectedLanguage === 'arabic'
-                            ? 'بيانات العنوان التي طلبها المتجر'
-                            : 'a corrected delivery detail requested by the store'];
-                    }
-                    if ($detectedLanguage === 'arabic') {
+                        $aiResponse = $detectedLanguage === 'arabic'
+                            ? 'لم يتم إرسال الطلب بعد؛ تعذّر على نظام الشحن تحديد موقع العنوان تلقائيًا. وصلني اسم المدينة والعنوان، فلا تحتاج إلى إرسال إحداثيات. راجع المدينة والحي والشارع، وإذا كانت صحيحة أقدر أوصلك بموظف يكمل معك.'
+                            : 'The order has not been submitted; the shipping system could not locate the address automatically. I received the city and address, so you do not need to send coordinates. Please check the city, district, and street; if they are correct, I can connect you with a team member to complete the order.';
+                    } elseif ($detectedLanguage === 'arabic') {
                         $aiResponse = 'لم يتم إرسال الطلب بعد. طلب المتجر هذه البيانات الإضافية فقط: ' . implode('، ', $requestedFields) . '. أرسلها في رسالة واحدة من فضلك.';
                     } else {
                         $aiResponse = 'The order has not been submitted yet. The store requires these additional details: ' . implode(', ', $requestedFields) . '. Please send them in one message.';
@@ -4663,7 +4664,10 @@ $aiResponse = $intro
                         $knownRequired = is_array($conversation->fresh()->checkout_state)
                             ? (array) ($conversation->fresh()->checkout_state['salla_required_fields'] ?? [])
                             : [];
-                        $mergedRequired = array_values(array_unique(array_merge($knownRequired, (array) $sallaRes['missing_fields'])));
+                        $mergedRequired = array_values(array_diff(
+                            array_unique(array_merge($knownRequired, (array) $sallaRes['missing_fields'])),
+                            ['geo_coordinates']
+                        ));
                         $stateWithRequired = is_array($conversation->fresh()->checkout_state) ? $conversation->fresh()->checkout_state : [];
                         $stateWithRequired['salla_required_fields'] = $mergedRequired;
                         $stateWithRequired['confirmation_state'] = 'collecting_info';

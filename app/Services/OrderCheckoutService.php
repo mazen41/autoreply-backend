@@ -244,6 +244,29 @@ class OrderCheckoutService
             }
         }
 
+        // The destination city is stronger evidence than the customer's SIM
+        // country. This matters when, for example, an Egyptian number is used
+        // for delivery to Riyadh. Keep this list aligned with the city aliases
+        // accepted by extractDeliveryCity().
+        $city = mb_strtolower((string) $this->extractDeliveryCity($address));
+        $cityCountry = [
+            'Saudi Arabia' => ['riyadh', 'jeddah', 'mecca', 'medina', 'dammam', 'al khobar', 'al hofuf', 'taif', 'tabuk', 'abha'],
+            'Egypt' => ['alexandria', 'cairo', 'giza', 'port said', 'mansoura', 'tanta', 'asyut', 'luxor', 'aswan', 'suez', 'ismailia', 'fayoum'],
+            'United Arab Emirates' => ['dubai', 'abu dhabi', 'sharjah'],
+            'Kuwait' => ['kuwait city'], 'Qatar' => ['doha'], 'Bahrain' => ['manama'], 'Oman' => ['muscat'],
+            'Jordan' => ['amman'], 'Lebanon' => ['beirut'], 'Iraq' => ['baghdad'], 'Syria' => ['damascus'],
+            'Tunisia' => ['tunis'], 'Algeria' => ['algiers'], 'Morocco' => ['casablanca'], 'Sudan' => ['khartoum'],
+        ];
+        foreach ($cityCountry as $countryName => $cities) {
+            if (in_array($city, $cities, true)) {
+                foreach ($countries as $country) {
+                    if ($country['name'] === $countryName) {
+                        return $country;
+                    }
+                }
+            }
+        }
+
         $phoneDigits = preg_replace('/\D+/', '', (string) $phone);
         if (str_starts_with($phoneDigits, '00')) {
             $phoneDigits = substr($phoneDigits, 2);
@@ -692,22 +715,15 @@ class OrderCheckoutService
         $requiredFields = self::REQUIRED_FIELDS;
 
         // A base Salla order needs name, phone and address; email is optional.
-        // Saudi National Address fields are collected before submission so
-        // the store's preflight never starts an order with known-missing data.
+        // Ask for additional Salla fields only after this store has explicitly
+        // rejected them. The app cannot assume every Saudi store requires the
+        // same National Address fields; coordinates are internal lookup data.
         if ($requireSallaShippingDetails && $sallaRequiredFields !== []) {
+            $sallaRequiredFields = array_values(array_filter(
+                $sallaRequiredFields,
+                static fn ($field) => $field !== 'geo_coordinates'
+            ));
             $requiredFields = array_values(array_unique(array_merge($requiredFields, $sallaRequiredFields)));
-        }
-        if ($requireSallaShippingDetails) {
-            $country = $this->deliveryCountryForAddress(
-                (string) ($normalizedState['address'] ?? $normalizedState['customer_address'] ?? ''),
-                (string) ($normalizedState['phone'] ?? $normalizedState['customer_phone'] ?? ''),
-            );
-            if (($country['dial'] ?? null) === '966') {
-                $requiredFields = array_values(array_unique(array_merge($requiredFields, [
-                    'delivery_city', 'street_number', 'building_number', 'block', 'short_address',
-                    'additional_number', 'postal_code', 'geo_coordinates',
-                ])));
-            }
         }
 
         $fieldAliases = [

@@ -817,6 +817,22 @@ class SallaService
             }
         }
 
+        // The destination city is stronger evidence than the customer's SIM
+        // country. A customer can use an Egyptian number for a Saudi delivery.
+        $locationCountry = app(OrderCheckoutService::class)
+            ->resolveDeliveryLocation($freeformAddress, null)['country'] ?? null;
+        $locationCodes = [
+            'Egypt' => 'EG', 'Saudi Arabia' => 'SA', 'United Arab Emirates' => 'AE',
+            'Kuwait' => 'KW', 'Qatar' => 'QA', 'Bahrain' => 'BH', 'Oman' => 'OM',
+            'Yemen' => 'YE', 'Iraq' => 'IQ', 'Syria' => 'SY', 'Jordan' => 'JO',
+            'Lebanon' => 'LB', 'Palestine' => 'PS', 'Libya' => 'LY', 'Tunisia' => 'TN',
+            'Algeria' => 'DZ', 'Morocco' => 'MA', 'Sudan' => 'SD', 'Somalia' => 'SO',
+            'Djibouti' => 'DJ', 'Comoros' => 'KM', 'Mauritania' => 'MR',
+        ];
+        if (is_string($locationCountry) && isset($locationCodes[$locationCountry])) {
+            return $locationCodes[$locationCountry];
+        }
+
         return null;
     }
 
@@ -936,10 +952,9 @@ class SallaService
                 'channel_id' => $channel->id,
                 'country_id' => (int) $countryId,
                 'country_code' => $countryCode,
-                'address'    => $freeformAddress,
                 'catalog_synced' => $catalogHealthy,
                 'cities_checked' => $catalogHealthy ? (int) ($catalog->saved_city_count ?? 0) : 0,
-                'available_city_names_sample' => $cities->take(30)->map(fn ($city) => $city->name)->values()->all(),
+                'candidate_count' => $cities->count(),
             ]);
             return null;
         }
@@ -965,6 +980,7 @@ class SallaService
         $addressData = array_filter([
             'city_id'       => $matchedCityId,
             'country_id'    => (int) $countryId,
+            'country_code'  => $countryCode,
             'street_number' => $streetNumber,
             'block'         => $block,
             'postal_code'   => $postalCode,
@@ -1018,16 +1034,21 @@ class SallaService
         }
 
         $freeformAddress = $checkoutState['address'] ?? '';
-        $countryCode = SallaPhoneHelper::getCountryCode($phone) ?? 'SA';
         $shippingAddress = $this->resolveShippingAddressForChannel($channel, $freeformAddress, $phone);
 
         if (!$shippingAddress) {
             Log::warning('SallaService: shipping address could not be confidently mapped to merchant Salla city/fields', [
                 'channel_id' => $channel->id,
-                'address'    => $freeformAddress,
+                'address_present' => trim($freeformAddress) !== '',
             ]);
             return null;
         }
+
+        $countryCode = (string) ($shippingAddress['country_code']
+            ?? $this->countryFromAddress($freeformAddress)
+            ?? SallaPhoneHelper::getCountryCode($phone)
+            ?? 'SA');
+        $phoneCountryCode = SallaPhoneHelper::getCountryCode($phone) ?? 'SA';
 
         $postalCode = $checkoutState['postal_code'] ?? $shippingAddress['postal_code'] ?? null;
         $coordinates = $checkoutState['geo_coordinates'] ?? null;
@@ -1123,7 +1144,7 @@ class SallaService
         if ($normalizedLineItems === [] && !$productId) {
             Log::warning('SallaService: missing salla_product_id for order creation', [
                 'channel_id' => $channel->id,
-                'checkout_state' => $checkoutState,
+                'checkout_state_keys' => array_keys($checkoutState),
             ]);
             return null;
         }
@@ -1301,7 +1322,7 @@ class SallaService
             ], fn ($value) => !is_null($value) && $value !== ''),
             'receiver' => array_filter([
                 'name'         => $fullName,
-                'country_code' => $countryCode,
+                'country_code' => $phoneCountryCode,
                 'phone'        => $receiverPhone,
                 'email'        => $email,
                 'notify'       => false,
@@ -1386,13 +1407,13 @@ class SallaService
 
             // Pre-submit check: ask for missing required fields before any Salla request.
             $requiredFields = (array) ($data['salla_required_fields'] ?? []);
-            $shippingCountryCode = $this->countryFromAddress($address) ?? SallaPhoneHelper::getCountryCode($phone);
-            if ($shippingCountryCode === 'SA') {
-                $requiredFields = array_merge($requiredFields, [
-                    'street_number', 'building_number', 'block', 'short_address',
-                    'additional_number', 'postal_code', 'geo_coordinates',
-                ]);
-            }
+            // Collect provider-specific fields only after Salla explicitly
+            // rejects them. Saudi stores do not all require the same address
+            // fields, and coordinates are always resolved internally.
+            $requiredFields = array_values(array_filter(
+                $requiredFields,
+                static fn ($field) => $field !== 'geo_coordinates'
+            ));
             $presubmitMissing = SallaOrderValidator::missingFields(
                 $data,
                 $requiredFields
@@ -1510,7 +1531,6 @@ class SallaService
             Log::warning('SALLA_ORDER_CREATE_VALIDATION_FAILED', [
                 'channel_id' => $channel->id,
                 'salla_fields' => array_keys($e->fields),
-                'salla_field_details' => $e->fields,
                 'mapped_missing_fields' => $missingFields,
             ]);
 

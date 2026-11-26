@@ -1725,7 +1725,8 @@ class SallaService
 
         return collect($options)
             ->filter(fn ($option) => is_array($option)
-                && (($option['purpose'] ?? null) === 'variants' || !empty($option['required'])))
+                && (in_array(mb_strtolower((string) ($option['purpose'] ?? '')), ['variant', 'variants'], true)
+                    || !empty($option['required'])))
             ->map(function (array $option): array {
                 $values = collect($option['values'] ?? [])
                     ->filter(fn ($value) => is_array($value) && empty($value['is_out_of_stock']))
@@ -1740,7 +1741,7 @@ class SallaService
                 return [
                     'id' => (string) ($option['id'] ?? ''),
                     'name' => trim((string) ($option['name'] ?? 'Product option')),
-                    'purpose' => (string) ($option['purpose'] ?? ''),
+                    'purpose' => mb_strtolower((string) ($option['purpose'] ?? '')),
                     'values' => $values,
                 ];
             })

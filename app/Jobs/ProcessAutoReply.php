@@ -733,8 +733,9 @@ class ProcessAutoReply implements ShouldQueue
         $orderStatusKeywords = [
             'order status', 'status of my order', 'track my order', 'track order',
             'where is my order', 'where is the order', 'when will my order',
+            'was my order placed', 'was the order submitted', 'did my order go through', 'is my order confirmed', 'verify my order', 'check my order',
             'حالة الطلب', 'حالة طلبي', 'تتبع الطلب', 'تتبع طلبي', 'وين طلبي', 'فين طلبي',
-            'أين طلبي', 'اين طلبي', 'متى يوصل طلبي', 'متى يصل الطلب',
+            'أين طلبي', 'اين طلبي', 'متى يوصل طلبي', 'متى يصل الطلب', 'هل تم إرسال طلبي', 'هل تم ارسال طلبي', 'هل تأكد طلبي', 'هل تأكد الطلب',
         ];
         // Keywords that indicate customer wants to PLACE a new order / buy a SPECIFIC item.
         // ⚠️  Do NOT add general product-browse phrases here ("show me products", "what do you
@@ -742,10 +743,10 @@ class ProcessAutoReply implements ShouldQueue
         // adding them here causes "fetch the products" to be misclassified as place_order,
         // which triggers an unwarranted escalation.
         $placeOrderKeywords = [
-            'place an order','place the order','i want to order','i want to buy','purchase','i\'d like to order',
+            'place an order','place the order','i want to order','i want to buy','purchase','i\'d like to order', 'i would like to order', 'would like to order',
             'i\'d like to buy','i\'ll take','i will take','add to cart','i wanna order','i wanna buy',
             'i wanna place','okay now i wanna','now i wanna',
-            'عايز اطلب','ابي اشتري','ابغا اشتري','اشتري','اطلب منكم',
+            'عايز اطلب','عاوز اطلب','ابي اشتري','ابي اطلب','ابغا اشتري','ابغى اطلب','أبغى أطلب','ودي اطلب','ودي أطلب','اشتري','اطلب منكم',
         ];
 
         // ── AGGREGATE INTENT DETECTION ────────────────────────────────────────
@@ -820,7 +821,7 @@ class ProcessAutoReply implements ShouldQueue
         // such as "what is my order status?" and sent them down the store-wide
         // order-list path. Explicit status/tracking requests always win.
         $isExplicitOrderStatusRequest = (bool) preg_match(
-            '/\b(?:order\s+)?status\b|\bwhere\s+(?:is|are)\s+(?:my|the)\s+orders?\b|\bwhen\s+will\s+(?:my|the)\s+order\b|\btrack(?:ing)?\s+(?:my\s+|the\s+)?orders?\b|(?:حالة\s*(?:الطلب|طلبي)|وين\s*(?:طلبي|الطلب)|فين\s*(?:طلبي|الطلب)|أين\s*(?:طلبي|الطلب)|اين\s*(?:طلبي|الطلب)|متى\s*(?:يوصل|يصل)\s*(?:طلبي|الطلب)|تتبع\s*(?:طلبي|الطلب))/iu',
+            '/\b(?:order\s+)?status\b|\bwhere\s+(?:is|are)\s+(?:my|the)\s+orders?\b|\bwhen\s+will\s+(?:my|the)\s+order\b|\btrack(?:ing)?\s+(?:my\s+|the\s+)?orders?\b|\b(?:was\s+(?:my|the)\s+order\s+(?:placed|submitted)|did\s+my\s+order\s+go\s+through|is\s+my\s+order\s+confirmed|(?:verify|check)\s+my\s+order)\b|(?:حالة\s*(?:الطلب|طلبي)|وين\s*(?:طلبي|الطلب)|فين\s*(?:طلبي|الطلب)|أين\s*(?:طلبي|الطلب)|اين\s*(?:طلبي|الطلب)|متى\s*(?:يوصل|يصل)\s*(?:طلبي|الطلب)|تتبع\s*(?:طلبي|الطلب)|هل\s*(?:تم\s*(?:إرسال|ارسال|تأكيد|تاكيد)|تأكد)\s*(?:طلبي|الطلب))/iu',
             $message->content
         );
         $isOrderAggregate = !$isExplicitOrderStatusRequest && (
@@ -897,7 +898,7 @@ class ProcessAutoReply implements ShouldQueue
         // when they contain a phone number, delivery, or the word "order".
         // A real status question is recognized by its status/tracking wording.
         $incomingCheckoutDetails = (bool) preg_match(
-            '/\b(?:phone|mobile|address|delivery\s+address|building|street|postal|zip|cash\s+on\s+delivery|cod)\b|رقم\s*(?:الجوال|الهاتف)|(?:العنوان|عنوان\s*التوصيل|رقم\s*(?:المبنى|الشارع)|الدفع\s*عند\s*الاستلام)/iu',
+            '/\b(?:full\s+name|name|phone|mobile|address|delivery\s+address|city|building|street|postal|zip|cash\s+on\s+delivery|cod)\b|رقم\s*(?:الجوال|الهاتف)|(?:الاسم|اسمي|المدينة|مدينة\s*التوصيل|العنوان|عنوان\s*التوصيل|رقم\s*(?:المبنى|الشارع)|الدفع\s*عند\s*الاستلام)/iu',
             (string) $message->content
         );
         if (!empty($checkoutState['salla_product_id']) && $incomingCheckoutDetails && !$isExplicitOrderStatusRequest) {
@@ -940,7 +941,7 @@ class ProcessAutoReply implements ShouldQueue
             $isProductAggregate = false;
             $isOrderAggregate = false;
             $isOrderStatus = false;
-        } elseif ($referenceIntent === 'question') {
+        } elseif ($referenceIntent === 'question' && !$isPlaceOrder) {
             $isPlaceOrder = false;
         }
 
@@ -2034,7 +2035,7 @@ class ProcessAutoReply implements ShouldQueue
 
                 $variantOptions = array_values(array_filter(
                     $sallaProductOptions,
-                    static fn (array $option): bool => ($option['purpose'] ?? '') === 'variants'
+                    static fn (array $option): bool => in_array(($option['purpose'] ?? ''), ['variant', 'variants'], true)
                 ));
                 if ($variantOptions !== []) {
                     $selectedVariantValueIds = [];
@@ -2084,6 +2085,13 @@ class ProcessAutoReply implements ShouldQueue
                     $updatedCheckoutState['salla_option_titles'] = array_values($savedTitles);
                 }
             } catch (\Throwable $e) {
+                if ($isPlaceOrder || ($updatedCheckoutState['confirmation_state'] ?? null) === 'selecting_salla_option') {
+                    // An option lookup failure must not silently fall back to
+                    // the base product price or allow an unpriced variant order.
+                    $sallaVariantPriceUnavailable = true;
+                    $updatedCheckoutState['salla_variant_price_unresolved'] = true;
+                    $conversation->update(['checkout_state' => $updatedCheckoutState]);
+                }
                 Log::warning('ProcessAutoReply: could not inspect Salla product options', [
                     'conversation_id' => $conversation->id,
                     'connection_id' => $commerceChannel->id,
@@ -2712,15 +2720,30 @@ class ProcessAutoReply implements ShouldQueue
             }
         }
 
+        // Respond directly to price objections so product disambiguation or
+        // provider outages cannot ignore the objection or expose internal IDs.
+        $isDiscountObjection = (bool) preg_match(
+            '/\b(?:discount|cheaper|too\s+expensive|too\s+much|lower\s+price|price\s+is\s+high|any\s+offer)\b|(?:خصم|أرخص|ارخص|غالي|غالية|مكلف|السعر\s+مرتفع|فيه\s+عرض)/iu',
+            (string) $message->content
+        );
+        if ($sallaChannel && $isDiscountObjection) {
+            $reply = $detectedLanguage === 'arabic'
+                ? 'فاهم إن السعر ممكن يكون أعلى من ميزانيتك. ما عندي خصم مؤكد من المتجر أقدر أوعدك به. تحب أساعدك تبحث عن خيار أقل سعرًا؟'
+                : "I understand the price may be over your budget. I don't have a verified store discount to offer. Would you like help finding a lower-priced option?";
+            $this->sendSallaDeterministicReply($channel, $conversation, $reply, $detectedLanguage, 'salla_discount_objection');
+            return;
+        }
+
         // Salla-exclusive turns intentionally omit unrelated business memory,
         // and this integration does not yet load delivery/payment policy
         // settings from Salla. Answer policy questions honestly instead of
         // letting the model fill the gap with generic industry assumptions.
         $isStorePolicyQuestion = (bool) preg_match(
-            '/\b(?:delivery\s*time|shipping\s*time|how\s+long\s+(?:does\s+)?(?:delivery|shipping|it\s+take)|when\s+(?:will\s+)?(?:it|my\s+order)\s+arrive|payment\s+methods?|pay\s+by\s+card|accept\s+(?:cards?|cash\s+on\s+delivery)|cash\s+on\s+delivery|return\s+policy|refund\s+policy|exchange\s+policy)\b|(?:كم\s+يوم|مدة\s+(?:التوصيل|الشحن)|متى\s+(?:يوصل|يصل)|طرق\s+الدفع|وسائل\s+الدفع|الدفع\s+ب(?:البطاقة|بطاقة)|تقبلون\s+بطاقات?|الدفع\s+عند\s+الاستلام|سياسة\s+(?:الاسترجاع|الاستبدال)|استرجاع|استبدال)/iu',
+            '/\b(?:delivery\s*time|shipping\s*time|how\s+long\s+(?:does\s+)?(?:delivery|shipping|it\s+take)|when\s+(?:will\s+)?(?:it|my\s+order)\s+arrive|payment\s+methods?|pay\s+by\s+card|accept\s+(?:cards?|cash\s+on\s+delivery)|return\s+policy|refund\s+policy|exchange\s+policy)\b|(?:كم\s+يوم|مدة\s+(?:التوصيل|الشحن)|متى\s+(?:يوصل|يصل)|طرق\s+الدفع|وسائل\s+الدفع|الدفع\s+ب(?:البطاقة|بطاقة)|تقبلون\s+بطاقات?|(?:هل|تقبلون).{0,20}الدفع\s+عند\s+الاستلام|سياسة\s+(?:الاسترجاع|الاستبدال)|استرجاع|استبدال)/iu',
             (string) $message->content
         );
-        if ($sallaChannel && $isStorePolicyQuestion) {
+        $isCheckoutOrPurchaseTurn = $isPlaceOrder || $isExplicitOrderConfirmationMessage || $incomingCheckoutDetails;
+        if ($sallaChannel && $isStorePolicyQuestion && !$isCheckoutOrPurchaseTurn && !$isOrderStatus) {
             $policyReply = $detectedLanguage === 'arabic'
                 ? 'ما عندي حاليًا معلومة مؤكدة من المتجر عن سياسة التوصيل أو الدفع أو الاسترجاع، وما أبغى أعطيك معلومة غير دقيقة. أقدر أساعدك في سؤال آخر عن المنتجات أو الطلب.'
                 : "I don't have verified store information about delivery, payment, or returns right now, and I don't want to give you an inaccurate answer. I can still help with products or your order.";
@@ -3101,8 +3124,7 @@ if (!$isProductBrowseMessage && $commerceChannel && !$summaryConfirmTurn) {
                 $options = [];
                 foreach (array_values($referenceResolution['candidates']) as $index => $candidate) {
                     $options[] = ($index + 1) . '. ' . ($candidate['name'] ?? 'Product') . ' — '
-                        . ($candidate['price'] ?? '?') . ' ' . ($candidate['currency'] ?? '')
-                        . (!empty($candidate['sku']) ? ' (SKU: ' . $candidate['sku'] . ')' : '');
+                        . ($candidate['price'] ?? '?') . ' ' . ($candidate['currency'] ?? '');
                 }
                 if ($options) {
                     $aiResult['reply'] = $detectedLanguage === 'arabic'

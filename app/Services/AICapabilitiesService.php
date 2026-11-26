@@ -448,8 +448,7 @@ ROLE;
             $p .= "Ask the customer to choose one product by number. Do not guess or begin checkout. List these exact options with prices:\n";
             foreach (array_values($context['referenced_product_candidates']) as $index => $candidate) {
                 $p .= ($index + 1) . '. ' . ($candidate['name'] ?? 'Product') . ' — '
-                    . ($candidate['price'] ?? '?') . ' ' . ($candidate['currency'] ?? '')
-                    . (!empty($candidate['sku']) ? ' (SKU: ' . $candidate['sku'] . ')' : '') . "\n";
+                    . ($candidate['price'] ?? '?') . ' ' . ($candidate['currency'] ?? '') . "\n";
             }
             $p .= "Set intent=question and needs_escalation=false.\n\n";
         } elseif ($referenceInstruction) {
@@ -467,9 +466,6 @@ ROLE;
                 $p .= $rp['available']
                     ? '• Availability: in stock (' . (int) ($rp['stock_quantity'] ?? 0) . ")\n"
                     : "• Availability: currently out of stock. Do not start checkout for this item.\n";
-            }
-            if (!empty($rp['sku'])) {
-                $p .= '• SKU: ' . $rp['sku'] . "\n";
             }
             if ($referenceResolution === 'resolved_recent') {
                 $p .= "This was inferred from one recent product message, not an explicit quote. Ask the customer to confirm this product before starting checkout.\n";

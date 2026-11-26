@@ -862,6 +862,17 @@ class ProcessAutoReply implements ShouldQueue
             if (str_contains($msgLower, $kw)) { $isPlaceOrder = true; break; }
         }
 
+        // An exact customer confirmation outranks the generic `order` status
+        // keyword match (e.g. "confirm order" contains both intents).
+        $isExplicitOrderConfirmationMessage = OrderCheckoutService::isExplicitOrderConfirmation((string) $message->content);
+        if ($isExplicitOrderConfirmationMessage) {
+            $isOrderStatus = false;
+            $isPlaceOrder = true;
+            $isOrderAggregate = false;
+            $isProductAggregate = false;
+        }
+        $isExplicitOrderStatusMessage = $isOrderStatus && !$isOrderAggregate && !$isProductAggregate;
+
         // Aggregate intent is more specific than the generic order-status / place-order
         // keyword buckets (which share words like "order" and "products") — it always wins.
         if ($isProductAggregate || $isOrderAggregate) {
@@ -881,6 +892,18 @@ class ProcessAutoReply implements ShouldQueue
             $isOrderStatus = false;
         } elseif ($referenceIntent === 'question') {
             $isPlaceOrder = false;
+        }
+
+        // A product reference may provide context, but it must not overwrite
+        // an explicit status question or a confirmation of the held checkout.
+        if ($isExplicitOrderConfirmationMessage) {
+            $isOrderStatus = false;
+            $isPlaceOrder = true;
+        } elseif ($isExplicitOrderStatusMessage) {
+            $isOrderStatus = true;
+            $isPlaceOrder = false;
+            $isProductAggregate = false;
+            $isOrderAggregate = false;
         }
 
         if ($referenceResolution['is_pointer'] || $quotedMessageId) {
@@ -1149,19 +1172,17 @@ class ProcessAutoReply implements ShouldQueue
                         Log::warning('ProcessAutoReply: Salla order lookup failed', ['exception_type' => get_class($e)]);
                     }
                 } else {
-                    // Non-WhatsApp: scan conversation for order number or phone
-                    $recentMessages = Message::where('conversation_id', $conversation->id)
-                        ->orderBy('created_at', 'desc')->take(6)->get();
-
+                    // Use lookup details only when the customer supplied them
+                    // with this status request. A held checkout's old address,
+                    // postal code, or phone must not silently become a lookup.
+                    $lookupText = (string) $message->content;
                     $orderNumberMatch = null;
                     $phoneMatch       = null;
-                    foreach ($recentMessages as $m) {
-                        if (!$orderNumberMatch && preg_match('/\b(?:order|orders|طلب|رقم\s+الطلب)\s*(?:number|no\.?|#|id)?\s*:?\s*#?\s*(\d{4,10})\b/iu', $m->content, $mo)) {
-                            $orderNumberMatch = $mo[1];
-                        }
-                        if (!$phoneMatch && preg_match('/\b(05\d{8}|9665\d{8}|\+9665\d{8})\b/', $m->content, $mp)) {
-                            $phoneMatch = preg_replace('/[^0-9]/', '', $mp[1]);
-                        }
+                    if (preg_match('/\b(?:order|orders|طلب|رقم\s+الطلب)\s*(?:number|no\.?|#|id)?\s*:?\s*#?\s*(\d{4,10})\b/iu', $lookupText, $mo)) {
+                        $orderNumberMatch = $mo[1];
+                    }
+                    if (preg_match('/\b(05\d{8}|9665\d{8}|\+9665\d{8})\b/', $lookupText, $mp)) {
+                        $phoneMatch = preg_replace('/[^0-9]/', '', $mp[1]);
                     }
 
                     if ($orderNumberMatch || $phoneMatch) {
@@ -2985,7 +3006,7 @@ $aiResponse = $intro
             }
         }
 
-        if ($sallaCheckoutActive && $addressGeocodingStatus === 'country_unknown') {
+        if ($sallaCheckoutActive && !$isOrderStatus && $addressGeocodingStatus === 'country_unknown') {
             $aiResponse = $detectedLanguage === 'arabic'
                 ? 'من فضلك اذكر الدولة والمدينة التي سيتم التوصيل إليها حتى أتمكن من متابعة الطلب.'
                 : 'Please tell me the country and city for delivery so I can continue with the order.';
@@ -3443,6 +3464,7 @@ $aiResponse = $intro
         // Salla's required receiver/shipping details have been collected.
         if (
             $sallaChannel
+            && !$isOrderStatus
             && !empty($updatedCheckoutState['salla_product_id'])
             && empty($fieldStatus['is_complete'])
             && !$isProductBrowseMessage

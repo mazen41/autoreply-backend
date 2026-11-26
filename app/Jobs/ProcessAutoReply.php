@@ -2013,40 +2013,151 @@ class ProcessAutoReply implements ShouldQueue
                 $savedTitles = [];
                 $selectingSallaOption = ($updatedCheckoutState['confirmation_state'] ?? null) === 'selecting_salla_option';
 
+                // ── DETERMINISTIC SALLA OPTION MATCHER ──────────────────────────────
+                // Normalise a customer reply string: Arabic-Indic → Latin digits,
+                // dash variants and extra whitespace → single space, strip punctuation.
+                $normaliseSallaReply = static function (string $raw): string {
+                    $s = strtr(mb_strtolower(trim($raw)), [
+                        '٠' => '0', '١' => '1', '٢' => '2', '٣' => '3', '٤' => '4',
+                        '٥' => '5', '٦' => '6', '٧' => '7', '٨' => '8', '٩' => '9',
+                        '–' => '-', '—' => '-',
+                    ]);
+                    // Replace dash+spaces combos and strip punctuation except letters/digits/space
+                    $s = preg_replace('/\s*-\s*/', ' ', $s) ?? $s;
+                    $s = preg_replace('/[^\p{L}\p{N} ]+/u', '', $s) ?? $s;
+                    return preg_replace('/\s+/', ' ', trim($s)) ?? $s;
+                };
+
+                // Strip all spaces for compact comparison ("40m" == "40 m").
+                $stripSpaces = static fn (string $s): string => str_replace(' ', '', $s);
+
                 foreach ($sallaProductOptions as $option) {
                     $optionId = (string) $option['id'];
-                    $values = $option['values'];
+                    $values   = $option['values'];
                     $selectedIds = array_values(array_unique(array_intersect(
                         array_map('strval', (array) ($savedSelections[$optionId] ?? [])),
                         array_column($values, 'id')
                     )));
 
-                    if ($selectedIds === [] && $selectingSallaOption) {
-                        $selectionText = strtr(mb_strtolower(trim((string) $message->content)), [
-                            '٠' => '0', '١' => '1', '٢' => '2', '٣' => '3', '٤' => '4',
-                            '٥' => '5', '٦' => '6', '٧' => '7', '٨' => '8', '٩' => '9',
-                        ]);
-                        $index = null;
-                        if (preg_match('/^\s*(?:(?:size|option|choice|المقاس|مقاس|الخيار|الاختيار)\s*)?(\d{1,2})(?:\s*[.)]|\s*\(|\s*$)/iu', $selectionText, $numberMatch)) {
-                            $index = (int) $numberMatch[1] - 1;
-                        }
-                        $normalizedSelection = preg_replace('/[^\p{L}\p{N}]+/u', '', $selectionText) ?? $selectionText;
-                        $matchingValueIds = [];
-                        foreach ($values as $value) {
-                            $normalizedValue = preg_replace('/[^\p{L}\p{N}]+/u', '', mb_strtolower(trim((string) $value['name']))) ?? '';
-                            if ($normalizedValue !== '' && ($normalizedSelection === $normalizedValue
-                                || str_contains($normalizedSelection, $normalizedValue))) {
-                                $matchingValueIds[] = (string) $value['id'];
+                    // ── Attempt to pre-fill from the original order message text ──────
+                    // Rule 7: if the customer said "jacket size M" in their very first
+                    // order message, carry that choice now instead of asking.
+                    if ($selectedIds === [] && !$selectingSallaOption && $startsNewSallaOrder) {
+                        $prefillText  = $normaliseSallaReply((string) $message->content);
+                        $prefillHits  = [];
+                        foreach ($values as $vi => $value) {
+                            $normVal = $normaliseSallaReply((string) $value['name']);
+                            if ($normVal === '') continue;
+                            // Whole-word or token match inside the message.
+                            if (preg_match('/(?<![^\s])\Q' . preg_quote($normVal, '/') . '\E(?![^\s])/u', $prefillText)
+                                || $stripSpaces($prefillText) === $stripSpaces($normVal)
+                            ) {
+                                $prefillHits[] = (string) $value['id'];
                             }
                         }
-                        $matchingValueIds = array_values(array_unique($matchingValueIds));
-                        if (count($matchingValueIds) === 1 && ($index === null || !isset($values[$index])
-                            || (string) $values[$index]['id'] === $matchingValueIds[0])) {
-                            $selectedIds = $matchingValueIds;
-                        } elseif ($matchingValueIds === [] && $index !== null && isset($values[$index])) {
-                            $selectedIds = [(string) $values[$index]['id']];
+                        if (count($prefillHits) === 1) {
+                            $selectedIds = $prefillHits;
+                            $sallaOptionChosenThisMessage = true;
                         }
-                        $sallaOptionChosenThisMessage = $selectedIds !== [];
+                    }
+
+                    // ── Full deterministic reply matching (only during selection state) ──
+                    if ($selectedIds === [] && $selectingSallaOption) {
+                        $rawReply    = (string) $message->content;
+                        $selText     = $normaliseSallaReply($rawReply);
+                        $selCompact  = $stripSpaces($selText);
+
+                        // Build per-value normalised names once.
+                        $normValues = [];
+                        foreach ($values as $vi => $value) {
+                            $normValues[$vi] = [
+                                'id'      => (string) $value['id'],
+                                'normed'  => $normaliseSallaReply((string) $value['name']),
+                                'compact' => $stripSpaces($normaliseSallaReply((string) $value['name'])),
+                                'raw'     => (string) $value['name'],
+                            ];
+                        }
+
+                        // ── Rule 3a/3b: index match ──────────────────────────────────
+                        // Extract a leading integer from the reply.
+                        $index = null;
+                        if (preg_match('/^(?:(?:size|option|choice|المقاس|مقاس|الخيار|الاختيار)\s+)?(\d{1,2})(?:\s|$)/u', $selText, $m)) {
+                            $index = (int) $m[1] - 1;
+                        }
+
+                        // If the reply is JUST an index with no other non-digit tokens,
+                        // accept it immediately (Rule 3a).
+                        $indexOnlyMatch = null;
+                        if ($index !== null && isset($values[$index])) {
+                            $afterIndex = trim(preg_replace('/^(?:(?:size|option|choice|المقاس|مقاس|الخيار|الاختيار)\s+)?\d{1,2}\s*/u', '', $selText) ?? '');
+                            if ($afterIndex === '') {
+                                // Pure index reply.
+                                $indexOnlyMatch = (string) $values[$index]['id'];
+                            } else {
+                                // Rule 3b: index + trailing text — accept if trailing
+                                // text is consistent with (or a substring of) that option.
+                                $indexedNorm    = $normValues[$index]['normed'];
+                                $indexedCompact = $normValues[$index]['compact'];
+                                $trailCompact   = $stripSpaces($afterIndex);
+                                $consistent     = ($afterIndex === $indexedNorm)
+                                    || ($trailCompact === $indexedCompact)
+                                    || str_contains($indexedCompact, $trailCompact)
+                                    || str_contains($trailCompact, $indexedCompact);
+                                if ($consistent) {
+                                    $indexOnlyMatch = (string) $values[$index]['id'];
+                                }
+                            }
+                        }
+
+                        if ($indexOnlyMatch !== null) {
+                            $selectedIds = [$indexOnlyMatch];
+                            $sallaOptionChosenThisMessage = true;
+                        } else {
+                            // ── Rules 3c/3d/3e: label / token matching ───────────────
+                            $labelHits = [];
+                            foreach ($normValues as $vi => $nv) {
+                                if ($nv['normed'] === '') continue;
+                                // 3c: exact full label match (with or without spaces).
+                                if ($selText === $nv['normed'] || $selCompact === $nv['compact']) {
+                                    $labelHits[] = $nv['id'];
+                                    continue;
+                                }
+                                // 3d/3e: reply is a token that appears in the label OR
+                                // the label is a token that appears in the reply.
+                                // Guard: token must be a whole word boundary.
+                                $selWords   = explode(' ', $selCompact);
+                                $labelWords = explode(' ', $nv['compact']);
+                                foreach ($selWords as $sw) {
+                                    if ($sw !== '' && in_array($sw, $labelWords, true)) {
+                                        $labelHits[] = $nv['id'];
+                                        break;
+                                    }
+                                }
+                            }
+                            $labelHits = array_values(array_unique($labelHits));
+
+                            if (count($labelHits) === 1) {
+                                // If we also had an index, make sure they agree.
+                                if ($index === null
+                                    || !isset($values[$index])
+                                    || (string) $values[$index]['id'] === $labelHits[0]
+                                ) {
+                                    $selectedIds = $labelHits;
+                                    $sallaOptionChosenThisMessage = true;
+                                } else {
+                                    // Index and label disagree → ambiguous, ask again (handled below).
+                                    $labelHits = [$labelHits[0], (string) $values[$index]['id']];
+                                }
+                            }
+
+                            // Multiple hits → ambiguous. Store the candidates so the
+                            // re-prompt can show only the matching subset.
+                            if (count($labelHits) > 1 && $selectedIds === []) {
+                                $updatedCheckoutState['salla_option_ambiguous_ids'] = $labelHits;
+                            } elseif ($selectedIds !== []) {
+                                unset($updatedCheckoutState['salla_option_ambiguous_ids']);
+                            }
+                        }
                     }
 
                     if ($selectedIds === []) {
@@ -2055,6 +2166,8 @@ class ProcessAutoReply implements ShouldQueue
                         continue;
                     }
 
+                    // Clear ambiguous hint on success.
+                    unset($updatedCheckoutState['salla_option_ambiguous_ids']);
                     $savedSelections[$optionId] = $selectedIds;
                     $selectedValue = collect($values)->firstWhere('id', $selectedIds[0]);
                     if ($selectedValue) {
@@ -2112,13 +2225,23 @@ class ProcessAutoReply implements ShouldQueue
                 if ($savedSelections !== []) {
                     $updatedCheckoutState['salla_options'] = $savedSelections;
                     $updatedCheckoutState['salla_option_titles'] = array_values($savedTitles);
+                    // Clear selection-loop counters on a successful match.
+                    if ($sallaOptionChosenThisMessage) {
+                        unset(
+                            $updatedCheckoutState['salla_option_failed_attempts'],
+                            $updatedCheckoutState['salla_option_ambiguous_ids']
+                        );
+                    }
                 } elseif ($startsNewSallaOrder) {
                     // Drop the previous checkout's size/colour and its variant price.
                     unset(
                         $updatedCheckoutState['salla_options'],
                         $updatedCheckoutState['salla_option_titles'],
                         $updatedCheckoutState['salla_variant_id'],
-                        $updatedCheckoutState['salla_variant_price']
+                        $updatedCheckoutState['salla_variant_price'],
+                        $updatedCheckoutState['salla_option_failed_attempts'],
+                        $updatedCheckoutState['salla_option_ambiguous_ids'],
+                        $updatedCheckoutState['salla_offered_options']
                     );
                 }
             } catch (\Throwable $e) {
@@ -3574,13 +3697,67 @@ $aiResponse = $intro
             $option = $sallaOptionPrompt;
             $values = $option['values'] ?? [];
             if ($option && $values !== []) {
-                $choices = [];
-                foreach ($values as $index => $value) {
-                    $choices[] = ($index + 1) . '. ' . $value['name'];
+                // ── Rule 1: store offered options in checkout_state so the matcher
+                // has index↔label↔id mapping across turns without re-fetching. ──
+                $offeredMap = [];
+                foreach ($values as $vi => $value) {
+                    $offeredMap[] = [
+                        'index' => $vi + 1,
+                        'id'    => (string) $value['id'],
+                        'name'  => (string) $value['name'],
+                    ];
                 }
-                $aiResponse = $detectedLanguage === 'arabic'
-                    ? 'اختار ' . mb_strtolower($option['name']) . ' المناسب لك، واكتب رقم الاختيار أو اسمه:' . "\n" . implode("\n", $choices)
-                    : 'Which ' . mb_strtolower($option['name']) . ' would you like? Reply with its number or exact name:' . "\n" . implode("\n", $choices);
+                $updatedCheckoutState['salla_offered_options'][$option['id']] = $offeredMap;
+
+                // ── Rules 4 & 6: detect ambiguity vs. repeated failed match ─────
+                $ambiguousIds    = $updatedCheckoutState['salla_option_ambiguous_ids'] ?? [];
+                $failedAttempts  = (int) ($updatedCheckoutState['salla_option_failed_attempts'] ?? 0);
+
+                if ($ambiguousIds !== [] && $failedAttempts === 0) {
+                    // Rule 4: Multiple options matched — show only the ambiguous subset.
+                    $filteredValues  = array_values(array_filter(
+                        $values,
+                        static fn ($v) => in_array((string) $v['id'], $ambiguousIds, true)
+                    ));
+                    $choices = [];
+                    foreach ($filteredValues as $fi => $fv) {
+                        // Keep original index numbers so customer can still use them.
+                        $origIndex = array_search($fv, $values, true);
+                        $choices[] = (($origIndex !== false ? $origIndex : $fi) + 1) . '. ' . $fv['name'];
+                    }
+                    $aiResponse = $detectedLanguage === 'arabic'
+                        ? 'تعددت الخيارات المطابقة. اختر من هذه:' . "\n" . implode("\n", $choices)
+                        : 'A few options matched. Which one did you mean?' . "\n" . implode("\n", $choices);
+                    unset($updatedCheckoutState['salla_option_ambiguous_ids']);
+                } else {
+                    // Rule 6: on second failed match add an example hint.
+                    $updatedCheckoutState['salla_option_failed_attempts'] = $failedAttempts + 1;
+
+                    $choices = [];
+                    foreach ($values as $vi => $value) {
+                        $choices[] = ($vi + 1) . '. ' . $value['name'];
+                    }
+                    $optionNameLower = mb_strtolower((string) $option['name']);
+                    $exampleValue    = $values[0]['name'] ?? '1';
+                    $exampleIndex    = 1;
+
+                    if ($failedAttempts === 0) {
+                        // First time asking.
+                        $aiResponse = $detectedLanguage === 'arabic'
+                            ? 'اختار ' . $optionNameLower . ' المناسب لك، واكتب رقم الاختيار أو اسمه:' . "\n" . implode("\n", $choices)
+                            : 'Which ' . $optionNameLower . ' would you like? Reply with its number or exact name:' . "\n" . implode("\n", $choices);
+                    } elseif ($failedAttempts === 1) {
+                        // Rule 6: second failed attempt — show hint with example.
+                        $aiResponse = $detectedLanguage === 'arabic'
+                            ? 'لم أتمكن من فهم الاختيار. اكتب رقم الخيار (مثل: ' . $exampleIndex . ') أو اسمه (مثل: ' . $exampleValue . '):' . "\n" . implode("\n", $choices)
+                            : 'I couldn\'t match that. Type a number (e.g. ' . $exampleIndex . ') or the exact name (e.g. ' . $exampleValue . '):' . "\n" . implode("\n", $choices);
+                    } else {
+                        // Rule 6: third+ failed attempt — short re-list only.
+                        $aiResponse = $detectedLanguage === 'arabic'
+                            ? 'اختر رقماً:' . "\n" . implode("\n", $choices)
+                            : 'Please choose by number:' . "\n" . implode("\n", $choices);
+                    }
+                }
             }
         }
 

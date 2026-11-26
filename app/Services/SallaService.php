@@ -916,6 +916,20 @@ class SallaService
                     $matchedCityNameLength = 1000;
                 }
             }
+
+            // An explicitly supplied city is authoritative. If it cannot be
+            // resolved uniquely in this country's Salla catalog, stop and
+            // ask for clarification; fuzzy matching the whole address can
+            // otherwise silently send the order to an unrelated city.
+            if (!$matchedCityId) {
+                Log::warning('SALLA_ORDER_CITY_UNRESOLVED', [
+                    'channel_id' => $channel->id,
+                    'country_id' => (int) $countryId,
+                    'city_hint' => $cityHint,
+                    'candidate_count' => isset($hintRows) ? $hintRows->count() : 0,
+                ]);
+                return null;
+            }
         }
         $cities = $catalogHealthy && $countryId
             ? $this->findIndexedCityCandidates((int) $countryId, $normalizedAddress)
@@ -1418,12 +1432,8 @@ class SallaService
                 $shipTo[$nullableField] = null;
             }
         }
-        // Salla's validation rejects `null` for ship_to.block on some stores/couriers even though
-        // the field is logically optional for the customer. Rather than fail checkout, substitute a
-        // safe non-empty placeholder so the order can still be created.
-        if ($shipTo['block'] === null) {
-            $shipTo['block'] = '-';
-        }
+        // Salla documents block as nullable. Do not invent a placeholder: it
+        // makes the address look populated while leaving it incomplete.
         if ($districtId === null) {
             unset($shipTo['district']);
         }
@@ -1530,13 +1540,16 @@ class SallaService
 
             // Pre-submit check: ask for missing required fields before any Salla request.
             $requiredFields = (array) ($data['salla_required_fields'] ?? []);
-            // Collect provider-specific fields only after Salla explicitly
-            // rejects them. Saudi stores do not all require the same address
-            // fields, and coordinates are always resolved internally.
-            $requiredFields = array_values(array_filter(
-                $requiredFields,
-                static fn ($field) => $field !== 'geo_coordinates'
-            ));
+            // Salla's current Create Order contract requires National Address
+            // fields. We collect customer-entered components and require the
+            // application to resolve coordinates before sending an order.
+            if (strtoupper((string) ($shippingAddress['country_code'] ?? '')) === 'SA') {
+                $requiredFields = array_values(array_unique(array_merge($requiredFields, [
+                    'street_number', 'block', 'short_address', 'building_number',
+                    'additional_number', 'postal_code', 'geo_coordinates',
+                ])));
+            }
+            $requiredFields = array_values(array_filter($requiredFields, static fn ($field) => is_string($field) && $field !== ''));
             $presubmitMissing = SallaOrderValidator::missingFields(
                 $data,
                 $requiredFields
@@ -1571,6 +1584,18 @@ class SallaService
             'channel_id' => $channel->id,
             'field_names' => array_keys($data),
         ]);
+        $sentCityId = (int) ($data['ship_to']['city'] ?? 0);
+        $sentCity = $sentCityId > 0
+            ? DB::table('salla_city_reference_cities')->where('salla_city_id', $sentCityId)
+                ->where('country_id', (int) ($data['ship_to']['country'] ?? 0))
+                ->select('name', 'name_en', 'name_ar')->first()
+            : null;
+        Log::info('SALLA_ORDER_CITY_SENT', [
+            'channel_id' => $channel->id,
+            'city_id' => $sentCityId ?: null,
+            'city_name' => $sentCity->name_en ?? $sentCity->name_ar ?? $sentCity->name ?? null,
+            'ship_to_field_names' => array_keys($data['ship_to'] ?? []),
+        ]);
 
         try {
             try {
@@ -1596,6 +1621,11 @@ class SallaService
                 'payment_method' => is_string($res['data']['payment_method'] ?? null)
                     ? $res['data']['payment_method']
                     : null,
+                'address_incomplete' => $res['data']['address_incomplete'] ?? null,
+                'returned_city' => data_get($res, 'data.ship_to.city')
+                    ?? data_get($res, 'data.ship_to.city_name')
+                    ?? data_get($res, 'data.city'),
+                'returned_ship_to_field_names' => array_keys((array) data_get($res, 'data.ship_to', [])),
             ]);
 
             $orderId = (string)($res['data']['reference_id'] ?? $res['data']['id'] ?? $res['id'] ?? null);

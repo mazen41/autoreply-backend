@@ -304,6 +304,23 @@ class OrderCheckoutService
     {
         $existingState = is_array($conversation->checkout_state) ? $conversation->checkout_state : [];
 
+        // A new explicit order from a product reference starts a fresh option
+        // selection, even if it is the same product as a previous checkout.
+        // Otherwise a prior size/color can silently leak into the next order.
+        $startsNewReferencedOrder = $referencedProduct
+            && \App\Services\ShopifyOrderIntent::wantsToOrder($incomingText);
+        if ($startsNewReferencedOrder) {
+            foreach ([
+                'salla_options', 'salla_option_titles', 'commerce_variant_id',
+                'commerce_variant_title', 'salla_variant_id', 'salla_variant_title',
+                'salla_variant_price', 'salla_shipping_quote', 'confirmation_summary_message_id',
+                'confirmation_summary_fingerprint', 'confirmation_summary_sent_at',
+            ] as $key) {
+                unset($existingState[$key]);
+            }
+            $existingState['confirmation_state'] = 'selecting_salla_option';
+        }
+
         // A completed order belongs to the exact product and store that were
         // confirmed. Starting checkout for another referenced product must
         // discard the old order identity before the new product is merged.
@@ -903,7 +920,10 @@ class OrderCheckoutService
             && strtoupper((string) ($normalizedState['delivery_country_code'] ?? '')) === 'SA') {
             $requiredFields = array_values(array_unique(array_merge(
                 $requiredFields,
-                ['building_number', 'additional_number']
+                [
+                    'street_number', 'block', 'short_address', 'building_number',
+                    'additional_number', 'postal_code', 'geo_coordinates',
+                ]
             )));
         }
 
@@ -931,6 +951,7 @@ class OrderCheckoutService
             // a city and a street/address line, let Salla validate the textual
             // address rather than trapping checkout on a missing GPS pin.
             if ($field === 'geo_coordinates' && empty($value)
+                && strtoupper((string) ($normalizedState['delivery_country_code'] ?? '')) !== 'SA'
                 && !empty($normalizedState['delivery_city'])
                 && !empty($normalizedState['address_line'] ?? $normalizedState['address'] ?? null)) {
                 continue;

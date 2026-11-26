@@ -73,6 +73,9 @@ class AICapabilitiesService
             : "CRITICAL: You MUST reply ONLY in English. Never use Arabic under any circumstances.\n\n";
 
         $p = $langRule;
+        if (!empty($context['salla_connected'])) {
+            $p .= "SALLA STORE FACTS ARE THE ONLY AUTHORITY: Never invent delivery times, shipping coverage, accepted payment methods, COD availability or fees, return/refund rules, or any other store policy. State a policy only when the exact fact is present in the supplied store settings, product/order data, or relevant knowledge source. If the store data does not answer the question, say you do not have verified information and offer to check with the store team. A customer's chosen COD method during checkout is not evidence that the store accepts other methods.\n\n";
+        }
         if (!empty($context['business_id'])
             && \App\Models\FeatureFlag::isEnabled('salla_workflow_guardrails', (int) $context['business_id'])) {
             $p .= "For Salla checkout, follow the Salla workflow guardrails: use shipping fees only when supplied store data explicitly contains them; otherwise say the fee or coverage is unavailable and direct the customer to checkout or the merchant. Never invent a fee or promise free shipping.\n\n";
@@ -511,6 +514,9 @@ ROLE;
             }
 
             $p .= "✅ AVAILABLE PRODUCTS:\n{$productList}\n";
+            if (!empty($context['salla_connected'])) {
+                $p .= "For a specific product question, compare the requested item and stated attributes (such as color/size) against this catalog. Do not ask a vague 'which product?' when a catalog is available. If no exact item/attribute match exists, say that no matching product was found and list up to five available catalog items with their prices; do not substitute a different product or claim a color/size that is not in the data.\n\n";
+            }
 
             // ── CHECKOUT & FIELD COLLECTION STATE ─────────────────────────────
             $knownFields   = $context['known_fields'] ?? [];

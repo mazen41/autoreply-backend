@@ -718,8 +718,14 @@ class ProcessAutoReply implements ShouldQueue
         $sallaOrderReferenceMatchedUnverified = false;
         $matchedSallaOrderReference = null;
         $pendingSallaStatusReference = trim((string) ($checkoutState['pending_salla_status_reference_id'] ?? ''));
+        $pendingStatusText = strtr((string) $message->content, [
+            '٠' => '0', '١' => '1', '٢' => '2', '٣' => '3', '٤' => '4',
+            '٥' => '5', '٦' => '6', '٧' => '7', '٨' => '8', '٩' => '9',
+            '۰' => '0', '۱' => '1', '۲' => '2', '۳' => '3', '۴' => '4',
+            '۵' => '5', '۶' => '6', '۷' => '7', '۸' => '8', '۹' => '9',
+        ]);
         $pendingSallaStatusPhoneReply = $pendingSallaStatusReference !== ''
-            && (bool) preg_match('/^\s*\+?[0-9][0-9\s().-]{7,17}\s*$/u', (string) $message->content);
+            && (bool) preg_match('/(?:^\s*\+?[0-9][0-9\s().-]{7,17}\s*$|(?:phone|mobile|telephone|رقم\s*(?:الجوال|الهاتف))\D{0,20}\+?[0-9][0-9\s().-]{7,17}[0-9])/iu', $pendingStatusText);
         $productsContext = null;
         $msgLower = mb_strtolower($message->content);
 
@@ -944,6 +950,15 @@ class ProcessAutoReply implements ShouldQueue
             $isOrderStatus = false;
             $isPlaceOrder = true;
         } elseif ($isExplicitOrderStatusMessage) {
+            $isOrderStatus = true;
+            $isPlaceOrder = false;
+            $isProductAggregate = false;
+            $isOrderAggregate = false;
+        }
+
+        // A phone sent in response to the verification prompt belongs to the
+        // pending order lookup, even if an old checkout is still held.
+        if ($sallaChannel && $pendingSallaStatusPhoneReply) {
             $isOrderStatus = true;
             $isPlaceOrder = false;
             $isProductAggregate = false;
@@ -1976,10 +1991,7 @@ class ProcessAutoReply implements ShouldQueue
                         array_column($values, 'id')
                     )));
 
-                    if ($selectedIds === [] && count($values) === 1) {
-                        $selectedIds = [(string) $values[0]['id']];
-                        $sallaOptionChosenThisMessage = true;
-                    } elseif ($selectedIds === [] && $selectingSallaOption) {
+                    if ($selectedIds === [] && $selectingSallaOption) {
                         $selectionText = strtr(mb_strtolower(trim((string) $message->content)), [
                             '٠' => '0', '١' => '1', '٢' => '2', '٣' => '3', '٤' => '4',
                             '٥' => '5', '٦' => '6', '٧' => '7', '٨' => '8', '٩' => '9',
@@ -2599,6 +2611,121 @@ class ProcessAutoReply implements ShouldQueue
             $context['knowledge_status'] = $knowledgeStatus ?? 'unavailable';
         }
 
+        // Resolve narrow, attribute-specific catalog questions from the
+        // selected Salla store's synced products. If the requested item or
+        // attribute is absent from that data, do not ask a vague clarification
+        // or let the model invent a match; show actual available products.
+        $isSpecificProductQuestion = (bool) preg_match(
+            '/(?:how\s+much|what(?:\'s|\s+is)\s+the\s+price|price\s+of|do\s+you\s+have|is\s+there|available\s+in|كم\s+سعر|بكام|سعر\s+|عندكم|هل\s+يوجد|متوفر)/iu',
+            (string) $message->content
+        );
+        if ($sallaChannel && !$isPlaceOrder && !$isProductAggregate && $isSpecificProductQuestion
+            && is_array($productsContext) && $productsContext !== []) {
+            $categoryAliases = [
+                ['jacket', 'جاكيت', 'جاكت'], ['blouse', 'بلوزة'],
+                ['skirt', 'تنورة'], ['dress', 'فستان'], ['pants', 'trousers', 'بنطلون'],
+                ['shirt', 'قميص'], ['t-shirt', 't shirt', 'تيشيرت'], ['shoes', 'shoe', 'حذاء', 'أحذية'],
+            ];
+            $requestedCategory = null;
+            foreach ($categoryAliases as $aliases) {
+                foreach ($aliases as $alias) {
+                    if (preg_match('/(?<![\pL\pN])' . preg_quote($alias, '/') . '(?![\pL\pN])/iu', (string) $message->content)) {
+                        $requestedCategory = $aliases;
+                        break 2;
+                    }
+                }
+            }
+
+            if ($requestedCategory !== null) {
+                $matchingProducts = array_values(array_filter($productsContext, static function ($product) use ($requestedCategory): bool {
+                    if (!is_array($product)) return false;
+                    $searchable = mb_strtolower(implode(' ', [
+                        (string) ($product['name'] ?? ''),
+                        (string) ($product['description'] ?? ''),
+                        json_encode($product['variants'] ?? [], JSON_UNESCAPED_UNICODE) ?: '',
+                    ]));
+                    foreach ($requestedCategory as $alias) {
+                        if (preg_match('/(?<![\pL\pN])' . preg_quote(mb_strtolower($alias), '/') . '(?![\pL\pN])/iu', $searchable)) {
+                            return true;
+                        }
+                    }
+                    return false;
+                }));
+
+                $requestedAttributes = [];
+                $attributeAliases = [
+                    ['black', 'أسود', 'اسود'], ['white', 'أبيض', 'ابيض'], ['red', 'أحمر', 'احمر'],
+                    ['blue', 'أزرق', 'ازرق'], ['green', 'أخضر', 'اخضر'], ['beige', 'بيج'],
+                ];
+                foreach ($attributeAliases as $aliases) {
+                    foreach ($aliases as $alias) {
+                        if (preg_match('/(?<![\pL\pN])' . preg_quote($alias, '/') . '(?![\pL\pN])/iu', (string) $message->content)) {
+                            $requestedAttributes[] = $aliases;
+                            break;
+                        }
+                    }
+                }
+                if (preg_match('/\b(?:size\s*)?(xs|s|m|l|xl|xxl|xxxl|\d{2})\b|مقاس\s*(xs|s|m|l|xl|xxl|xxxl|\d{2})/iu', (string) $message->content, $sizeMatch)) {
+                    $requestedSize = strtoupper((string) ($sizeMatch[1] ?: $sizeMatch[2]));
+                    $requestedAttributes[] = [$requestedSize];
+                }
+
+                $attributeMatch = $requestedAttributes === [] || array_filter($matchingProducts, static function ($product) use ($requestedAttributes): bool {
+                    $searchable = mb_strtolower(implode(' ', [
+                        (string) ($product['name'] ?? ''), (string) ($product['description'] ?? ''),
+                        json_encode($product['variants'] ?? [], JSON_UNESCAPED_UNICODE) ?: '',
+                    ]));
+                    foreach ($requestedAttributes as $aliases) {
+                        $found = false;
+                        foreach ($aliases as $alias) {
+                            if (preg_match('/(?<![\pL\pN])' . preg_quote(mb_strtolower((string) $alias), '/') . '(?![\pL\pN])/iu', $searchable)) {
+                                $found = true;
+                                break;
+                            }
+                        }
+                        if (!$found) return false;
+                    }
+                    return true;
+                }) !== [];
+
+                if ($matchingProducts === [] || !$attributeMatch) {
+                    $availableLines = [];
+                    foreach (array_slice($productsContext, 0, 5) as $product) {
+                        if (!is_array($product)) continue;
+                        $productName = trim((string) ($product['name'] ?? ''));
+                        if ($productName === '') continue;
+                        $productPrice = $product['price'] ?? null;
+                        $availableLines[] = $productPrice !== null
+                            ? $productName . ' — ' . $productPrice . ' ' . ($product['currency'] ?? 'SAR')
+                            : $productName;
+                    }
+                    $reply = $detectedLanguage === 'arabic'
+                        ? 'ما لقيت منتجًا أو خيارًا مطابقًا لطلبك في كتالوج المتجر. المنتجات المتاحة حاليًا:'
+                            . ($availableLines !== [] ? "\n" . implode("\n", $availableLines) : '')
+                        : 'I could not find an exact product or option match in this store catalog. Here are products currently listed:'
+                            . ($availableLines !== [] ? "\n" . implode("\n", $availableLines) : '');
+                    $this->sendSallaDeterministicReply($channel, $conversation, $reply, $detectedLanguage, 'salla_product_no_exact_match');
+                    return;
+                }
+            }
+        }
+
+        // Salla-exclusive turns intentionally omit unrelated business memory,
+        // and this integration does not yet load delivery/payment policy
+        // settings from Salla. Answer policy questions honestly instead of
+        // letting the model fill the gap with generic industry assumptions.
+        $isStorePolicyQuestion = (bool) preg_match(
+            '/\b(?:delivery\s*time|shipping\s*time|how\s+long\s+(?:does\s+)?(?:delivery|shipping|it\s+take)|when\s+(?:will\s+)?(?:it|my\s+order)\s+arrive|payment\s+methods?|pay\s+by\s+card|accept\s+(?:cards?|cash\s+on\s+delivery)|cash\s+on\s+delivery|return\s+policy|refund\s+policy|exchange\s+policy)\b|(?:كم\s+يوم|مدة\s+(?:التوصيل|الشحن)|متى\s+(?:يوصل|يصل)|طرق\s+الدفع|وسائل\s+الدفع|الدفع\s+ب(?:البطاقة|بطاقة)|تقبلون\s+بطاقات?|الدفع\s+عند\s+الاستلام|سياسة\s+(?:الاسترجاع|الاستبدال)|استرجاع|استبدال)/iu',
+            (string) $message->content
+        );
+        if ($sallaChannel && $isStorePolicyQuestion) {
+            $policyReply = $detectedLanguage === 'arabic'
+                ? 'ما عندي حاليًا معلومة مؤكدة من المتجر عن سياسة التوصيل أو الدفع أو الاسترجاع، وما أبغى أعطيك معلومة غير دقيقة. أقدر أساعدك في سؤال آخر عن المنتجات أو الطلب.'
+                : "I don't have verified store information about delivery, payment, or returns right now, and I don't want to give you an inaccurate answer. I can still help with products or your order.";
+            $this->sendSallaDeterministicReply($channel, $conversation, $policyReply, $detectedLanguage, 'salla_policy_not_configured');
+            return;
+        }
+
         // Step 4: Single AI Call with JSON Output
         try {
             $aiResult = AICapabilitiesService::callAIWithJSON($message->content, $context);
@@ -2628,21 +2755,27 @@ class ProcessAutoReply implements ShouldQueue
         }
 
         if (!$aiResult['success']) {
-            // Keep transient/model-format problems recoverable. A single failed
-            // AI turn should not immediately disable automation or hand off the
-            // conversation. Escalate only after three consecutive failed turns.
+            // Provider outages are transient service failures, not a reason to
+            // transfer the customer. callAIWithJSON already retries and tries
+            // configured fallback models; keep the reply recoverable if those
+            // providers are rate-limited or unavailable.
             $aiFailureKey = 'ai_reply_failures:conversation:' . $conversation->id;
+            $aiFailureCode = (string) ($aiResult['failure_code'] ?? data_get($aiResult, 'validation.reasons.0', 'ai_failure'));
             try {
-                \Illuminate\Support\Facades\Cache::add($aiFailureKey, 0, now()->addMinutes(15));
-                $consecutiveAiFailures = (int) \Illuminate\Support\Facades\Cache::increment($aiFailureKey);
-                \Illuminate\Support\Facades\Cache::put($aiFailureKey, $consecutiveAiFailures, now()->addMinutes(15));
+                if ($aiFailureCode === 'provider_exception') {
+                    \Illuminate\Support\Facades\Cache::forget($aiFailureKey);
+                    $consecutiveAiFailures = 0;
+                } else {
+                    \Illuminate\Support\Facades\Cache::add($aiFailureKey, 0, now()->addMinutes(15));
+                    $consecutiveAiFailures = (int) \Illuminate\Support\Facades\Cache::increment($aiFailureKey);
+                    \Illuminate\Support\Facades\Cache::put($aiFailureKey, $consecutiveAiFailures, now()->addMinutes(15));
+                }
             } catch (\Throwable $cacheException) {
                 // Cache is only a guardrail; if unavailable, prefer the safe
                 // non-escalating first-failure behavior.
                 $consecutiveAiFailures = 1;
             }
-            $shouldEscalateAiFailure = $consecutiveAiFailures >= 3;
-            $aiFailureCode = (string) ($aiResult['failure_code'] ?? data_get($aiResult, 'validation.reasons.0', 'ai_failure'));
+            $shouldEscalateAiFailure = $aiFailureCode !== 'provider_exception' && $consecutiveAiFailures >= 3;
 
             Log::error('ProcessAutoReply: AI call failed', [
                 'conversation_id' => $conversation->id,

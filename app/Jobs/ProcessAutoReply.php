@@ -922,7 +922,9 @@ class ProcessAutoReply implements ShouldQueue
             '/\b(?:full\s+name|name|phone|mobile|address|delivery\s+address|city|building|street|postal|zip|cash\s+on\s+delivery|cod)\b|رقم\s*(?:الجوال|الهاتف)|(?:الاسم|اسمي|المدينة|مدينة\s*التوصيل|العنوان|عنوان\s*التوصيل|رقم\s*(?:المبنى|الشارع)|الدفع\s*عند\s*الاستلام)/iu',
             (string) $message->content
         );
-        if (!empty($checkoutState['salla_product_id']) && $incomingCheckoutDetails && !$isExplicitOrderStatusRequest) {
+        if (!empty($checkoutState['salla_product_id'])
+            && ($incomingCheckoutDetails || ($checkoutState['confirmation_state'] ?? null) === 'collecting_info')
+            && !$isExplicitOrderStatusRequest) {
             $isOrderStatus = false;
             $isPlaceOrder = true;
         }

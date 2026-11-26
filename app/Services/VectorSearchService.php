@@ -132,6 +132,60 @@ class VectorSearchService
     }
 
     /**
+     * Local retrieval fallback when the embedding provider is unavailable.
+     *
+     * Stored chunks are never re-embedded here. This deliberately uses only
+     * text already stored for the current business, and returns no chunk when
+     * there is no meaningful word overlap with the incoming query.
+     *
+     * @return array<int, BusinessKnowledgeChunk>
+     */
+    public function searchText(string $queryText, int $businessProfileId, int $limit = 3): array
+    {
+        $tokens = $this->searchTokens($queryText);
+        if ($tokens === []) {
+            return [];
+        }
+
+        $chunks = BusinessKnowledgeChunk::query()
+            ->where('business_profile_id', $businessProfileId)
+            ->get();
+
+        $scored = [];
+        foreach ($chunks as $chunk) {
+            $content = mb_strtolower((string) $chunk->content);
+            $score = 0;
+            foreach ($tokens as $token) {
+                $score += substr_count($content, $token);
+            }
+            if ($score > 0) {
+                $chunk->setAttribute('similarity_score', (float) $score);
+                $scored[] = ['chunk' => $chunk, 'score' => $score];
+            }
+        }
+
+        usort($scored, static fn (array $left, array $right): int => $right['score'] <=> $left['score']);
+
+        return array_map(
+            static fn (array $item): BusinessKnowledgeChunk => $item['chunk'],
+            array_slice($scored, 0, max(1, $limit))
+        );
+    }
+
+    /** @return array<int, string> */
+    private function searchTokens(string $text): array
+    {
+        $normalized = mb_strtolower($text);
+        $normalized = preg_replace('/[^\p{L}\p{N}]+/u', ' ', $normalized) ?? '';
+        $tokens = preg_split('/\s+/u', trim($normalized)) ?: [];
+
+        return array_values(array_unique(array_filter(
+            $tokens,
+            static fn (string $token): bool => mb_strlen($token) >= 3
+        )));
+    }
+
+    /**
      * Compute cosine similarity between two vectors
      * 
      * @param array<float> $vec1

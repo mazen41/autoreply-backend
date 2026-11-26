@@ -403,7 +403,19 @@ class KnowledgeController extends Controller
             $embeddingsService = app(\App\Services\EmbeddingsService::class);
             $vectorSearch = app(\App\Services\VectorSearchService::class);
 
-            $queryEmbedding = $embeddingsService->embedChunk($query, $business, $idempotencyKey ? \App\Services\AiGateway::stableOperationId('knowledge-answer:' . $business->id . ':' . $idempotencyKey) : (string) \Illuminate\Support\Str::uuid());
+            try {
+                $queryEmbedding = $embeddingsService->embedChunk($query, $business, $idempotencyKey ? \App\Services\AiGateway::stableOperationId('knowledge-answer:' . $business->id . ':' . $idempotencyKey) : (string) \Illuminate\Support\Str::uuid());
+            } catch (\Throwable $exception) {
+                // A query embedding is needed for semantic ranking, not for
+                // reading the already-indexed chunks. Fall back locally so a
+                // transient provider failure never blocks the test reply.
+                $queryEmbedding = null;
+                Log::warning('Knowledge test query embedding unavailable; using local text retrieval', [
+                    'business_id' => $business->id,
+                    'exception_type' => get_class($exception),
+                ]);
+            }
+
             if (!empty($queryEmbedding)) {
                 $relevantChunks = $vectorSearch->search(
                     $queryEmbedding,
@@ -414,11 +426,14 @@ class KnowledgeController extends Controller
                     $embeddingsService->activeModel(),
                     $embeddingsService->dimension()
                 );
-                foreach ($relevantChunks as $index => $chunk) {
-                    $fileName = $chunk->file ? $chunk->file->filename : 'Knowledge Base';
-                    $knowledgeText .= "\n[Source: {$fileName}] (Relevance Top " . ($index + 1) . ")\n";
-                    $knowledgeText .= $chunk->content . "\n";
-                }
+            } else {
+                $relevantChunks = $vectorSearch->searchText($query, $business->id, 5);
+            }
+
+            foreach ($relevantChunks as $index => $chunk) {
+                $fileName = $chunk->file ? $chunk->file->filename : 'Knowledge Base';
+                $knowledgeText .= "\n[Source: {$fileName}] (Relevance Top " . ($index + 1) . ")\n";
+                $knowledgeText .= $chunk->content . "\n";
             }
         }
 

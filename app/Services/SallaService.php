@@ -1075,17 +1075,25 @@ class SallaService
     /** Look up an order by Salla's customer-facing reference number, not its internal ID. */
     public function getOrderByReferenceForChannel(Channel $channel, string $referenceId): ?array
     {
-        $response = $this->apiCallForChannel($channel, 'GET', '/orders', [
-            'reference_id' => $referenceId,
-            'per_page' => 1,
-        ]);
-        $orders = $response['data'] ?? [];
-        if (isset($orders['reference_id'])) {
-            $orders = [$orders];
+        $referenceId = trim($referenceId);
+        if ($referenceId === '') {
+            return null;
         }
-        foreach ((array) $orders as $order) {
-            if ((string) ($order['reference_id'] ?? '') === $referenceId) {
-                return $order;
+
+        // Salla documents reference_id as a List Orders filter, but some
+        // stores/API responses do not apply it consistently. Try the exact
+        // filter first, then the documented keyword search, and always verify
+        // an exact reference match locally before returning an order.
+        foreach ([['reference_id' => $referenceId], ['keyword' => $referenceId]] as $filters) {
+            $response = $this->apiCallForChannel($channel, 'GET', '/orders', $filters + ['per_page' => 30]);
+            $orders = $response['data'] ?? [];
+            if (isset($orders['reference_id'])) {
+                $orders = [$orders];
+            }
+            foreach ((array) $orders as $order) {
+                if (is_array($order) && (string) ($order['reference_id'] ?? '') === $referenceId) {
+                    return $order;
+                }
             }
         }
 

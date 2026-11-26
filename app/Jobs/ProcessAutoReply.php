@@ -712,6 +712,7 @@ class ProcessAutoReply implements ShouldQueue
         // Detect intent from message BEFORE calling AI, so we can pre-load the
         // right Salla data (order data OR product list) into the AI context.
         $sallaContext   = null;
+        $sallaOrderReferenceMatchedUnverified = false;
         $productsContext = null;
         $msgLower = mb_strtolower($message->content);
 
@@ -1229,8 +1230,8 @@ class ProcessAutoReply implements ShouldQueue
                     $lookupText = (string) $message->content;
                     $orderNumberMatch = null;
                     $phoneMatch       = null;
-                    if (preg_match('/\b(?:order|orders|طلب|رقم\s+الطلب)\s*(?:number|no\.?|#|id)?\s*:?\s*#?\s*(\d{4,12})\b/iu', $lookupText, $mo)) {
-                        $orderNumberMatch = $mo[1];
+                    if (preg_match('/(?:\borders?\s*(?:(?:number|no\.?|id)\s*)?(?:(?:is|:|#|-)\s*)?#?\s*(\d{4,12})\b|\bرقم\s*الطلب\s*(?:(?:هو|:|#|-)\s*)?#?\s*(\d{4,12})\b)/iu', $lookupText, $mo)) {
+                        $orderNumberMatch = $mo[1] ?? $mo[2] ?? null;
                     } elseif (preg_match('/^\s*#?(\d{5,12})\s*$/u', $lookupText, $mo)) {
                         $orderNumberMatch = $mo[1];
                     }
@@ -1262,7 +1263,8 @@ class ProcessAutoReply implements ShouldQueue
                             $order = null;
                             if ($orderNumberMatch) {
                                 $order = $sallaService->getOrderByReferenceForChannel($sallaChannel, $orderNumberMatch);
-                                if ($order && !$this->orderBelongsToSender($order, [$phoneMatch, $this->senderPhoneDigits($conversation)])) {
+                            if ($order && !$this->orderBelongsToSender($order, [$phoneMatch, $this->senderPhoneDigits($conversation)])) {
+                                $sallaOrderReferenceMatchedUnverified = $orderNumberMatch !== null && !$phoneMatch;
                                     Log::warning('ProcessAutoReply: order number does not belong to sender; not disclosed');
                                     $order = null;
                                 }
@@ -1492,6 +1494,10 @@ class ProcessAutoReply implements ShouldQueue
                     : 'I found your order' . ($reference !== '' ? " #{$reference}" : '') . ($status !== '' ? " with status: {$status}" : '')
                         . ($total !== '' ? ". Total: {$total} {$currency}" : '')
                         . ($shipping !== '' && $shipping !== 'Not shipped' ? ". Shipping: {$shipping}" : '') . '.';
+            } elseif ($sallaOrderReferenceMatchedUnverified) {
+                $statusReply = $detectedLanguage === 'arabic'
+                    ? 'وجدت رقم الطلب، لكن لحماية بياناتك أرسل رقم الجوال المستخدم عند إتمام الشراء حتى أتحقق من حالة الطلب.'
+                    : 'I found that order number, but to protect your information, please send the phone number used at checkout so I can verify the order.';
             } elseif ($hasIdentifier) {
                 $statusReply = $detectedLanguage === 'arabic'
                     ? 'لم أجد طلبًا يطابق البيانات المرسلة. راجع رقم الطلب أو أرسل رقم الجوال المستخدم وقت الشراء.'
@@ -2166,6 +2172,30 @@ class ProcessAutoReply implements ShouldQueue
                 $fieldStatus,
                 $hasValidOrderSummary,
                 (bool) $autoOrderConfirmationEnabled,
+                $detectedLanguage
+            )) {
+                return;
+            }
+        }
+
+        // Starting or continuing a Salla checkout is also deterministic:
+        // collect all missing fields in one turn and show a persisted summary
+        // without depending on the AI service being available.
+        if ($sallaChannel
+            && $commerceChannel?->type === 'salla'
+            && !empty($updatedCheckoutState['salla_product_id'])
+            && !$containsConfirmPhrase
+            && !$isOrderStatus
+            && !$isProductBrowseMessage
+            && ($isPlaceOrder || $isSallaOptionFollowUp || $sallaOptionChosenThisMessage)) {
+            if ($this->handleSallaCheckoutWithoutAi(
+                $channel,
+                $conversation,
+                $commerceChannel,
+                $updatedCheckoutState,
+                $fieldStatus,
+                $sallaOptionSelectionRequired,
+                $sallaOptionPrompt,
                 $detectedLanguage
             )) {
                 return;
@@ -3478,7 +3508,12 @@ $aiResponse = $intro
 
                 $orderData = $this->createRealExternalOrder($conversation, $orderInput, $channel);
 
-                if ($orderData && !empty($orderData['order_id'])) {
+                if (($orderData['status'] ?? null) === 'already_completed') {
+                    $existingReference = trim((string) ($orderData['existing_order_number'] ?? ''));
+                    $aiResponse = $detectedLanguage === 'arabic'
+                        ? 'هذا الطلب مسجل لدينا بالفعل' . ($existingReference !== '' ? " بالرقم #{$existingReference}" : '') . '، لذلك لم أنشئ طلبًا آخر.'
+                        : 'This checkout is already recorded' . ($existingReference !== '' ? " as order #{$existingReference}" : '') . ', so I did not create another order.';
+                } elseif ($orderData && !empty($orderData['order_id'])) {
                     // ✅ SUCCESS — override the AI reply with the real order confirmation
                     $realOrderId  = $orderData['order_id'];
                     $realOrderNumber = $orderData['order_number'] ?? $realOrderId;
@@ -3505,6 +3540,7 @@ $aiResponse = $intro
                         [
                             'status'   => 'completed',
                             'order_id' => $realOrderId,
+                            'order_number' => $realOrderNumber,
                             'confirmation_state' => 'order_placed',
                             'order_fingerprint' => $this->orderFingerprint($orderInput),
                             'order_product_id' => (string) ($orderInput['commerce_external_id'] ?? $orderInput['salla_product_id'] ?? ''),
@@ -4968,6 +5004,14 @@ $aiResponse = $intro
         ];
 
         $orderData = $this->createRealExternalOrder($conversation, $orderInput, $channel);
+        if (($orderData['status'] ?? null) === 'already_completed') {
+            $existingReference = trim((string) ($orderData['existing_order_number'] ?? ''));
+            $reply = $detectedLanguage === 'arabic'
+                ? 'هذا الطلب مسجل لدينا بالفعل' . ($existingReference !== '' ? " بالرقم #{$existingReference}" : '') . '، لذلك لم أنشئ طلبًا آخر.'
+                : 'This checkout is already recorded' . ($existingReference !== '' ? " as order #{$existingReference}" : '') . ', so I did not create another order.';
+            $this->sendSallaDeterministicReply($channel, $conversation, $reply, $detectedLanguage, 'salla_order_already_recorded');
+            return true;
+        }
         if (($orderData['status'] ?? null) === 'needs_fields') {
             $missingFields = array_values(array_diff((array) ($orderData['missing_fields'] ?? []), ['geo_coordinates']));
             $freshState = is_array($conversation->fresh()->checkout_state) ? $conversation->fresh()->checkout_state : $checkoutState;
@@ -5054,6 +5098,7 @@ $aiResponse = $intro
             [
                 'status' => 'completed',
                 'order_id' => $orderId,
+                'order_number' => $customerOrderNumber,
                 'confirmation_state' => 'order_placed',
                 'order_fingerprint' => $this->orderFingerprint($orderInput),
                 'order_product_id' => (string) ($orderInput['commerce_external_id'] ?? $orderInput['salla_product_id'] ?? ''),
@@ -5110,6 +5155,103 @@ $aiResponse = $intro
             ]);
         }
 
+        return true;
+    }
+
+    /** Handle Salla checkout collection and summary without an AI provider call. */
+    private function handleSallaCheckoutWithoutAi(
+        Channel $channel,
+        Conversation $conversation,
+        Channel $commerceChannel,
+        array $checkoutState,
+        array $fieldStatus,
+        bool $optionSelectionRequired,
+        ?array $optionPrompt,
+        string $detectedLanguage
+    ): bool {
+        if ($optionSelectionRequired && !empty($optionPrompt['values'])) {
+            $values = (array) $optionPrompt['values'];
+            $choices = [];
+            foreach ($values as $index => $value) {
+                $choices[] = ($index + 1) . '. ' . trim((string) ($value['name'] ?? ''));
+            }
+            $optionName = trim((string) ($optionPrompt['name'] ?? 'الخيار'));
+            $reply = $detectedLanguage === 'arabic'
+                ? 'اختر ' . $optionName . ' المناسب لك، واكتب رقم الاختيار أو اسمه:' . "\n" . implode("\n", $choices)
+                : 'Which ' . $optionName . ' would you like? Reply with its number or exact name:' . "\n" . implode("\n", $choices);
+            $checkoutState['confirmation_state'] = 'selecting_salla_option';
+            unset(
+                $checkoutState['confirmation_summary_message_id'],
+                $checkoutState['confirmation_summary_fingerprint'],
+                $checkoutState['confirmation_summary_sent_at']
+            );
+            $conversation->update(['checkout_state' => $checkoutState]);
+            $this->sendSallaDeterministicReply($channel, $conversation, $reply, $detectedLanguage, 'salla_checkout_option_required');
+            return true;
+        }
+
+        if (empty($fieldStatus['is_complete'])) {
+            $labels = $detectedLanguage === 'arabic' ? [
+                'full_name' => 'الاسم الكامل', 'phone' => 'رقم الجوال', 'address' => 'عنوان التوصيل',
+                'delivery_city' => 'مدينة التوصيل', 'street_number' => 'رقم الشارع', 'building_number' => 'رقم المبنى',
+                'block' => 'الدور أو الشقة', 'postal_code' => 'الرمز البريدي', 'email' => 'البريد الإلكتروني',
+                'district' => 'الحي', 'short_address' => 'العنوان الوطني المختصر', 'additional_number' => 'الرقم الإضافي للمبنى',
+            ] : [
+                'full_name' => 'full name', 'phone' => 'phone number', 'address' => 'delivery address',
+                'delivery_city' => 'delivery city', 'street_number' => 'street number', 'building_number' => 'building number',
+                'block' => 'block or floor', 'postal_code' => 'postal code', 'email' => 'email address',
+                'district' => 'district', 'short_address' => 'short national address', 'additional_number' => 'additional building number',
+            ];
+            $missing = array_values(array_filter(array_map(
+                static fn ($field) => $labels[$field] ?? null,
+                array_diff((array) ($fieldStatus['missing_fields'] ?? []), ['geo_coordinates'])
+            )));
+            if ($missing === []) {
+                return false;
+            }
+            $checkoutState['confirmation_state'] = 'collecting_info';
+            unset(
+                $checkoutState['confirmation_summary_message_id'],
+                $checkoutState['confirmation_summary_fingerprint'],
+                $checkoutState['confirmation_summary_sent_at']
+            );
+            $conversation->update(['checkout_state' => $checkoutState]);
+            $reply = $detectedLanguage === 'arabic'
+                ? 'أقدر أجهز طلبك. أرسل البيانات التالية كلها في رسالة واحدة: ' . implode('، ', $missing) . '.'
+                : 'I can prepare that order. Please send these details together in one message: ' . implode(', ', $missing) . '.';
+            $this->sendSallaDeterministicReply($channel, $conversation, $reply, $detectedLanguage, 'salla_checkout_fields_required');
+            return true;
+        }
+
+        $checkoutState['confirmation_state'] = 'confirmation_pending';
+        unset(
+            $checkoutState['confirmation_summary_message_id'],
+            $checkoutState['confirmation_summary_fingerprint'],
+            $checkoutState['confirmation_summary_sent_at']
+        );
+        $conversation->update(['checkout_state' => $checkoutState]);
+        $summary = $this->buildOrderConfirmationSummary($checkoutState, $commerceChannel);
+        $summaryMessage = Message::create([
+            'conversation_id' => $conversation->id,
+            'content' => $summary,
+            'direction' => 'outbound', 'status' => 'auto', 'is_ai' => false,
+            'source' => 'salla_order_summary', 'send_status' => 'pending',
+            'metadata' => ['order_summary' => true],
+            'intent' => 'place_order', 'detected_language' => $detectedLanguage,
+        ]);
+        if ($channel->user_id) broadcast(new \App\Events\MessageReceived($summaryMessage, $conversation, $channel->user_id));
+        if ($this->sendReply($channel, $conversation, $summaryMessage)) {
+            $checkoutState['confirmation_summary_message_id'] = $summaryMessage->id;
+            $checkoutState['confirmation_summary_fingerprint'] = $this->orderFingerprint($checkoutState);
+            $checkoutState['confirmation_summary_sent_at'] = now()->toIso8601String();
+            $conversation->update(['checkout_state' => $checkoutState]);
+        }
+        Log::info('SALLA_DETERMINISTIC_CHECKOUT_SUMMARY', [
+            'conversation_id' => $conversation->id,
+            'message_id' => $summaryMessage->id,
+            'provider_called' => false,
+            'summary_sent' => $summaryMessage->fresh()?->send_status === 'sent',
+        ]);
         return true;
     }
 
@@ -5306,11 +5448,26 @@ $aiResponse = $intro
 
                 if (($storedFingerprint && hash_equals($storedFingerprint, $requestedFingerprint))
                     || (!$storedFingerprint && $legacyMatches)) {
+                    $existingOrderNumber = trim((string) ($currentState['order_number'] ?? ''));
+                    if ($existingOrderNumber === '') {
+                        $existingOrderNumber = trim((string) \App\Models\CommerceOrderAttempt::query()
+                            ->where('conversation_id', $conversation->id)
+                            ->where('external_order_id', (string) $currentState['order_id'])
+                            ->where('status', 'completed')
+                            ->latest('id')
+                            ->value('order_number'));
+                    }
                     Log::info('ProcessAutoReply: matching order already exists, skipping duplicate creation', [
                         'conversation_id' => $conversation->id,
-                        'order_id' => $currentState['order_id'],
+                        'order_exists' => true,
+                        'customer_reference_present' => $existingOrderNumber !== '',
                     ]);
-                    return $currentState;
+                    // This is a duplicate guard, not a successful new order.
+                    // Omit order_id so no caller can report a newly placed order.
+                    return [
+                        'status' => 'already_completed',
+                        'existing_order_number' => $existingOrderNumber !== '' ? $existingOrderNumber : null,
+                    ];
                 }
 
                 // Completed state refers to a different product/store/customer

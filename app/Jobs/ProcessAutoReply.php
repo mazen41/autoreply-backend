@@ -112,12 +112,33 @@ class ProcessAutoReply implements ShouldQueue
         // did not also persist ai_enabled=false. Only the explicit handled
         // action clears requires_human and resumes future customer turns.
         if ($conversation->requires_human) {
+            // The bot stays paused for the human, but the customer must never be left
+            // without a reply. Send one short holding message per 10 minutes per conversation.
             Log::info('ProcessAutoReply: conversation is waiting for human handling', [
                 'conversation_id' => $conversation->id,
                 'message_id' => $message->id,
             ]);
+            if (Cache::add('handoff_hold_reply:' . $conversation->id, 1, now()->addMinutes(10))) {
+                $holdingArabic = $this->detectLanguage($message->content) === 'arabic';
+                $holdingReply = Message::create([
+                    'conversation_id' => $conversation->id,
+                    'content' => $holdingArabic
+                        ? 'فريقنا سيرد عليك قريباً. شكراً لصبرك.'
+                        : 'A team member will reply to you shortly. Thank you for your patience.',
+                    'direction' => 'outbound',
+                    'status' => 'auto',
+                    'is_ai' => false,
+                    'source' => 'handoff_holding_reply',
+                    'send_status' => 'pending',
+                ]);
+                if ($channel->user_id) {
+                    broadcast(new \App\Events\MessageReceived($holdingReply, $conversation, $channel->user_id));
+                }
+                $this->sendReply($channel, $conversation, $holdingReply);
+            }
             return;
         }
+
 
         // Global human-only/emergency pause must also cover inbound AI replies
         // and deterministic attachment acknowledgements. Drop this turn while
@@ -1126,7 +1147,7 @@ class ProcessAutoReply implements ShouldQueue
                     return [
                         'id' => (string) $product->commerce_external_id,
                         'name' => $product->name,
-                        'price' => (float) $product->price,
+                        'price' => empty($metadata['variants']) ? (float) $product->price : null,
                         'currency' => $metadata['currency'] ?? 'SAR',
                         'quantity' => (int) $product->stock_quantity,
                         'sku' => $product->sku,
@@ -1373,7 +1394,9 @@ class ProcessAutoReply implements ShouldQueue
                     $productsContext = [[
                         'id'        => $referencedProduct['salla_product_id'],
                         'name'      => $referencedProduct['name'] ?? 'Unknown',
-                        'price'     => $referencedProduct['price'] ?? '?',
+                        'price'     => (empty($referencedProduct['variants'] ?? []) && empty($referencedProduct['options'] ?? []))
+                            ? ($referencedProduct['price'] ?? '?')
+                            : null,
                         'currency'  => $referencedProduct['currency'] ?? 'SAR',
                         'available' => true,
                         'url'       => null,
@@ -1977,7 +2000,13 @@ class ProcessAutoReply implements ShouldQueue
                     $commerceChannel,
                     (string) $updatedCheckoutState['salla_product_id']
                 );
-                $savedSelections = (array) ($updatedCheckoutState['salla_options'] ?? []);
+                // A new order request starts with no carried-over size or colour. An
+                // option chosen in an earlier, abandoned checkout must never silently
+                // reappear (the customer is asked again). A pending summary keeps its selections.
+                $startsNewSallaOrder = \App\Services\ShopifyOrderIntent::wantsToOrder((string) $message->content)
+                    && ($updatedCheckoutState['confirmation_state'] ?? null) !== 'confirmation_pending'
+                    && ($updatedCheckoutState['confirmation_state'] ?? null) !== 'selecting_salla_option';
+                $savedSelections = $startsNewSallaOrder ? [] : (array) ($updatedCheckoutState['salla_options'] ?? []);
                 // Titles are derived from the canonical option-ID map below.
                 // Carrying a legacy numeric title list forward caused each
                 // extraction pass to append another copy of size/color.
@@ -2083,6 +2112,14 @@ class ProcessAutoReply implements ShouldQueue
                 if ($savedSelections !== []) {
                     $updatedCheckoutState['salla_options'] = $savedSelections;
                     $updatedCheckoutState['salla_option_titles'] = array_values($savedTitles);
+                } elseif ($startsNewSallaOrder) {
+                    // Drop the previous checkout's size/colour and its variant price.
+                    unset(
+                        $updatedCheckoutState['salla_options'],
+                        $updatedCheckoutState['salla_option_titles'],
+                        $updatedCheckoutState['salla_variant_id'],
+                        $updatedCheckoutState['salla_variant_price']
+                    );
                 }
             } catch (\Throwable $e) {
                 if ($isPlaceOrder || ($updatedCheckoutState['confirmation_state'] ?? null) === 'selecting_salla_option') {
@@ -2265,6 +2302,32 @@ class ProcessAutoReply implements ShouldQueue
                 'auto_order_confirmation_enabled' => (bool) $autoOrderConfirmationEnabled,
                 'is_product_browse_message' => (bool) $isProductBrowseMessage,
             ]);
+        }
+
+        // Explicit cancel is deterministic: it clears the in-progress checkout
+        // (product, options, details, summary) without calling the model. It only
+        // applies while a checkout is active and no order has been placed.
+        if (\App\Services\OrderCheckoutService::isExplicitOrderCancellation((string) $message->content)
+            && (!empty($checkoutState['salla_product_id']) || !empty($checkoutState['confirmation_state']))
+            && empty($checkoutState['order_id'])) {
+            $conversation->update(['checkout_state' => null]);
+            $cancelReply = Message::create([
+                'conversation_id' => $conversation->id,
+                'content' => $detectedLanguage === 'arabic'
+                    ? 'تم إلغاء الطلب الحالي، ولم يتم تنفيذ أي شيء. تقدر تبدأ طلب جديد في أي وقت.'
+                    : 'Okay, I have cancelled the current order. Nothing was placed. You can start a new order any time.',
+                'direction' => 'outbound',
+                'status' => 'auto',
+                'is_ai' => false,
+                'source' => 'checkout_cancelled',
+                'send_status' => 'pending',
+            ]);
+            if ($channel->user_id) {
+                broadcast(new \App\Events\MessageReceived($cancelReply, $conversation, $channel->user_id));
+            }
+            Log::info('ProcessAutoReply: checkout cancelled by customer', ['conversation_id' => $conversation->id]);
+            $this->sendReply($channel, $conversation, $cancelReply);
+            return;
         }
 
         // Once the customer explicitly confirms a Salla checkout, do not ask
@@ -3600,6 +3663,9 @@ $aiResponse = $intro
                 'escalated_at' => now(),
                 'escalation_reason' => 'order_confirmation_disabled',
             ]);
+            $aiResponse = $detectedLanguage === 'arabic'
+                ? 'تم حفظ تفاصيل طلبك، لكن لا يمكنني تقديم الطلب تلقائياً الآن. سيتواصل معك أحد أعضاء الفريق لتأكيده.'
+                : "I've saved your order details, but I can't place the order automatically right now. A team member will contact you to confirm it.";
             Log::info('Order confirmation disabled', [
                 'conversation_id' => $conversation->id,
                 'channel_id' => $channel->id,
@@ -4112,10 +4178,13 @@ $aiResponse = $intro
         $aiResponse = \App\Services\ConfirmationGuard::replaceModelConfirmation(
             (string) $aiResponse,
             $checkoutState['confirmation_state'] ?? null,
-            (bool) $containsConfirmPhrase
+            (bool) $containsConfirmPhrase,
+            !empty($checkoutState['confirmation_summary_sent_at']),
+            (string) $detectedLanguage
         );
         // Block claimed-action hallucinations across ALL conversation states.
-        if (\App\Models\FeatureFlag::isEnabled('ai_action_claim_guard', (int) $conversation->business_id)) {
+        if (\App\Models\FeatureFlag::isEnabled('ai_action_claim_guard', (int) $conversation->business_id)
+            && ($orderCreationFailedReason ?? null) !== 'order_confirmation_disabled') {
             $successfulActionTypes = \App\Models\AiActionLog::query()
                 ->where('conversation_id', $conversation->id)
                 ->where('message_id', $message->id)
@@ -6270,7 +6339,7 @@ $aiResponse = $intro
             $orderTotal = $checkoutLineItems !== []
                 ? array_sum(array_map(static fn (array $item): float =>
                     max(0, (float) ($item['price'] ?? 0)) * max(1, (int) ($item['quantity'] ?? 1)), $checkoutLineItems))
-                : (float) ($checkoutState['product_price'] ?? 0);
+                : (float) (!empty($checkoutState['salla_variant_price']) ? $checkoutState['salla_variant_price'] : ($checkoutState['product_price'] ?? 0));
             $orderItems = $checkoutLineItems !== []
                 ? array_map(static fn (array $item): array => [
                     'name' => trim((string) ($item['product_name'] ?? $item['name'] ?? 'Product')),
@@ -6390,7 +6459,13 @@ $aiResponse = $intro
                 max(0, (float) ($item['price'] ?? 0)) * max(1, (int) ($item['quantity'] ?? 1)), $lineItems));
         } else {
             $productName = trim((string) ($checkoutState['product_name'] ?? 'Selected product'));
-            $price = $checkoutState['product_price'] ?? $checkoutState['price'] ?? null;
+            // The price must match what Salla will charge. Once an option (size, colour)
+            // is chosen, Salla prices the order by that variant, so use the variant price.
+            // Never fall back to the base or first-variant product price for a chosen option.
+            $hasChosenOptions = !empty($checkoutState['salla_options']) || !empty($checkoutState['salla_option_titles']);
+            $price = !empty($checkoutState['salla_variant_price'])
+                ? $checkoutState['salla_variant_price']
+                : (!$hasChosenOptions ? ($checkoutState['product_price'] ?? $checkoutState['price'] ?? null) : null);
         }
         $currency = trim((string) ($checkoutState['product_currency'] ?? $checkoutState['currency'] ?? ''));
         $priceText = $price !== null && $price !== '' ? trim((string) $price . ' ' . $currency) : 'Not available';

@@ -186,18 +186,48 @@ class ProductAwarenessService
         $products = $this->getProductsForContext($businessId, $filters);
 
         return array_map(function ($product) {
+            // A product with sizes or colours can cost different amounts per option.
+            // Never present one base price for it: show the range, or no price, until the
+            // customer chooses an option. Otherwise the model quotes a price Salla won't charge.
+            $variants = is_array($product['variants'] ?? null) ? $product['variants'] : [];
+            $hasOptions = $variants !== [] || !empty($product['options']);
+            $variantPrices = [];
+            foreach ($variants as $variant) {
+                if (is_array($variant) && isset($variant['price']) && is_numeric($variant['price'])) {
+                    $variantPrices[] = (float) $variant['price'];
+                }
+            }
+            $price = $product['price'] ?? null;
+            $priceRange = null;
+            $priceNote = null;
+            if ($hasOptions) {
+                $distinct = array_values(array_unique($variantPrices));
+                if (count($distinct) === 1) {
+                    $price = $distinct[0];
+                } elseif (count($distinct) > 1) {
+                    $priceRange = ['min' => min($distinct), 'max' => max($distinct)];
+                    $price = null;
+                    $priceNote = 'Price depends on the chosen option. Give the range, and ask the customer to choose before quoting an exact price.';
+                } else {
+                    $price = null;
+                    $priceNote = 'Price depends on the chosen option. Ask the customer to choose before quoting an exact price.';
+                }
+            }
+
             return [
                 'id'        => $product['id'] ?? null,
                 'internal_id' => $product['internal_id'] ?? null,
                 'commerce_channel_id' => $product['commerce_channel_id'] ?? null,
                 'commerce_external_id' => $product['commerce_external_id'] ?? null,
                 'name'      => $product['name'] ?? 'Unknown',
-                'price'     => $product['price'] ?? '?',
+                'price'     => $price,
+                'price_range' => $priceRange,
+                'price_note' => $priceNote,
                 'currency'  => $product['currency'] ?? 'SAR',
                 'available' => $product['available'] ?? true,
                 'url'       => $product['url'] ?? null,
                 'image_url' => $product['image_url'] ?? null,
-                'variants'  => $product['variants'] ?? [],
+                'variants'  => $variants,
             ];
         }, $products);
     }

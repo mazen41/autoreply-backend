@@ -712,6 +712,17 @@ class SallaService
     }
 
     /**
+     * Normalized address words that must never be treated as a city name during
+     * indexed matching: address structure words, contact words, and test labels.
+     */
+    private const NON_CITY_TOKENS = [
+        'qa', 'test', 'street', 'road', 'building', 'block', 'floor', 'apartment',
+        'district', 'neighborhood', 'neighbourhood', 'postal', 'code', 'box', 'number',
+        'phone', 'mobile', 'name', 'address', 'city', 'saudi', 'arabia', 'egypt',
+        'near', 'opposite', 'behind', 'the', 'and', 'from',
+    ];
+
+    /**
      * Use the country/name indexes to find exact and known-alias candidates
      * before falling back to a full-country fuzzy scan.
      */
@@ -724,6 +735,12 @@ class SallaService
         for ($start = 0; $start < $tokenCount; $start++) {
             for ($length = 1; $length <= 8 && $start + $length <= $tokenCount; $length++) {
                 $phrase = implode(' ', array_slice($tokens, $start, $length));
+                // Short tokens and address/contact words (for example "qa" from a test
+                // address) are never city names. Matching them made an unrelated city
+                // such as "AL QA'" compete with the real city.
+                if (mb_strlen($phrase) < 4 || in_array($phrase, self::NON_CITY_TOKENS, true)) {
+                    continue;
+                }
                 foreach ($this->cityNameSearchVariants($phrase) as $variant) {
                     if ($variant !== '') {
                         $names[$variant] = true;

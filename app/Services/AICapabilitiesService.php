@@ -577,7 +577,7 @@ ROLE;
             } elseif ($isComplete && !$realOrderId) {
                 $p .= "⚠️ STAGE: AWAITING CUSTOMER FINAL CONFIRMATION (ORDER IS NOT PLACED YET!)\n";
                 $p .= "CRITICAL MANDATORY RULE: The order has NOT been submitted to the store yet! YOU MUST NEVER say \"Your order has been placed\", \"Order confirmed\", or \"Your order is processed\".\n";
-                $p .= "Action: Summarize the product, total price, name, and delivery address. Ask the customer explicitly: \"Would you like me to confirm and submit this order now? Please reply YES to confirm! ✅\"\n\n";
+                $p .= "Action: Summarize the product, total price, name, and delivery address. Ask the customer explicitly: \"Would you like me to confirm and submit this order now? Please reply \"confirm order\" to place it, or \"cancel\" to stop! ✅\"\n\n";
             } else {
                 $p .= "⚠️ DO NOT claim the order has been placed because required fields are still missing!\n\n";
             }
@@ -1124,6 +1124,23 @@ JSON;
      */
     private static function getFallbackResponse(string $failureCode = 'ai_failure'): array
     {
+        // A transient provider failure (rate limit, timeout, outage) is not a reason to
+        // hand the customer to a human. Keep the conversation with the bot and ask them
+        // to resend; the order state is not touched here.
+        if ($failureCode === 'provider_exception') {
+            return [
+                'success' => false,
+                'reply' => "I'm sorry, I'm having a brief connection issue right now. Please send your message again in a moment and I'll pick up where we left off.",
+                'intent' => 'question',
+                'needs_escalation' => false,
+                'confidence' => 0.5,
+                'validation' => ['valid' => false, 'reasons' => [$failureCode]],
+                'failure_code' => $failureCode,
+                'provider' => self::$lastRequestProvider,
+                'model' => self::$lastRequestModel,
+            ];
+        }
+
         return [
             'success' => false,
             'reply' => "I apologize, but I'm having trouble processing your request right now. Let me connect you with a human agent who can help you better.",

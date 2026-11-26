@@ -193,7 +193,7 @@ class OrderCheckoutService
             }
 
             $candidate = trim((string) end($parts));
-            if ($candidate !== '' && !preg_match('/\d/u', $candidate)) {
+            if ($this->looksLikeCityName($candidate)) {
                 return $candidate;
             }
         }
@@ -204,6 +204,26 @@ class OrderCheckoutService
         }
 
         return null;
+    }
+
+    /**
+     * A plausible city name for the comma-fallback: one to three words of letters,
+     * with no digits, symbols, or street, building, or contact vocabulary. This stops
+     * a leftover address fragment from being saved and sent to Salla as the city.
+     */
+    private function looksLikeCityName(string $candidate): bool
+    {
+        if ($candidate === '' || preg_match('/[\d@#\/]/u', $candidate)) {
+            return false;
+        }
+        if (preg_match('/^[\p{L}][\p{L}\'’-]*(?:\s+[\p{L}][\p{L}\'’-]*){0,2}$/u', $candidate) !== 1) {
+            return false;
+        }
+
+        return !preg_match(
+            '/\b(?:street|st|road|rd|avenue|ave|building|bldg|block|floor|apt|apartment|flat|villa|district|neighbou?rhood|postal|zip|box|phone|mobile|address|name|near|opposite|behind)\b|شارع|طريق|حي|مبنى|عمارة|الدور|شقة|رقم|صندوق/iu',
+            $candidate
+        );
     }
 
     /** Determine the English country name to append to the geocoding query. */
@@ -1045,6 +1065,17 @@ class OrderCheckoutService
 
         return (bool) preg_match(
             '/^(?:(?:yes|yeah|yep|sure|ok|okay)(?:[,.!\\s]+(?:please\\s+)?confirm(?:\\s+(?:the\\s+)?order|\\s+(?:it|this))?)?|confirm(?:\\s+(?:the\\s+)?order|\\s+(?:it|this))?|please\\s+confirm(?:\\s+(?:the\\s+)?order)?|submit\\s+(?:the\\s+)?order|نعم(?:\\s+(?:أكد|اكد|تأكيد|موافق))?|(?:أكد|اكد|تأكيد|موافق|اعتمد)\\s+(?:الطلب|الاوردر)|تأكيد الطلب|تم التأكيد)[.!\\s]*$/ui',
+            $normalized
+        );
+    }
+
+    /** Deterministic cancel phrases for an in-progress order (no model call). */
+    public static function isExplicitOrderCancellation(string $text): bool
+    {
+        $normalized = mb_strtolower(trim($text));
+
+        return (bool) preg_match(
+            '/^(?:cancel(?:\s+(?:the\s+|my\s+|this\s+)?(?:order|it))?|stop|إلغاء(?:\s+(?:الطلب|الاوردر))?|الغاء(?:\s+(?:الطلب|الاوردر))?|الغي(?:\s+(?:الطلب|الاوردر))?|إلغي(?:\s+(?:الطلب|الاوردر))?)[.!\s]*$/ui',
             $normalized
         );
     }

@@ -9,9 +9,9 @@ namespace App\Services;
  */
 class ConfirmationGuard
 {
-    public const CONFIRM_INSTRUCTION = 'Your order summary is above. Reply "confirm order" to place it, or "cancel" to stop.';
+    public const CONFIRM_INSTRUCTION = 'Reply "confirm order" to place your order, or "cancel" to stop.';
 
-    public static function replaceModelConfirmation(string $reply, ?string $confirmationState, bool $customerConfirmed): string
+    public static function replaceModelConfirmation(string $reply, ?string $confirmationState, bool $customerConfirmed, bool $summarySent = true, string $language = 'other'): string
     {
         if ($confirmationState !== 'confirmation_pending' || $customerConfirmed) {
             return $reply;
@@ -23,6 +23,12 @@ class ConfirmationGuard
         }
 
         if (preg_match('/\b(?:yes|confirm|submit)\b/i', $reply) === 1) {
+            // The confirm line is only valid after a summary was actually delivered.
+            if (!$summarySent) {
+                return $language === 'arabic'
+                    ? 'من فضلك أرسل تفاصيل الطلب الناقصة أولاً، وبعدها أعرض عليك ملخص الطلب للتأكيد.'
+                    : 'Please send the missing order details first, and I will show you the order summary to confirm.';
+            }
             return self::CONFIRM_INSTRUCTION;
         }
 

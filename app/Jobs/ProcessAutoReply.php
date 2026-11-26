@@ -2211,6 +2211,7 @@ class ProcessAutoReply implements ShouldQueue
                             );
                             if ($variantPricing) {
                                 $updatedCheckoutState['product_price'] = (string) $variantPricing['price'];
+                                $updatedCheckoutState['salla_variant_price'] = (string) $variantPricing['price'];
                                 $updatedCheckoutState['product_currency'] = (string) $variantPricing['currency'];
                                 $updatedCheckoutState['salla_variant_id'] = (string) $variantPricing['variant_id'];
                                 unset($updatedCheckoutState['salla_variant_price_unresolved']);
@@ -2225,6 +2226,9 @@ class ProcessAutoReply implements ShouldQueue
                                 // Fallback: use the base product price instead of dead-ending.
                                 // The base price is already in checkout_state from the product
                                 // selection step — keep it and proceed rather than blocking.
+                                if (!empty($updatedCheckoutState['product_price'])) {
+                                    $updatedCheckoutState['salla_variant_price'] = (string) $updatedCheckoutState['product_price'];
+                                }
                                 Log::warning('ProcessAutoReply: variant price lookup returned null, using base product price as fallback', [
                                     'conversation_id' => $conversation->id,
                                     'connection_id' => $commerceChannel->id,
@@ -2235,6 +2239,9 @@ class ProcessAutoReply implements ShouldQueue
                             }
                         } catch (\Throwable $priceException) {
                             // On exception, also fall back to base price instead of dead-ending.
+                            if (!empty($updatedCheckoutState['product_price'])) {
+                                $updatedCheckoutState['salla_variant_price'] = (string) $updatedCheckoutState['product_price'];
+                            }
                             Log::warning('ProcessAutoReply: could not resolve selected Salla variant price, using base product price', [
                                 'conversation_id' => $conversation->id,
                                 'connection_id' => $commerceChannel->id,
@@ -6708,7 +6715,7 @@ $aiResponse = $intro
                 . (!empty($checkoutState['additional_number']) ? 'الرقم الإضافي: ' . trim((string) $checkoutState['additional_number']) . "\n" : '')
                 . "\n"
                 . ($commerceChannel?->type === 'salla' && !$showShippingQuote
-                    ? 'تعذر تأكيد رسوم التوصيل الآن؛ سيؤكد فريق المتجر الإجمالي قبل إتمام الطلب.'
+                    ? "تعذر تأكيد رسوم التوصيل الآن؛ سيؤكد فريق المتجر الإجمالي قبل إتمام الطلب.\nأرسل «تأكيد الطلب» لإتمامه، أو «إلغاء» لإيقافه."
                     : 'أرسل «تأكيد الطلب» لإتمامه، أو «إلغاء» لإيقافه.');
         }
 
@@ -6726,7 +6733,7 @@ $aiResponse = $intro
             . (!empty($checkoutState['additional_number']) ? 'Additional number: ' . trim((string) $checkoutState['additional_number']) . "\n" : '')
             . "\n"
             . ($commerceChannel?->type === 'salla' && !$showShippingQuote
-                ? 'Delivery cost could not be confirmed yet. The store team will confirm the total before placing the order.'
+                ? "Delivery cost could not be confirmed yet. The store team will confirm the total before placing the order.\nReply “confirm order” to place it, or “cancel” to stop."
                 : 'Reply “confirm order” to place it, or “cancel” to stop.');
     }
 

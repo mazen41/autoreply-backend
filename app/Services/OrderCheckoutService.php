@@ -300,7 +300,7 @@ class OrderCheckoutService
     /**
      * Extract order fields from incoming message text and merge with existing checkout_state.
      */
-    public function extractAndMergeState(Conversation $conversation, string $incomingText, ?array $referencedProduct = null): array
+    public function extractAndMergeState(Conversation $conversation, string $incomingText, ?array $referencedProduct = null, bool $addressWasRequested = false): array
     {
         $existingState = is_array($conversation->checkout_state) ? $conversation->checkout_state : [];
 
@@ -514,8 +514,7 @@ class OrderCheckoutService
             // earlier conversational filler to be stored as the address.
             $lastCue = end($addressMatches[0]);
             $candidate = trim(substr($incomingText, $lastCue[1] + strlen($lastCue[0])));
-            if (strlen($candidate) >= 4
-                && !preg_match('/^(?:hi|hello|hey|yes|no|ok|sure|thanks|the dress|this one|that one|مرحبا|سلام|نعم|لا|حسنا|شكرا|الفستان|هذا|هذه)$/ui', $candidate)) {
+            if ($this->isAcceptableAddressValue($candidate, $addressWasRequested)) {
                 $extractedAddress = $candidate;
             }
         }
@@ -531,8 +530,8 @@ class OrderCheckoutService
             && !empty($existingState['salla_product_id'])
             && empty($existingState['address'])
             && empty($existingState['customer_address'])
-            && mb_strlen(trim($incomingText)) >= 8
-            && preg_match('/(?:\b\d{1,5}\s+\p{L}|\b(?:street|st\.?|road|rd\.?|avenue|ave\.?|district|city|giza|cairo|riyadh|jeddah|mecca|dammam)\b|Ø´Ø§Ø±Ø¹|Ù…Ø¯ÙŠÙ†Ø©|Ø­ÙŠ)/iu', $incomingText)) {
+            && $this->isAcceptableAddressValue($incomingText, $addressWasRequested)
+            && ($this->looksLikeDeliveryAddress($incomingText) || $addressWasRequested)) {
             $extractedAddress = trim($incomingText);
         }
 
@@ -615,6 +614,48 @@ class OrderCheckoutService
         }
 
         return $mergedState;
+    }
+
+    /** Reject ordinary questions/actions as address values, even during checkout. */
+    public function isAcceptableAddressValue(string $candidate, bool $addressWasRequested = false): bool
+    {
+        $candidate = trim($candidate);
+        if (mb_strlen($candidate) < 4
+            || preg_match('/^(?:hi|hello|hey|yes|no|ok|sure|thanks|the dress|this one|that one|مرحبا|سلام|نعم|لا|حسنا|شكرا|الفستان|هذا|هذه)$/ui', $candidate)) {
+            return false;
+        }
+
+        $hasAddressShape = $this->looksLikeDeliveryAddress($candidate);
+        $isAddressControlQuestion = (bool) preg_match(
+            '/[?؟]|\b(?:can|could|may|how|what|where|why|change|update|edit|correct|cancel|stop)\b|(?:هل|ممكن|ازاي|كيف|أغير|اغير|تعديل|تغيير|إلغاء|الغاء|ألغي|الغي|أوقف|اوقف)/iu',
+            $candidate
+        );
+
+        if ($isAddressControlQuestion && !$hasAddressShape) {
+            return false;
+        }
+
+        return $hasAddressShape || $addressWasRequested;
+    }
+
+    /** Address-like structure: location terms, a numbered street/building, or multiple address components. */
+    private function looksLikeDeliveryAddress(string $text): bool
+    {
+        $text = trim($text);
+        if (mb_strlen($text) < 8) {
+            return false;
+        }
+
+        $hasLocationTerm = (bool) preg_match(
+            '/\b(?:street|st\.?|road|rd\.?|avenue|ave\.?|district|neighborhood|city|building|block|floor|riyadh|jeddah|mecca|makkah|dammam|cairo|giza|alexandria|saudi arabia)\b|(?:شارع|طريق|حي|مدينة|محافظة|مبنى|عمارة|الدور|الرياض|جدة|مكة|مكه|الدمام|القاهرة|الإسكندرية)/iu',
+            $text
+        );
+        $hasNumberedAddress = (bool) preg_match('/(?:^|[,،\s])\d{1,5}\s+\p{L}|\p{L}[^,،\n]{0,40}\s+\d{1,5}(?:[,،\s]|$)/u', $text);
+        $hasMultipleComponents = preg_match_all('/[,،\n]/u', $text) >= 1
+            && preg_match('/\p{L}/u', $text)
+            && preg_match('/\d/u', $text);
+
+        return $hasLocationTerm || $hasNumberedAddress || $hasMultipleComponents;
     }
 
     /** Merge AI-extracted checkout spans only when each value occurs in the latest customer message. */

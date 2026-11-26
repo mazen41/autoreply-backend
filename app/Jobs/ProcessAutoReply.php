@@ -1519,6 +1519,20 @@ class ProcessAutoReply implements ShouldQueue
         // ── ORDER CHECKOUT STATE & FIELD EXTRACTION ─────────────────────────
         $checkoutService = app(\App\Services\OrderCheckoutService::class);
         $hasActiveSallaCheckout = (bool) $sallaChannel && !empty($checkoutState['salla_product_id']);
+        $addressWasRequested = false;
+        if ($hasActiveSallaCheckout && empty($checkoutState['address'] ?? $checkoutState['customer_address'] ?? null)) {
+            $lastAiCheckoutPrompt = Message::query()
+                ->where('conversation_id', $conversation->id)
+                ->where('direction', 'outbound')
+                ->where('is_ai', true)
+                ->where('id', '<', $message->id)
+                ->latest('id')
+                ->value('content');
+            $addressWasRequested = is_string($lastAiCheckoutPrompt) && (bool) preg_match(
+                '/(?:\\b(?:send|provide|share|reply\\s+with|enter)\\b.{0,100}\\b(?:delivery\\s+)?address\\b|\\bwhere\\s+should\\s+(?:i|we)\\s+deliver\\b|(?:ابعت|أرسل|ارسل|اكتب|اذكر|شارك).{0,100}(?:العنوان|عنوان التوصيل|مدينة التوصيل|الشارع))/iu',
+                $lastAiCheckoutPrompt
+            );
+        }
         if (!$isProductBrowseMessage
             && $hasActiveSallaCheckout
             && (empty($checkoutState['postal_code']) || empty($checkoutState['geo_coordinates']))) {
@@ -1563,7 +1577,7 @@ class ProcessAutoReply implements ShouldQueue
             : [];
         $updatedCheckoutState = $isProductBrowseMessage
             ? []
-            : $checkoutService->extractAndMergeState($conversation, $message->content, $referencedProduct);
+            : $checkoutService->extractAndMergeState($conversation, $message->content, $referencedProduct, $addressWasRequested);
         if (!empty($updatedCheckoutState)) {
             $hasArabicText = (bool) preg_match('/[\x{0600}-\x{06FF}]/u', (string) $message->content);
             $hasLatinText = (bool) preg_match('/[A-Za-z]/', (string) $message->content);
@@ -1803,6 +1817,8 @@ class ProcessAutoReply implements ShouldQueue
             }
         }
         $checkoutState = $updatedCheckoutState;
+        $checkoutDataChangedThisTurn = $this->orderSummaryFingerprint($checkoutStateBeforeIncoming)
+            !== $this->orderSummaryFingerprint($updatedCheckoutState);
         $fieldStatus = $checkoutService->computeFieldStatus(
             $updatedCheckoutState,
             $sallaCheckoutActive,
@@ -2447,6 +2463,11 @@ class ProcessAutoReply implements ShouldQueue
                     unset($aiFields[$field]);
                 }
             }
+            if (isset($aiFields['address'])
+                && (!is_string($aiFields['address'])
+                    || !$checkoutService->isAcceptableAddressValue($aiFields['address'], $addressWasRequested))) {
+                unset($aiFields['address']);
+            }
             $updatedCheckoutState = $checkoutService->mergeVerifiedAiFields(
                 $updatedCheckoutState,
                 $aiFields,
@@ -2486,6 +2507,8 @@ class ProcessAutoReply implements ShouldQueue
                     'missing_field_names' => array_values($fieldStatus['missing_fields'] ?? []),
                 ]);
             }
+            $checkoutDataChangedThisTurn = $checkoutDataChangedThisTurn
+                || $this->orderSummaryFingerprint($checkoutStateBeforeIncoming) !== $this->orderSummaryFingerprint($updatedCheckoutState);
         }
 
         // Step 5: Intelligent Escalation Decision
@@ -2881,6 +2904,8 @@ if (!$isProductBrowseMessage && $commerceChannel && !$summaryConfirmTurn) {
             $intent === 'place_order'
             && $containsConfirmPhrase
             && !empty($fieldStatus['is_complete'])
+            && $autoOrderConfirmationEnabled
+            && !$isOrderStatus
             && !in_array($checkoutState['confirmation_state'] ?? null, ['confirmed', 'order_placed'], true)
         ) {
             $aiResponse = $detectedLanguage === 'arabic'
@@ -2888,7 +2913,14 @@ if (!$isProductBrowseMessage && $commerceChannel && !$summaryConfirmTurn) {
                 : 'Your order details are ready. Please review the summary, then reply “confirm order” to place it.';
         }
 
-        $isOrderSummaryMessage = $intent === 'place_order'
+        $shouldPresentOrderSummary = !$isOrderStatus
+            && $intent === 'place_order'
+            && (
+                $confirmationStateBeforeUpdate !== 'confirmation_pending'
+                || $checkoutDataChangedThisTurn
+                || ($containsConfirmPhrase && !$hasValidOrderSummary && $autoOrderConfirmationEnabled)
+            );
+        $isOrderSummaryMessage = $shouldPresentOrderSummary
             && !empty($fieldStatus['is_complete'])
             && !$shopifyVariantSelectionRequired
             && !$sallaOptionSelectionRequired
@@ -3562,7 +3594,10 @@ $aiResponse = $intro
         if (
             !$claimGuard['allowed']
             && !empty($claimGuard['should_send_order_summary'])
+            && !$isOrderStatus
+            && !$containsConfirmPhrase
             && ($aiResult['intent'] ?? null) !== 'order_status'
+            && $shouldPresentOrderSummary
             && !empty($fieldStatus['is_complete'])
             && !$shopifyVariantSelectionRequired
             && !empty($guardCheckoutState['product_name'])
@@ -3592,6 +3627,20 @@ $aiResponse = $intro
                 'message_id' => $message->id,
                 'field_reason' => $knownFieldReason,
             ]);
+        }
+        if (!$claimGuard['allowed']
+            && !empty($claimGuard['should_send_order_summary'])
+            && !$shouldPresentOrderSummary
+            && !$isOrderStatus) {
+            // A known-field re-ask must not turn every unrelated held-checkout
+            // turn into another order summary. Preserve the pending checkout
+            // and give a short next-step reply instead.
+            $aiResponse = $detectedLanguage === 'arabic'
+                ? 'بيانات طلبك محفوظة. لو حابب تكمل، ابعت «تأكيد الطلب»؛ ولو عندك سؤال تاني اسألني.'
+                : 'Your order details are saved. Reply “confirm order” when you want to continue, or ask me another question.';
+            $claimGuard['allowed'] = true;
+            $claimGuard['decision'] = 'replaced';
+            $claimGuard['reason'] = 'known_field_reask_suppressed_during_held_checkout';
         }
         if (!$claimGuard['allowed']) {
             $aiResponse = $claimGuard['replacement'];
@@ -3663,38 +3712,39 @@ $aiResponse = $intro
         $confirmedSallaCheckoutWithAutomationOff = $sallaChannel
             && !$autoOrderConfirmationEnabled
             && $containsConfirmPhrase
-            && $hasValidOrderSummary
-            && in_array($checkoutState['confirmation_state'] ?? null, ['confirmed', 'order_placed'], true)
+            && empty($realOrderId)
+            && ($checkoutState['confirmation_state'] ?? null) !== 'order_placed'
+            && !empty($checkoutState['salla_product_id'])
             && !empty($fieldStatus['is_complete']);
         if ($confirmedSallaCheckoutWithAutomationOff) {
             $aiResponse = $detectedLanguage === 'arabic'
-                ? 'لا أستطيع تسجيل الطلب تلقائيًا من المتجر حاليًا، لذلك لم يتم إرسال الطلب. سيتواصل معك أحد أفراد الفريق لتأكيده ومساعدتك في إتمامه.'
-                : 'I can’t place this order automatically right now, so it has not been submitted. A team member will follow up to confirm it and help complete it.';
+                ? 'لم يتم إرسال الطلب؛ لأن الإرسال التلقائي متوقف حاليًا. سيتواصل معك أحد أفراد الفريق لمساعدتك في إتمامه.'
+                : 'Your order has not been submitted because automatic order submission is currently off. A team member will follow up to help complete it.';
+            app(\App\Services\HandoffTaskService::class)->openForConversation(
+                $conversation,
+                'order_confirmation_disabled',
+                'normal'
+            );
+            $conversation->update([
+                'requires_human' => true,
+                'status' => 'pending_human',
+                'escalated_at' => now(),
+                'escalation_reason' => 'order_confirmation_disabled',
+            ]);
         }
 
         $isSallaOrderStatusWithoutLookupDetails = $isOrderStatus && $sallaChannel
             && $this->senderPhoneDigits($conversation) === '';
         if ($isSallaOrderStatusWithoutLookupDetails) {
-            $recentStatusMessages = Message::query()
-                ->where('conversation_id', $conversation->id)
-                ->where('direction', 'inbound')
-                ->orderByDesc('created_at')
-                ->limit(6)
-                ->pluck('content');
-            $hasOrderNumber = false;
-            $hasPhoneNumber = false;
-            foreach ($recentStatusMessages as $recentStatusMessage) {
-                $recentStatusText = (string) $recentStatusMessage;
-                if (!$hasOrderNumber && (
-                    preg_match('/(?:\border\b|طلب)\s*(?:number|no\.?|رقم)?\s*[:#-]?\s*#?\d{4,12}/iu', $recentStatusText)
-                    || preg_match('/^\s*#?\d{4,12}\s*$/u', $recentStatusText)
-                )) {
-                    $hasOrderNumber = true;
-                }
-                if (!$hasPhoneNumber && preg_match('/\+?\d(?:[\s().-]*\d){8,14}/u', $recentStatusText)) {
-                    $hasPhoneNumber = true;
-                }
-            }
+            $currentStatusText = trim((string) $message->content);
+            $hasOrderNumber = (bool) preg_match(
+                '/(?:\border\b|طلب)\s*(?:number|no\.?|رقم)?\s*[:#-]?\s*#?\d{4,12}|^\s*#?\d{4,12}\s*$/iu',
+                $currentStatusText
+            );
+            $hasPhoneNumber = (bool) preg_match(
+                '/\b(?:phone|mobile|telephone|رقم الجوال|رقم الهاتف)\b\s*[:#-]?\s*\+?\d(?:[\s().-]*\d){7,14}/iu',
+                $currentStatusText
+            );
             if (!$hasOrderNumber && !$hasPhoneNumber) {
                 $aiResponse = $detectedLanguage === 'arabic'
                     ? 'أكيد أساعدك في متابعة طلبك. ابعتلي رقم الطلب أو رقم الجوال المستخدم وقت الشراء عشان أقدر أتحقق من حالته.'
@@ -5339,6 +5389,21 @@ $aiResponse = $intro
         }
 
         return hash('sha256', implode('|', $identity));
+    }
+
+    /** Fields shown to a customer in the confirmation summary. */
+    private function orderSummaryFingerprint(array $state): string
+    {
+        $summaryFields = [
+            'commerce_channel_id', 'commerce_external_id', 'salla_product_id',
+            'product_name', 'product_price', 'product_currency', 'commerce_variant_id',
+            'commerce_variant_title', 'salla_options', 'salla_option_titles', 'salla_line_items',
+            'full_name', 'customer_name', 'phone', 'customer_phone', 'address', 'customer_address',
+        ];
+
+        $summary = array_intersect_key($state, array_flip($summaryFields));
+        ksort($summary);
+        return hash('sha256', json_encode($summary, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE) ?: '');
     }
 
     /** Build the exact summary required before an explicit order confirmation. */

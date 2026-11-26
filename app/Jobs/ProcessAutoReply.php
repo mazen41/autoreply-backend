@@ -2302,8 +2302,8 @@ class ProcessAutoReply implements ShouldQueue
             // If the saved address had no city (e.g. a partial National Address),
             // check if the customer's latest message supplied the city name.
             if ((!$resolvedShipping || empty($resolvedShipping['city_id']))
-                && !$isConfirmOrder
-                && !$isCancelOrder
+                && !$isExplicitOrderConfirmationMessage
+                && !preg_match('/^(?:cancel(?:\s+order)?|إلغاء(?:\s+الطلب)?|الغاء(?:\s+الطلب)?|ألغي|الغي)\s*[.!؟?]*$/iu', trim((string) $message->content))
                 && trim((string) $message->content) !== '') {
                 $cityFromReply = (new SallaService())->resolveShippingAddressForChannel(
                     $commerceChannel,

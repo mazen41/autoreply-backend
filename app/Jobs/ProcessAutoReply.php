@@ -2299,6 +2299,24 @@ class ProcessAutoReply implements ShouldQueue
                 (string) ($updatedCheckoutState['phone'] ?? ''),
                 (string) ($updatedCheckoutState['delivery_city'] ?? '')
             );
+            // If the saved address had no city (e.g. a partial National Address),
+            // check if the customer's latest message supplied the city name.
+            if ((!$resolvedShipping || empty($resolvedShipping['city_id']))
+                && !$isConfirmOrder
+                && !$isCancelOrder
+                && trim((string) $message->content) !== '') {
+                $cityFromReply = (new SallaService())->resolveShippingAddressForChannel(
+                    $commerceChannel,
+                    (string) $message->content,
+                    (string) ($updatedCheckoutState['phone'] ?? ''),
+                    ''
+                );
+                if ($cityFromReply && !empty($cityFromReply['city_id'])) {
+                    $resolvedShipping = $cityFromReply;
+                    $updatedCheckoutState['address'] = trim((string) $message->content . '، ' . (string) $updatedCheckoutState['address'], " ،,");
+                    $updatedCheckoutState['address_line'] = $updatedCheckoutState['address'];
+                }
+            }
             if ($resolvedShipping && !empty($resolvedShipping['city_id'])) {
                 $updatedCheckoutState['delivery_city'] = (string) $resolvedShipping['city_id'];
                 $updatedCheckoutState['delivery_country_code'] = $resolvedShipping['country_code'] ?? null;
@@ -2352,6 +2370,18 @@ class ProcessAutoReply implements ShouldQueue
             $sallaCheckoutActive,
             (array) ($updatedCheckoutState['salla_required_fields'] ?? [])
         );
+        // Never show a confirmation summary for a Salla order when the city
+        // could not be resolved from the address — otherwise the summary
+        // invites "confirm order" and then blocks on a missing shipping quote.
+        if ($commerceChannel?->type === 'salla'
+            && !empty($updatedCheckoutState['salla_product_id'])
+            && !empty($updatedCheckoutState['address'])
+            && empty($updatedCheckoutState['delivery_city'])) {
+            if (!in_array('delivery_city', $fieldStatus['missing_fields'], true)) {
+                $fieldStatus['missing_fields'][] = 'delivery_city';
+            }
+            $fieldStatus['is_complete'] = false;
+        }
         $hasValidOrderSummary = $this->hasValidOrderSummaryForConfirmation(
             $conversation,
             $message,

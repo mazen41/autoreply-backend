@@ -2643,6 +2643,7 @@ class ProcessAutoReply implements ShouldQueue
                         (string) ($product['name'] ?? ''),
                         (string) ($product['description'] ?? ''),
                         json_encode($product['variants'] ?? [], JSON_UNESCAPED_UNICODE) ?: '',
+                        json_encode($product['options'] ?? [], JSON_UNESCAPED_UNICODE) ?: '',
                     ]));
                     foreach ($requestedCategory as $alias) {
                         if (preg_match('/(?<![\pL\pN])' . preg_quote(mb_strtolower($alias), '/') . '(?![\pL\pN])/iu', $searchable)) {
@@ -2674,6 +2675,7 @@ class ProcessAutoReply implements ShouldQueue
                     $searchable = mb_strtolower(implode(' ', [
                         (string) ($product['name'] ?? ''), (string) ($product['description'] ?? ''),
                         json_encode($product['variants'] ?? [], JSON_UNESCAPED_UNICODE) ?: '',
+                        json_encode($product['options'] ?? [], JSON_UNESCAPED_UNICODE) ?: '',
                     ]));
                     foreach ($requestedAttributes as $aliases) {
                         $found = false;

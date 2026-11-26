@@ -59,6 +59,7 @@ class ProductAwarenessService
                     'url' => $product->metadata['url'] ?? null,
                     'currency' => $product->metadata['currency'] ?? 'SAR',
                     'variants' => $product->metadata['variants'] ?? [],
+                    'options' => $product->metadata['options'] ?? [],
                 ];
             })->toArray();
         });

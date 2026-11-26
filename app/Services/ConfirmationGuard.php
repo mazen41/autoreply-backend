@@ -64,6 +64,17 @@ class ConfirmationGuard
         array $successfulActions = []
     ): string {
         $lower = mb_strtolower($reply);
+        // A negative status statement is evidence that the action did NOT
+        // happen, not a claim that it did. Mask only the negated action phrase
+        // before checking completion patterns, so a separate positive claim in
+        // the same reply still gets caught.
+        $lower = preg_replace([
+            '/\b(?:your\s+|the\s+)?(?:order|purchase)\b[^.!?\n]{0,90}\b(?:has\s+)?(?:not|hasn\x27t|hasn’t|wasn\x27t|wasn’t|was\s+not)\s+(?:yet\s+)?(?:been\s+)?(?:placed|created|submitted|confirmed|processed|completed)\b/iu',
+            '/\b(?:i|we)\s+(?:(?:have|has)\s+)?(?:not|haven\x27t|hasn\x27t|haven’t|hasn’t)\s+(?:yet\s+)?(?:placed|created|submitted|confirmed|processed|completed)\b[^.!?\n]{0,35}\b(?:your\s+|the\s+)?(?:order|purchase)\b/iu',
+            '/\b(?:not|never)\s+(?:yet\s+)?(?:placed|created|submitted|confirmed|processed|completed)\s+(?:your\s+|the\s+)?(?:order|purchase)\b/iu',
+            '/لم\s+يتم\s+(?:إرسال|ارسال|تأكيد|تاكيد|إنشاء|انشاء|تسجيل|تجهيز|إتمام|اتمام)\s*(?:ال)?(?:طلب|الطلب)/u',
+            '/لم\s+(?:أ|ا)(?:رسل|كد|كد|نشئ|سجل|جهز|تمم)\s*(?:ال)?(?:طلب|الطلب)/u',
+        ], ' ', $lower) ?? $lower;
 
         $claimTypes = [
             'order' => '/(?:\border\s*(?:number|no\.?|id)\s*(?:is|:)?\s*#?\d{5,}|awaiting review|waiting for review|\b(?:order|purchase)\b[^.!?\n]{0,70}\b(?:placed|created|submitted|confirmed|processed|completed|done)\b|\b(?:placed|created|submitted)\b[^.!?\n]{0,30}\border\b|تم\s*(?:تأكيد|إنشاء|تسجيل|استلام|تجهيز|إتمام)\s*(?:ال)?(?:طلب|الطلب)?|(?:طلبك|الطلب)\s*(?:اتأكد|تأكد|اتسجل|اتعمل|تم))/u',

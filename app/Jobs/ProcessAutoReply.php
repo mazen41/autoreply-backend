@@ -801,8 +801,17 @@ class ProcessAutoReply implements ShouldQueue
             $conversation->update(['checkout_state' => null]);
         }
 
-        $isOrderAggregate = (bool) preg_match($orderAggregatePattern, $message->content)
-            || (bool) preg_match($orderAggregatePatternAr, $message->content);
+        // The broad singular `my order` pattern also matched status questions
+        // such as "what is my order status?" and sent them down the store-wide
+        // order-list path. Explicit status/tracking requests always win.
+        $isExplicitOrderStatusRequest = (bool) preg_match(
+            '/\b(?:order\s+)?status\b|\bwhere\s+(?:is|are)\s+(?:my|the)\s+orders?\b|\btrack\s+(?:my\s+|the\s+)?orders?\b|(?:حالة\s*(?:الطلب|طلبي)|وين\s*(?:طلبي|الطلب)|فين\s*(?:طلبي|الطلب)|أين\s*(?:طلبي|الطلب)|اين\s*(?:طلبي|الطلب))/iu',
+            $message->content
+        );
+        $isOrderAggregate = !$isExplicitOrderStatusRequest && (
+            (bool) preg_match($orderAggregatePattern, $message->content)
+            || (bool) preg_match($orderAggregatePatternAr, $message->content)
+        );
 
         // ── FOLLOW-UP CONTEXT DETECTION ───────────────────────────────────────
         if (!$isProductAggregate && !$isOrderAggregate) {
@@ -1238,7 +1247,7 @@ class ProcessAutoReply implements ShouldQueue
                                     $order = null;
                                 }
                             } elseif ($phoneMatch) {
-                                $order = $sallaService->getLatestOrderByPhone($sallaChannel->access_token, $phoneMatch);
+                                $order = $sallaService->getLatestOrderByPhoneForChannel($sallaChannel, $phoneMatch);
                             }
                             if ($order) {
                                 $sallaContext = $sallaService->formatOrderForAI($order);
@@ -1683,6 +1692,7 @@ class ProcessAutoReply implements ShouldQueue
         }
         $sallaCheckoutActive = (bool) $sallaChannel && !empty($updatedCheckoutState['salla_product_id']);
         $addressGeocodingStatus = null;
+        $resolvedShippingForCheckout = null;
 
         // Reuse a saved Salla customer profile when the phone matches. This
         // avoids asking returning customers for an email already on file.
@@ -1715,6 +1725,21 @@ class ProcessAutoReply implements ShouldQueue
             }
         }
 
+        // Resolve the Salla city ID before geocoding so a city name absent
+        // from the freeform address can still provide a safe city-level pin.
+        if ($sallaCheckoutActive && !empty($updatedCheckoutState['address'])) {
+            $resolvedShippingForCheckout = (new SallaService())->resolveShippingAddressForChannel(
+                $sallaChannel,
+                (string) $updatedCheckoutState['address'],
+                (string) ($updatedCheckoutState['phone'] ?? $updatedCheckoutState['customer_phone'] ?? '')
+            );
+            if (!empty($resolvedShippingForCheckout['city_id'])) {
+                $updatedCheckoutState['delivery_city'] = (string) $resolvedShippingForCheckout['city_id'];
+                $updatedCheckoutState['delivery_country_code'] = $resolvedShippingForCheckout['country_code'] ?? null;
+                $conversation->update(['checkout_state' => $updatedCheckoutState]);
+            }
+        }
+
         // Resolve approximate delivery coordinates from the city alone;
         // a matching street or house number is not required.
         if (
@@ -1722,8 +1747,33 @@ class ProcessAutoReply implements ShouldQueue
             && empty($updatedCheckoutState['geo_coordinates'])
             && !empty($updatedCheckoutState['address'])
         ) {
+            $geocodingAddress = trim((string) $updatedCheckoutState['address']);
+            $deliveryCity = trim((string) ($updatedCheckoutState['delivery_city'] ?? ''));
+            $deliveryCountryCode = strtoupper((string) ($updatedCheckoutState['delivery_country_code'] ?? ''));
+            $deliveryCountryName = match ($deliveryCountryCode) {
+                'SA' => 'Saudi Arabia', 'AE' => 'United Arab Emirates', 'KW' => 'Kuwait',
+                'QA' => 'Qatar', 'BH' => 'Bahrain', 'OM' => 'Oman', 'EG' => 'Egypt',
+                default => null,
+            };
+            $cityName = null;
+            if ($deliveryCity !== '' && ctype_digit($deliveryCity)) {
+                $cityRow = \Illuminate\Support\Facades\DB::table('salla_city_reference_cities as cities')
+                    ->join('salla_city_catalogs as catalogs', 'catalogs.country_id', '=', 'cities.country_id')
+                    ->where('catalogs.country_code', $deliveryCountryCode ?: 'SA')
+                    ->where('cities.salla_city_id', (int) $deliveryCity)
+                    ->select('cities.name_en', 'cities.name', 'cities.name_ar')
+                    ->first();
+                $cityName = trim((string) ($cityRow->name_en ?? $cityRow->name ?? $cityRow->name_ar ?? '')) ?: null;
+            } elseif ($deliveryCity !== '') {
+                $cityName = $deliveryCity;
+            }
+            $geocodingAddress = implode(', ', array_values(array_filter([
+                $geocodingAddress,
+                $cityName,
+                $deliveryCountryName,
+            ], static fn ($part) => is_string($part) && trim($part) !== '')));
             $geocodingResult = $checkoutService->geocodeDeliveryAddress(
-                (string) $updatedCheckoutState['address'],
+                $geocodingAddress,
                 (string) ($updatedCheckoutState['phone'] ?? $updatedCheckoutState['customer_phone'] ?? '')
             );
             $addressGeocodingStatus = $geocodingResult['status'] ?? 'unavailable';
@@ -1865,7 +1915,7 @@ class ProcessAutoReply implements ShouldQueue
 
         if ($commerceChannel?->type === 'salla'
             && !empty($updatedCheckoutState['address'])) {
-            $resolvedShipping = (new SallaService())->resolveShippingAddressForChannel(
+            $resolvedShipping = $resolvedShippingForCheckout ?? (new SallaService())->resolveShippingAddressForChannel(
                 $commerceChannel,
                 (string) $updatedCheckoutState['address'],
                 (string) ($updatedCheckoutState['phone'] ?? '')
@@ -3812,7 +3862,7 @@ $aiResponse = $intro
 
         $isSallaOrderStatusWithoutLookupDetails = $isOrderStatus && $sallaChannel
             && $this->senderPhoneDigits($conversation) === '';
-        if ($isSallaOrderStatusWithoutLookupDetails) {
+        if ($isOrderStatus && $sallaChannel && empty($sallaContext)) {
             $currentStatusText = trim((string) $message->content);
             $hasOrderNumber = (bool) preg_match(
                 '/(?:\border\b|طلب)\s*(?:number|no\.?|رقم)?\s*[:#-]?\s*#?\d{4,12}|^\s*#?\d{4,12}\s*$/iu',
@@ -3822,10 +3872,14 @@ $aiResponse = $intro
                 '/(?:\b(?:phone|mobile|telephone)\b|رقم\s*(?:الجوال|الهاتف))\s*[:#-]?\s*\+?\d(?:[\s().-]*\d){7,14}|^\s*\+?\d[\d\s().-]{7,17}\s*$/iu',
                 $currentStatusText
             );
-            if (!$hasOrderNumber && !$hasPhoneNumber) {
+            if (!$hasOrderNumber && !$hasPhoneNumber && $isSallaOrderStatusWithoutLookupDetails) {
                 $aiResponse = $detectedLanguage === 'arabic'
                     ? 'أكيد أساعدك في متابعة طلبك. ابعتلي رقم الطلب أو رقم الجوال المستخدم وقت الشراء عشان أقدر أتحقق من حالته.'
                     : 'I can help check your order. Please send the order number or the phone number used at checkout so I can look it up.';
+            } elseif ($hasOrderNumber || $hasPhoneNumber) {
+                $aiResponse = $detectedLanguage === 'arabic'
+                    ? 'لم أتمكن من التحقق من الطلب بهذه البيانات حتى الآن. راجع رقم الجوال أو أرسل رقم الطلب، وسأحاول البحث عنه مرة أخرى.'
+                    : 'I could not verify an order with those details yet. Please check the phone number or send the order number, and I will look it up again.';
             }
         }
 
@@ -5059,6 +5113,7 @@ $aiResponse = $intro
                     $sallaRes = $sallaService->createOrderForChannel($sallaChannel, $checkoutState);
 
                     if (($sallaRes['status'] ?? null) === 'needs_fields') {
+                        $providerMissingFields = array_values(array_unique((array) ($sallaRes['missing_fields'] ?? [])));
                         // Salla's own API validation named the specific
                         // ship_to fields THIS store requires. Persist them so
                         // the next turn asks the customer only for those,
@@ -5084,7 +5139,10 @@ $aiResponse = $intro
                         ]);
                         return [
                             'status' => 'needs_fields',
-                            'missing_fields' => $mergedRequired,
+                            // Keep the current 422 separate from previously
+                            // learned store requirements. The caller may clear
+                            // only fields Salla rejected in this request.
+                            'missing_fields' => $providerMissingFields !== [] ? $providerMissingFields : $mergedRequired,
                         ];
                     }
 

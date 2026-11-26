@@ -928,6 +928,9 @@ class ProcessAutoReply implements ShouldQueue
         // AND a recent AI message asked for the order number, treat this as an order-status request.
         if (!$isOrderStatus) {
             $trimmedMsg = trim($message->content);
+            $isBareSaudiPhone = preg_match('/^\+?[0-9\s().-]+$/u', $trimmedMsg)
+                && \App\Helpers\SallaPhoneHelper::getCountryCode($trimmedMsg) === 'SA'
+                && \App\Helpers\SallaPhoneHelper::isValidSaudiMobile($trimmedMsg);
             if (preg_match('/^#?(\d{5,12})$/', $trimmedMsg, $bareMatch)) {
                 // Looks like a standalone order number. Check if last AI reply asked for it.
                 $recentAiMsg = Message::where('conversation_id', $conversation->id)
@@ -936,7 +939,7 @@ class ProcessAutoReply implements ShouldQueue
                     ->orderBy('created_at', 'desc')
                     ->value('content');
 
-                $orderRequestPhrases = ['order number', 'رقم الطلب', 'رقم طلبك', 'order no', 'your order'];
+                $orderRequestPhrases = ['order number', 'رقم الطلب', 'رقم طلبك', 'order no', 'your order', 'phone number', 'mobile number', 'رقم الجوال', 'رقم الهاتف'];
                 $aiAskedForOrderNumber = false;
                 if ($recentAiMsg) {
                     $recentAiLower = mb_strtolower($recentAiMsg);
@@ -953,6 +956,26 @@ class ProcessAutoReply implements ShouldQueue
                     Log::info('ProcessAutoReply: detected bare order number follow-up', [
                         'conversation_id' => $conversation->id,
                         'order_number'    => $bareMatch[1],
+                    ]);
+                }
+            } elseif ($isBareSaudiPhone) {
+                $recentAiMsg = Message::where('conversation_id', $conversation->id)
+                    ->where('is_ai', true)
+                    ->where('direction', 'outbound')
+                    ->orderBy('created_at', 'desc')
+                    ->value('content');
+                $recentAiLower = mb_strtolower((string) $recentAiMsg);
+                $askedForLookupDetail = false;
+                foreach (['order number', 'رقم الطلب', 'رقم طلبك', 'order no', 'your order', 'phone number', 'mobile number', 'رقم الجوال', 'رقم الهاتف'] as $phrase) {
+                    if (str_contains($recentAiLower, $phrase)) {
+                        $askedForLookupDetail = true;
+                        break;
+                    }
+                }
+                if ($askedForLookupDetail) {
+                    $isOrderStatus = true;
+                    Log::info('ProcessAutoReply: detected Saudi phone follow-up for order lookup', [
+                        'conversation_id' => $conversation->id,
                     ]);
                 }
             }
@@ -1181,8 +1204,26 @@ class ProcessAutoReply implements ShouldQueue
                     if (preg_match('/\b(?:order|orders|طلب|رقم\s+الطلب)\s*(?:number|no\.?|#|id)?\s*:?\s*#?\s*(\d{4,10})\b/iu', $lookupText, $mo)) {
                         $orderNumberMatch = $mo[1];
                     }
-                    if (preg_match('/\b(05\d{8}|9665\d{8}|\+9665\d{8})\b/', $lookupText, $mp)) {
-                        $phoneMatch = preg_replace('/[^0-9]/', '', $mp[1]);
+                    if (preg_match('/(?:phone|mobile|telephone|رقم\s*(?:الجوال|الهاتف))\D{0,12}(\+?\d[\d\s().-]{7,17}\d)/iu', $lookupText, $mp)) {
+                        $phoneCandidate = trim($mp[1]);
+                        if (\App\Helpers\SallaPhoneHelper::getCountryCode($phoneCandidate) === 'SA'
+                            && \App\Helpers\SallaPhoneHelper::isValidSaudiMobile($phoneCandidate)) {
+                            $phoneMatch = \App\Helpers\SallaPhoneHelper::formatForCustomerMobile($phoneCandidate);
+                        }
+                    } else {
+                        $phoneCandidates = [];
+                        if (preg_match('/^\+?[0-9][0-9\s().-]{7,17}$/u', trim($lookupText))) {
+                            $phoneCandidates[] = trim($lookupText);
+                        } elseif (preg_match_all('/(?<![0-9])\+?[0-9][0-9\s().-]{7,17}[0-9](?![0-9])/u', $lookupText, $phoneMatches)) {
+                            $phoneCandidates = $phoneMatches[0];
+                        }
+                        foreach ($phoneCandidates as $phoneCandidate) {
+                            if (\App\Helpers\SallaPhoneHelper::getCountryCode($phoneCandidate) === 'SA'
+                                && \App\Helpers\SallaPhoneHelper::isValidSaudiMobile($phoneCandidate)) {
+                                $phoneMatch = \App\Helpers\SallaPhoneHelper::formatForCustomerMobile($phoneCandidate);
+                                break;
+                            }
+                        }
                     }
 
                     if ($orderNumberMatch || $phoneMatch) {
@@ -2208,7 +2249,7 @@ class ProcessAutoReply implements ShouldQueue
             'checkout_extraction'      => ($sallaCheckoutActive
                 && ($updatedCheckoutState['confirmation_state'] ?? null) !== 'selecting_salla_option'
                 && !empty($fieldStatus['missing_fields'])) ? [
-                'fields' => ['full_name', 'phone', 'email', 'address', 'postal_code', 'building_number', 'block', 'district', 'short_address', 'additional_number'],
+                'fields' => ['full_name', 'phone', 'email', 'address', 'postal_code', 'building_number', 'street_number', 'block', 'district', 'short_address', 'additional_number'],
                 'language' => $detectedLanguage,
             ] : null,
             'incoming_attachment'      => ($attachment = data_get($message->metadata, 'attachment'))
@@ -2468,6 +2509,7 @@ class ProcessAutoReply implements ShouldQueue
                 'full_name' => ['full_name', 'customer_name'], 'phone' => ['phone', 'customer_phone'],
                 'email' => ['email', 'customer_email'], 'address' => ['address', 'customer_address'],
                 'postal_code' => ['postal_code'], 'building_number' => ['building_number'],
+                'street_number' => ['street_number'],
                 'block' => ['block'], 'district' => ['district'], 'short_address' => ['short_address'],
                 'additional_number' => ['additional_number'],
             ];
@@ -2494,7 +2536,7 @@ class ProcessAutoReply implements ShouldQueue
                 $aiFields,
                 (string) $message->content
             );
-            foreach (['full_name', 'phone', 'email', 'address', 'postal_code', 'building_number', 'block', 'district', 'short_address', 'additional_number'] as $field) {
+            foreach (['full_name', 'phone', 'email', 'address', 'postal_code', 'building_number', 'street_number', 'block', 'district', 'short_address', 'additional_number'] as $field) {
                 if (($updatedCheckoutState[$field] ?? null) !== ($beforeAiExtraction[$field] ?? null)
                     && !empty($updatedCheckoutState[$field])) {
                     $checkoutAiFieldsSaved[] = $field;
@@ -2574,17 +2616,24 @@ class ProcessAutoReply implements ShouldQueue
             }
         }
 
+        // Deterministic order-status detection outranks a model label such as
+        // `place_order`, especially while an unrelated checkout is held open.
+        if ($isOrderStatus && !$isExplicitOrderConfirmationMessage) {
+            $intent = 'order_status';
+            $aiResult['intent'] = 'order_status';
+        }
+
         if ($checkoutAiFieldsSaved !== [] && $intent === 'place_order' && empty($fieldStatus['is_complete'])) {
             $fieldLabels = $detectedLanguage === 'arabic' ? [
                 'full_name' => 'الاسم الكامل', 'phone' => 'رقم الجوال', 'address' => 'عنوان التوصيل',
                 'email' => 'البريد الإلكتروني', 'postal_code' => 'الرمز البريدي',
-                'building_number' => 'رقم المبنى', 'block' => 'الحي أو رقم الدور',
+                'building_number' => 'رقم المبنى', 'street_number' => 'رقم الشارع', 'block' => 'الحي أو رقم الدور',
                 'district' => 'الحي', 'short_address' => 'العنوان الوطني المختصر',
                 'additional_number' => 'الرقم الإضافي', 'delivery_city' => 'المدينة',
             ] : [
                 'full_name' => 'full name', 'phone' => 'phone number', 'address' => 'delivery address',
                 'email' => 'email address', 'postal_code' => 'postal code',
-                'building_number' => 'building number', 'block' => 'block or floor',
+                'building_number' => 'building number', 'street_number' => 'street number', 'block' => 'block or floor',
                 'district' => 'district', 'short_address' => 'short national address',
                 'additional_number' => 'additional address number', 'delivery_city' => 'delivery city',
             ];
@@ -2830,13 +2879,12 @@ if (!$isProductBrowseMessage && $commerceChannel && !$summaryConfirmTurn) {
         $checkoutHardEscalations = ['customer_requested_human', 'complaint', 'sensitive_issue', 'business_rule'];
         if (
             $shouldEscalate
-            && $intent === 'place_order'
+            && ($intent === 'place_order' || ($isOrderStatus && $sallaChannel))
             && $commerceChannel
-            && !empty($updatedCheckoutState['salla_product_id'])
             && !in_array($escalationReason, $checkoutHardEscalations, true)
         ) {
             $shouldEscalate = false;
-            $decisionReason = 'active_checkout_collecting_or_confirming';
+            $decisionReason = $isOrderStatus ? 'salla_order_status_lookup' : 'active_checkout_collecting_or_confirming';
         }
 
         if ($isProductBrowseMessage) {
@@ -3278,7 +3326,14 @@ $aiResponse = $intro
                             'order_connection_id' => (string) $commerceChannel->id,
                         ]
                     );
-                    $conversation->update(['checkout_state' => $completedState, 'requires_human' => false]);
+                    $conversation->update([
+                        'checkout_state' => $completedState,
+                        'requires_human' => false,
+                        'status' => 'open',
+                        'ai_enabled' => true,
+                        'escalated_at' => null,
+                        'escalation_reason' => null,
+                    ]);
                     HandoffTask::where('conversation_id', $conversation->id)
                         ->where('status', 'open')
                         ->update(['status' => 'resolved', 'resolved_at' => now()]);
@@ -3764,7 +3819,7 @@ $aiResponse = $intro
                 $currentStatusText
             );
             $hasPhoneNumber = (bool) preg_match(
-                '/\b(?:phone|mobile|telephone|رقم الجوال|رقم الهاتف)\b\s*[:#-]?\s*\+?\d(?:[\s().-]*\d){7,14}/iu',
+                '/(?:\b(?:phone|mobile|telephone)\b|رقم\s*(?:الجوال|الهاتف))\s*[:#-]?\s*\+?\d(?:[\s().-]*\d){7,14}|^\s*\+?\d[\d\s().-]{7,17}\s*$/iu',
                 $currentStatusText
             );
             if (!$hasOrderNumber && !$hasPhoneNumber) {
@@ -4681,14 +4736,88 @@ $aiResponse = $intro
             'postal_code' => $checkoutState['postal_code'] ?? null,
             'geo_coordinates' => $checkoutState['geo_coordinates'] ?? null,
             'building_number' => $checkoutState['building_number'] ?? null,
+            'street_number' => $checkoutState['street_number'] ?? null,
+            'address_line' => $checkoutState['address_line'] ?? null,
+            'block' => $checkoutState['block'] ?? null,
+            'district' => $checkoutState['district'] ?? null,
             'short_address' => $checkoutState['short_address'] ?? null,
             'additional_number' => $checkoutState['additional_number'] ?? null,
+            'salla_options' => $checkoutState['salla_options'] ?? [],
+            'salla_option_titles' => $checkoutState['salla_option_titles'] ?? [],
+            'salla_line_items' => $checkoutState['salla_line_items'] ?? [],
         ];
 
         $orderData = $this->createRealExternalOrder($conversation, $orderInput, $channel);
+        if (($orderData['status'] ?? null) === 'needs_fields') {
+            $missingFields = array_values(array_diff((array) ($orderData['missing_fields'] ?? []), ['geo_coordinates']));
+            $freshState = is_array($conversation->fresh()->checkout_state) ? $conversation->fresh()->checkout_state : $checkoutState;
+            $freshState['confirmation_state'] = 'collecting_info';
+            unset(
+                $freshState['confirmation_summary_message_id'],
+                $freshState['confirmation_summary_fingerprint'],
+                $freshState['confirmation_summary_sent_at']
+            );
+            $conversation->update(['checkout_state' => $freshState]);
+            $conversation->update([
+                'requires_human' => false,
+                'status' => 'open',
+                'ai_enabled' => true,
+                'escalated_at' => null,
+                'escalation_reason' => null,
+            ]);
+            $labels = $detectedLanguage === 'arabic' ? [
+                'street_number' => 'رقم الشارع', 'building_number' => 'رقم المبنى',
+                'postal_code' => 'الرمز البريدي', 'email' => 'البريد الإلكتروني',
+                'address_line' => 'اسم الشارع وعنوان التوصيل', 'delivery_city' => 'مدينة التوصيل',
+                'block' => 'رقم الدور أو الشقة', 'district' => 'الحي',
+                'short_address' => 'العنوان الوطني المختصر', 'additional_number' => 'الرقم الإضافي للمبنى',
+            ] : [
+                'street_number' => 'street number', 'building_number' => 'building number',
+                'postal_code' => 'postal code', 'email' => 'email address',
+                'address_line' => 'street and delivery address', 'delivery_city' => 'delivery city',
+                'block' => 'block or floor', 'district' => 'district',
+                'short_address' => 'short national address', 'additional_number' => 'additional building number',
+            ];
+            $details = array_values(array_filter(array_map(fn ($field) => $labels[$field] ?? null, $missingFields)));
+            if ($details === [] && in_array('geo_coordinates', (array) ($orderData['missing_fields'] ?? []), true)) {
+                $details = [$detectedLanguage === 'arabic'
+                    ? 'اسم المدينة والحي والشارع ورقم المبنى بوضوح لتحديد موقع التوصيل'
+                    : 'the city, district, street, and building number clearly so the delivery location can be identified'];
+            }
+            $reply = $detectedLanguage === 'arabic'
+                ? 'لم يتم إرسال الطلب بعد. المتجر يحتاج البيانات التالية لإتمامه: ' . implode('، ', $details) . '. أرسلها في رسالة واحدة، وبعدها سأعرض عليك الملخص للتأكيد.'
+                : 'Your order has not been submitted yet. The store requires: ' . implode(', ', $details) . '. Send those details in one message and I will show you the summary to confirm.';
+            $replyMessage = Message::create([
+                'conversation_id' => $conversation->id,
+                'content' => $reply,
+                'direction' => 'outbound', 'status' => 'auto', 'is_ai' => false,
+                'source' => 'commerce_order_fields_required', 'send_status' => 'pending',
+                'intent' => 'place_order', 'detected_language' => $detectedLanguage,
+            ]);
+            if ($channel->user_id) broadcast(new \App\Events\MessageReceived($replyMessage, $conversation, $channel->user_id));
+            $this->sendReply($channel, $conversation, $replyMessage);
+            return true;
+        }
         $orderId = (string) ($orderData['order_id'] ?? '');
         if ($orderId === '') {
-            return false;
+            $reply = $detectedLanguage === 'arabic'
+                ? 'لم يتم إرسال الطلب، ولم يتم تأكيده في المتجر. واجهت مشكلة أثناء الإرسال، وسيتابع معك أحد أفراد الفريق للتأكد من النتيجة ومساعدتك.'
+                : 'Your order was not confirmed by the store, so I cannot say it was placed. A team member will follow up to check the result and help complete it.';
+            $conversation->update([
+                'requires_human' => true, 'status' => 'pending_human', 'ai_enabled' => false,
+                'escalated_at' => now(), 'escalation_reason' => 'commerce_order_submission_unconfirmed',
+            ]);
+            app(\App\Services\HandoffTaskService::class)->openForConversation($conversation, 'commerce_order_submission_unconfirmed');
+            $replyMessage = Message::create([
+                'conversation_id' => $conversation->id,
+                'content' => $reply,
+                'direction' => 'outbound', 'status' => 'auto', 'is_ai' => false,
+                'source' => 'commerce_order_submission_unconfirmed', 'send_status' => 'pending',
+                'intent' => 'place_order', 'detected_language' => $detectedLanguage,
+            ]);
+            if ($channel->user_id) broadcast(new \App\Events\MessageReceived($replyMessage, $conversation, $channel->user_id));
+            $this->sendReply($channel, $conversation, $replyMessage);
+            return true;
         }
 
         $productName = trim((string) ($orderInput['product_name'] ?? ''));
@@ -4710,7 +4839,14 @@ $aiResponse = $intro
                 'order_connection_id' => (string) $commerceChannel->id,
             ]
         );
-        $conversation->update(['checkout_state' => $completedState, 'requires_human' => false]);
+        $conversation->update([
+            'checkout_state' => $completedState,
+            'requires_human' => false,
+            'status' => 'open',
+            'ai_enabled' => true,
+            'escalated_at' => null,
+            'escalation_reason' => null,
+        ]);
         HandoffTask::where('conversation_id', $conversation->id)
             ->where('status', 'open')
             ->update(['status' => 'resolved', 'resolved_at' => now()]);
@@ -5448,15 +5584,29 @@ $aiResponse = $intro
         $priceText = $price !== null && $price !== '' ? trim((string) $price . ' ' . $currency) : 'Not available';
         $storeName = trim((string) ($commerceChannel?->page_name ?? '')) ?: 'our store';
         $phone = $checkoutState['phone'] ?? $checkoutState['customer_phone'] ?? null;
+        $isArabic = ($checkoutState['checkout_language'] ?? null) === 'arabic';
         if ($lineItems !== []) {
             $optionGroups = array_values(array_filter(array_map(static function (array $item): string {
                 $titles = $item['option_titles'] ?? $item['salla_option_titles'] ?? [];
                 return implode(', ', array_values(array_unique(array_map('strval', (array) $titles))));
             }, $lineItems)));
-            $optionsText = $optionGroups !== [] ? 'Options: ' . implode('; ', $optionGroups) . "\n" : '';
+            $optionsText = $optionGroups !== [] ? ($isArabic ? 'الخيارات: ' : 'Options: ') . implode('; ', $optionGroups) . "\n" : '';
         } else {
             $titles = array_values(array_unique(array_map('strval', (array) ($checkoutState['salla_option_titles'] ?? []))));
-            $optionsText = $titles !== [] ? 'Options: ' . implode(', ', $titles) . "\n" : '';
+            $optionsText = $titles !== [] ? ($isArabic ? 'الخيارات: ' : 'Options: ') . implode(', ', $titles) . "\n" : '';
+        }
+
+        if ($isArabic) {
+            return "راجع ملخص طلبك:\n"
+                . "المنتج: {$productName}\n"
+                . (!empty($checkoutState['commerce_variant_title']) ? 'الخيار: ' . trim((string) $checkoutState['commerce_variant_title']) . "\n" : '')
+                . $optionsText
+                . "السعر: {$priceText}\n"
+                . "المتجر: {$storeName}\n"
+                . 'الاسم: ' . trim((string) ($checkoutState['full_name'] ?? '')) . "\n"
+                . 'رقم الجوال: ' . (\App\Services\OrderCheckoutService::isValidPhone($phone) ? trim((string) $phone) : 'غير متوفر') . "\n"
+                . 'عنوان التوصيل: ' . trim((string) ($checkoutState['address'] ?? $checkoutState['customer_address'] ?? '')) . "\n\n"
+                . 'أرسل «تأكيد الطلب» لإتمامه، أو «إلغاء» لإيقافه.';
         }
 
         return "Please review your order summary:\n"

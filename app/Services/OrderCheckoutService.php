@@ -675,7 +675,7 @@ class OrderCheckoutService
 
         $limits = [
             'full_name' => 120, 'phone' => 32, 'email' => 254, 'address' => 500,
-            'postal_code' => 16, 'building_number' => 24, 'block' => 80,
+            'postal_code' => 16, 'building_number' => 24, 'street_number' => 24, 'block' => 80,
             'district' => 100, 'short_address' => 16, 'additional_number' => 16,
         ];
         foreach ($limits as $field => $maxLength) {
@@ -707,6 +707,11 @@ class OrderCheckoutService
             if ($field === 'email' && !filter_var($candidate, FILTER_VALIDATE_EMAIL)) {
                 continue;
             }
+            if ($field === 'street_number'
+                && (!preg_match('/[0-9٠-٩]/u', $candidate)
+                    || !preg_match('/street\s*(?:number|no\.?|#)|رقم\s*(?:الشارع|الطريق)/iu', $incomingText))) {
+                continue;
+            }
             if ($field === 'full_name') {
                 $explicitNameCue = (bool) preg_match('/(?:my name is|name is|اسمي|أنا|انا)/iu', $incomingText);
                 $wordCount = preg_match_all('/[\p{L}]+/u', $candidate);
@@ -727,6 +732,7 @@ class OrderCheckoutService
             $fieldCuePatterns = [
                 'postal_code' => '/postal|zip|الرمز\s*البريدي/iu',
                 'building_number' => '/building|house\s*(?:no|number)?|مبنى|مبنى|عمارة|رقم\s*(?:المبنى|المنزل)/iu',
+                'street_number' => '/street\s*(?:number|no\.?|#)|رقم\s*(?:الشارع|الطريق)/iu',
                 'block' => '/block|floor|بلوك|الدور|الطابق|رقم\s*الدور/iu',
                 'district' => '/district|neighbou?rhood|area|حي|منطقة/iu',
                 'short_address' => '/short\s*(?:national\s*)?address|national\s*address|العنوان\s*الوطني\s*المختصر|العنوان\s*المختصر/iu',

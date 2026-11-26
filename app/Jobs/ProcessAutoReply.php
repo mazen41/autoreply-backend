@@ -717,9 +717,10 @@ class ProcessAutoReply implements ShouldQueue
 
         // Keywords that indicate customer is asking about an EXISTING order
         $orderStatusKeywords = [
-            'طلب','أوردر','order','شحن','توصيل','delivery','shipping',
-            'وين','فين','متى','when','status','حالة','مشتريات',
-            'بضاعتي','بتاعي','اين طلبي','where is my','track',
+            'order status', 'status of my order', 'track my order', 'track order',
+            'where is my order', 'where is the order', 'when will my order',
+            'حالة الطلب', 'حالة طلبي', 'تتبع الطلب', 'تتبع طلبي', 'وين طلبي', 'فين طلبي',
+            'أين طلبي', 'اين طلبي', 'متى يوصل طلبي', 'متى يصل الطلب',
         ];
         // Keywords that indicate customer wants to PLACE a new order / buy a SPECIFIC item.
         // ⚠️  Do NOT add general product-browse phrases here ("show me products", "what do you
@@ -805,7 +806,7 @@ class ProcessAutoReply implements ShouldQueue
         // such as "what is my order status?" and sent them down the store-wide
         // order-list path. Explicit status/tracking requests always win.
         $isExplicitOrderStatusRequest = (bool) preg_match(
-            '/\b(?:order\s+)?status\b|\bwhere\s+(?:is|are)\s+(?:my|the)\s+orders?\b|\btrack\s+(?:my\s+|the\s+)?orders?\b|(?:حالة\s*(?:الطلب|طلبي)|وين\s*(?:طلبي|الطلب)|فين\s*(?:طلبي|الطلب)|أين\s*(?:طلبي|الطلب)|اين\s*(?:طلبي|الطلب))/iu',
+            '/\b(?:order\s+)?status\b|\bwhere\s+(?:is|are)\s+(?:my|the)\s+orders?\b|\bwhen\s+will\s+(?:my|the)\s+order\b|\btrack(?:ing)?\s+(?:my\s+|the\s+)?orders?\b|(?:حالة\s*(?:الطلب|طلبي)|وين\s*(?:طلبي|الطلب)|فين\s*(?:طلبي|الطلب)|أين\s*(?:طلبي|الطلب)|اين\s*(?:طلبي|الطلب)|متى\s*(?:يوصل|يصل)\s*(?:طلبي|الطلب)|تتبع\s*(?:طلبي|الطلب))/iu',
             $message->content
         );
         $isOrderAggregate = !$isExplicitOrderStatusRequest && (
@@ -869,6 +870,18 @@ class ProcessAutoReply implements ShouldQueue
         }
         foreach ($placeOrderKeywords as $kw) {
             if (str_contains($msgLower, $kw)) { $isPlaceOrder = true; break; }
+        }
+
+        // Customer details during an active checkout are checkout input, even
+        // when they contain a phone number, delivery, or the word "order".
+        // A real status question is recognized by its status/tracking wording.
+        $incomingCheckoutDetails = (bool) preg_match(
+            '/\b(?:phone|mobile|address|delivery\s+address|building|street|postal|zip|cash\s+on\s+delivery|cod)\b|رقم\s*(?:الجوال|الهاتف)|(?:العنوان|عنوان\s*التوصيل|رقم\s*(?:المبنى|الشارع)|الدفع\s*عند\s*الاستلام)/iu',
+            (string) $message->content
+        );
+        if (!empty($checkoutState['salla_product_id']) && $incomingCheckoutDetails && !$isExplicitOrderStatusRequest) {
+            $isOrderStatus = false;
+            $isPlaceOrder = true;
         }
 
         // An exact customer confirmation outranks the generic `order` status
@@ -1172,9 +1185,8 @@ class ProcessAutoReply implements ShouldQueue
 
                         // If message is a bare order number, look up directly
                         $trimmedMsg = trim($message->content);
-                        if (preg_match('/^#?(\d{5,12})$/', $trimmedMsg, $bareOrderMatch)) {
-                            $raw   = $sallaService->getOrderForChannel($sallaChannel, $bareOrderMatch[1]);
-                            $order = $raw['data'] ?? $raw ?? null;
+                        if (preg_match('/(?:\border\b|طلب)?\s*(?:number|no\.?|رقم)?\s*[:#-]?\s*#?(\d{5,12})/iu', $trimmedMsg, $bareOrderMatch)) {
+                            $order = $sallaService->getOrderByReferenceForChannel($sallaChannel, $bareOrderMatch[1]);
                             if ($order && !$this->orderBelongsToSender($order, [$rawPhone])) {
                                 Log::warning('ProcessAutoReply: order number does not belong to sender; not disclosed');
                                 $order = null;
@@ -1210,7 +1222,9 @@ class ProcessAutoReply implements ShouldQueue
                     $lookupText = (string) $message->content;
                     $orderNumberMatch = null;
                     $phoneMatch       = null;
-                    if (preg_match('/\b(?:order|orders|طلب|رقم\s+الطلب)\s*(?:number|no\.?|#|id)?\s*:?\s*#?\s*(\d{4,10})\b/iu', $lookupText, $mo)) {
+                    if (preg_match('/\b(?:order|orders|طلب|رقم\s+الطلب)\s*(?:number|no\.?|#|id)?\s*:?\s*#?\s*(\d{4,12})\b/iu', $lookupText, $mo)) {
+                        $orderNumberMatch = $mo[1];
+                    } elseif (preg_match('/^\s*#?(\d{5,12})\s*$/u', $lookupText, $mo)) {
                         $orderNumberMatch = $mo[1];
                     }
                     if (preg_match('/(?:phone|mobile|telephone|رقم\s*(?:الجوال|الهاتف))\D{0,12}(\+?\d[\d\s().-]{7,17}\d)/iu', $lookupText, $mp)) {
@@ -1240,8 +1254,7 @@ class ProcessAutoReply implements ShouldQueue
                             $sallaService = new SallaService();
                             $order = null;
                             if ($orderNumberMatch) {
-                                $raw   = $sallaService->getOrder($sallaChannel->access_token, $orderNumberMatch);
-                                $order = $raw['data'] ?? $raw ?? null;
+                                $order = $sallaService->getOrderByReferenceForChannel($sallaChannel, $orderNumberMatch);
                                 if ($order && !$this->orderBelongsToSender($order, [$phoneMatch, $this->senderPhoneDigits($conversation)])) {
                                     Log::warning('ProcessAutoReply: order number does not belong to sender; not disclosed');
                                     $order = null;
@@ -1731,7 +1744,8 @@ class ProcessAutoReply implements ShouldQueue
             $resolvedShippingForCheckout = (new SallaService())->resolveShippingAddressForChannel(
                 $sallaChannel,
                 (string) $updatedCheckoutState['address'],
-                (string) ($updatedCheckoutState['phone'] ?? $updatedCheckoutState['customer_phone'] ?? '')
+                (string) ($updatedCheckoutState['phone'] ?? $updatedCheckoutState['customer_phone'] ?? ''),
+                (string) ($updatedCheckoutState['delivery_city'] ?? '')
             );
             if (!empty($resolvedShippingForCheckout['city_id'])) {
                 $updatedCheckoutState['delivery_city'] = (string) $resolvedShippingForCheckout['city_id'];
@@ -1913,12 +1927,14 @@ class ProcessAutoReply implements ShouldQueue
             }
         }
 
+        $resolvedShipping = null;
         if ($commerceChannel?->type === 'salla'
             && !empty($updatedCheckoutState['address'])) {
             $resolvedShipping = $resolvedShippingForCheckout ?? (new SallaService())->resolveShippingAddressForChannel(
                 $commerceChannel,
                 (string) $updatedCheckoutState['address'],
-                (string) ($updatedCheckoutState['phone'] ?? '')
+                (string) ($updatedCheckoutState['phone'] ?? ''),
+                (string) ($updatedCheckoutState['delivery_city'] ?? '')
             );
             if ($resolvedShipping && !empty($resolvedShipping['city_id'])) {
                 $updatedCheckoutState['delivery_city'] = (string) $resolvedShipping['city_id'];
@@ -1928,6 +1944,43 @@ class ProcessAutoReply implements ShouldQueue
                 unset($updatedCheckoutState['delivery_country_code']);
             }
         }
+
+        // Quote COD shipping before showing the final summary so the amount the
+        // customer confirms includes the courier fee. Recompute it on every
+        // checkout turn; the quote is reused by the immediately following
+        // order request and is bound to the exact address and resolved city.
+        if ($commerceChannel?->type === 'salla'
+            && !empty($updatedCheckoutState['salla_product_id'])
+            && !empty($updatedCheckoutState['full_name'])
+            && !empty($updatedCheckoutState['phone'] ?? $updatedCheckoutState['customer_phone'])
+            && !empty($updatedCheckoutState['address'])
+            && !empty($resolvedShipping['city_id'])) {
+            try {
+                $shippingQuote = (new SallaService())->estimateCodShippingQuoteForChannel(
+                    $commerceChannel,
+                    $resolvedShipping,
+                    $updatedCheckoutState
+                );
+            } catch (\Throwable $quoteException) {
+                $shippingQuote = null;
+                Log::warning('ProcessAutoReply: Salla COD shipping estimate unavailable before order summary', [
+                    'connection_id' => $commerceChannel->id,
+                    'exception_type' => get_class($quoteException),
+                ]);
+            }
+            if ($shippingQuote) {
+                $updatedCheckoutState['salla_shipping_quote'] = array_merge($shippingQuote, [
+                    'city_id' => (int) $resolvedShipping['city_id'],
+                    'address_hash' => hash('sha256', trim((string) $updatedCheckoutState['address'])),
+                    'quoted_at' => now()->timestamp,
+                ]);
+            } else {
+                unset($updatedCheckoutState['salla_shipping_quote']);
+            }
+        } elseif (empty($updatedCheckoutState['salla_product_id']) || empty($updatedCheckoutState['address'])) {
+            unset($updatedCheckoutState['salla_shipping_quote']);
+        }
+
         $checkoutState = $updatedCheckoutState;
         $checkoutDataChangedThisTurn = $this->orderSummaryFingerprint($checkoutStateBeforeIncoming)
             !== $this->orderSummaryFingerprint($updatedCheckoutState);
@@ -3302,6 +3355,7 @@ $aiResponse = $intro
             && !empty($checkoutState['customer_phone'] ?? $checkoutState['phone'] ?? '')
             && !empty($checkoutState['address'] ?? $checkoutState['customer_address'] ?? '')
             && !empty($checkoutState['full_name'] ?? $checkoutState['customer_name'] ?? '')
+            && ($commerceChannel->type !== 'salla' || !empty($checkoutState['salla_shipping_quote']))
             && $autoOrderConfirmationEnabled
         ) {
             Log::info('ProcessAutoReply: triggering real commerce order creation after validated confirmation', [
@@ -3331,6 +3385,8 @@ $aiResponse = $intro
                     'phone'            => $checkoutState['customer_phone']    ?? $checkoutState['phone']             ?? '',
                     'address'          => $checkoutState['address']           ?? $checkoutState['customer_address'] ?? '',
                     'email'            => $checkoutState['email']              ?? $checkoutState['customer_email'] ?? null,
+                    'delivery_city'    => $checkoutState['delivery_city']       ?? null,
+                    'salla_shipping_quote' => $checkoutState['salla_shipping_quote'] ?? null,
                     'postal_code'      => $checkoutState['postal_code']         ?? null,
                     'geo_coordinates'  => $checkoutState['geo_coordinates']     ?? null,
                     'building_number'  => $checkoutState['building_number']     ?? null,
@@ -3347,6 +3403,7 @@ $aiResponse = $intro
                 if ($orderData && !empty($orderData['order_id'])) {
                     // ✅ SUCCESS — override the AI reply with the real order confirmation
                     $realOrderId  = $orderData['order_id'];
+                    $realOrderNumber = $orderData['order_number'] ?? $realOrderId;
                     $customerName = $orderInput['full_name'] ?? '';
                     $productName  = $orderInput['product_name'] ?? '';
 
@@ -3354,13 +3411,13 @@ $aiResponse = $intro
                         $aiResponse = "✅ تم تأكيد طلبك بنجاح!" .
                             (!empty($customerName) ? " شكراً {$customerName}" : '') . "\n" .
                             (!empty($productName)  ? "المنتج: {$productName}\n" : '') .
-                            "رقم الطلب: #{$realOrderId}\n" .
+                            "رقم الطلب: #{$realOrderNumber}\n" .
                             "سيتم التواصل معك قريباً لتأكيد التفاصيل 🚀";
                     } else {
                         $aiResponse = "✅ Your order has been placed successfully!" .
                             (!empty($customerName) ? " Thank you, {$customerName}" : '') . "\n" .
                             (!empty($productName)  ? "Product: {$productName}\n" : '') .
-                            "Order #: {$realOrderId}\n" .
+                            "Order #: {$realOrderNumber}\n" .
                             "We'll contact you shortly to confirm the details ðŸš€";
                     }
 
@@ -3860,9 +3917,24 @@ $aiResponse = $intro
             ]);
         }
 
-        $isSallaOrderStatusWithoutLookupDetails = $isOrderStatus && $sallaChannel
-            && $this->senderPhoneDigits($conversation) === '';
-        if ($isOrderStatus && $sallaChannel && empty($sallaContext)) {
+        $confirmedSallaCheckoutWithoutShippingQuote = $sallaChannel
+            && $autoOrderConfirmationEnabled
+            && $containsConfirmPhrase
+            && empty($checkoutState['salla_shipping_quote'])
+            && !empty($checkoutState['salla_product_id'])
+            && !empty($fieldStatus['is_complete']);
+        if ($confirmedSallaCheckoutWithoutShippingQuote) {
+            $aiResponse = $detectedLanguage === 'arabic'
+                ? 'لم أتمكن من تأكيد رسوم التوصيل الآن، لذلك لم أرسل الطلب. سيؤكد لك فريق المتجر الإجمالي قبل إتمامه.'
+                : 'I could not confirm the delivery fee, so I have not submitted the order. The store team will confirm the total before it is placed.';
+            app(\App\Services\HandoffTaskService::class)->openForConversation(
+                $conversation,
+                'salla_shipping_quote_unavailable',
+                'normal'
+            );
+        }
+
+        if ($isOrderStatus && $sallaChannel) {
             $currentStatusText = trim((string) $message->content);
             $hasOrderNumber = (bool) preg_match(
                 '/(?:\border\b|طلب)\s*(?:number|no\.?|رقم)?\s*[:#-]?\s*#?\d{4,12}|^\s*#?\d{4,12}\s*$/iu',
@@ -3872,11 +3944,25 @@ $aiResponse = $intro
                 '/(?:\b(?:phone|mobile|telephone)\b|رقم\s*(?:الجوال|الهاتف))\s*[:#-]?\s*\+?\d(?:[\s().-]*\d){7,14}|^\s*\+?\d[\d\s().-]{7,17}\s*$/iu',
                 $currentStatusText
             );
-            if (!$hasOrderNumber && !$hasPhoneNumber && $isSallaOrderStatusWithoutLookupDetails) {
+            if (!empty($sallaContext)) {
+                $orderSummary = $this->parseSallaContext($sallaContext);
+                $number = trim((string) ($orderSummary['order_number'] ?? ''));
+                $status = trim((string) ($orderSummary['status'] ?? ''));
+                $total = trim((string) ($orderSummary['total'] ?? ''));
+                $currency = trim((string) ($orderSummary['currency'] ?? 'SAR'));
+                $shipping = trim((string) ($orderSummary['shipping_status'] ?? ''));
+                $aiResponse = $detectedLanguage === 'arabic'
+                    ? 'لقيت طلبك' . ($number !== '' ? " رقم #{$number}" : '') . ($status !== '' ? " وحالته: {$status}" : '')
+                        . ($total !== '' ? "، والإجمالي {$total} {$currency}" : '')
+                        . ($shipping !== '' && $shipping !== 'Not shipped' ? "، وحالة الشحن: {$shipping}" : '') . '.'
+                    : 'I found your order' . ($number !== '' ? " #{$number}" : '') . ($status !== '' ? " with status: {$status}" : '')
+                        . ($total !== '' ? ". Total: {$total} {$currency}" : '')
+                        . ($shipping !== '' && $shipping !== 'Not shipped' ? ". Shipping: {$shipping}" : '') . '.';
+            } elseif (!$hasOrderNumber && !$hasPhoneNumber && $this->senderPhoneDigits($conversation) === '') {
                 $aiResponse = $detectedLanguage === 'arabic'
                     ? 'أكيد أساعدك في متابعة طلبك. ابعتلي رقم الطلب أو رقم الجوال المستخدم وقت الشراء عشان أقدر أتحقق من حالته.'
                     : 'I can help check your order. Please send the order number or the phone number used at checkout so I can look it up.';
-            } elseif ($hasOrderNumber || $hasPhoneNumber) {
+            } else {
                 $aiResponse = $detectedLanguage === 'arabic'
                     ? 'لم أتمكن من التحقق من الطلب بهذه البيانات حتى الآن. راجع رقم الجوال أو أرسل رقم الطلب، وسأحاول البحث عنه مرة أخرى.'
                     : 'I could not verify an order with those details yet. Please check the phone number or send the order number, and I will look it up again.';
@@ -4787,6 +4873,8 @@ $aiResponse = $intro
             'phone' => $checkoutState['customer_phone'] ?? $checkoutState['phone'] ?? '',
             'address' => $checkoutState['address'] ?? $checkoutState['customer_address'] ?? '',
             'email' => $checkoutState['email'] ?? $checkoutState['customer_email'] ?? null,
+            'delivery_city' => $checkoutState['delivery_city'] ?? null,
+            'salla_shipping_quote' => $checkoutState['salla_shipping_quote'] ?? null,
             'postal_code' => $checkoutState['postal_code'] ?? null,
             'geo_coordinates' => $checkoutState['geo_coordinates'] ?? null,
             'building_number' => $checkoutState['building_number'] ?? null,
@@ -5618,6 +5706,12 @@ $aiResponse = $intro
         ];
 
         $summary = array_intersect_key($state, array_flip($summaryFields));
+        if (is_array($state['salla_shipping_quote'] ?? null)) {
+            $quote = $state['salla_shipping_quote'];
+            $summary['salla_shipping_quote'] = array_intersect_key($quote, array_flip([
+                'company_id', 'shipping_amount', 'cod_service_amount', 'currency', 'city_id', 'address_hash',
+            ]));
+        }
         ksort($summary);
         return hash('sha256', json_encode($summary, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE) ?: '');
     }
@@ -5640,6 +5734,16 @@ $aiResponse = $intro
         }
         $currency = trim((string) ($checkoutState['product_currency'] ?? $checkoutState['currency'] ?? ''));
         $priceText = $price !== null && $price !== '' ? trim((string) $price . ' ' . $currency) : 'Not available';
+        $shippingQuote = is_array($checkoutState['salla_shipping_quote'] ?? null) ? $checkoutState['salla_shipping_quote'] : null;
+        $showShippingQuote = $commerceChannel?->type === 'salla' && $shippingQuote !== null;
+        $shippingAmount = (float) ($shippingQuote['shipping_amount'] ?? 0);
+        $codFee = (float) ($shippingQuote['cod_service_amount'] ?? 0);
+        $estimatedTotal = $price !== null && $price !== '' ? (float) $price + $shippingAmount + $codFee : null;
+        $shippingText = number_format($shippingAmount, 2, '.', '') . ' ' . ($shippingQuote['currency'] ?? ($currency ?: 'SAR'));
+        $codFeeText = number_format($codFee, 2, '.', '') . ' ' . ($shippingQuote['currency'] ?? ($currency ?: 'SAR'));
+        $totalText = $estimatedTotal !== null
+            ? number_format($estimatedTotal, 2, '.', '') . ' ' . ($shippingQuote['currency'] ?? ($currency ?: 'SAR'))
+            : 'Not available';
         $storeName = trim((string) ($commerceChannel?->page_name ?? '')) ?: 'our store';
         $phone = $checkoutState['phone'] ?? $checkoutState['customer_phone'] ?? null;
         $isArabic = ($checkoutState['checkout_language'] ?? null) === 'arabic';
@@ -5660,11 +5764,14 @@ $aiResponse = $intro
                 . (!empty($checkoutState['commerce_variant_title']) ? 'الخيار: ' . trim((string) $checkoutState['commerce_variant_title']) . "\n" : '')
                 . $optionsText
                 . "السعر: {$priceText}\n"
+                . ($showShippingQuote ? "الشحن: {$shippingText}\nرسوم الدفع عند الاستلام: {$codFeeText}\nالإجمالي التقديري: {$totalText}\n" : '')
                 . "المتجر: {$storeName}\n"
                 . 'الاسم: ' . trim((string) ($checkoutState['full_name'] ?? '')) . "\n"
                 . 'رقم الجوال: ' . (\App\Services\OrderCheckoutService::isValidPhone($phone) ? trim((string) $phone) : 'غير متوفر') . "\n"
                 . 'عنوان التوصيل: ' . trim((string) ($checkoutState['address'] ?? $checkoutState['customer_address'] ?? '')) . "\n\n"
-                . 'أرسل «تأكيد الطلب» لإتمامه، أو «إلغاء» لإيقافه.';
+                . ($commerceChannel?->type === 'salla' && !$showShippingQuote
+                    ? 'تعذر تأكيد رسوم التوصيل الآن؛ سيؤكد فريق المتجر الإجمالي قبل إتمام الطلب.'
+                    : 'أرسل «تأكيد الطلب» لإتمامه، أو «إلغاء» لإيقافه.');
         }
 
         return "Please review your order summary:\n"
@@ -5672,11 +5779,14 @@ $aiResponse = $intro
             . (!empty($checkoutState['commerce_variant_title']) ? 'Variant: ' . trim((string) $checkoutState['commerce_variant_title']) . "\n" : '')
             . $optionsText
             . "Price: {$priceText}\n"
+            . ($showShippingQuote ? "Shipping: {$shippingText}\nCOD fee: {$codFeeText}\nEstimated total: {$totalText}\n" : '')
             . "Store: {$storeName}\n"
             . 'Name: ' . trim((string) ($checkoutState['full_name'] ?? '')) . "\n"
             . 'Phone: ' . (\App\Services\OrderCheckoutService::isValidPhone($phone) ? trim((string) $phone) : 'not provided yet') . "\n"
             . 'Delivery address: ' . trim((string) ($checkoutState['address'] ?? $checkoutState['customer_address'] ?? '')) . "\n\n"
-            . 'Reply “confirm order” to place it, or “cancel” to stop.';
+            . ($commerceChannel?->type === 'salla' && !$showShippingQuote
+                ? 'Delivery cost could not be confirmed yet. The store team will confirm the total before placing the order.'
+                : 'Reply “confirm order” to place it, or “cancel” to stop.');
     }
 
     /** Keep Shopify's useful validation details in logs without exposing checkout PII. */

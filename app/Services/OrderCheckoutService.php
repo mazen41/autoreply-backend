@@ -1048,18 +1048,19 @@ class OrderCheckoutService
             return $m[1];
         }
 
-        // A PO Box number is not a delivery building/street number. Remove
-        // labeled PO Box segments before applying the conservative leading-number heuristic.
+        // A PO Box number or price is not a building number. Remove them
+        // before the conservative heuristic (prices often occur in checkout
+        // messages before the address itself).
         $streetAddress = preg_replace(
-            '/(?:p\.?\s*o\.?\s*box|post\s+office\s+box|صندوق\s+البريد|ص\.?\s*ب\.?)\s*[:#-]?\s*\d{1,10}/iu',
+            '/(?:p\.?\s*o\.?\s*box|post\s+office\s+box|صندوق\s+البريد|ص\.?\s*ب\.?)\s*[:#-]?\s*\d{1,10}|(?:price|cost|السعر|قيمته)\s*[:=]?\s*\d+(?:[.,]\d+)?\s*(?:SAR|ر\.س|ريال)|\d+(?:[.,]\d+)?\s*(?:SAR|ر\.س|ريال)/iu',
             ' ',
             $text
         ) ?? $text;
 
-        if (preg_match('/(?:^|[\s,،])(\d{1,5}[A-Za-z]?)\s+(?=\p{L})/u', $streetAddress, $m, PREG_OFFSET_CAPTURE) === 1) {
-            $number = $m[1][0];
-            $offset = (int) $m[1][1];
-            $before = strtolower(substr($text, max(0, $offset - 25), min(25, $offset)));
+        // Only infer an unlabeled building number when it starts the remaining
+        // address. Never grab an unrelated number from the middle of a message.
+        if (preg_match('/^\s*(\d{1,5}[A-Za-z]?)\s+(?=\p{L})/u', trim($streetAddress), $m) === 1) {
+            $number = $m[1];
             // A five-digit number after "postal code"/"zip" is a postal code, not a building.
             if (strlen(preg_replace('/\D/', '', $number)) === 5) {
                 return null;

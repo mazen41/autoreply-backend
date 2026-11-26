@@ -840,7 +840,7 @@ class SallaService
      * Dynamically resolve Salla shipping address fields against the merchant's Salla account data.
      * Returns null if city_id or required address components cannot be confidently resolved.
      */
-    public function resolveShippingAddressForChannel(Channel $channel, string $freeformAddress, string $phone = ''): ?array
+    public function resolveShippingAddressForChannel(Channel $channel, string $freeformAddress, string $phone = '', string $cityHint = ''): ?array
     {
         if (empty(trim($freeformAddress))) {
             return null;
@@ -877,11 +877,51 @@ class SallaService
         $matchedCityId = null;
         $matchedCityNameLength = 0;
         $normalizedAddress = $this->normalizeCitySearchText($freeformAddress);
+        $cityHint = trim($cityHint);
+
+        // Prefer the customer's explicit city field over fuzzy matching the
+        // entire address. This keeps Arabic city names such as الرياض attached
+        // to the correct Salla city even when the remaining address is noisy.
+        if ($countryId && $cityHint !== '') {
+            if (ctype_digit($cityHint)) {
+                $hintCity = DB::table('salla_city_reference_cities')
+                    ->where('country_id', $countryId)
+                    ->where('salla_city_id', (int) $cityHint)
+                    ->first();
+                if ($hintCity) {
+                    $matchedCityId = (int) $hintCity->salla_city_id;
+                    $matchedCityNameLength = 1000;
+                }
+            } else {
+                $normalizedHint = $this->normalizeCitySearchText($cityHint);
+                $hintNames = $this->cityNameSearchVariants($cityHint);
+                $hintRows = DB::table('salla_city_reference_cities')
+                    ->where('country_id', $countryId)
+                    ->where(function ($query) use ($hintNames): void {
+                        $query->whereIn('normalized_name', $hintNames)
+                            ->orWhereIn('normalized_en', $hintNames)
+                            ->orWhereIn('normalized_ar', $hintNames);
+                    })
+                    ->get();
+                $hintIds = $hintRows->filter(function ($city) use ($normalizedHint): bool {
+                    foreach ([$city->name, $city->name_en, $city->name_ar] as $name) {
+                        if (in_array($normalizedHint, $this->cityNameSearchVariants((string) $name), true)) {
+                            return true;
+                        }
+                    }
+                    return false;
+                })->pluck('salla_city_id')->map(fn ($id) => (int) $id)->unique()->values();
+                if ($hintIds->count() === 1) {
+                    $matchedCityId = (int) $hintIds->first();
+                    $matchedCityNameLength = 1000;
+                }
+            }
+        }
         $cities = $catalogHealthy && $countryId
             ? $this->findIndexedCityCandidates((int) $countryId, $normalizedAddress)
             : collect();
 
-        foreach ($cities as $city) {
+        foreach ($matchedCityId ? [] : $cities as $city) {
             foreach ([$city->name, $city->name_en, $city->name_ar] as $cityName) {
                 $cityName = trim((string) $cityName);
                 if ($cityName === '') {
@@ -994,6 +1034,64 @@ class SallaService
         return $addressData;
     }
 
+    /** Return the COD delivery estimate used to show a customer the real total before confirmation. */
+    public function estimateCodShippingQuoteForChannel(Channel $channel, array $shippingAddress, array $checkoutState): ?array
+    {
+        if (empty($shippingAddress['city_id']) || empty($shippingAddress['country_id'])) {
+            return null;
+        }
+
+        $estimateParams = [
+            'city_id' => $shippingAddress['city_id'],
+            'country_id' => $shippingAddress['country_id'],
+            'postal_code' => $checkoutState['postal_code'] ?? $shippingAddress['postal_code'] ?? null,
+        ];
+        $coordinates = $checkoutState['geo_coordinates'] ?? null;
+        if (!empty($coordinates['lat']) && !empty($coordinates['lng'])) {
+            $estimateParams['geocode'] = $coordinates['lat'] . ',' . $coordinates['lng'];
+        }
+
+        $ratesResponse = $this->apiCallForChannel($channel, 'GET', '/shipping/companies/estimate-rate', $estimateParams);
+        foreach (($ratesResponse['data'] ?? []) as $rate) {
+            if (empty($rate['company_id'])) {
+                continue;
+            }
+            foreach (($rate['services'] ?? []) as $service) {
+                if (strtolower((string) ($service['name'] ?? '')) !== 'cod') {
+                    continue;
+                }
+                return [
+                    'company_id' => (int) $rate['company_id'],
+                    'shipping_amount' => (float) ($rate['total']['amount'] ?? 0),
+                    'cod_service_amount' => (float) ($service['amount']['amount'] ?? 0),
+                    'currency' => (string) ($rate['total']['currency'] ?? 'SAR'),
+                ];
+            }
+        }
+
+        return null;
+    }
+
+    /** Look up an order by Salla's customer-facing reference number, not its internal ID. */
+    public function getOrderByReferenceForChannel(Channel $channel, string $referenceId): ?array
+    {
+        $response = $this->apiCallForChannel($channel, 'GET', '/orders', [
+            'reference_id' => $referenceId,
+            'per_page' => 1,
+        ]);
+        $orders = $response['data'] ?? [];
+        if (isset($orders['reference_id'])) {
+            $orders = [$orders];
+        }
+        foreach ((array) $orders as $order) {
+            if ((string) ($order['reference_id'] ?? '') === $referenceId) {
+                return $order;
+            }
+        }
+
+        return null;
+    }
+
     /**
      * Build canonical Salla POST /admin/v2/orders payload containing all required API fields.
      */
@@ -1034,7 +1132,12 @@ class SallaService
         }
 
         $freeformAddress = $checkoutState['address'] ?? '';
-        $shippingAddress = $this->resolveShippingAddressForChannel($channel, $freeformAddress, $phone);
+        $shippingAddress = $this->resolveShippingAddressForChannel(
+            $channel,
+            $freeformAddress,
+            $phone,
+            (string) ($checkoutState['delivery_city'] ?? '')
+        );
 
         if (!$shippingAddress) {
             Log::warning('SallaService: shipping address could not be confidently mapped to merchant Salla city/fields', [
@@ -1152,29 +1255,30 @@ class SallaService
         // Ask Salla for valid delivery options for the resolved city and the
         // customer's actual postal/geographic location. courier_id is a store
         // shipping company ID; the estimate's own ID is a shipping-details ID.
-        $estimateParams = [
-            'city_id' => $shippingAddress['city_id'],
-            'country_id' => $shippingAddress['country_id'],
-            'postal_code' => $postalCode,
-        ];
-        if (!empty($coordinates['lat']) && !empty($coordinates['lng'])) {
-            $estimateParams['geocode'] = $coordinates['lat'] . ',' . $coordinates['lng'];
-        }
-        $ratesResponse = $this->apiCallForChannel($channel, 'GET', '/shipping/companies/estimate-rate', $estimateParams);
-        $rates = $ratesResponse['data'] ?? [];
-        $selectedRate = null;
-        foreach ($rates as $rate) {
-            if (empty($rate['company_id'])) {
-                continue;
+        $quote = $checkoutState['salla_shipping_quote'] ?? null;
+        $quoteIsCurrent = is_array($quote)
+            && (int) ($quote['city_id'] ?? 0) === (int) ($shippingAddress['city_id'] ?? 0)
+            && hash_equals((string) ($quote['address_hash'] ?? ''), hash('sha256', trim((string) $freeformAddress)))
+            && (int) ($quote['quoted_at'] ?? 0) >= now()->subMinutes(10)->timestamp;
+        $selectedRate = $quoteIsCurrent
+            ? [
+                'company_id' => (int) ($quote['company_id'] ?? 0),
+                'total' => ['amount' => (float) ($quote['shipping_amount'] ?? 0), 'currency' => (string) ($quote['currency'] ?? 'SAR')],
+                'services' => [['name' => 'cod', 'amount' => ['amount' => (float) ($quote['cod_service_amount'] ?? 0)]]],
+            ]
+            : null;
+        if (empty($selectedRate['company_id'])) {
+            $selectedRate = null;
+            $quote = $this->estimateCodShippingQuoteForChannel($channel, $shippingAddress, $checkoutState);
+            if ($quote) {
+                $selectedRate = [
+                    'company_id' => $quote['company_id'],
+                    'total' => ['amount' => $quote['shipping_amount'], 'currency' => $quote['currency']],
+                    'services' => [['name' => 'cod', 'amount' => ['amount' => $quote['cod_service_amount']]]],
+                ];
             }
-            $hasCod = collect($rate['services'] ?? [])->contains(function ($service) {
-                return strtolower((string) ($service['name'] ?? '')) === 'cod';
-            });
-            if ($hasCod) {
-                $selectedRate = $rate;
-                break;
-            }
         }
+        $rates = [];
 
         if (!$selectedRate) {
             Log::warning('SallaService: no COD shipping estimate available for the delivery address', [
@@ -1273,7 +1377,6 @@ class SallaService
 
         $payment = [
             'method' => 'cod',
-            'status' => 'pending_payment',
             'cash_on_delivery' => [
                 'amount' => $productAmount + $shippingAmount + $codServiceAmount,
                 'currency' => $currency,
@@ -1400,7 +1503,12 @@ class SallaService
 
             $phone = (string) ($data['phone'] ?? $data['customer_phone'] ?? '');
             $address = (string) ($data['address'] ?? $data['customer_address'] ?? '');
-            $shippingAddress = $this->resolveShippingAddressForChannel($channel, $address, $phone);
+            $shippingAddress = $this->resolveShippingAddressForChannel(
+                $channel,
+                $address,
+                $phone,
+                (string) ($data['delivery_city'] ?? '')
+            );
             if (!$shippingAddress) {
                 return ['status' => 'needs_fields', 'missing_fields' => ['delivery_city']];
             }
@@ -1470,6 +1578,9 @@ class SallaService
                 'channel_id' => $channel->id,
                 'status'     => 200,
                 'has_order_id' => !empty($res['data']['reference_id'] ?? $res['data']['id'] ?? $res['id'] ?? null),
+                'payment_method' => is_string($res['data']['payment_method'] ?? null)
+                    ? $res['data']['payment_method']
+                    : null,
             ]);
 
             $orderId = (string)($res['data']['reference_id'] ?? $res['data']['id'] ?? $res['id'] ?? null);

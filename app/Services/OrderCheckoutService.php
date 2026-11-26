@@ -413,6 +413,11 @@ class OrderCheckoutService
             }
         }
 
+        // Preserve an explicitly named delivery city as its own field. Salla's
+        // city lookup must use this customer input instead of fuzzy matching
+        // noisy street text (which can select a different city).
+        $extractedDeliveryCity = $this->extractDeliveryCity((string) $incomingText);
+
         $extractedBuildingNumber = self::extractBuildingNumber((string) $incomingText);
         $extractedPoBox = self::extractPoBox((string) $incomingText);
 
@@ -579,6 +584,7 @@ class OrderCheckoutService
             'phone'            => $extractedPhone                    ?? $existingPhone,
             'customer_phone'   => $extractedPhone                    ?? $existingPhone, // Alias for backward compatibility
             'address'          => $mergedAddress,
+            'delivery_city'    => $extractedDeliveryCity ?? ($existingState['delivery_city'] ?? null),
             'email'            => $extractedEmail                    ?? ($existingState['email']             ?? null),
             'customer_email'   => $extractedEmail                    ?? ($existingState['customer_email']    ?? $existingState['email'] ?? null),
             'postal_code'      => $extractedPostalCode               ?? ($existingState['postal_code']       ?? null),
@@ -888,6 +894,17 @@ class OrderCheckoutService
                 static fn ($field) => $field !== 'geo_coordinates'
             ));
             $requiredFields = array_values(array_unique(array_merge($requiredFields, $sallaRequiredFields)));
+        }
+        // Saudi orders marked incomplete by Salla commonly lack these National
+        // Address components. Require explicit values before order submission;
+        // the parser can fill them from a clearly labeled address, otherwise
+        // the deterministic checkout asks for both together.
+        if ($requireSallaShippingDetails
+            && strtoupper((string) ($normalizedState['delivery_country_code'] ?? '')) === 'SA') {
+            $requiredFields = array_values(array_unique(array_merge(
+                $requiredFields,
+                ['building_number', 'additional_number']
+            )));
         }
 
         $fieldAliases = [

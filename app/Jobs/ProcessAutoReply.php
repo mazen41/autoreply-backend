@@ -673,6 +673,9 @@ class ProcessAutoReply implements ShouldQueue
         // Keep the checkout's language for replies such as "1" or "2", which
         // contain no language signal of their own.
         if (!empty($checkoutState['checkout_language'])
+            && OrderCheckoutService::isExplicitOrderConfirmation((string) $message->content)) {
+            $detectedLanguage = $checkoutState['checkout_language'] === 'arabic' ? 'arabic' : 'english';
+        } elseif (!empty($checkoutState['checkout_language'])
             && !preg_match('/[\p{L}]/u', (string) $message->content)) {
             $detectedLanguage = $checkoutState['checkout_language'] === 'arabic' ? 'arabic' : 'english';
         }
@@ -1530,6 +1533,19 @@ class ProcessAutoReply implements ShouldQueue
             } else {
                 unset($statusCheckoutState['pending_salla_status_reference_id']);
             }
+            $verifiedReference = trim((string) ($order['reference_id'] ?? ''));
+            $savedCompletedReference = trim((string) ($statusCheckoutState['order_number'] ?? ''));
+            if ($order !== [] && $verifiedReference !== '' && $savedCompletedReference === $verifiedReference
+                && !empty($statusCheckoutState['order_id'])) {
+                // Repair completed checkouts written by older releases that
+                // retained the pre-order cart/options alongside the real order.
+                $statusCheckoutState = array_intersect_key($statusCheckoutState, array_flip([
+                    'status', 'order_id', 'order_number', 'confirmation_state',
+                    'order_fingerprint', 'order_product_id', 'order_connection_id',
+                ]));
+                $statusCheckoutState['status'] = 'completed';
+                $statusCheckoutState['confirmation_state'] = 'order_placed';
+            }
             if ($statusCheckoutState !== []) {
                 $conversation->update(['checkout_state' => $statusCheckoutState]);
             }
@@ -1889,6 +1905,7 @@ class ProcessAutoReply implements ShouldQueue
         $sallaProductOptions = [];
         $sallaOptionSelectionRequired = false;
         $sallaOptionChosenThisMessage = false;
+        $sallaVariantPriceUnavailable = false;
         $sallaOptionPrompt = null;
         if ($commerceChannel?->type === 'shopify' && !empty($updatedCheckoutState['commerce_external_id'])) {
             $commerceProduct = \App\Models\Product::query()
@@ -2000,6 +2017,53 @@ class ProcessAutoReply implements ShouldQueue
                     $selectedValue = collect($values)->firstWhere('id', $selectedIds[0]);
                     if ($selectedValue) {
                         $savedTitles[$optionId] = trim($option['name'] . ': ' . $selectedValue['name']);
+                    }
+                }
+
+                $variantOptions = array_values(array_filter(
+                    $sallaProductOptions,
+                    static fn (array $option): bool => ($option['purpose'] ?? '') === 'variants'
+                ));
+                if ($variantOptions !== []) {
+                    $selectedVariantValueIds = [];
+                    foreach ($variantOptions as $variantOption) {
+                        $variantOptionId = (string) $variantOption['id'];
+                        $selected = array_values(array_intersect(
+                            array_map('strval', (array) ($savedSelections[$variantOptionId] ?? [])),
+                            array_column((array) $variantOption['values'], 'id')
+                        ));
+                        if (count($selected) !== 1) {
+                            $selectedVariantValueIds = [];
+                            break;
+                        }
+                        $selectedVariantValueIds[] = $selected[0];
+                    }
+
+                    if (count($selectedVariantValueIds) === count($variantOptions)) {
+                        try {
+                            $variantPricing = (new SallaService())->getVariantPriceForOptions(
+                                $commerceChannel,
+                                (string) $updatedCheckoutState['salla_product_id'],
+                                $selectedVariantValueIds
+                            );
+                            if ($variantPricing) {
+                                $updatedCheckoutState['product_price'] = (string) $variantPricing['price'];
+                                $updatedCheckoutState['product_currency'] = (string) $variantPricing['currency'];
+                                $updatedCheckoutState['salla_variant_id'] = (string) $variantPricing['variant_id'];
+                                unset($updatedCheckoutState['salla_variant_price_unresolved']);
+                            } else {
+                                $sallaVariantPriceUnavailable = true;
+                                $updatedCheckoutState['salla_variant_price_unresolved'] = true;
+                            }
+                        } catch (\Throwable $priceException) {
+                            $sallaVariantPriceUnavailable = true;
+                            $updatedCheckoutState['salla_variant_price_unresolved'] = true;
+                            Log::warning('ProcessAutoReply: could not resolve selected Salla variant price', [
+                                'conversation_id' => $conversation->id,
+                                'connection_id' => $commerceChannel->id,
+                                'exception_type' => get_class($priceException),
+                            ]);
+                        }
                     }
                 }
 
@@ -2230,7 +2294,8 @@ class ProcessAutoReply implements ShouldQueue
                 $fieldStatus,
                 $sallaOptionSelectionRequired,
                 $sallaOptionPrompt,
-                $detectedLanguage
+                $detectedLanguage,
+                $sallaVariantPriceUnavailable
             )) {
                 return;
             }
@@ -3569,9 +3634,11 @@ $aiResponse = $intro
                     }
 
                     // Persist completed checkout state so tests/callers can verify the order ID
-                    $completedState = array_merge(
-                        is_array($conversation->checkout_state) ? $conversation->checkout_state : [],
-                        [
+                    // A completed order keeps only its idempotency/status
+                    // facts. Removing customer details and product selections
+                    // prevents a later confirmation from reusing stale size,
+                    // address or contact data to create a duplicate order.
+                    $completedState = [
                             'status'   => 'completed',
                             'order_id' => $realOrderId,
                             'order_number' => $realOrderNumber,
@@ -3579,8 +3646,7 @@ $aiResponse = $intro
                             'order_fingerprint' => $this->orderFingerprint($orderInput),
                             'order_product_id' => (string) ($orderInput['commerce_external_id'] ?? $orderInput['salla_product_id'] ?? ''),
                             'order_connection_id' => (string) $commerceChannel->id,
-                        ]
-                    );
+                        ];
                     $conversation->update([
                         'checkout_state' => $completedState,
                         'requires_human' => false,
@@ -5127,9 +5193,9 @@ $aiResponse = $intro
             : "✅ Your order has been placed successfully!" . ($customerName !== '' ? " Thank you, {$customerName}" : '') . "\n"
                 . ($productName !== '' ? "Product: {$productName}\n" : '') . "Order #: {$customerOrderNumber}\nWe'll contact you shortly to confirm the details ðŸš€";
 
-        $completedState = array_merge(
-            is_array($conversation->fresh()->checkout_state) ? $conversation->fresh()->checkout_state : [],
-            [
+        // Do not retain the held checkout's old product option selections once
+        // the store has confirmed order creation.
+        $completedState = [
                 'status' => 'completed',
                 'order_id' => $orderId,
                 'order_number' => $customerOrderNumber,
@@ -5137,8 +5203,7 @@ $aiResponse = $intro
                 'order_fingerprint' => $this->orderFingerprint($orderInput),
                 'order_product_id' => (string) ($orderInput['commerce_external_id'] ?? $orderInput['salla_product_id'] ?? ''),
                 'order_connection_id' => (string) $commerceChannel->id,
-            ]
-        );
+            ];
         $conversation->update([
             'checkout_state' => $completedState,
             'requires_human' => false,
@@ -5201,8 +5266,17 @@ $aiResponse = $intro
         array $fieldStatus,
         bool $optionSelectionRequired,
         ?array $optionPrompt,
-        string $detectedLanguage
+        string $detectedLanguage,
+        bool $variantPriceUnavailable = false
     ): bool {
+        if ($variantPriceUnavailable || !empty($checkoutState['salla_variant_price_unresolved'])) {
+            $reply = $detectedLanguage === 'arabic'
+                ? 'لم أتمكن من التأكد من سعر المقاس الذي اخترته من المتجر، لذلك لم أرسل الطلب ولم أعرض سعرًا تقديريًا غير مؤكد. سيتحقق فريق المتجر من السعر.'
+                : 'I could not verify the store price for that option, so I have not submitted the order or shown an unverified price. The store team will confirm it.';
+            $this->sendSallaDeterministicReply($channel, $conversation, $reply, $detectedLanguage, 'salla_variant_price_unavailable');
+            return true;
+        }
+
         if ($optionSelectionRequired && !empty($optionPrompt['values'])) {
             $values = (array) $optionPrompt['values'];
             $choices = [];
@@ -5300,6 +5374,14 @@ $aiResponse = $intro
         bool $autoSubmissionEnabled,
         string $detectedLanguage
     ): bool {
+        if (!empty($checkoutState['salla_variant_price_unresolved'])) {
+            $reply = $detectedLanguage === 'arabic'
+                ? 'لم أتمكن من التأكد من سعر المقاس من المتجر، لذلك لم أرسل الطلب. سيتحقق فريق المتجر من السعر قبل إتمامه.'
+                : 'I could not verify the selected option price with the store, so I have not submitted the order. The store team will confirm the price before completing it.';
+            $this->sendSallaDeterministicReply($channel, $conversation, $reply, $detectedLanguage, 'salla_variant_price_unavailable');
+            return true;
+        }
+
         if (!$autoSubmissionEnabled) {
             $reply = $detectedLanguage === 'arabic'
                 ? 'لم يتم إرسال الطلب؛ لأن الإرسال التلقائي متوقف حاليًا. سيتواصل معك أحد أفراد الفريق لمساعدتك في إتمامه.'
@@ -6185,11 +6267,14 @@ $aiResponse = $intro
                 . (!empty($checkoutState['commerce_variant_title']) ? 'الخيار: ' . trim((string) $checkoutState['commerce_variant_title']) . "\n" : '')
                 . $optionsText
                 . "السعر: {$priceText}\n"
-                . ($showShippingQuote ? "الشحن: {$shippingText}\nرسوم الدفع عند الاستلام: {$codFeeText}\nالإجمالي التقديري: {$totalText}\n" : '')
+                . ($showShippingQuote ? "طريقة الدفع: الدفع عند الاستلام\nالشحن: {$shippingText}\nرسوم الدفع عند الاستلام: {$codFeeText}\nالإجمالي التقديري: {$totalText}\n" : '')
                 . "المتجر: {$storeName}\n"
                 . 'الاسم: ' . trim((string) ($checkoutState['full_name'] ?? '')) . "\n"
                 . 'رقم الجوال: ' . (\App\Services\OrderCheckoutService::isValidPhone($phone) ? trim((string) $phone) : 'غير متوفر') . "\n"
-                . 'عنوان التوصيل: ' . trim((string) ($checkoutState['address'] ?? $checkoutState['customer_address'] ?? '')) . "\n\n"
+                . 'عنوان التوصيل: ' . trim((string) ($checkoutState['address'] ?? $checkoutState['customer_address'] ?? '')) . "\n"
+                . (!empty($checkoutState['building_number']) ? 'رقم المبنى: ' . trim((string) $checkoutState['building_number']) . "\n" : '')
+                . (!empty($checkoutState['additional_number']) ? 'الرقم الإضافي: ' . trim((string) $checkoutState['additional_number']) . "\n" : '')
+                . "\n"
                 . ($commerceChannel?->type === 'salla' && !$showShippingQuote
                     ? 'تعذر تأكيد رسوم التوصيل الآن؛ سيؤكد فريق المتجر الإجمالي قبل إتمام الطلب.'
                     : 'أرسل «تأكيد الطلب» لإتمامه، أو «إلغاء» لإيقافه.');
@@ -6200,11 +6285,14 @@ $aiResponse = $intro
             . (!empty($checkoutState['commerce_variant_title']) ? 'Variant: ' . trim((string) $checkoutState['commerce_variant_title']) . "\n" : '')
             . $optionsText
             . "Price: {$priceText}\n"
-            . ($showShippingQuote ? "Shipping: {$shippingText}\nCOD fee: {$codFeeText}\nEstimated total: {$totalText}\n" : '')
+            . ($showShippingQuote ? "Payment: Cash on delivery\nShipping: {$shippingText}\nCOD fee: {$codFeeText}\nEstimated total: {$totalText}\n" : '')
             . "Store: {$storeName}\n"
             . 'Name: ' . trim((string) ($checkoutState['full_name'] ?? '')) . "\n"
             . 'Phone: ' . (\App\Services\OrderCheckoutService::isValidPhone($phone) ? trim((string) $phone) : 'not provided yet') . "\n"
-            . 'Delivery address: ' . trim((string) ($checkoutState['address'] ?? $checkoutState['customer_address'] ?? '')) . "\n\n"
+            . 'Delivery address: ' . trim((string) ($checkoutState['address'] ?? $checkoutState['customer_address'] ?? '')) . "\n"
+            . (!empty($checkoutState['building_number']) ? 'Building number: ' . trim((string) $checkoutState['building_number']) . "\n" : '')
+            . (!empty($checkoutState['additional_number']) ? 'Additional number: ' . trim((string) $checkoutState['additional_number']) . "\n" : '')
+            . "\n"
             . ($commerceChannel?->type === 'salla' && !$showShippingQuote
                 ? 'Delivery cost could not be confirmed yet. The store team will confirm the total before placing the order.'
                 : 'Reply “confirm order” to place it, or “cancel” to stop.');

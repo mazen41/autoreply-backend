@@ -1390,7 +1390,10 @@ class SallaService
             'method' => 'cod',
             'accepted_methods' => ['cod'],
             'cash_on_delivery' => [
-                'amount' => $productAmount + $shippingAmount + $codServiceAmount,
+                // This field is the COD collection/service fee, not the amount
+                // the courier collects. The item + shipping total is already
+                // represented by Salla's order totals.
+                'amount' => $codServiceAmount,
                 'currency' => $currency,
             ],
         ];
@@ -1707,12 +1710,57 @@ class SallaService
                 return [
                     'id' => (string) ($option['id'] ?? ''),
                     'name' => trim((string) ($option['name'] ?? 'Product option')),
+                    'purpose' => (string) ($option['purpose'] ?? ''),
                     'values' => $values,
                 ];
             })
             ->filter(fn ($option) => $option['id'] !== '' && $option['values'] !== [])
             ->values()
             ->all();
+    }
+
+    /** Resolve a selected Salla variant to its current customer-facing price. */
+    public function getVariantPriceForOptions(Channel $channel, string $productId, array $selectedValueIds): ?array
+    {
+        $selectedValueIds = array_values(array_unique(array_filter(array_map('strval', $selectedValueIds))));
+        sort($selectedValueIds, SORT_STRING);
+        if ($selectedValueIds === []) {
+            return null;
+        }
+
+        $cacheKey = "salla_variant_prices_channel_{$channel->id}_product_{$productId}";
+        $variants = \Illuminate\Support\Facades\Cache::remember($cacheKey, now()->addMinutes(5), function () use ($channel, $productId): array {
+            $response = $this->apiCallForChannel($channel, 'GET', '/products/' . rawurlencode($productId) . '/variants', ['per_page' => 60]);
+            return is_array($response['data'] ?? null) ? $response['data'] : [];
+        });
+
+        foreach ((array) $variants as $variant) {
+            if (!is_array($variant)) {
+                continue;
+            }
+            $relatedValues = array_values(array_unique(array_filter(array_map('strval', (array) ($variant['related_option_values'] ?? [])))));
+            sort($relatedValues, SORT_STRING);
+            if ($relatedValues !== $selectedValueIds) {
+                continue;
+            }
+
+            $saleAmount = data_get($variant, 'sale_price.amount');
+            $regularAmount = data_get($variant, 'price.amount');
+            $amount = !empty($variant['has_special_price']) && is_numeric($saleAmount) && (float) $saleAmount > 0
+                ? (float) $saleAmount
+                : (is_numeric($regularAmount) ? (float) $regularAmount : null);
+            if ($amount === null) {
+                return null;
+            }
+
+            return [
+                'variant_id' => (string) ($variant['id'] ?? ''),
+                'price' => $amount,
+                'currency' => (string) (data_get($variant, 'price.currency') ?? data_get($variant, 'sale_price.currency') ?? 'SAR'),
+            ];
+        }
+
+        return null;
     }
 
     /**

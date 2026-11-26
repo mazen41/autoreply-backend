@@ -713,6 +713,10 @@ class ProcessAutoReply implements ShouldQueue
         // right Salla data (order data OR product list) into the AI context.
         $sallaContext   = null;
         $sallaOrderReferenceMatchedUnverified = false;
+        $matchedSallaOrderReference = null;
+        $pendingSallaStatusReference = trim((string) ($checkoutState['pending_salla_status_reference_id'] ?? ''));
+        $pendingSallaStatusPhoneReply = $pendingSallaStatusReference !== ''
+            && (bool) preg_match('/^\s*\+?[0-9][0-9\s().-]{7,17}\s*$/u', (string) $message->content);
         $productsContext = null;
         $msgLower = mb_strtolower($message->content);
 
@@ -871,6 +875,13 @@ class ProcessAutoReply implements ShouldQueue
         }
         foreach ($placeOrderKeywords as $kw) {
             if (str_contains($msgLower, $kw)) { $isPlaceOrder = true; break; }
+        }
+        if ($pendingSallaStatusPhoneReply) {
+            // The previous turn explicitly asked for a phone to verify one
+            // order number. Route the phone back to that exact lookup before
+            // an active checkout can consume it as a checkout field.
+            $isOrderStatus = true;
+            $isPlaceOrder = false;
         }
 
         // Customer details during an active checkout are checkout input, even
@@ -1235,6 +1246,10 @@ class ProcessAutoReply implements ShouldQueue
                     } elseif (preg_match('/^\s*#?(\d{5,12})\s*$/u', $lookupText, $mo)) {
                         $orderNumberMatch = $mo[1];
                     }
+                    if ($pendingSallaStatusPhoneReply && $pendingSallaStatusReference !== '') {
+                        $orderNumberMatch = $pendingSallaStatusReference;
+                    }
+                    $matchedSallaOrderReference = $orderNumberMatch;
                     if (preg_match('/(?:phone|mobile|telephone|رقم\s*(?:الجوال|الهاتف))\D{0,12}(\+?\d[\d\s().-]{7,17}\d)/iu', $lookupText, $mp)) {
                         $phoneCandidate = trim($mp[1]);
                         if (\App\Helpers\SallaPhoneHelper::getCountryCode($phoneCandidate) === 'SA'
@@ -1264,7 +1279,7 @@ class ProcessAutoReply implements ShouldQueue
                             if ($orderNumberMatch) {
                                 $order = $sallaService->getOrderByReferenceForChannel($sallaChannel, $orderNumberMatch);
                             if ($order && !$this->orderBelongsToSender($order, [$phoneMatch, $this->senderPhoneDigits($conversation)])) {
-                                $sallaOrderReferenceMatchedUnverified = $orderNumberMatch !== null && !$phoneMatch;
+                                    $sallaOrderReferenceMatchedUnverified = $orderNumberMatch !== null && !$phoneMatch;
                                     Log::warning('ProcessAutoReply: order number does not belong to sender; not disclosed');
                                     $order = null;
                                 }
@@ -1506,6 +1521,17 @@ class ProcessAutoReply implements ShouldQueue
                 $statusReply = $detectedLanguage === 'arabic'
                     ? 'أكيد أساعدك في متابعة الطلب. أرسل رقم الطلب أو رقم الجوال المستخدم وقت الشراء لأتحقق من حالته.'
                     : 'I can check that for you. Please send the order number or the phone number used at checkout.';
+            }
+
+            $statusCheckoutState = is_array($conversation->checkout_state) ? $conversation->checkout_state : [];
+            $referenceToVerify = $matchedSallaOrderReference ?: $pendingSallaStatusReference;
+            if ($sallaOrderReferenceMatchedUnverified && $referenceToVerify !== '') {
+                $statusCheckoutState['pending_salla_status_reference_id'] = $referenceToVerify;
+            } else {
+                unset($statusCheckoutState['pending_salla_status_reference_id']);
+            }
+            if ($statusCheckoutState !== []) {
+                $conversation->update(['checkout_state' => $statusCheckoutState]);
             }
 
             Log::info('SALLA_DETERMINISTIC_STATUS_REPLY', [
@@ -1941,18 +1967,25 @@ class ProcessAutoReply implements ShouldQueue
                             '٠' => '0', '١' => '1', '٢' => '2', '٣' => '3', '٤' => '4',
                             '٥' => '5', '٦' => '6', '٧' => '7', '٨' => '8', '٩' => '9',
                         ]);
-                        $index = preg_match('/^\s*(\d{1,2})\s*\.?\s*$/u', $selectionText, $numberMatch)
-                            ? ((int) $numberMatch[1] - 1)
-                            : null;
-                        if ($index !== null && isset($values[$index])) {
-                            $selectedIds = [(string) $values[$index]['id']];
-                        } else {
-                            foreach ($values as $value) {
-                                if (mb_strtolower(trim($value['name'])) === $selectionText) {
-                                    $selectedIds = [(string) $value['id']];
-                                    break;
-                                }
+                        $index = null;
+                        if (preg_match('/^\s*(?:(?:size|option|choice|المقاس|مقاس|الخيار|الاختيار)\s*)?(\d{1,2})(?:\s*[.)]|\s*\(|\s*$)/iu', $selectionText, $numberMatch)) {
+                            $index = (int) $numberMatch[1] - 1;
+                        }
+                        $normalizedSelection = preg_replace('/[^\p{L}\p{N}]+/u', '', $selectionText) ?? $selectionText;
+                        $matchingValueIds = [];
+                        foreach ($values as $value) {
+                            $normalizedValue = preg_replace('/[^\p{L}\p{N}]+/u', '', mb_strtolower(trim((string) $value['name']))) ?? '';
+                            if ($normalizedValue !== '' && ($normalizedSelection === $normalizedValue
+                                || str_contains($normalizedSelection, $normalizedValue))) {
+                                $matchingValueIds[] = (string) $value['id'];
                             }
+                        }
+                        $matchingValueIds = array_values(array_unique($matchingValueIds));
+                        if (count($matchingValueIds) === 1 && ($index === null || !isset($values[$index])
+                            || (string) $values[$index]['id'] === $matchingValueIds[0])) {
+                            $selectedIds = $matchingValueIds;
+                        } elseif ($matchingValueIds === [] && $index !== null && isset($values[$index])) {
+                            $selectedIds = [(string) $values[$index]['id']];
                         }
                         $sallaOptionChosenThisMessage = $selectedIds !== [];
                     }
@@ -2187,7 +2220,8 @@ class ProcessAutoReply implements ShouldQueue
             && !$containsConfirmPhrase
             && !$isOrderStatus
             && !$isProductBrowseMessage
-            && ($isPlaceOrder || $isSallaOptionFollowUp || $sallaOptionChosenThisMessage)) {
+            && ($isPlaceOrder || $isSallaOptionFollowUp || $sallaOptionChosenThisMessage
+                || ($hasActiveSallaCheckout && $incomingCheckoutDetails))) {
             if ($this->handleSallaCheckoutWithoutAi(
                 $channel,
                 $conversation,

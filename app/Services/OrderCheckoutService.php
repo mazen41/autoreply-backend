@@ -443,10 +443,26 @@ class OrderCheckoutService
 
         // 2. Extract full name heuristics (if message is a name response or contains name patterns)
         $extractedName = null;
+        // Accept names supplied with an explicit label, including when the
+        // same message also contains phone/address fields. Stop at the next
+        // labeled field so contact details can never leak into the name.
+        if (preg_match(
+            '/(?:\bfull\s+name\b|\bname\b|الاسم\s+الكامل|الاسم|اسمي)\s*(?:(?:is|هو)\s+|[:=]\s*)?([\p{L}][\p{L}\x{2019}\x{27}-]*(?:\s+[\p{L}][\p{L}\x{2019}\x{27}-]*){0,3})(?=\s*(?:[,;|]|\band\s+(?:my\s+)?(?:phone|mobile|address|email)\b|\b(?:phone|mobile|telephone|address|email)\b|\s+و\s*(?:رقم\s*)?(?:الجوال|الهاتف|العنوان|البريد)|$))/iu',
+            $incomingText,
+            $labeledName
+        )) {
+            $candidate = trim($labeledName[1]);
+            if (!preg_match('/^(?:phone|mobile|address|email|الاسم|الجوال|الهاتف)$/iu', $candidate)) {
+                $extractedName = $candidate;
+            }
+        }
         $namePatterns = [
             '/(?:my name is|i am|name is|اسمى|اسمي|أنا|انا|اسمي هو|معاكم)\s+([A-Za-z\x{0600}-\x{06FF}\s]{2,40})/ui',
         ];
         foreach ($namePatterns as $pattern) {
+            if ($extractedName !== null) {
+                break;
+            }
             if (preg_match($pattern, $incomingText, $nm)) {
                 $candidate = trim($nm[1]);
                 if (strlen($candidate) >= 2 && !preg_match('/(?:order|buy|help|address|phone|price|product|طلب|شراء|عنوان|هاتف|جوال)/ui', $candidate)) {

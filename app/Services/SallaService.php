@@ -1384,7 +1384,11 @@ class SallaService
         }
 
         $payment = [
+            // Salla requires a payment status. COD remains unpaid at order
+            // creation, so keep it pending and explicitly allow COD only.
+            'status' => 'pending_payment',
             'method' => 'cod',
+            'accepted_methods' => ['cod'],
             'cash_on_delivery' => [
                 'amount' => $productAmount + $shippingAmount + $codServiceAmount,
                 'currency' => $currency,

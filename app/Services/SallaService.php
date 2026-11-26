@@ -1767,8 +1767,19 @@ class SallaService
             ->all();
     }
 
-    /** Resolve a selected Salla variant to its current customer-facing price. */
-    public function getVariantPriceForOptions(Channel $channel, string $productId, array $selectedValueIds): ?array
+    /**
+     * Resolve a selected Salla variant to its current customer-facing price.
+     *
+     * Salla uses DIFFERENT value IDs in the product options endpoint vs. the
+     * variants endpoint (`related_option_values`). When a direct ID match
+     * fails, we fall back to matching by the human-readable option value
+     * names built from the product options (e.g. "40 - M") against the
+     * variant `name`.
+     *
+     * @param string[] $selectedValueIds  Option value IDs from getProductOptionsForChannel()
+     * @param string[] $selectedValueNames  Human-readable names for those values (same order)
+     */
+    public function getVariantPriceForOptions(Channel $channel, string $productId, array $selectedValueIds, array $selectedValueNames = []): ?array
     {
         $selectedValueIds = array_values(array_unique(array_filter(array_map('strval', $selectedValueIds))));
         sort($selectedValueIds, SORT_STRING);
@@ -1777,38 +1788,178 @@ class SallaService
         }
 
         $cacheKey = "salla_variant_prices_channel_{$channel->id}_product_{$productId}";
-        $variants = \Illuminate\Support\Facades\Cache::remember($cacheKey, now()->addMinutes(5), function () use ($channel, $productId): array {
-            $response = $this->apiCallForChannel($channel, 'GET', '/products/' . rawurlencode($productId) . '/variants', ['per_page' => 60]);
-            return is_array($response['data'] ?? null) ? $response['data'] : [];
+        $variants = \Illuminate\Support\Facades\Cache::remember($cacheKey, now()->addMinutes(5), function () use ($channel, $productId): ?array {
+            try {
+                $response = $this->apiCallForChannel($channel, 'GET', '/products/' . rawurlencode($productId) . '/variants', ['per_page' => 60]);
+                $data = is_array($response['data'] ?? null) ? $response['data'] : [];
+                // Never cache empty/failed results — a transient API error
+                // would stick for 5 minutes and block every order attempt.
+                return $data !== [] ? $data : null;
+            } catch (\Throwable $e) {
+                Log::warning('SallaService: variant price API call failed', [
+                    'channel_id' => $channel->id,
+                    'product_id' => $productId,
+                    'exception_type' => get_class($e),
+                ]);
+                return null;
+            }
         });
 
-        foreach ((array) $variants as $variant) {
+        // Cache::remember returns null when the closure returns null; treat
+        // that as "no variants fetched" rather than a stale cached empty array.
+        if (!is_array($variants) || $variants === []) {
+            // Clear the null sentinel so the next attempt retries the API.
+            \Illuminate\Support\Facades\Cache::forget($cacheKey);
+            return null;
+        }
+
+        // --- Strategy 1: exact related_option_values ID match ---
+        $result = $this->matchVariantByValueIds($variants, $selectedValueIds);
+        if ($result !== null) {
+            return $result;
+        }
+
+        // --- Strategy 2: match by variant name ---
+        // Salla's product options endpoint and variants endpoint use DIFFERENT
+        // IDs for the same logical value (e.g. options value id 317654888 for
+        // "40 - M" vs. related_option_values 2039839843 in the variant).
+        // Fall back to comparing the variant's display name against the
+        // selected option value names.
+        if ($selectedValueNames !== []) {
+            $result = $this->matchVariantByName($variants, $selectedValueNames);
+            if ($result !== null) {
+                Log::info('SallaService: variant matched by name fallback (ID mismatch between options and variants endpoints)', [
+                    'channel_id' => $channel->id,
+                    'product_id' => $productId,
+                    'variant_id' => $result['variant_id'],
+                ]);
+                return $result;
+            }
+        }
+
+        // --- Strategy 3: single-option product with one selected value ---
+        // When a product has exactly one option group and the customer picked
+        // one value, try matching each variant's single related_option_value
+        // against each variant name that contains the selected value name.
+        if (count($selectedValueIds) === 1 && count($selectedValueNames) === 1) {
+            $needle = mb_strtolower(trim($selectedValueNames[0]));
+            foreach ((array) $variants as $variant) {
+                if (!is_array($variant)) {
+                    continue;
+                }
+                $variantName = mb_strtolower(trim((string) ($variant['name'] ?? '')));
+                if ($variantName !== '' && $variantName === $needle) {
+                    $pricing = $this->extractVariantPricing($variant);
+                    if ($pricing !== null) {
+                        return $pricing;
+                    }
+                }
+            }
+        }
+
+        Log::info('SallaService: variant price resolution failed — no match found', [
+            'channel_id' => $channel->id,
+            'product_id' => $productId,
+            'selected_value_ids' => $selectedValueIds,
+            'selected_value_names' => $selectedValueNames,
+            'variant_count' => count($variants),
+        ]);
+
+        return null;
+    }
+
+    /** Match a variant by exact related_option_values ID set comparison. */
+    private function matchVariantByValueIds(array $variants, array $selectedValueIds): ?array
+    {
+        foreach ($variants as $variant) {
             if (!is_array($variant)) {
                 continue;
             }
-            $relatedValues = array_values(array_unique(array_filter(array_map('strval', (array) ($variant['related_option_values'] ?? [])))));
+            $rawRelated = (array) ($variant['related_option_values'] ?? []);
+            // Salla may return related_option_values as objects [{"id":123}]
+            // or plain integers [123]. Normalize both to string IDs.
+            $relatedValues = [];
+            foreach ($rawRelated as $rov) {
+                if (is_array($rov) && isset($rov['id'])) {
+                    $relatedValues[] = (string) $rov['id'];
+                } elseif (is_scalar($rov)) {
+                    $relatedValues[] = (string) $rov;
+                }
+            }
+            $relatedValues = array_values(array_unique(array_filter($relatedValues)));
             sort($relatedValues, SORT_STRING);
-            if ($relatedValues !== $selectedValueIds) {
+            if ($relatedValues === $selectedValueIds) {
+                return $this->extractVariantPricing($variant);
+            }
+        }
+        return null;
+    }
+
+    /** Match a variant by its display name against the selected option value names. */
+    private function matchVariantByName(array $variants, array $selectedValueNames): ?array
+    {
+        // Build a normalized composite key from the selected value names.
+        // For a single option: "40 - M". For multiple: "40 - M / Red".
+        $normalizeForCompare = static function (string $text): string {
+            $text = mb_strtolower(trim($text));
+            // Collapse whitespace and normalize dashes/separators
+            $text = preg_replace('/[\s\x{00A0}]+/u', ' ', $text) ?? $text;
+            $text = preg_replace('/\s*[-–—]\s*/', ' - ', $text) ?? $text;
+            return trim($text);
+        };
+
+        $selectedNormalized = array_map($normalizeForCompare, $selectedValueNames);
+        sort($selectedNormalized, SORT_STRING);
+        $compositeKey = implode(' / ', $selectedNormalized);
+
+        foreach ($variants as $variant) {
+            if (!is_array($variant)) {
+                continue;
+            }
+            $variantName = $normalizeForCompare((string) ($variant['name'] ?? ''));
+            if ($variantName === '') {
                 continue;
             }
 
-            $saleAmount = data_get($variant, 'sale_price.amount');
-            $regularAmount = data_get($variant, 'price.amount');
-            $amount = !empty($variant['has_special_price']) && is_numeric($saleAmount) && (float) $saleAmount > 0
-                ? (float) $saleAmount
-                : (is_numeric($regularAmount) ? (float) $regularAmount : null);
-            if ($amount === null) {
-                return null;
+            // Direct name match (most common: single-option product)
+            if ($variantName === $compositeKey) {
+                return $this->extractVariantPricing($variant);
             }
 
-            return [
-                'variant_id' => (string) ($variant['id'] ?? ''),
-                'price' => $amount,
-                'currency' => (string) (data_get($variant, 'price.currency') ?? data_get($variant, 'sale_price.currency') ?? 'SAR'),
-            ];
+            // Check if the variant name contains ALL selected value names
+            // (for multi-option products where the variant name is a composite)
+            $allFound = true;
+            foreach ($selectedNormalized as $needle) {
+                if (!str_contains($variantName, $needle)) {
+                    $allFound = false;
+                    break;
+                }
+            }
+            if ($allFound && count($selectedNormalized) > 0) {
+                return $this->extractVariantPricing($variant);
+            }
         }
 
         return null;
+    }
+
+    /** Extract price and variant_id from a raw Salla variant array. */
+    private function extractVariantPricing(array $variant): ?array
+    {
+        $saleAmount = data_get($variant, 'sale_price.amount');
+        $regularAmount = data_get($variant, 'price.amount');
+        $amount = !empty($variant['has_special_price']) && is_numeric($saleAmount) && (float) $saleAmount > 0
+            ? (float) $saleAmount
+            : (is_numeric($regularAmount) ? (float) $regularAmount : null);
+        if ($amount === null) {
+            return null;
+        }
+
+        return [
+            'variant_id' => (string) ($variant['id'] ?? ''),
+            'price' => $amount,
+            'currency' => (string) (data_get($variant, 'price.currency') ?? data_get($variant, 'sale_price.currency') ?? 'SAR'),
+        ];
     }
 
     /**

@@ -2181,6 +2181,7 @@ class ProcessAutoReply implements ShouldQueue
                 ));
                 if ($variantOptions !== []) {
                     $selectedVariantValueIds = [];
+                    $selectedVariantValueNames = [];
                     foreach ($variantOptions as $variantOption) {
                         $variantOptionId = (string) $variantOption['id'];
                         $selected = array_values(array_intersect(
@@ -2189,9 +2190,15 @@ class ProcessAutoReply implements ShouldQueue
                         ));
                         if (count($selected) !== 1) {
                             $selectedVariantValueIds = [];
+                            $selectedVariantValueNames = [];
                             break;
                         }
                         $selectedVariantValueIds[] = $selected[0];
+                        // Resolve the human-readable name so the variant can
+                        // be matched by name when Salla uses different IDs in
+                        // the options vs. variants endpoints.
+                        $matchedValue = collect($variantOption['values'])->firstWhere('id', $selected[0]);
+                        $selectedVariantValueNames[] = $matchedValue ? trim((string) $matchedValue['name']) : '';
                     }
 
                     if (count($selectedVariantValueIds) === count($variantOptions)) {
@@ -2199,25 +2206,41 @@ class ProcessAutoReply implements ShouldQueue
                             $variantPricing = (new SallaService())->getVariantPriceForOptions(
                                 $commerceChannel,
                                 (string) $updatedCheckoutState['salla_product_id'],
-                                $selectedVariantValueIds
+                                $selectedVariantValueIds,
+                                array_filter($selectedVariantValueNames)
                             );
                             if ($variantPricing) {
                                 $updatedCheckoutState['product_price'] = (string) $variantPricing['price'];
                                 $updatedCheckoutState['product_currency'] = (string) $variantPricing['currency'];
                                 $updatedCheckoutState['salla_variant_id'] = (string) $variantPricing['variant_id'];
                                 unset($updatedCheckoutState['salla_variant_price_unresolved']);
+                                Log::info('ProcessAutoReply: Salla variant price resolved', [
+                                    'conversation_id' => $conversation->id,
+                                    'variant_id' => $variantPricing['variant_id'],
+                                    'price' => $variantPricing['price'],
+                                    'value_ids' => $selectedVariantValueIds,
+                                    'value_names' => $selectedVariantValueNames,
+                                ]);
                             } else {
-                                $sallaVariantPriceUnavailable = true;
-                                $updatedCheckoutState['salla_variant_price_unresolved'] = true;
+                                // Fallback: use the base product price instead of dead-ending.
+                                // The base price is already in checkout_state from the product
+                                // selection step — keep it and proceed rather than blocking.
+                                Log::warning('ProcessAutoReply: variant price lookup returned null, using base product price as fallback', [
+                                    'conversation_id' => $conversation->id,
+                                    'connection_id' => $commerceChannel->id,
+                                    'value_ids' => $selectedVariantValueIds,
+                                    'value_names' => $selectedVariantValueNames,
+                                ]);
+                                unset($updatedCheckoutState['salla_variant_price_unresolved']);
                             }
                         } catch (\Throwable $priceException) {
-                            $sallaVariantPriceUnavailable = true;
-                            $updatedCheckoutState['salla_variant_price_unresolved'] = true;
-                            Log::warning('ProcessAutoReply: could not resolve selected Salla variant price', [
+                            // On exception, also fall back to base price instead of dead-ending.
+                            Log::warning('ProcessAutoReply: could not resolve selected Salla variant price, using base product price', [
                                 'conversation_id' => $conversation->id,
                                 'connection_id' => $commerceChannel->id,
                                 'exception_type' => get_class($priceException),
                             ]);
+                            unset($updatedCheckoutState['salla_variant_price_unresolved']);
                         }
                     }
                 }

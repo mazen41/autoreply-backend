@@ -904,6 +904,13 @@ class ProcessAutoReply implements ShouldQueue
 
         // Capture intent before applying the explicit reference policy for logs.
         $intentBefore = $isOrderStatus ? 'order_status' : ($isPlaceOrder ? 'place_order' : ($isProductAggregate ? 'product_inquiry' : 'question'));
+        if ($sallaChannel) {
+            Log::info('ProcessAutoReply: Salla intent route selected', [
+                'conversation_id' => $conversation->id,
+                'message_id' => $message->id,
+                'route' => $isOrderStatus ? 'status_lookup' : ($isExplicitOrderConfirmationMessage ? 'order_confirmation' : ($isPlaceOrder ? 'checkout' : 'general_ai')),
+            ]);
+        }
 
         // A resolved pointer becomes an order only when ordering language is
         // present. A pointer alone asks about that product.
@@ -1460,6 +1467,49 @@ class ProcessAutoReply implements ShouldQueue
                 broadcast(new \App\Events\MessageReceived($replyMessage, $conversation, $channel->user_id));
             }
             $this->sendReply($channel, $conversation, $replyMessage);
+            return;
+        }
+
+        // Salla order status is store data, not a language-generation task.
+        // The lookup above is already scoped to this conversation's store and
+        // checks order ownership; answer directly so provider outages cannot
+        // turn a successful lookup into a generic AI failure.
+        if ($isOrderStatus && $sallaChannel) {
+            $order = $sallaContext ? $this->parseSallaContext($sallaContext) : [];
+            $reference = trim((string) ($order['order_number'] ?? ''));
+            $status = trim((string) ($order['status'] ?? ''));
+            $total = trim((string) ($order['total'] ?? ''));
+            $currency = trim((string) ($order['currency'] ?? 'SAR'));
+            $shipping = trim((string) ($order['shipping_status'] ?? ''));
+            $currentStatusText = trim((string) $message->content);
+            $hasIdentifier = (bool) preg_match('/(?:#?\d{5,12})|(?:\+?\d[\d\s().-]{7,17}\d)/u', $currentStatusText);
+
+            if ($order !== []) {
+                $statusReply = $detectedLanguage === 'arabic'
+                    ? 'لقيت طلبك' . ($reference !== '' ? " رقم #{$reference}" : '') . ($status !== '' ? " وحالته: {$status}" : '')
+                        . ($total !== '' ? "، والإجمالي {$total} {$currency}" : '')
+                        . ($shipping !== '' && $shipping !== 'Not shipped' ? "، وحالة الشحن: {$shipping}" : '') . '.'
+                    : 'I found your order' . ($reference !== '' ? " #{$reference}" : '') . ($status !== '' ? " with status: {$status}" : '')
+                        . ($total !== '' ? ". Total: {$total} {$currency}" : '')
+                        . ($shipping !== '' && $shipping !== 'Not shipped' ? ". Shipping: {$shipping}" : '') . '.';
+            } elseif ($hasIdentifier) {
+                $statusReply = $detectedLanguage === 'arabic'
+                    ? 'لم أجد طلبًا يطابق البيانات المرسلة. راجع رقم الطلب أو أرسل رقم الجوال المستخدم وقت الشراء.'
+                    : 'I could not find an order matching those details. Please check the order number or send the phone number used at checkout.';
+            } else {
+                $statusReply = $detectedLanguage === 'arabic'
+                    ? 'أكيد أساعدك في متابعة الطلب. أرسل رقم الطلب أو رقم الجوال المستخدم وقت الشراء لأتحقق من حالته.'
+                    : 'I can check that for you. Please send the order number or the phone number used at checkout.';
+            }
+
+            Log::info('SALLA_DETERMINISTIC_STATUS_REPLY', [
+                'conversation_id' => $conversation->id,
+                'message_id' => $message->id,
+                'lookup_found' => $order !== [],
+                'identifier_supplied' => $hasIdentifier,
+                'provider_called' => false,
+            ]);
+            $this->sendSallaDeterministicReply($channel, $conversation, $statusReply, $detectedLanguage, 'salla_order_status');
             return;
         }
 
@@ -2092,6 +2142,34 @@ class ProcessAutoReply implements ShouldQueue
                 'auto_order_confirmation_enabled' => (bool) $autoOrderConfirmationEnabled,
                 'is_product_browse_message' => (bool) $isProductBrowseMessage,
             ]);
+        }
+
+        // Once the customer explicitly confirms a Salla checkout, do not ask
+        // an LLM to decide whether that confirmation counts. Validate the
+        // saved summary and fields locally, then submit or explain the exact
+        // gate that prevents submission.
+        if ($sallaChannel && $containsConfirmPhrase) {
+            Log::info('SALLA_DETERMINISTIC_CONFIRM_ROUTE', [
+                'conversation_id' => $conversation->id,
+                'message_id' => $message->id,
+                'auto_submission_enabled' => (bool) $autoOrderConfirmationEnabled,
+                'checkout_complete' => (bool) ($fieldStatus['is_complete'] ?? false),
+                'summary_valid' => (bool) $hasValidOrderSummary,
+                'shipping_quote_present' => !empty($updatedCheckoutState['salla_shipping_quote']),
+                'provider_called' => false,
+            ]);
+            if ($this->handleSallaConfirmationWithoutAi(
+                $channel,
+                $conversation,
+                $commerceChannel,
+                $updatedCheckoutState,
+                $fieldStatus,
+                $hasValidOrderSummary,
+                (bool) $autoOrderConfirmationEnabled,
+                $detectedLanguage
+            )) {
+                return;
+            }
         }
         $realOrderId = $updatedCheckoutState['order_id'] ?? null;
 
@@ -4962,13 +5040,14 @@ $aiResponse = $intro
             return true;
         }
 
+        $customerOrderNumber = trim((string) ($orderData['order_number'] ?? $orderId));
         $productName = trim((string) ($orderInput['product_name'] ?? ''));
         $customerName = trim((string) ($orderInput['full_name'] ?? ''));
         $reply = $detectedLanguage === 'arabic'
             ? "✅ تم تأكيد طلبك بنجاح!" . ($customerName !== '' ? " شكرًا {$customerName}" : '') . "\n"
-                . ($productName !== '' ? "المنتج: {$productName}\n" : '') . "رقم الطلب: #{$orderId}\nسيتم التواصل معك قريبًا لتأكيد التفاصيل 🚀"
+                . ($productName !== '' ? "المنتج: {$productName}\n" : '') . "رقم الطلب: #{$customerOrderNumber}\nسيتم التواصل معك قريبًا لتأكيد التفاصيل 🚀"
             : "✅ Your order has been placed successfully!" . ($customerName !== '' ? " Thank you, {$customerName}" : '') . "\n"
-                . ($productName !== '' ? "Product: {$productName}\n" : '') . "Order #: {$orderId}\nWe'll contact you shortly to confirm the details ðŸš€";
+                . ($productName !== '' ? "Product: {$productName}\n" : '') . "Order #: {$customerOrderNumber}\nWe'll contact you shortly to confirm the details ðŸš€";
 
         $completedState = array_merge(
             is_array($conversation->fresh()->checkout_state) ? $conversation->fresh()->checkout_state : [],
@@ -5032,6 +5111,157 @@ $aiResponse = $intro
         }
 
         return true;
+    }
+
+    /** Handle every Salla confirmation from saved checkout state without an AI provider call. */
+    private function handleSallaConfirmationWithoutAi(
+        Channel $channel,
+        Conversation $conversation,
+        ?Channel $commerceChannel,
+        array $checkoutState,
+        array $fieldStatus,
+        bool $hasValidOrderSummary,
+        bool $autoSubmissionEnabled,
+        string $detectedLanguage
+    ): bool {
+        if (!$autoSubmissionEnabled) {
+            $reply = $detectedLanguage === 'arabic'
+                ? 'لم يتم إرسال الطلب؛ لأن الإرسال التلقائي متوقف حاليًا. سيتواصل معك أحد أفراد الفريق لمساعدتك في إتمامه.'
+                : 'Your order has not been submitted because automatic order submission is currently off. A team member will follow up to help complete it.';
+            $conversation->update([
+                'requires_human' => true,
+                'status' => 'pending_human',
+                'escalated_at' => now(),
+                'escalation_reason' => 'order_confirmation_disabled',
+            ]);
+            app(\App\Services\HandoffTaskService::class)->openForConversation(
+                $conversation,
+                'order_confirmation_disabled',
+                'normal'
+            );
+            $this->sendSallaDeterministicReply($channel, $conversation, $reply, $detectedLanguage, 'salla_order_confirmation_disabled');
+            return true;
+        }
+
+        if (empty($fieldStatus['is_complete'])) {
+            $labels = $detectedLanguage === 'arabic' ? [
+                'full_name' => 'الاسم الكامل', 'phone' => 'رقم الجوال', 'address' => 'عنوان التوصيل',
+                'delivery_city' => 'مدينة التوصيل', 'street_number' => 'رقم الشارع', 'building_number' => 'رقم المبنى',
+                'block' => 'الدور أو الشقة', 'postal_code' => 'الرمز البريدي', 'email' => 'البريد الإلكتروني',
+                'district' => 'الحي', 'short_address' => 'العنوان الوطني المختصر', 'additional_number' => 'الرقم الإضافي للمبنى',
+            ] : [
+                'full_name' => 'full name', 'phone' => 'phone number', 'address' => 'delivery address',
+                'delivery_city' => 'delivery city', 'street_number' => 'street number', 'building_number' => 'building number',
+                'block' => 'block or floor', 'postal_code' => 'postal code', 'email' => 'email address',
+                'district' => 'district', 'short_address' => 'short national address', 'additional_number' => 'additional building number',
+            ];
+            $missing = array_values(array_filter(array_map(
+                static fn ($field) => $labels[$field] ?? null,
+                array_diff((array) ($fieldStatus['missing_fields'] ?? []), ['geo_coordinates'])
+            )));
+            $reply = $detectedLanguage === 'arabic'
+                ? 'لم يتم إرسال الطلب بعد. أرسل البيانات الناقصة في رسالة واحدة: ' . implode('، ', $missing) . '.'
+                : 'Your order has not been submitted yet. Please send the missing details together in one message: ' . implode(', ', $missing) . '.';
+            $this->sendSallaDeterministicReply($channel, $conversation, $reply, $detectedLanguage, 'salla_checkout_fields_required');
+            return true;
+        }
+
+        if (empty($checkoutState['salla_shipping_quote'])) {
+            $reply = $detectedLanguage === 'arabic'
+                ? 'لم أتمكن من تأكيد رسوم التوصيل الآن، لذلك لم أرسل الطلب. سيتواصل معك فريق المتجر لتأكيد الإجمالي.'
+                : 'I could not confirm the delivery fee, so I have not submitted the order. The store team will confirm the total with you.';
+            $conversation->update([
+                'requires_human' => true, 'status' => 'pending_human',
+                'escalated_at' => now(), 'escalation_reason' => 'salla_shipping_quote_unavailable',
+            ]);
+            app(\App\Services\HandoffTaskService::class)->openForConversation($conversation, 'salla_shipping_quote_unavailable');
+            $this->sendSallaDeterministicReply($channel, $conversation, $reply, $detectedLanguage, 'salla_shipping_quote_unavailable');
+            return true;
+        }
+
+        if (!$hasValidOrderSummary) {
+            $checkoutState['confirmation_state'] = 'confirmation_pending';
+            unset(
+                $checkoutState['confirmation_summary_message_id'],
+                $checkoutState['confirmation_summary_fingerprint'],
+                $checkoutState['confirmation_summary_sent_at']
+            );
+            $conversation->update(['checkout_state' => $checkoutState]);
+            $summary = $this->buildOrderConfirmationSummary($checkoutState, $commerceChannel);
+            $replyMessage = Message::create([
+                'conversation_id' => $conversation->id,
+                'content' => $summary,
+                'direction' => 'outbound', 'status' => 'auto', 'is_ai' => false,
+                'source' => 'salla_order_summary', 'send_status' => 'pending',
+                'metadata' => ['order_summary' => true],
+                'intent' => 'place_order', 'detected_language' => $detectedLanguage,
+            ]);
+            if ($channel->user_id) broadcast(new \App\Events\MessageReceived($replyMessage, $conversation, $channel->user_id));
+            $sent = $this->sendReply($channel, $conversation, $replyMessage);
+            if ($sent) {
+                $checkoutState['confirmation_summary_message_id'] = $replyMessage->id;
+                $checkoutState['confirmation_summary_fingerprint'] = $this->orderFingerprint($checkoutState);
+                $checkoutState['confirmation_summary_sent_at'] = now()->toIso8601String();
+                $conversation->update(['checkout_state' => $checkoutState]);
+            }
+            return true;
+        }
+
+        if (!$commerceChannel || $commerceChannel->type !== 'salla') {
+            $reply = $detectedLanguage === 'arabic'
+                ? 'لم يتم إرسال الطلب؛ تعذر تحديد متجر سلة المتصل بهذه المحادثة. سيتحقق فريق المتجر من الربط.'
+                : 'Your order has not been submitted because I could not resolve the connected Salla store. The store team will check the connection.';
+            app(\App\Services\HandoffTaskService::class)->openForConversation($conversation, 'salla_connection_unresolved');
+            $this->sendSallaDeterministicReply($channel, $conversation, $reply, $detectedLanguage, 'salla_connection_unresolved');
+            return true;
+        }
+
+        try {
+            if ($this->submitConfirmedCheckoutWithoutAi($conversation, $channel, $commerceChannel, $checkoutState, $detectedLanguage)) {
+                return true;
+            }
+        } catch (\Throwable $exception) {
+            Log::error('ProcessAutoReply: deterministic Salla order submission threw', [
+                'conversation_id' => $conversation->id,
+                'connection_id' => $commerceChannel->id,
+                'exception_type' => get_class($exception),
+            ]);
+        }
+
+        $reply = $detectedLanguage === 'arabic'
+            ? 'لم يتم تأكيد إرسال الطلب من متجر سلة. لن أكرر الإرسال حتى لا يتكرر الطلب؛ سيتحقق فريق المتجر من النتيجة.'
+            : 'Salla did not confirm the order, so I have not marked it as placed. I will not retry automatically to avoid creating a duplicate; the store team will check the result.';
+        app(\App\Services\HandoffTaskService::class)->openForConversation($conversation, 'salla_order_submission_unconfirmed');
+        $this->sendSallaDeterministicReply($channel, $conversation, $reply, $detectedLanguage, 'salla_order_submission_unconfirmed');
+        return true;
+    }
+
+    /** Persist and send a deterministic Salla reply without calling any AI provider. */
+    private function sendSallaDeterministicReply(
+        Channel $channel,
+        Conversation $conversation,
+        string $reply,
+        string $detectedLanguage,
+        string $source
+    ): bool {
+        $replyMessage = Message::create([
+            'conversation_id' => $conversation->id,
+            'content' => $reply,
+            'direction' => 'outbound', 'status' => 'auto', 'is_ai' => false,
+            'source' => $source, 'send_status' => 'pending',
+            'intent' => str_contains($source, 'status') ? 'order_status' : 'place_order',
+            'detected_language' => $detectedLanguage,
+        ]);
+        if ($channel->user_id) broadcast(new \App\Events\MessageReceived($replyMessage, $conversation, $channel->user_id));
+        $sent = $this->sendReply($channel, $conversation, $replyMessage);
+        Log::info('Salla deterministic reply sent', [
+            'conversation_id' => $conversation->id,
+            'message_id' => $replyMessage->id,
+            'source' => $source,
+            'send_success' => $sent,
+            'provider_called' => false,
+        ]);
+        return $sent;
     }
 
     /**
